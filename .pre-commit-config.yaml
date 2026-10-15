@@ -4,15 +4,21 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
+      - id: check-symlinks
+      - id: destroyed-symlinks
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        args: [--allow-multiple-documents]
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files
         args: ['--maxkb=1500']
       - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+      - id: detect-private-key
       - id: debug-statements
+      - id: no-commit-to-branch
   - repo: https://github.com/PyCQA/isort
     rev: 7.0.0
     hooks:
@@ -24,7 +30,7 @@ repos:
         args:
           - --select=F401,F821,F823,UP037
           - --fix
-        exclude: .*/__init__\.py$
+        exclude: (.*/__init__\.py|.*\.ipynb)$
       - id: ruff-format
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
