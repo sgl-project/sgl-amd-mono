@@ -20,6 +20,7 @@ BACKEND = "amd"
 SPECS = {
     "DeepseekV4ForCausalLM": "sgl_amd_mono.deepseek_v41.spec:SPEC",
     "DeepseekV4ForCausalLMDSpark": "sgl_amd_mono.deepseek_v41.draft:SPEC",
+    "Glm5NextForConditionalGeneration": "sgl_amd_mono.glm53_flash.spec:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)

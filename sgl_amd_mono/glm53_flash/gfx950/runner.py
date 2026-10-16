@@ -1,0 +1,375 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm at ca328e297b (Apache-2.0):
+# vllm/models/glm5next/amd/ops/mono/ffn/op.py
+"""Host side of the GLM-5.3-Flash layer launch: one runtime per (width, kind),
+shared by every covered layer of that kind in a step, and one op per layer
+holding its weights."""
+
+from __future__ import annotations
+
+import inspect
+import os
+from pathlib import Path
+from typing import Optional
+
+import msgspec
+import torch
+
+from .config import HC_MULT, HIDDEN, KPOOL
+from .layout import DSA_TAB, ROW_WORDS
+
+
+class FlashFfnWeights(msgspec.Struct, frozen=True):
+    """One layer's MoE-side tensors as the kernel reads them; ``*_sh_*`` is the
+    shared expert, a slice of the routed tensors or a packed copy."""
+
+    w_r: torch.Tensor  # router [288, HIDDEN] bf16, packed in 16 x 64 MFMA tiles
+    bias: torch.Tensor  # [288] f32
+    w_ug: torch.Tensor  # routed gate | up, MXFP4 bytes in AITER's (16, 16) shuffle
+    s_ug: torch.Tensor  # their E8M0 scales, AITER's e8m0_shuffle
+    w_dn: torch.Tensor
+    s_dn: torch.Tensor
+    w_sh_ug: torch.Tensor
+    s_sh_ug: torch.Tensor
+    w_sh_dn: torch.Tensor
+    s_sh_dn: torch.Tensor
+    hc_fn: torch.Tensor  # [24, 4 * HIDDEN] f32: the FFN mHC
+    hc_scale: torch.Tensor  # [3] f32
+    hc_base: torch.Tensor  # [24] f32
+    g_norm: torch.Tensor  # [HIDDEN] bf16: post_attention_layernorm
+
+
+class FlashKdaWeights(msgspec.Struct, frozen=True):
+    """One KDA layer's attention-side tensors, every projection row-major bf16:
+    ``w_in`` [3P + H + 2 * 128, HIDDEN] (q | k | v | beta | f_a | g_a), ``w_fb`` and
+    ``w_gb`` [P, 128], ``w_o`` [HIDDEN, P]; ``conv_w`` [3P, 4], ``a_log`` [H],
+    ``dt_bias`` [P] and ``w_on`` [128] f32."""
+
+    hc_fn: torch.Tensor
+    hc_scale: torch.Tensor
+    hc_base: torch.Tensor
+    g_norm: torch.Tensor
+    w_in: torch.Tensor
+    w_fb: torch.Tensor
+    w_gb: torch.Tensor
+    conv_w: torch.Tensor
+    a_log: torch.Tensor
+    dt_bias: torch.Tensor
+    w_on: torch.Tensor
+    w_o: torch.Tensor
+
+
+class FlashDsaWeights(msgspec.Struct, frozen=True):
+    """One sparse-attention layer's attention-side tensors. ``w_qkv`` [1536 + 512,
+    HIDDEN] (q_a | kv_a), ``w_qb`` [H * 256, 1536] and ``w_o`` [HIDDEN, H * 256] are
+    each FP8 with f32 128 x 128 block scales, or bf16 with no scale; ``w_idx`` bf16
+    [128 + 32, HIDDEN] (wk | weights_proj), ``w_gate`` bf16 [128, HIDDEN]; q_a / kv_a
+    RMSNorm weights; k LayerNorm weight and bias and kpool ``ape`` [4, 128] f32;
+    ``w_iq`` bf16 [32 * 128, 1536]; ``w_uk`` bf16 [H, 512, 256] (W_UK^T, packed
+    once); ``w_kvb`` bf16 [H * 512, 512] (kv_b_proj, W_UV rows at 256 ..).
+    ``shuffled``: which FP8 weights are in AITER's (16, 16) preshuffled layout."""
+
+    hc_fn: torch.Tensor
+    hc_scale: torch.Tensor
+    hc_base: torch.Tensor
+    g_norm: torch.Tensor
+    w_qkv: torch.Tensor
+    s_qkv: Optional[torch.Tensor]
+    w_idx: torch.Tensor
+    w_gate: torch.Tensor
+    g_qa: torch.Tensor
+    g_kv: torch.Tensor
+    ln_w: torch.Tensor
+    ln_b: torch.Tensor
+    ape: torch.Tensor
+    w_qb: torch.Tensor
+    s_qb: Optional[torch.Tensor]
+    w_iq: torch.Tensor
+    w_uk: torch.Tensor
+    w_kvb: torch.Tensor
+    w_o: torch.Tensor
+    s_o: Optional[torch.Tensor]
+    shuffled: tuple[bool, bool, bool] = (False, False, False)
+
+    @property
+    def fp8(self) -> tuple[bool, bool, bool]:
+        """Which of q_a | kv_a, q_b, o_proj are FP8 (scales present)."""
+        return tuple(sc is not None for sc in (self.s_qkv, self.s_qb, self.s_o))
+
+
+class FlashDsaCaches(msgspec.Struct, frozen=True):
+    """One sparse-attention layer's SGLang caches: the bf16 MLA latent cache
+    [slots, row] (``row`` >= 512 elements), the uint8 index cache [index pages,
+    64 pools x 132 B] (the pools' FP8 values in 16-pool x 16-byte tiles, then their
+    f32 scales), and the bf16 kpool k and gate rings [request slots, 4, 128]."""
+
+    kv_cache: torch.Tensor
+    idx_cache: torch.Tensor
+    tail_k: torch.Tensor
+    tail_g: torch.Tensor
+
+
+class FlashKdaState(msgspec.Struct, frozen=True):
+    """One KDA layer's decode state: bf16 conv state [slots, 3, 3P] and f32
+    recurrent state [slots, H, 128 (v), 128 (k)], slot strides in elements."""
+
+    conv_state: torch.Tensor
+    rec_state: torch.Tensor
+
+
+# Rows of SGLang's DSA page table an index block spans: an index page holds 64
+# pools (256 tokens), and the table holds one entry per 64 tokens.
+PAGE_TOKENS = 64
+INDEX_BLOCK_POOLS = 64
+IDX_BT_GROUP = INDEX_BLOCK_POOLS * KPOOL // PAGE_TOKENS
+
+
+def compile_only(launch) -> None:
+    """Compile a launch for this process without running it (FlyDSL's compile-only
+    mode, for the one call); the first real call then only loads the code."""
+    from flydsl.utils.env import CompileEnvManager
+
+    names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
+    var = CompileEnvManager.options["compile_only"].env_var
+    old = os.environ.get(var)
+    os.environ[var] = "1"
+    try:
+        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
+    finally:
+        if old is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = old
+
+
+def ensure_writable_flydsl_cache() -> None:
+    """Point FlyDSL at a writable cache (aiter sets a read-only one)."""
+    cur = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR")
+    if cur and os.access(cur, os.W_OK):
+        return
+    path = Path.home() / ".flydsl" / "cache"
+    path.mkdir(parents=True, exist_ok=True)
+    os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = str(path)
+
+
+class FlashRuntime:
+    """The compiled launch for one (width, kind) plus the state its layers share:
+    scratch mailboxes, the symmetric peer buffer, and the guard block, whose word 0
+    is the step epoch (``advance_step``)."""
+
+    def __init__(self, key, rank: int, group, device: torch.device):
+        from sgl_amd_mono.common import guard
+        from sgl_amd_mono.common.peer import PeerBuffer
+
+        from .kernel import build_flash_kernel
+
+        ensure_writable_flydsl_cache()
+        self.key, self.width, self.rank = key, key.rows, rank
+        self.launch, self.sc, self.sy = build_flash_kernel(key)
+        self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
+        self.peer.bytes.zero_()
+        self.scratch = torch.zeros(self.sc["_bytes"], dtype=torch.uint8, device=device)
+        self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
+        # two output sets, by layer parity: a layer never writes what it reads
+        w = key.rows
+        self.outs = [
+            (
+                torch.empty(w, HIDDEN, dtype=torch.bfloat16, device=device),
+                torch.empty(w, HC_MULT, HIDDEN, dtype=torch.bfloat16, device=device),
+                torch.empty(w, HC_MULT, 1, dtype=torch.float32, device=device),
+                torch.empty(w, HC_MULT, HC_MULT, dtype=torch.float32, device=device),
+            )
+            for _ in range(2)
+        ]
+
+    def set_deadline(self, seconds: float) -> None:
+        """Every wait's deadline (below the server's watchdog timeout)."""
+        from sgl_amd_mono.common import guard
+
+        ticks = guard.deadline_ticks(seconds)
+        lo = ticks & 0xFFFFFFFF
+        self.epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
+        self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
+
+    def precompile(self) -> None:
+        compile_only(self.launch)
+
+    def advance_step(self) -> None:
+        self.epoch[:1].add_(1)
+
+    def close(self) -> None:
+        self.peer.close()
+
+
+def _check(name: str, t: torch.Tensor, shape: tuple, dtype: torch.dtype) -> None:
+    if tuple(t.shape) != shape or t.dtype != dtype or not t.is_contiguous():
+        raise ValueError(
+            f"GLM-5.3-Flash monokernel needs {name} as contiguous {dtype} {shape}, "
+            f"got {t.dtype} {tuple(t.shape)}"
+        )
+
+
+class FlashLayerOp:
+    """One covered layer: its weights and its ordinal among its kind's layers."""
+
+    def __init__(
+        self,
+        runtime: FlashRuntime,
+        weights: FlashFfnWeights,
+        layer: int,
+        kda: Optional[FlashKdaWeights] = None,
+        dsa: Optional[FlashDsaWeights] = None,
+    ):
+        if (kda is None) == runtime.key.kda:
+            raise ValueError("a KDA runtime needs KDA weights, and only it")
+        if (dsa is None) == runtime.key.dsa:
+            raise ValueError(
+                "a sparse-attention runtime needs DSA weights, and only it"
+            )
+        key = runtime.key
+        if dsa is not None and (dsa.fp8, dsa.shuffled) != (
+            (key.qkv_fp8, key.qb_fp8, key.o_fp8),
+            (key.qkv_shuffled, key.qb_shuffled, key.o_shuffled),
+        ):
+            raise ValueError(
+                f"DSA weights (fp8 {dsa.fp8}, shuffled {dsa.shuffled}) on another runtime"
+            )
+        self.rt, self.w, self.layer, self.kda, self.dsa = (
+            runtime,
+            weights,
+            layer,
+            kda,
+            dsa,
+        )
+        # the layer's argument table (``DSA_TAB`` order), rewritten outside capture
+        # when a cache moves; the page table is a launch argument
+        self.tab: Optional[torch.Tensor] = None
+        self._tab_host: list[int] = []
+        if dsa is not None:
+            self.tab = torch.zeros(
+                len(DSA_TAB), dtype=torch.int64, device=dsa.w_qkv.device
+            )
+
+    def _dsa_table(self, caches: FlashDsaCaches) -> torch.Tensor:
+        d, c = self.dsa, caches
+        kv, idx = c.kv_cache, c.idx_cache
+        values = {
+            **{
+                name: 0 if getattr(d, name) is None else getattr(d, name).data_ptr()
+                for name in DSA_TAB[:16]
+            },
+            "kv_cache": kv.data_ptr(),
+            "idx_cache": idx.data_ptr(),
+            "tail_k": c.tail_k.data_ptr(),
+            "tail_g": c.tail_g.data_ptr(),
+            "idx_bt_group": IDX_BT_GROUP,
+            "kv_block_elems": PAGE_TOKENS * kv.stride(0),
+            "kv_block_tokens": PAGE_TOKENS,
+            "kv_row_elems": kv.stride(0),
+            "idx_block_bytes": idx.stride(0),
+            "idx_block_pools": INDEX_BLOCK_POOLS,
+            "tail_block_elems": c.tail_k.stride(0),
+        }
+        host = [values[name] for name in DSA_TAB]
+        if host != self._tab_host:
+            # every graph of this width reads the one table: set it outside capture
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "the sparse-attention table changed during a graph capture"
+                )
+            self.tab.copy_(torch.tensor(host, dtype=torch.int64))
+            self._tab_host = host
+        return self.tab
+
+    def launch(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        state: Optional[FlashKdaState] = None,
+        state_idx: Optional[torch.Tensor] = None,
+        caches: Optional[FlashDsaCaches] = None,
+        rows: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The previous layer's (x [S, HIDDEN], residual [S, HC, HIDDEN], post
+        [S, HC, 1], comb [S, HC, HC]), with its FFN post still owed. A KDA op takes
+        its layer's state and ``state_idx`` int32 [S] (not positive: padding); a
+        sparse-attention op its caches, the step's ``rows`` int32 [S, ROW_WORDS]
+        and SGLang's int32 64-token page table. Returns the layer's (x, residual,
+        post, comb), its own FFN post owed."""
+        rt, w, S = self.rt, self.w, self.rt.width
+        _check("x", x, (S, HIDDEN), torch.bfloat16)
+        _check("residual", residual, (S, HC_MULT, HIDDEN), torch.bfloat16)
+        _check("post", post, (S, HC_MULT, 1), torch.float32)
+        _check("comb", comb, (S, HC_MULT, HC_MULT), torch.float32)
+        x_out, res_out, post_out, comb_out = rt.outs[self.layer % 2]
+        p = lambda t: t.data_ptr()  # noqa: E731
+        kda_args = [0] * 17
+        dsa_args = [0, 0, 0, 0]
+        if self.dsa is not None:
+            if caches is None or rows is None or page_table is None:
+                raise ValueError(
+                    "a sparse-attention launch needs caches, rows and a page table"
+                )
+            _check("rows", rows, (S, ROW_WORDS), torch.int32)
+            if page_table.dtype != torch.int32 or page_table.stride(1) != 1:
+                raise ValueError("needs an int32 page table with contiguous rows")
+            d = self.dsa
+            kda_args[:4] = [p(d.hc_fn), p(d.hc_scale), p(d.hc_base), p(d.g_norm)]
+            dsa_args = [
+                p(self._dsa_table(caches)),
+                p(rows),
+                p(page_table),
+                page_table.stride(0),
+            ]
+        if self.kda is not None:
+            if state is None or state_idx is None:
+                raise ValueError("a KDA launch needs its state and state indices")
+            _check("state_idx", state_idx, (S,), torch.int32)
+            k = self.kda
+            kda_args = [
+                *map(p, (k.hc_fn, k.hc_scale, k.hc_base, k.g_norm, k.w_in, k.w_fb)),
+                *map(p, (k.w_gb, k.conv_w, k.a_log, k.dt_bias, k.w_on, k.w_o)),
+                p(state.conv_state),
+                p(state.rec_state),
+                p(state_idx),
+                state.conv_state.stride(0),
+                state.rec_state.stride(0),
+            ]
+        rt.launch(
+            p(x),
+            p(residual),
+            p(post),
+            p(comb),
+            p(w.hc_fn),
+            p(w.hc_scale),
+            p(w.hc_base),
+            p(w.g_norm),
+            p(res_out),
+            p(post_out),
+            p(comb_out),
+            p(x_out),
+            p(w.w_r),
+            p(w.bias),
+            p(w.w_ug),
+            p(w.s_ug),
+            p(w.w_dn),
+            p(w.s_dn),
+            p(w.w_sh_ug),
+            p(w.s_sh_ug),
+            p(w.w_sh_dn),
+            p(w.s_sh_dn),
+            *kda_args,
+            *dsa_args,
+            p(rt.scratch),
+            rt.peer.local,
+            p(rt.peer.addresses),
+            p(rt.epoch),
+            rt.rank,
+            self.layer,
+            stream=torch.cuda.current_stream(),
+        )
+        return x_out, res_out, post_out, comb_out

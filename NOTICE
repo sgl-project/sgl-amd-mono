@@ -27,3 +27,9 @@ in its header. ROCm/ATOM is distributed under this license:
   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   SOFTWARE.
+
+Portions are adapted from vllm-project/vllm (https://github.com/vllm-project/vllm):
+the GLM-5.3-Flash decoder-layer kernel, which vLLM adapted from ROCm/aiter
+(https://github.com/ROCm/aiter, Copyright (c) 2025 FlyDSL Project Contributors).
+Each adapted file names its origin in its header. These portions are distributed
+under the Apache License 2.0.
