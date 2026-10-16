@@ -31,6 +31,7 @@ SPECS = {
         "MiniMaxM3SparseForConditionalGeneration",
         None,
     ): "sgl_amd_mono.minimax.spec:SPEC",
+    ("Qwen3_5ForConditionalGeneration", None): "sgl_amd_mono.qwen3_8_dense.spec:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
