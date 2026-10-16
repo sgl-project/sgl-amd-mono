@@ -1,1 +1,6 @@
-* @HaiShaw @kkHuang-amd @kevin-mii @alexnails @Oasis-Git @billishyahao
+# Overall owners: every path without a more specific line below.
+* @HaiShaw @kevin-mii @alexnails
+
+# Per model: its spec, forward, kernels and tests. The last matching line wins,
+# so each model line repeats the overall owners. A new model's PR adds its line.
+**/*deepseek_v41* @HaiShaw @kevin-mii @alexnails @kkHuang-amd
