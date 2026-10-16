@@ -15,10 +15,12 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | Model | GPU | Tensor parallel | Coverage |
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
+| GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | The 41 MoE layers but the last (one launch each) in decode steps of up to 8 rows (4 at TP2) |
+| GLM-5.3 | MI355X (gfx950) | 4, 8 | The 75 MoE layers (one launch each) in decode steps of up to 8 rows (4 at TP4) |
 
 ### Design
 
-- **Two launches per layer.** K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits.
+- **One or two launches per layer.** DeepSeek-V4.1-Flash runs two. K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits. GLM-5.3-Flash and GLM-5.3 run each covered layer as one launch.
 - **Graph-safe routing.** Each step is routed by its CUDA graph key alone, so every rank makes the same decision and a captured graph replays the decision made at capture.
 - **Fail-stop synchronization.** Every wait on another workgroup or GPU has a deadline. A failed wait stops the launch on every rank, so no token from a failed step is returned.
 - **In-place weights.** The kernels read the weights SGLang loaded. The few weights that need another layout are copied once at startup, and each copy is logged.
@@ -59,9 +61,17 @@ If the model, GPU or configuration is not supported, the server refuses to start
 sgl-amd-mono/
 ├── sgl_amd_mono/
 │   ├── common/          # HIP device runtime: guarded waits, epochs, peer memory
-│   └── deepseek_v41/
-│       ├── spec.py      # target model: spec and forward
-│       ├── draft.py     # DSpark draft model: spec and forward
+│   ├── deepseek_v41/
+│   │   ├── spec.py      # target model: spec and forward
+│   │   ├── draft.py     # DSpark draft model: spec and forward
+│   │   └── gfx950/      # kernels and launch runner
+│   ├── glm53_flash/
+│   │   ├── spec.py      # spec and forward
+│   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
+│   │   └── gfx950/      # kernels and launch runner
+│   └── glm53/
+│       ├── spec.py      # spec and forward
+│       ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
 │       └── gfx950/      # kernels and launch runner
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
@@ -74,6 +84,8 @@ sgl-amd-mono/
 ```bash
 pytest test/unit               # CPU only
 pytest test/kernels test/e2e   # 4 x MI350X or MI355X, with DEEPSEEK_V41_FLASH_MODEL_PATH set
+                               # (GLM-5.3-Flash: 8 GPUs, GLM_53_FLASH_MODEL_PATH;
+                               # GLM-5.3: 8 GPUs, GLM_53_MODEL_PATH, e2e only)
 ```
 
 ## Contributing
