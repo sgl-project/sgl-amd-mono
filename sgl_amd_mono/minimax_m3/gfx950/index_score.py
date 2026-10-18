@@ -353,24 +353,3 @@ def emit_index_scores(
         # cold: a step without context-parallel requests runs none of it
         if unlikely(total_cp > 0):
             emit_cp_tasks()
-
-
-def q_frag_from(iq, heads=ONE_INDEX_HEAD):
-    """(``q_frag``, ``q_frag_head``) reading index q from memory: [token][head]
-    [HEAD_DIM] bf16, ``heads.count`` heads a token."""
-
-    def q_frag_head(tk, s, head):
-        lane = fx.thread_idx.x % 64
-        return fx.Vector(
-            bo.buffer_load(
-                rsrc(iq),
-                ((tk * heads.count + head) * HEAD_DIM + 32 * s + 8 * (lane // 16)) // 2,
-                vec_width=4,
-                dtype=T.i32,
-            )
-        ).bitcast(fx.BFloat16)
-
-    def q_frag(tk, s):
-        return q_frag_head(tk, s, heads.own)
-
-    return q_frag, q_frag_head

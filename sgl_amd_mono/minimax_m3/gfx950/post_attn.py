@@ -43,8 +43,6 @@ walks the stages in order. Dependencies only point to earlier stages and all
 CTAs are co-resident, so every spin wait makes progress.
 """
 
-import struct
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -167,10 +165,6 @@ S13_BYTES = (N_ROUTED + 1) * W13_ROWS * W13_SCALE_COLS
 
 # The launch goes on the caller's current stream (graph capture included).
 _CURRENT_STREAM = fx.Stream(None)
-
-
-def _f32(x: float) -> float:
-    return struct.unpack("f", struct.pack("f", x))[0]
 
 
 # blocks at least the selection floor, counted against each other (from ATOM's M3

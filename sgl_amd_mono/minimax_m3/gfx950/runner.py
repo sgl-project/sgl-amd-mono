@@ -128,7 +128,6 @@ class M3MonoRunner:
         _ensure_writable_flydsl_cache()
         self.tp, self.rank, self.device = tp, rank, device
         self.layers = layers
-        self.first_layer = layers[0].layer_id
         self.k4_build = k4_build
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
@@ -181,9 +180,6 @@ class M3MonoRunner:
         from sgl_amd_mono.minimax_m3.gfx950.pre_attn import K1_ARGS
 
         no_capture("the caches bound")
-        ids = [L.layer_id for L in self.layers]
-        k0 = pool.get_key_buffer(ids[0])
-        self.num_slots = k0.shape[0]
         self.k_ptrs, self.v_ptrs, self.k1_args = [], [], []
         for i, L in enumerate(self.layers):
             k = pool.get_key_buffer(L.layer_id)
