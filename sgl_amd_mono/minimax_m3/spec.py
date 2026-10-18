@@ -149,7 +149,8 @@ SGLANG_READS = {
     "srt/configs/minimax_vl.py": ("text_config",),
 }
 
-# Each launch against SGLang's modules on the same input (check mode, 4 requests,
+# Each launch against SGLang's modules on the same input, with the attention
+# projections in FP8 where SGLang's are bf16 (check mode, 4 requests,
 # about 60k launches in each of two runs): the residual after the attention add on
 # every row, and the MLP output on the rows whose residuals route to SGLang's
 # experts. Median / p99 / worst: residual rel 0.006 / 0.021 / 0.063, row cosine

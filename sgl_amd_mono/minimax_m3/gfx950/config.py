@@ -2,7 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Shapes the mono kernels are compiled for: one MiniMax-M3 TP4 rank.
 
-The host op validates every tensor it is given against these values.
+``weights.layer_reasons`` and ``M3MonoRunner.cache_reasons`` check SGLang's weights
+and caches against these values.
 """
 
 from __future__ import annotations

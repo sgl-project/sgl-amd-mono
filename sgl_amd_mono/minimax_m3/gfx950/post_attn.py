@@ -22,7 +22,7 @@ S = 1..MAX_TOKENS tokens (each token's stage tasks side by side); for one token:
             -> acc = bf16(sum) + h   (h_mid = bf16(acc), mailbox ``a`` = acc)
     router: gemma RMSNorm(acc) in the fused all-reduce's reduction order -> bf16
             gate GEMV -> logits; publishes its slice of the normalized input
-    moe   : sigmoid + bias top-4 (+ the fused shared expert) -> MXFP4 a16w4
+    moe   : sigmoid + bias top-4 (+ the fused shared expert) -> MXFP8 x MXFP4 (a8w4)
             up/gate on aiter's shuffled layout -> swiglu -> mid (bf16);
             the CTA's down task reuses that routing, its weights prefetched
             under the up/gate GEMV: route-weighted down GEMV -> push bf16

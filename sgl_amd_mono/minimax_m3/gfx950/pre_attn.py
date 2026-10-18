@@ -15,9 +15,9 @@ rows a request (each row below is per token)::
 
 It reads what the unfused path leaves in memory (the ``ar`` / ``res`` pair of the
 all-reduce, the loaded weights, the bound caches) and writes what
-``fused_qknorm_idxrqknorm`` writes, so either path can run any layer. The
-numerical contracts (reduction orders, where values round to bf16) follow the
-aiter kernels the unfused path uses; see each stage.
+``fused_qknorm_idxrqknorm`` writes, so either path can run any layer. The norms,
+RoPE and reduction orders follow the aiter kernels the unfused path uses (see each
+stage); the qkv / index GEMV is FP8 where the unfused path's is bf16.
 """
 
 import flydsl.expr as fx
