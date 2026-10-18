@@ -12,6 +12,8 @@
 import enum
 import functools
 import hashlib
+import importlib.util
+import re
 from pathlib import Path
 
 import msgspec
@@ -93,20 +95,45 @@ def padded(n: int, align: int) -> int:
 # ---------------------------------------------------------------- build keys
 _SCALARS = (int, float, bool, str, enum.Enum)
 _ROOT = Path(__file__).resolve().parents[1]  # the sgl_amd_mono package
+# FlyDSL keys a kernel on its own directory's helpers only, so the aiter FlyDSL
+# helpers the sources import are hashed too
+_AITER_IMPORT = re.compile(
+    rb"^[ \t]*from (aiter\.ops\.flydsl\.kernels(?:\.\w+)*) import \(?\s*(\w+)", re.M
+)
+
+
+def _aiter_helper(package: str, name: str):
+    """The source file of the aiter module ``from package import name`` reads."""
+    for module in (f"{package}.{name}", package):  # a submodule, else an attribute
+        try:
+            spec = importlib.util.find_spec(module)
+        except ModuleNotFoundError:  # not a package, or no aiter (nothing compiles)
+            continue
+        if spec is not None and spec.origin and spec.origin.endswith(".py"):
+            return Path(spec.origin)
+    return None
 
 
 @functools.cache
 def source_digest(*paths: str) -> str:
-    """Return the sha256 of every ``.py`` file under ``paths`` (path and contents)."""
+    """Return the sha256 of every ``.py`` file under ``paths`` (path and contents),
+    and of the aiter FlyDSL helpers they import."""
     h = hashlib.sha256()
+    helpers = set()
     for rel in paths:
         root = _ROOT / rel
         files = [root] if root.is_file() else sorted(root.rglob("*.py"))
         if not files:
             raise FileNotFoundError(f"no kernel sources at {root}")
         for f in files:
+            text = f.read_bytes()
             h.update(str(f.relative_to(_ROOT)).encode())
-            h.update(f.read_bytes())
+            h.update(text)
+            for package, name in _AITER_IMPORT.findall(text):
+                helpers.add(_aiter_helper(package.decode(), name.decode()))
+    for f in sorted(p for p in helpers if p is not None):
+        h.update(f.name.encode())
+        h.update(f.read_bytes())
     return h.hexdigest()[:16]
 
 
