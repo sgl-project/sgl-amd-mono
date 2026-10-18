@@ -79,6 +79,8 @@ SGLANG_READS = {
         "enable_lmcache",
         "enable_flexkv",
         "disaggregation_decode_enable_offload_kvcache",
+        "enable_hisparse",
+        "expert_distribution_recorder_mode",
     ),
     "srt/environ.py": (
         "SGLANG_USE_AITER",
@@ -508,6 +510,10 @@ SPEC = MonoSpec(
             # the shared expert runs as the fused expert of the MXFP4 MoE
             "disable_shared_experts_fusion": frozenset({False}),
             "speculative_algorithm": frozenset({None, "EAGLE3"}),
+            # HiSparse maps the logical KV slots to device rows; the kernels write raw slots
+            "enable_hisparse": frozenset({False}),
+            # the launches record no expert distribution
+            "expert_distribution_recorder_mode": frozenset({None}),
         },
         env={
             "SGLANG_USE_AITER": True,
