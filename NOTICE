@@ -33,3 +33,8 @@ the GLM-5.3-Flash decoder-layer kernel, which vLLM adapted from ROCm/aiter
 (https://github.com/ROCm/aiter, Copyright (c) 2025 FlyDSL Project Contributors),
 and its geometry, host runner and weight views. Each adapted file names its
 origin in its header. These portions are distributed under the Apache License 2.0.
+
+Portions are adapted from ROCm/aiter (https://github.com/ROCm/aiter): the GLM-5.3
+decoder-layer kernel of ROCm/aiter#6173 (Copyright (c) 2025 FlyDSL Project
+Contributors). Each adapted file names its origin in its header. These portions
+are distributed under the Apache License 2.0.
