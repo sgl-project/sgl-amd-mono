@@ -216,7 +216,6 @@ SGLANG_READS = {
     ),
     "srt/configs/deepseek_v4.py": ("vision_n_layers", "image_token_id"),
     "srt/layers/engram.py": ("layer_hash_index", "forward(cp_all_tokens)"),
-    "srt/model_executor/forward_batch_info.py": ("contains_mm_inputs",),
     "srt/models/deepseek_common/amd/deepseek_v4_hip.py": ("hc_boundary_fused",),
     "srt/models/deepseek_v2.py": (
         "experts",
@@ -859,7 +858,9 @@ class _Built:
                 residual = engram(
                     before, hash_ids[:, engram.layer_hash_index], forward_batch
                 )
-                if m.config.vision_n_layers > 0 and forward_batch.contains_mm_inputs():
+                # every image-token row keeps its residual, as in SGLang's forward: a
+                # captured graph cannot branch on whether the batch has mm inputs
+                if m.config.vision_n_layers > 0:
                     image = input_ids == m.config.image_token_id
                     residual = torch.where(image[:, None, None], before, residual)
                 pending = (None, residual, None, None)
