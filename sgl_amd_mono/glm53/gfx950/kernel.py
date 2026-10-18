@@ -371,7 +371,7 @@ def build_glm5_monokernel(
     class Smem:
         work: fx.Array[fx.Float32, WORK_WORDS, 16]
 
-    keyed = (("sources", kernel_sources("glm53")),)
+    keyed = (("sources", kernel_sources(__name__)),)
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def glm5_monokernel(

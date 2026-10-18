@@ -39,7 +39,7 @@ def build_k2i(tokens: int):
     """K2i for a step of ``tokens`` rows."""
     assert 0 < tokens <= MAX_ROWS, tokens
     name = kernel_symbol("dsv41_mono_k2i", s=tokens)
-    keyed = (("tokens", tokens), ("sources", kernel_sources("deepseek_v41")))
+    keyed = (("tokens", tokens), ("sources", kernel_sources(__name__)))
 
     @fx.struct
     class RowsLds:

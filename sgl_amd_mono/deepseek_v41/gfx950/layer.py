@@ -216,7 +216,7 @@ def build_mono_k1(key: MonoBuild):
         i=key.index,
         **_variant(key),
     )
-    keyed = key_tuple(key, kernel_sources("deepseek_v41"))
+    keyed = key_tuple(key, kernel_sources(__name__))
     half = peer_half_bytes(tp)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -615,7 +615,7 @@ def build_mono_ffn(key: MonoBuild):
         moe: MoeLds  # type: ignore[valid-type]
 
     name = kernel_symbol("dsv41_mono_ffn", s=s, tp=tp, **_variant(key))
-    keyed = key_tuple(key, kernel_sources("deepseek_v41"))
+    keyed = key_tuple(key, kernel_sources(__name__))
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kffn(
@@ -796,7 +796,7 @@ def build_mono_k2(key: MonoBuild):
     name = kernel_symbol(
         "dsv41_mono_k2", s=s, tp=tp, c=key.compressed, i=key.index, **_variant(key)
     )
-    keyed = key_tuple(key, kernel_sources("deepseek_v41"))
+    keyed = key_tuple(key, kernel_sources(__name__))
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(

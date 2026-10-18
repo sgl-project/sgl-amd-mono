@@ -225,7 +225,7 @@ def build_flash_kernel(key: FlashBuild):
         q=int(QKV8),
         h=int(QKV_SH or QB_SH or O_SH),
     )
-    keyed = key_tuple(key, kernel_sources("glm53_flash"))
+    keyed = key_tuple(key, kernel_sources(__name__))
     SHARED = SHARED_EXPERT
     G = BLOCKS
     SC, SY = layout(S, W, expert_inter, kda, dsa, max_pools)

@@ -9,11 +9,11 @@
 # atom/mono/plan/build_key.py
 """Plain-Python planning of the mono kernels: execution model, layouts, TP shards and build keys."""
 
+import ast
 import enum
 import functools
 import hashlib
 import importlib.util
-import re
 from pathlib import Path
 
 import msgspec
@@ -95,52 +95,77 @@ def padded(n: int, align: int) -> int:
 # ---------------------------------------------------------------- build keys
 _SCALARS = (int, float, bool, str, enum.Enum)
 _ROOT = Path(__file__).resolve().parents[1]  # the sgl_amd_mono package
-# FlyDSL keys a kernel on its own directory's helpers only, so the aiter FlyDSL
-# helpers the sources import are hashed too
-_AITER_IMPORT = re.compile(
-    rb"^[ \t]*from (aiter\.ops\.flydsl\.kernels(?:\.\w+)*) import \(?\s*(\w+)", re.M
-)
+# FlyDSL keys a kernel on its own directory's plain helpers only, so the plugin and
+# aiter FlyDSL modules a kernel imports are hashed into its key
+_TRACED = ("sgl_amd_mono", "aiter.ops.flydsl.kernels")
+_DOCUMENTED = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
 
 
-def _aiter_helper(package: str, name: str):
-    """The source file of the aiter module ``from package import name`` reads."""
-    for module in (f"{package}.{name}", package):  # a submodule, else an attribute
-        try:
-            spec = importlib.util.find_spec(module)
-        except ModuleNotFoundError:  # not a package, or no aiter (nothing compiles)
-            continue
-        if spec is not None and spec.origin and spec.origin.endswith(".py"):
-            return Path(spec.origin)
-    return None
+def _module_file(name: str):
+    """The source file of module ``name``, or None when ``name`` is not a module."""
+    if name.partition(".")[0] == "sgl_amd_mono":
+        base = _ROOT.parent.joinpath(*name.split("."))
+        return next(
+            (f for f in (base / "__init__.py", base.with_suffix(".py")) if f.is_file()),
+            None,
+        )
+    try:
+        spec = importlib.util.find_spec(name)
+    except ModuleNotFoundError:  # an attribute, or no aiter (nothing compiles)
+        return None
+    if spec is None or not (spec.origin or "").endswith(".py"):
+        return None
+    return Path(spec.origin)
+
+
+def _imported(name: str, tree: ast.Module, package: bool):
+    """Every module name ``tree`` can import, at any depth; for ``from m import x``
+    both ``m`` and ``m.x``, as ``x`` may be a submodule."""
+    parent = name if package else name.rpartition(".")[0]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            yield from (a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                anchor = parent.rsplit(".", node.level - 1)[0]
+                base = f"{anchor}.{base}" if base else anchor
+            yield base
+            yield from (f"{base}.{a.name}" for a in node.names)
+
+
+def _code(tree: ast.Module) -> str:
+    """``tree`` without its docstrings; comments and layout are already gone."""
+    for node in ast.walk(tree):
+        if isinstance(node, _DOCUMENTED) and ast.get_docstring(node) is not None:
+            node.body = node.body[1:] or [ast.Pass()]
+    return ast.dump(tree)
 
 
 @functools.cache
-def source_digest(*paths: str) -> str:
-    """Return the sha256 of every ``.py`` file under ``paths`` (path and contents),
-    and of the aiter FlyDSL helpers they import."""
+def kernel_sources(module: str) -> str:
+    """The digest a kernel built in ``module`` closes over: the code of ``module`` and
+    of every plugin and aiter FlyDSL module it imports, transitively. Only a code
+    edit to one of them rebuilds it; comments, docstrings and other modules do not."""
+    codes, seen, todo = {}, set(), [module]
+    while todo:
+        name = todo.pop()
+        traced = any(name == p or name.startswith(f"{p}.") for p in _TRACED)
+        if name in seen or not traced:
+            continue
+        seen.add(name)
+        f = _module_file(name)
+        if f is None:
+            continue
+        tree = ast.parse(f.read_bytes())
+        todo.extend(_imported(name, tree, f.name == "__init__.py"))
+        codes[name] = _code(tree)
+    if module not in codes:
+        raise FileNotFoundError(f"no source for kernel module {module!r}")
     h = hashlib.sha256()
-    helpers = set()
-    for rel in paths:
-        root = _ROOT / rel
-        files = [root] if root.is_file() else sorted(root.rglob("*.py"))
-        if not files:
-            raise FileNotFoundError(f"no kernel sources at {root}")
-        for f in files:
-            text = f.read_bytes()
-            h.update(str(f.relative_to(_ROOT)).encode())
-            h.update(text)
-            for package, name in _AITER_IMPORT.findall(text):
-                helpers.add(_aiter_helper(package.decode(), name.decode()))
-    for f in sorted(p for p in helpers if p is not None):
-        h.update(f.name.encode())
-        h.update(f.read_bytes())
+    for name in sorted(codes):
+        h.update(f"{name}\0{codes[name]}\0".encode())
     return h.hexdigest()[:16]
-
-
-def kernel_sources(model: str) -> str:
-    """The digest every kernel of ``model`` closes over (``common/``, the model's
-    ``gfx950/`` and the aiter helpers they import), so editing any of them rebuilds."""
-    return source_digest("common", f"{model}/gfx950")
 
 
 def key_tuple(key, sources: str) -> tuple:
