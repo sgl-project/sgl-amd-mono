@@ -184,6 +184,7 @@ def _layer(**changes):
         num_fused_shared_experts=1,
         top_k=5,
         intermediate_size_per_partition=INTER,
+        moe_runner_config=SimpleNamespace(activation="silu"),
         w13_weight=_meta(
             E, 2 * INTER, HIDDEN // 2, dtype=torch.uint8, is_shuffled=True
         ),
@@ -251,6 +252,8 @@ def test_the_views_accept_a_sparse_layer():
                 N_ROUTED + 1, 2 * INTER, HIDDEN // 2, dtype=torch.uint8
             )
         },
+        # SGLang interleaves a SiTU activation's gate and up rows
+        {"mlp.experts.moe_runner_config": SimpleNamespace(activation="situ")},
         {"mlp.experts.num_local_experts": N_ROUTED},
         {"mlp.experts.moe_ep_rank": 1},
         {"mlp.e_score_correction_bias": None},
@@ -266,6 +269,7 @@ def test_the_views_accept_a_sparse_layer():
         "index heads",
         "fp8 o_proj",
         "unshuffled experts",
+        "interleaved gate and up",
         "no fused shared expert",
         "expert parallel",
         "no routing bias",

@@ -76,7 +76,9 @@ SGLANG_READS = {
         "num_fused_shared_experts",
         "top_k",
         "intermediate_size_per_partition",
+        "moe_runner_config",
     ),
+    "srt/layers/moe/moe_runner/base.py": ("activation",),
     "srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py": (
         "is_shuffled",
         '"w13_weight"',
@@ -184,6 +186,11 @@ def layer_reasons(layer, i: int) -> list[str]:
     # aiter's MXFP4 method marks its shuffled tensors; no mark is no shuffle
     if not (getattr(w13, "is_shuffled", False) and getattr(w2, "is_shuffled", False)):
         why.append(f"layer {i}: expert weights are not AITER-shuffled MXFP4")
+    # a SiTU activation makes SGLang interleave gate and up rows (A16W4), which
+    # also count as shuffled; the kernel reads them separated (A4W4)
+    activation = experts.moe_runner_config.activation
+    if activation != "silu":
+        why.append(f"layer {i}: expert activation {activation!r}, built for 'silu'")
     if not (w13.dtype == w2.dtype == torch.uint8
             and w13.numel() == EXPERTS * 2 * INTER * HIDDEN // 2
             and w2.numel() == EXPERTS * HIDDEN * INTER // 2):  # fmt: skip
