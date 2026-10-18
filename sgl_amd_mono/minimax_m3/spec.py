@@ -86,6 +86,8 @@ SGLANG_READS = {
         "SGLANG_USE_AITER",
         "SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ",
         "SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE",
+        "SGLANG_SIMULATE_UNIFORM_EXPERTS",
+        "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
         "envs",
     ),
     "srt/runtime_context.py": (
@@ -521,6 +523,9 @@ SPEC = MonoSpec(
             "SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ": 1,
             # the index-K cache the kernels score is FP8
             "SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE": True,
+            # benchmark routing overrides: the kernels route with the model's own router
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS": False,
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS": False,
         },
     ),
     numerics=NUMERICS,
