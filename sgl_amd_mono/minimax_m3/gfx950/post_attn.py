@@ -151,6 +151,7 @@ from sgl_amd_mono.minimax_m3.gfx950.select import (
     group_floor,
     put_key,
 )
+from sgl_amd_mono.minimax_m3.gfx950.sources import SOURCES
 
 FP8_MAX = 448.0
 NEG = -3.4e38  # the paged decode's masked-score value
@@ -271,6 +272,8 @@ def build_post_attn_kernel(
     # index heads go in as ints (a shared cache otherwise serves one rank's build
     # to every rank)
     ih_count, ih_own = heads.count, heads.own
+    # an edit to common/ or these kernel sources changes the key, so the kernel rebuilds
+    keyed = (("sources", SOURCES),)
     # with every index head: K1's index q of every head (qs) after its x8 rows in
     # the pool (K1 is done with the pool before K4's stages use it)
     QS_CP = tokens * HIDDEN // 4
@@ -310,6 +313,7 @@ def build_post_attn_kernel(
         slot_mapping: Int64,
         res: Int64,
     ):
+        _ = keyed
         # every wait runs under the guard: a deadline, the error words, and the
         # peers' flags at the tail of each rank's peer buffer
         with guard.scope(
@@ -2621,6 +2625,7 @@ def build_post_attn_kernel(
         res: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):
+        _ = keyed
         post_attn_kernel(
             h_in,
             q,
