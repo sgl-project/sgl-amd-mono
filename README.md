@@ -42,14 +42,19 @@ pip install -e .
 ### Usage
 
 ```bash
-python -m sglang.launch_server \
+SGLANG_USE_AITER=1 AITER_BF16_FP8_MOE_BOUND=0 python -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4.1-Flash \
   --tp 4 \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \
   --fp8-gemm-backend aiter \
+  --enforce-shared-experts-fusion \
   --monokernel-backend amd
 ```
+
+On gfx950 the decode graph capture fails in AITER's MoE without
+`AITER_BF16_FP8_MOE_BOUND=0`. The flags are those of the serving tests
+(`test/e2e/deepseek_v41_server.py`).
 
 If the model, GPU or configuration is not supported, the server refuses to start and lists every reason.
 
