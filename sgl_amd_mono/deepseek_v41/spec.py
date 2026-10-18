@@ -134,6 +134,7 @@ SGLANG_READS = {
         "SGLANG_DSV4_FP4_DEQUANT",
         "SGLANG_USE_AITER_MOE_GU_ITLV",
         "SGLANG_DSV4_KV_LAYOUT",
+        "SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE",
         "SGLANG_HIP_DSV41_INDEX_K_PAGE8",
         "SGLANG_SIMULATE_UNIFORM_EXPERTS",
         "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
@@ -995,6 +996,8 @@ SPEC = MonoSpec(
             "SGLANG_USE_AITER_MOE_GU_ITLV": True,
             # fp8 nope and bf16 rope, 584 B a token
             "SGLANG_DSV4_KV_LAYOUT": "v4",
+            # K1 quantizes the SWA nope payload from f32, as SGLang's fused writer does
+            "SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE": False,
             # the scorer reads the ratio-1 index-K pages in the page-64 byte layout
             "SGLANG_HIP_DSV41_INDEX_K_PAGE8": False,
             # benchmark routing overrides: K2 routes with the model's own router
