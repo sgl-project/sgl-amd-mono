@@ -277,9 +277,9 @@ SGLANG_READS = {
         "attn_sink",
         "compress_ratio",
     ),
+    "srt/configs/model_config.py": ("context_len",),
     "srt/runtime_context.py": (
         "get_parallel",
-        "get_model",
         '"tp_rank"',
         '"tp_size"',
         '"tp_group"',
@@ -917,13 +917,9 @@ class _Built:
 
 
 def _longest_context(hf_config) -> int:
-    """The longest context a request can have: ``--context-length``, else the
-    model's; a ratio-1 index source sees that many compressed rows (plus a
-    verify step's draft rows)."""
-    from sglang.srt.runtime_context import get_model
-
-    ctx = get_model().context_length or hf_config.max_position_embeddings
-    return int(ctx) + 2 * MAX_ROWS
+    """The longest context a request can have, SGLang's ``context_len``; a ratio-1
+    index source sees that many compressed rows (plus a verify step's draft rows)."""
+    return int(hf_config.context_len) + 2 * MAX_ROWS
 
 
 def _build(model, hf_config, ctx) -> _Built:
