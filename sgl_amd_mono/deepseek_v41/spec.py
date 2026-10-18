@@ -135,6 +135,8 @@ SGLANG_READS = {
         "SGLANG_USE_AITER_MOE_GU_ITLV",
         "SGLANG_DSV4_KV_LAYOUT",
         "SGLANG_HIP_DSV41_INDEX_K_PAGE8",
+        "SGLANG_SIMULATE_UNIFORM_EXPERTS",
+        "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
     ),
     # an index source's compressor, between K1 and K2
     "srt/layers/attention/deepseek_v4_backend.py": (
@@ -995,6 +997,9 @@ SPEC = MonoSpec(
             "SGLANG_DSV4_KV_LAYOUT": "v4",
             # the scorer reads the ratio-1 index-K pages in the page-64 byte layout
             "SGLANG_HIP_DSV41_INDEX_K_PAGE8": False,
+            # benchmark routing overrides: K2 routes with the model's own router
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS": False,
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS": False,
         },
     ),
     numerics=NUMERICS,
