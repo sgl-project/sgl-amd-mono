@@ -268,7 +268,9 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     if not sparse or sparse != list(range(sparse[0], len(m.layers))):
         return reasons + [f"MoE layers {sparse} are not a trailing run of the stack"]
     if sparse[0] == 0:
-        return reasons + ["the first launch takes a dense layer's residual"]
+        return reasons + [
+            "layer 0 is a MoE layer; the first launch needs a dense layer before it"
+        ]
     # the first launch takes the previous layer's MLP output with its residual add
     # still pending; the kernel applies the add with its input norm
     if not m.layers[sparse[0] - 1].ffn_boundary.declaration.update.is_plain_add:

@@ -136,8 +136,9 @@ def layer_reasons(layer, i: int) -> list[str]:
         why.append(f"layer {i}: the indexer carries values; the kernels read K only")
     shape = (attn.num_heads, attn.num_kv_heads, attn.num_idx_heads, attn.head_dim,
              attn.idx_head_dim)  # fmt: skip
-    if shape != (LOCAL_Q_HEADS, 1, ONE_INDEX_HEAD.count, HEAD_DIM, HEAD_DIM):
-        why.append(f"layer {i}: heads / dims {shape} a rank")
+    want = (LOCAL_Q_HEADS, 1, ONE_INDEX_HEAD.count, HEAD_DIM, HEAD_DIM)
+    if shape != want:
+        why.append(f"layer {i}: heads / dims {shape} a rank, built for {want}")
     if attn.rotary_dim != ROTARY_DIM:
         why.append(f"layer {i}: rotary_dim {attn.rotary_dim}, built for {ROTARY_DIM}")
     if not (attn.use_gemma_norm and attn.qk_norm_type == "per_head"):
