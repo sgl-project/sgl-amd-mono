@@ -4,3 +4,4 @@
 # Per model: one owner for its spec, forward, kernels and tests. Each new
 # model's PR adds its line.
 **/*deepseek_v41* @kkHuang-amd
+**/*minimax_m3* @zijiecode
