@@ -134,6 +134,7 @@ SGLANG_READS = {
         "SGLANG_DSV4_FP4_DEQUANT",
         "SGLANG_USE_AITER_MOE_GU_ITLV",
         "SGLANG_DSV4_KV_LAYOUT",
+        "SGLANG_HIP_DSV41_INDEX_K_PAGE8",
     ),
     # an index source's compressor, between K1 and K2
     "srt/layers/attention/deepseek_v4_backend.py": (
@@ -991,6 +992,8 @@ SPEC = MonoSpec(
             "SGLANG_USE_AITER_MOE_GU_ITLV": True,
             # fp8 nope and bf16 rope, 584 B a token
             "SGLANG_DSV4_KV_LAYOUT": "v4",
+            # the scorer reads the ratio-1 index-K pages in the page-64 byte layout
+            "SGLANG_HIP_DSV41_INDEX_K_PAGE8": False,
         },
     ),
     numerics=NUMERICS,
