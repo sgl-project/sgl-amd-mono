@@ -27,6 +27,7 @@ Examples: [Fix] deepseek_v41: Fix the K2 pad-row write; [Perf] [MI355X] deepseek
 - [ ] Tests under `test/` cover the change.
 - [ ] The SGLang commit or PR this was tested against is named above.
 - [ ] Accuracy and speed results are attached when kernel or forward code changes.
+- [ ] A new model adds one line to `.github/CODEOWNERS` that names its owner.
 
 ## Review and Merge Process
 

@@ -1,1 +1,6 @@
-* @HaiShaw @kkHuang-amd @kevin-mii
+# Overall owners: every path without a more specific line below.
+* @HaiShaw @kevin-mii @alexnails
+
+# Per model: one owner for its spec, forward, kernels and tests. Each new
+# model's PR adds its line.
+**/*deepseek_v41* @kkHuang-amd
