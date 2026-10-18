@@ -127,6 +127,7 @@ SGLANG_READS = {
         "enable_encoder_swa_bounded_replay",
         "fp8_gemm_runner_backend",
         "context_length",
+        "expert_distribution_recorder_mode",
     ),
     "srt/environ.py": (
         "SGLANG_DSV4_FP4_EXPERTS",
@@ -979,6 +980,8 @@ SPEC = MonoSpec(
             "speculative_algorithm": frozenset({None, "DSPARK"}),
             # the paged SWA cache, not a request window
             "enable_encoder_swa_bounded_replay": frozenset({False}),
+            # the launches record no expert distribution (SGLang's forward sets it per layer)
+            "expert_distribution_recorder_mode": frozenset({None}),
         },
         hf_config={**HF_CONFIG, "model_type": "deepseek_v41"},
         env={
