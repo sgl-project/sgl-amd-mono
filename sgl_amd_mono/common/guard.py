@@ -65,6 +65,7 @@ GUARD_WORDS = 8  # the epoch buffer's words before the per-CTA marks
 
 FLAG_WORDS = 8  # one a rank; TP 8 at most
 FLAG_BYTES = 256  # the peer buffer's flags region, padded to a cache line pair
+FLAG_LOAD_WORDS = 4  # buffer_load_dwordx4 is the widest AMDGCN buffer load
 
 CLOCK_HZ = 100_000_000  # s_memrealtime: the constant 100 MHz reference clock
 
@@ -169,21 +170,33 @@ class Guard:
         )
 
     def flags(self):
-        """This rank's flags as its peers wrote them (system scope); 0 when clean."""
+        """This rank's flags as its peers wrote them (system scope); 0 when clean.
+
+        Read in chunks of at most ``FLAG_LOAD_WORDS``: AMDGCN's widest buffer
+        load is ``buffer_load_dwordx4``, and the backend does not split a wider
+        one for us -- a ``vector<8xi32>`` buffer load fails instruction
+        selection outright ("LLVM ERROR: Cannot select ... v8i32
+        AMDGPUISD::BUFFER_LOAD"), which is exactly what one load a rank asked
+        for in an 8-rank group. Four ranks and fewer still issue the single
+        load they always did.
+        """
         if self.own is None:
             return fx.Int32(0)
-        v = fx.Vector(
-            bo.buffer_load(
-                rsrc(self.own + fx.Int64(self.flags_offset)),
-                0,
-                vec_width=self.npes,
-                dtype=T.i32,
-                cache_modifier=CM_SYS,
+        base = rsrc(self.own + fx.Int64(self.flags_offset))
+        words = []
+        for first in range(0, self.npes, FLAG_LOAD_WORDS):
+            width = min(FLAG_LOAD_WORDS, self.npes - first)
+            chunk = bo.buffer_load(
+                base, first, vec_width=width, dtype=T.i32, cache_modifier=CM_SYS
             )
-        )
-        acc = fx.Int32(v[0])
-        for p in range_constexpr(1, self.npes):
-            acc = acc | v[p]
+            if width == 1:  # a scalar, not a one-element vector
+                words.append(fx.Int32(chunk))
+                continue
+            v = fx.Vector(chunk)
+            words.extend(fx.Int32(v[p]) for p in range_constexpr(width))
+        acc = words[0]
+        for w in words[1:]:
+            acc = acc | w
         return acc
 
     def stopped(self):

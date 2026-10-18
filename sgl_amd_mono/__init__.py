@@ -20,6 +20,10 @@ BACKEND = "amd"
 SPECS = {
     "DeepseekV4ForCausalLM": "sgl_amd_mono.deepseek_v41.spec:SPEC",
     "DeepseekV4ForCausalLMDSpark": "sgl_amd_mono.deepseek_v41.draft:SPEC",
+    # the same decoder stack either way; the conditional-generation architecture
+    # wraps it with a vision tower, whose layers run SGLang's own path
+    "MiniMaxM3SparseForCausalLM": "sgl_amd_mono.minimax_m3.spec:SPEC",
+    "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax_m3.spec:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
