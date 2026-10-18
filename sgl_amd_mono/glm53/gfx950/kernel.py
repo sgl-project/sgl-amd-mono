@@ -56,6 +56,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import spin_until
+from sgl_amd_mono.common.plan import kernel_sources
 
 from .config import (
     EPS,
@@ -146,7 +147,6 @@ from .ops import (
 )
 from .ops import xred as _xred
 from .ops import xshfl as _xshfl
-from .sources import SOURCES
 from .tiles import (
     CM_DEV,
     CM_SYS,
@@ -371,8 +371,7 @@ def build_glm5_monokernel(
     class Smem:
         work: fx.Array[fx.Float32, WORK_WORDS, 16]
 
-    # the sources digest: an edit to common/ or these kernel sources rebuilds
-    keyed = (("sources", SOURCES),)
+    keyed = (("sources", kernel_sources("glm53")),)
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def glm5_monokernel(

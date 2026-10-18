@@ -70,6 +70,7 @@ from sgl_amd_mono.common.ops import (
     uniform,
     xshfl,
 )
+from sgl_amd_mono.common.plan import kernel_sources
 from sgl_amd_mono.common.sync import preg
 from sgl_amd_mono.minimax_m3.gfx950.config import (
     BLOCKS,
@@ -149,7 +150,6 @@ from sgl_amd_mono.minimax_m3.gfx950.select import (
     group_floor,
     put_key,
 )
-from sgl_amd_mono.minimax_m3.gfx950.sources import SOURCES
 
 FP8_MAX = 448.0
 NEG = -3.4e38  # the paged decode's masked-score value
@@ -266,8 +266,7 @@ def build_post_attn_kernel(
     # index heads go in as ints (a shared cache otherwise serves one rank's build
     # to every rank)
     ih_count, ih_own = heads.count, heads.own
-    # an edit to common/ or these kernel sources changes the key, so the kernel rebuilds
-    keyed = (("sources", SOURCES),)
+    keyed = (("sources", kernel_sources("minimax_m3")),)
     # with every index head: K1's index q of every head (qs) after its x8 rows in
     # the pool (K1 is done with the pool before K4's stages use it)
     QS_CP = tokens * HIDDEN // 4

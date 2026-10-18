@@ -32,6 +32,7 @@ from sgl_amd_mono.common.plan import (
     THREADS,
     WAVES,
     first_task,
+    kernel_sources,
     key_tuple,
 )
 from sgl_amd_mono.common.sync import Mailbox, preg, publish, sreg
@@ -39,7 +40,6 @@ from sgl_amd_mono.common.sync import Mailbox, preg, publish, sreg
 from .attention import back as mb_back
 from .attention import front as mb_front
 from .attention.plan import WINDOW, Dims, back_scratch, front_scratch
-from .sources import SOURCES
 from .stages import moe, seam
 from .stages.dims import Dims as StageDims
 from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
@@ -216,7 +216,7 @@ def build_mono_k1(key: MonoBuild):
         i=key.index,
         **_variant(key),
     )
-    keyed = key_tuple(key, SOURCES)
+    keyed = key_tuple(key, kernel_sources("deepseek_v41"))
     half = peer_half_bytes(tp)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -615,7 +615,7 @@ def build_mono_ffn(key: MonoBuild):
         moe: MoeLds  # type: ignore[valid-type]
 
     name = kernel_symbol("dsv41_mono_ffn", s=s, tp=tp, **_variant(key))
-    keyed = key_tuple(key, SOURCES)
+    keyed = key_tuple(key, kernel_sources("deepseek_v41"))
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kffn(
@@ -796,7 +796,7 @@ def build_mono_k2(key: MonoBuild):
     name = kernel_symbol(
         "dsv41_mono_k2", s=s, tp=tp, c=key.compressed, i=key.index, **_variant(key)
     )
-    keyed = key_tuple(key, SOURCES)
+    keyed = key_tuple(key, kernel_sources("deepseek_v41"))
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(

@@ -137,6 +137,12 @@ def source_digest(*paths: str) -> str:
     return h.hexdigest()[:16]
 
 
+def kernel_sources(model: str) -> str:
+    """The digest every kernel of ``model`` closes over (``common/``, the model's
+    ``gfx950/`` and the aiter helpers they import), so editing any of them rebuilds."""
+    return source_digest("common", f"{model}/gfx950")
+
+
 def key_tuple(key, sources: str) -> tuple:
     """Return ``key``'s (field, value) pairs, then ("sources", ``sources``)."""
     out = []

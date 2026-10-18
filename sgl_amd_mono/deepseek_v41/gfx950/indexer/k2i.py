@@ -27,9 +27,8 @@ import flydsl.expr as fx
 from flydsl.expr.typing import Int32, Int64
 
 from sgl_amd_mono.common.epoch import kernel_symbol
-from sgl_amd_mono.common.plan import BLOCKS, THREADS
+from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources
 
-from ..sources import SOURCES
 from .score_fp4 import ROWS_LDS_WORDS, run_scores4
 
 _STREAM = fx.Stream(None)
@@ -40,7 +39,7 @@ def build_k2i(tokens: int):
     """K2i for a step of ``tokens`` rows."""
     assert 0 < tokens <= MAX_ROWS, tokens
     name = kernel_symbol("dsv41_mono_k2i", s=tokens)
-    keyed = (("tokens", tokens), ("sources", SOURCES))
+    keyed = (("tokens", tokens), ("sources", kernel_sources("deepseek_v41")))
 
     @fx.struct
     class RowsLds:

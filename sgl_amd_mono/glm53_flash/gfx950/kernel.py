@@ -44,7 +44,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol, spin_until
-from sgl_amd_mono.common.plan import key_tuple
+from sgl_amd_mono.common.plan import kernel_sources, key_tuple
 
 from .config import (
     EPS,
@@ -137,7 +137,6 @@ from .ops import (
 )
 from .ops import xred as _xred
 from .ops import xshfl as _xshfl
-from .sources import SOURCES
 from .tiles import (
     BLOCKS,
     CM_DEV,
@@ -226,7 +225,7 @@ def build_flash_kernel(key: FlashBuild):
         q=int(QKV8),
         h=int(QKV_SH or QB_SH or O_SH),
     )
-    keyed = key_tuple(key, SOURCES)
+    keyed = key_tuple(key, kernel_sources("glm53_flash"))
     SHARED = SHARED_EXPERT
     G = BLOCKS
     SC, SY = layout(S, W, expert_inter, kda, dsa, max_pools)
