@@ -15,12 +15,12 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | Model | GPU | Tensor parallel | Coverage |
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
+| GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | 41 of the 42 MoE layers, all but the last (one launch each), in decode steps of up to 8 rows (4 at TP2) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 
 ### Design
 
-- **Two launches per layer (DeepSeek-V4.1).** K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits.
-- **One launch per layer (MiniMax-M3).** K1 (the input norm, the fused qkv and index projection, the q / k norms, RoPE, the KV and index-key writes and the index scores) runs in front of the block selection, the sparse attention, o_proj, the router, the MoE and both all-reduces, in one launch.
+- **One or two launches per layer.** DeepSeek-V4.1-Flash runs two. K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits. GLM-5.3-Flash runs each covered layer as one launch. MiniMax-M3 runs one too: K1 (the input norm, the fused qkv and index projection, the q / k norms, RoPE, the KV and index-key writes and the index scores) runs in front of the block selection, the sparse attention, o_proj, the router, the MoE and both all-reduces, in one launch.
 - **Graph-safe routing.** Each step is routed by its CUDA graph key alone, so every rank makes the same decision and a captured graph replays the decision made at capture.
 - **Fail-stop synchronization.** Every wait on another workgroup or GPU has a deadline. A failed wait stops the launch on every rank, so no token from a failed step is returned.
 - **In-place weights.** The kernels read the weights SGLang loaded. The few weights that need another layout or precision (MiniMax-M3's attention projections run in FP8) are copied once at startup, and each copy is logged.
@@ -45,14 +45,19 @@ pip install -e .
 ### Usage
 
 ```bash
-python -m sglang.launch_server \
+SGLANG_USE_AITER=1 AITER_BF16_FP8_MOE_BOUND=0 python -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4.1-Flash \
   --tp 4 \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \
   --fp8-gemm-backend aiter \
+  --enforce-shared-experts-fusion \
   --monokernel-backend amd
 ```
+
+On gfx950 the decode graph capture fails in AITER's MoE without
+`AITER_BF16_FP8_MOE_BOUND=0`. The flags are those of the serving tests
+(`test/e2e/deepseek_v41_server.py`).
 
 MiniMax-M3, with an EAGLE3 draft:
 
@@ -84,6 +89,10 @@ sgl-amd-mono/
 │   │   ├── spec.py      # target model: spec and forward
 │   │   ├── draft.py     # DSpark draft model: spec and forward
 │   │   └── gfx950/      # kernels and launch runner
+│   ├── glm53_flash/
+│   │   ├── spec.py      # spec and forward
+│   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
+│   │   └── gfx950/      # kernels and launch runner
 │   └── minimax_m3/
 │       ├── spec.py      # spec and forward
 │       ├── weights.py   # the layer views the kernels read
@@ -97,9 +106,10 @@ sgl-amd-mono/
 ## Testing
 
 ```bash
-pytest test/unit               # CPU only
-pytest test/kernels test/e2e   # 4 x MI350X or MI355X, with DEEPSEEK_V41_FLASH_MODEL_PATH,
-                               # MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
+pytest test/unit                                                      # CPU only
+pytest test/kernels test/e2e -k "not glm53_flash and not minimax_m3"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k glm53_flash                           # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
+pytest test/kernels test/e2e -k minimax_m3                            # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
 ```
 
 ## Contributing

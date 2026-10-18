@@ -17,7 +17,9 @@ import torch.distributed as dist
 _IPC_HANDLE_BYTES = 64
 _IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
 _DEVICE_MALLOC_UNCACHED = 0x3
-_PAGE = 4096  # hipIpcGetMemHandle on uncached allocations under 2 MiB needs whole pages
+# A peer maps an IPC handle in 2 MiB granules: bytes past the last whole granule of
+# the exporter's allocation fault on the peer, so allocate whole granules.
+_GRANULE = 2 << 20
 
 
 class PeerMemoryError(RuntimeError):
@@ -69,7 +71,7 @@ def _check(err: int, what: str) -> None:
 
 
 def _alloc_uncached(nbytes: int) -> int:
-    size = -(-nbytes // _PAGE) * _PAGE
+    size = -(-nbytes // _GRANULE) * _GRANULE
     ptr = ctypes.c_void_p()
     _check(
         _hip().hipExtMallocWithFlags(ctypes.byref(ptr), size, _DEVICE_MALLOC_UNCACHED),
@@ -124,10 +126,15 @@ class PeerBuffer:
         addresses = [self.local]
         if npes > 1:
             handles: list = [None] * npes
-            dist.all_gather_object(handles, _handle(self.local), group=group)
+            dist.all_gather_object(handles, (nbytes, _handle(self.local)), group=group)
             addresses, failure = [], None
             try:
-                for peer, handle in enumerate(handles):
+                for peer, (size, handle) in enumerate(handles):
+                    if size != nbytes:
+                        raise RuntimeError(
+                            f"rank {peer} offers {size} bytes, this rank {nbytes}: "
+                            "the ranks build their buffers in different orders"
+                        )
                     if peer == rank:
                         addresses.append(self.local)
                     else:

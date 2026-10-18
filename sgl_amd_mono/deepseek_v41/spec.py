@@ -127,12 +127,17 @@ SGLANG_READS = {
         "enable_encoder_swa_bounded_replay",
         "fp8_gemm_runner_backend",
         "context_length",
+        "expert_distribution_recorder_mode",
     ),
     "srt/environ.py": (
         "SGLANG_DSV4_FP4_EXPERTS",
         "SGLANG_DSV4_FP4_DEQUANT",
         "SGLANG_USE_AITER_MOE_GU_ITLV",
         "SGLANG_DSV4_KV_LAYOUT",
+        "SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE",
+        "SGLANG_HIP_DSV41_INDEX_K_PAGE8",
+        "SGLANG_SIMULATE_UNIFORM_EXPERTS",
+        "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
     ),
     # an index source's compressor, between K1 and K2
     "srt/layers/attention/deepseek_v4_backend.py": (
@@ -214,7 +219,6 @@ SGLANG_READS = {
     ),
     "srt/configs/deepseek_v4.py": ("vision_n_layers", "image_token_id"),
     "srt/layers/engram.py": ("layer_hash_index", "forward(cp_all_tokens)"),
-    "srt/model_executor/forward_batch_info.py": ("contains_mm_inputs",),
     "srt/models/deepseek_common/amd/deepseek_v4_hip.py": ("hc_boundary_fused",),
     "srt/models/deepseek_v2.py": (
         "experts",
@@ -273,9 +277,9 @@ SGLANG_READS = {
         "attn_sink",
         "compress_ratio",
     ),
+    "srt/configs/model_config.py": ("context_len",),
     "srt/runtime_context.py": (
         "get_parallel",
-        "get_model",
         '"tp_rank"',
         '"tp_size"',
         '"tp_group"',
@@ -857,7 +861,9 @@ class _Built:
                 residual = engram(
                     before, hash_ids[:, engram.layer_hash_index], forward_batch
                 )
-                if m.config.vision_n_layers > 0 and forward_batch.contains_mm_inputs():
+                # every image-token row keeps its residual, as in SGLang's forward: a
+                # captured graph cannot branch on whether the batch has mm inputs
+                if m.config.vision_n_layers > 0:
                     image = input_ids == m.config.image_token_id
                     residual = torch.where(image[:, None, None], before, residual)
                 pending = (None, residual, None, None)
@@ -911,13 +917,9 @@ class _Built:
 
 
 def _longest_context(hf_config) -> int:
-    """The longest context a request can have: ``--context-length``, else the
-    model's; a ratio-1 index source sees that many compressed rows (plus a
-    verify step's draft rows)."""
-    from sglang.srt.runtime_context import get_model
-
-    ctx = get_model().context_length or hf_config.max_position_embeddings
-    return int(ctx) + 2 * MAX_ROWS
+    """The longest context a request can have, SGLang's ``context_len``; a ratio-1
+    index source sees that many compressed rows (plus a verify step's draft rows)."""
+    return int(hf_config.context_len) + 2 * MAX_ROWS
 
 
 def _build(model, hf_config, ctx) -> _Built:
@@ -979,6 +981,8 @@ SPEC = MonoSpec(
             "speculative_algorithm": frozenset({None, "DSPARK"}),
             # the paged SWA cache, not a request window
             "enable_encoder_swa_bounded_replay": frozenset({False}),
+            # the launches record no expert distribution (SGLang's forward sets it per layer)
+            "expert_distribution_recorder_mode": frozenset({None}),
         },
         hf_config={**HF_CONFIG, "model_type": "deepseek_v41"},
         env={
@@ -988,6 +992,13 @@ SPEC = MonoSpec(
             "SGLANG_USE_AITER_MOE_GU_ITLV": True,
             # fp8 nope and bf16 rope, 584 B a token
             "SGLANG_DSV4_KV_LAYOUT": "v4",
+            # K1 quantizes the SWA nope payload from f32, as SGLang's fused writer does
+            "SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE": False,
+            # the scorer reads the ratio-1 index-K pages in the page-64 byte layout
+            "SGLANG_HIP_DSV41_INDEX_K_PAGE8": False,
+            # benchmark routing overrides: K2 routes with the model's own router
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS": False,
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS": False,
         },
     ),
     numerics=NUMERICS,
