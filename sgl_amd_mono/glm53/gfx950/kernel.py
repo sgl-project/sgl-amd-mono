@@ -56,7 +56,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import spin_until
-from sgl_amd_mono.common.plan import kernel_sources
+from sgl_amd_mono.common.plan import kernel_sources, key_tuple
 
 from .config import (
     EPS,
@@ -158,6 +158,8 @@ from .tiles import (
     atom_mxfp4_scale_index,
 )
 
+SOURCES = kernel_sources(__name__)
+
 
 def build_glm5_monokernel(
     S: int = 1,
@@ -210,6 +212,7 @@ def build_glm5_monokernel(
     dimension is stored as that many expert-shaped slices, every row routes to all
     of them with weight 1, and the router GEMV is skipped.
     """
+    keyed = key_tuple(locals(), SOURCES)
     assert uv_scale_rows in (64, 128)
     assert heads % WAVES == 0, "split attention maps one local head to each wave"
     assert kv_cache_dtype in ("bf16", "fp8")
@@ -370,8 +373,6 @@ def build_glm5_monokernel(
     @fx.struct
     class Smem:
         work: fx.Array[fx.Float32, WORK_WORDS, 16]
-
-    keyed = (("sources", kernel_sources(__name__)),)
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def glm5_monokernel(

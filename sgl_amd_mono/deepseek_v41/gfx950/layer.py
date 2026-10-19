@@ -44,6 +44,8 @@ from .stages import moe, seam
 from .stages.dims import Dims as StageDims
 from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
 
+SOURCES = kernel_sources(__name__)
+
 _STREAM = fx.Stream(None)
 MAX_TOKENS = 48
 HIDDEN = seam.HIDDEN
@@ -216,7 +218,7 @@ def build_mono_k1(key: MonoBuild):
         i=key.index,
         **_variant(key),
     )
-    keyed = key_tuple(key, kernel_sources(__name__))
+    keyed = key_tuple(key, SOURCES)
     half = peer_half_bytes(tp)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -615,7 +617,7 @@ def build_mono_ffn(key: MonoBuild):
         moe: MoeLds  # type: ignore[valid-type]
 
     name = kernel_symbol("dsv41_mono_ffn", s=s, tp=tp, **_variant(key))
-    keyed = key_tuple(key, kernel_sources(__name__))
+    keyed = key_tuple(key, SOURCES)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kffn(
@@ -796,7 +798,7 @@ def build_mono_k2(key: MonoBuild):
     name = kernel_symbol(
         "dsv41_mono_k2", s=s, tp=tp, c=key.compressed, i=key.index, **_variant(key)
     )
-    keyed = key_tuple(key, kernel_sources(__name__))
+    keyed = key_tuple(key, SOURCES)
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(

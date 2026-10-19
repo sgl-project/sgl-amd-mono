@@ -1,9 +1,11 @@
-"""The kernels' cache key: every FlyDSL launcher closes over its module's sources
-digest, and the digest follows the code that module imports."""
+"""The kernels' cache key: every FlyDSL launcher closes over its module's import-time
+sources digest and every build parameter, and the digest follows what the module
+imports."""
 
 import ast
-import importlib.machinery
-import importlib.util
+import functools
+import sys
+import types
 from pathlib import Path
 
 import sgl_amd_mono
@@ -34,20 +36,36 @@ def _reads(node: ast.AST) -> set:
     }
 
 
-def _digests_own_module(node: ast.AST) -> bool:
-    """Whether ``node`` calls ``kernel_sources(__name__)``."""
+def _digests_at_import(tree: ast.Module) -> bool:
+    """Whether the module assigns ``SOURCES = kernel_sources(__name__)`` at import."""
     return any(
-        isinstance(n, ast.Call)
-        and getattr(n.func, "id", None) == "kernel_sources"
-        and [getattr(a, "id", None) for a in n.args] == ["__name__"]
-        for n in ast.walk(node)
+        isinstance(n, ast.Assign)
+        and [getattr(t, "id", None) for t in n.targets] == ["SOURCES"]
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "id", None) == "kernel_sources"
+        and [getattr(a, "id", None) for a in n.value.args] == ["__name__"]
+        for n in tree.body
     )
+
+
+def _keys_the_build(builder: ast.FunctionDef) -> bool:
+    """Whether ``builder`` assigns ``keyed`` from ``SOURCES`` and each of its
+    parameters, or its whole ``locals()``."""
+    params = {a.arg for a in builder.args.args + builder.args.kwonlyargs}
+    for n in ast.walk(builder):
+        if isinstance(n, ast.Assign) and any(
+            getattr(t, "id", None) == "keyed" for t in n.targets
+        ):
+            reads = _reads(n.value)
+            if "SOURCES" in reads and ("locals" in reads or params <= reads):
+                return True
+    return False
 
 
 def _launchers():
     """Each ``@flyc.jit`` launcher in the package, with whether it closes over a
-    ``keyed`` built from ``kernel_sources(__name__)`` (itself or through a kernel it
-    calls)."""
+    ``keyed`` that holds its module's import-time digest and every build parameter
+    (itself or through a kernel it calls)."""
     for path in sorted(PACKAGE.rglob("*.py")):
         tree = ast.parse(path.read_text())
         parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
@@ -61,12 +79,6 @@ def _launchers():
             if builder is None:
                 yield name, False
                 continue
-            digested = any(
-                isinstance(n, ast.Assign)
-                and any(getattr(t, "id", None) == "keyed" for t in n.targets)
-                and _digests_own_module(n.value)
-                for n in ast.walk(builder)
-            )
             keyed_kernels = {
                 f.name
                 for f in ast.walk(builder)
@@ -75,46 +87,64 @@ def _launchers():
                 and "keyed" in _reads(f)
             }
             reads = _reads(fn)
-            yield name, digested and ("keyed" in reads or bool(reads & keyed_kernels))
+            yield (
+                name,
+                (
+                    _digests_at_import(tree)
+                    and _keys_the_build(builder)
+                    and ("keyed" in reads or bool(reads & keyed_kernels))
+                ),
+            )
 
 
 def test_every_launcher_closes_over_the_sources_digest():
-    # FlyDSL keys a launcher on its closure and same-directory helpers only, so one
-    # that never reads the digest keeps serving kernels built from old sources
+    # FlyDSL keys a launcher on its closure's scalars and same-directory helpers only,
+    # so one missing the digest or a build parameter keeps serving stale kernels
     launchers = dict(_launchers())
     assert launchers, "found no @flyc.jit launcher"
     missing = sorted(name for name, ok in launchers.items() if not ok)
-    assert not missing, f"close over kernel_sources(__name__) as `keyed`: {missing}"
+    assert not missing, (
+        "close over `keyed` built from the module's `SOURCES = kernel_sources(__name__)`"
+        f" and every build parameter: {missing}"
+    )
 
 
 def test_the_digest_follows_the_code_the_kernel_module_imports(tmp_path, monkeypatch):
     # FlyDSL's own key ignores modules outside the kernel's directory, so without
     # this a persistent cache would serve kernels traced against old helpers
-    model = tmp_path / "sgl_amd_mono" / "model"
-    model.mkdir(parents=True)
+    plugin, aiter = tmp_path / "sgl_amd_mono", tmp_path / "kernels"
+    model = plugin / "model"
+    for d in (model, aiter):
+        d.mkdir(parents=True)
+    for package, root in (
+        (plugin, "sgl_amd_mono"),
+        (aiter, "aiter.ops.flydsl.kernels"),
+    ):
+        (package / "__init__.py").write_text("")
+        module = types.ModuleType(root)
+        module.__file__ = str(package / "__init__.py")
+        monkeypatch.setitem(sys.modules, root, module)
     (model / "__init__.py").write_text("")
     (model / "kernel.py").write_text(
         "from aiter.ops.flydsl.kernels import buffer_ops as bo\n"
-        "from sgl_amd_mono.model import layout\n"
+        "from aiter.ops.flydsl.kernels.dpp import shuffle\n"
+        "import sgl_amd_mono.model.layout\n"
         "def build():\n"
-        "    from .tiles import TILE\n"
+        "    from ..model.tiles import TILE\n"
     )
-    helper = tmp_path / "buffer_ops.py"
-
-    def find_spec(name):
-        if name != "aiter.ops.flydsl.kernels.buffer_ops":
-            return None
-        return importlib.machinery.ModuleSpec(name, None, origin=str(helper))
-
-    monkeypatch.setattr(plan, "_ROOT", tmp_path / "sgl_amd_mono")
-    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    for cached in ("_module_code", "kernel_sources"):
+        monkeypatch.setattr(
+            plan, cached, functools.cache(getattr(plan, cached).__wrapped__)
+        )
 
     def digest():
+        plan._module_code.cache_clear()
         plan.kernel_sources.cache_clear()
         return plan.kernel_sources("sgl_amd_mono.model.kernel")
 
     edits = {
-        helper: "A = 1\n",
+        aiter / "buffer_ops.py": "A = 1\n",
+        aiter / "dpp.py": "def shuffle():\n    return 1\n",
         model / "layout.py": "B = 1\n",
         model / "tiles.py": "TILE = 1\n",
         model / "runner.py": "C = 1\n",

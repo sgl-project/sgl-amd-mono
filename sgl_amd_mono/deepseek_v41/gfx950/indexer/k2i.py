@@ -31,6 +31,8 @@ from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources
 
 from .score_fp4 import ROWS_LDS_WORDS, run_scores4
 
+SOURCES = kernel_sources(__name__)
+
 _STREAM = fx.Stream(None)
 MAX_ROWS = 48  # a step's rows at most (8 DSpark requests of 6)
 
@@ -39,7 +41,7 @@ def build_k2i(tokens: int):
     """K2i for a step of ``tokens`` rows."""
     assert 0 < tokens <= MAX_ROWS, tokens
     name = kernel_symbol("dsv41_mono_k2i", s=tokens)
-    keyed = (("tokens", tokens), ("sources", kernel_sources(__name__)))
+    keyed = (("tokens", tokens), ("sources", SOURCES))
 
     @fx.struct
     class RowsLds:

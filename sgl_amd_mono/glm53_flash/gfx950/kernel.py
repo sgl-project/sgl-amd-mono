@@ -152,6 +152,8 @@ from .tiles import (
     atom_mxfp4_scale_index,
 )
 
+SOURCES = kernel_sources(__name__)
+
 # 5-key descending sorting network (lane's router candidates)
 SORT5 = ((0, 1), (3, 4), (2, 4), (2, 3), (0, 3), (0, 2), (1, 4), (1, 3), (1, 2))
 # ID encoding for the tie-break: the larger of (ID_BASE - id) is the smaller id
@@ -225,7 +227,7 @@ def build_flash_kernel(key: FlashBuild):
         q=int(QKV8),
         h=int(QKV_SH or QB_SH or O_SH),
     )
-    keyed = key_tuple(key, kernel_sources(__name__))
+    keyed = key_tuple(key, SOURCES)
     SHARED = SHARED_EXPERT
     G = BLOCKS
     SC, SY = layout(S, W, expert_inter, kda, dsa, max_pools)

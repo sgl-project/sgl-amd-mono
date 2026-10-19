@@ -10,10 +10,11 @@
 """Plain-Python planning of the mono kernels: execution model, layouts, TP shards and build keys."""
 
 import ast
+import dataclasses
 import enum
 import functools
 import hashlib
-import importlib.util
+import sys
 from pathlib import Path
 
 import msgspec
@@ -93,8 +94,7 @@ def padded(n: int, align: int) -> int:
 
 
 # ---------------------------------------------------------------- build keys
-_SCALARS = (int, float, bool, str, enum.Enum)
-_ROOT = Path(__file__).resolve().parents[1]  # the sgl_amd_mono package
+_SCALARS = (int, float, bool, str, enum.Enum, type(None))
 # FlyDSL keys a kernel on its own directory's plain helpers only, so the plugin and
 # aiter FlyDSL modules a kernel imports are hashed into its key
 _TRACED = ("sgl_amd_mono", "aiter.ops.flydsl.kernels")
@@ -102,20 +102,15 @@ _DOCUMENTED = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
 
 
 def _module_file(name: str):
-    """The source file of module ``name``, or None when ``name`` is not a module."""
-    if name.partition(".")[0] == "sgl_amd_mono":
-        base = _ROOT.parent.joinpath(*name.split("."))
-        return next(
-            (f for f in (base / "__init__.py", base.with_suffix(".py")) if f.is_file()),
-            None,
-        )
-    try:
-        spec = importlib.util.find_spec(name)
-    except ModuleNotFoundError:  # an attribute, or no aiter (nothing compiles)
+    """The source file of module ``name`` in a traced package, found on disk without
+    importing anything; None for an attribute, or for a package not imported."""
+    root = next((p for p in _TRACED if name == p or name.startswith(f"{p}.")), None)
+    init = getattr(sys.modules.get(root or ""), "__file__", None)
+    if init is None:  # not traced, or no aiter (nothing compiles)
         return None
-    if spec is None or not (spec.origin or "").endswith(".py"):
-        return None
-    return Path(spec.origin)
+    base = Path(init).parent.joinpath(*name.split(".")[root.count(".") + 1 :])
+    files = (base / "__init__.py", base.with_suffix(".py"))
+    return next((f for f in files if f.is_file()), None)
 
 
 def _imported(name: str, tree: ast.Module, package: bool):
@@ -143,23 +138,31 @@ def _code(tree: ast.Module) -> str:
 
 
 @functools.cache
+def _module_code(name: str):
+    """Module ``name``'s code and the module names it can import, or None when
+    ``name`` is not a module in a traced package."""
+    f = _module_file(name)
+    if f is None:
+        return None
+    tree = ast.parse(f.read_bytes())
+    imported = tuple(_imported(name, tree, f.name == "__init__.py"))
+    return _code(tree), imported
+
+
+@functools.cache
 def kernel_sources(module: str) -> str:
-    """The digest a kernel built in ``module`` closes over: the code of ``module`` and
-    of every plugin and aiter FlyDSL module it imports, transitively. Only a code
-    edit to one of them rebuilds it; comments, docstrings and other modules do not."""
-    codes, seen, todo = {}, set(), [module]
+    """The digest of the code a kernel built in ``module`` traces: ``module`` and every
+    plugin and aiter FlyDSL module it imports, transitively, without comments or
+    docstrings (FlyDSL hashes each jit and kernel function's own source itself).
+    Take it at import, as ``SOURCES = kernel_sources(__name__)``: a digest read at
+    build time would pair an edit made since import with the code already loaded."""
+    codes, todo = {}, [module]
     while todo:
         name = todo.pop()
-        traced = any(name == p or name.startswith(f"{p}.") for p in _TRACED)
-        if name in seen or not traced:
-            continue
-        seen.add(name)
-        f = _module_file(name)
-        if f is None:
-            continue
-        tree = ast.parse(f.read_bytes())
-        todo.extend(_imported(name, tree, f.name == "__init__.py"))
-        codes[name] = _code(tree)
+        found = None if name in codes else _module_code(name)
+        if found is not None:
+            codes[name], imported = found
+            todo.extend(imported)
     if module not in codes:
         raise FileNotFoundError(f"no source for kernel module {module!r}")
     h = hashlib.sha256()
@@ -168,16 +171,29 @@ def kernel_sources(module: str) -> str:
     return h.hexdigest()[:16]
 
 
-def key_tuple(key, sources: str) -> tuple:
-    """Return ``key``'s (field, value) pairs, then ("sources", ``sources``)."""
-    out = []
-    for f in msgspec.structs.fields(key):
-        value = getattr(key, f.name)
-        if not isinstance(value, _SCALARS):
+def _fields(value) -> list:
+    if isinstance(value, msgspec.Struct):
+        return [(f.name, getattr(value, f.name)) for f in msgspec.structs.fields(value)]
+    return [(f.name, getattr(value, f.name)) for f in dataclasses.fields(value)]
+
+
+def _key_pairs(prefix: str, items):
+    for name, value in items:
+        if isinstance(value, msgspec.Struct) or dataclasses.is_dataclass(value):
+            yield from _key_pairs(f"{prefix}{name}.", _fields(value))
+        elif isinstance(value, _SCALARS):
+            yield f"{prefix}{name}", value
+        else:
             raise TypeError(
-                f"{type(key).__name__}.{f.name} = {value!r}: a build parameter must be"
-                " a scalar to reach the JIT cache key"
+                f"{prefix}{name} = {value!r}: a build parameter must be a scalar, or a"
+                " Struct or dataclass of them, to reach the JIT cache key"
             )
-        out.append((f.name, value))
-    out.append(("sources", sources))
-    return tuple(out)
+
+
+def key_tuple(key, sources: str) -> tuple:
+    """Return the (name, value) pair of every build parameter in ``key``, a nested
+    Struct's or dataclass's fields flattened, then ("sources", ``sources``). ``key``
+    is a build Struct, or a builder's ``locals()`` before its first assignment; FlyDSL
+    leaves Structs, dataclasses and dicts a kernel closes over out of its key."""
+    items = key.items() if isinstance(key, dict) else _fields(key)
+    return (*_key_pairs("", items), ("sources", sources))
