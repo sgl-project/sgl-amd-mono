@@ -143,7 +143,7 @@ def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
             ("crdy", s * d.heads // 8 * PAIR),
             ("x8b", s * d.o_rows),
             ("x8bs", s * d.o_rows // 32 * 4),
-            ("ardy", d.woa_tasks * PAIR),
+            ("ardy", d.woa_tasks * cdiv(s, ROWS) * PAIR),  # a flag a wo_a unit
         ],
         start=start,
     )
