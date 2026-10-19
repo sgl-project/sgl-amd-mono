@@ -1411,20 +1411,24 @@ def run_moe(c, key, bid, before_ug=None):
         while task < ug_total:
             task = stage_ug_tile(c, task, ug_total)
     else:
-        # one token tile: every task placed (its x in LDS once a CTA)
+        # one token tile: every task placed (its x in LDS once a CTA), on the CTAs
+        # without a shared unit: those reach ug ~10 us later and, given tasks,
+        # ended last (``ug0`` puts them at the last offsets)
         loaded = fx.Int32(0)
-        for task in range(first_task(bid, c["rs"].ug0), ug_tasks, BLOCKS):
+        free = BLOCKS - c["rs"].shared_units
+        at = first_task(bid, c["rs"].ug0)
+        for task in range(at, (at < free).select(fx.Int32(ug_tasks), at), free):
             if loaded == 0:
                 # X8R first: it is ready long before the routing
                 load_x8_rows(c, "x8r", "x8rs", c["x8rl"], c["x8rsl"], lambda j: j, s)
                 load_route(c, c["tab"])
             loaded = fx.Int32(1)
             stage_ug(c, task)
+        if loaded == 0:
+            # no ug task here: the down stage still reads the route table
+            load_route(c, c["tab"])
     stamp(c, 24)
     assert BLOCKS < DOWN_TASKS <= 2 * BLOCKS
-    # load the route table unless an earlier stage of this CTA loaded it
-    if const_expr(not multi and ug_tasks <= BLOCKS):
-        load_route(c, c["tab"])
     # every CTA its tile; the first CTAs here take the DOWN_TASKS - BLOCKS extra tiles
     down_task = first_task(bid, DOWN0)
     rank = take_down_rank(c)
