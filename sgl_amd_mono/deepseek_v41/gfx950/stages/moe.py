@@ -968,20 +968,24 @@ def stage_down(c, tasks):
     # slots of U a round: the loads of a round stay the same
     slots = DOWN_R_MAX // n
     per_round = WAVES * slots
+    rounds = (nu + per_round - 1) // per_round
+    # round 0's loads go out before the shared expert's down, and each later
+    # round's while the one before it multiplies (a round past U reloads the last)
+    loads = down_weights(c, tasks, 0, slots, nu)
     # the shared expert's down projection first: its input is ready long before the routed results
     down_shared(c, tasks)
-    for rnd in range(0, (nu + per_round - 1) // per_round, 1):
-        # issue every load of the round's slots before the first wait (a slot past U reloads the last)
+    for rnd in range(0, rounds, 1):
+        svs, avs = loads
         us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
         ucs = [fx.min(u, nu - 1) for u in us]
         firsts = [c["rs"].slot_first(tab, u) for u in ucs]
-        svs, avs = down_weights(c, tasks, rnd, slots, nu)
         # wait only on this round's slots' ug tasks
         c["poll"]([(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)])
         counts = [c["rs"].slot_first(tab, u + 1) - f for u, f in zip(ucs, firsts)]
         mids = [mid_operands(c, f, k) for f, k in zip(firsts, counts)]
         for q in range_constexpr(len(svs)):
             scale_block_store(c, svs[q], sl + q * sw)
+        loads = down_weights(c, tasks, rnd + 1, slots, nu)
         for i in range_constexpr(slots):
             for j in range_constexpr(n):
                 down_mfma(
