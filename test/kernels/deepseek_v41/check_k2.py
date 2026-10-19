@@ -2,8 +2,8 @@
 (torchrun, TP2 or TP4): its XO (combine, inverse RoPE, bf16) against a torch attention,
 its X8B against wo_a of its own XO, the wo_b partial it pushed against wo_b of its own X8B,
 its output bit for bit against the FFN launch fed that partial; an index source's K2,
-which builds the key table itself, and a window-only K2 bit for bit against the K2 of
-the same keys; then its graph replay."""
+which builds the key table itself, a window-only K2 and a token-parallel K2 (on this
+rank's rows) bit for bit against the K2 of the same keys; then its graph replay."""
 
 import argparse
 import os
@@ -212,6 +212,7 @@ def main():
         DSV41MonoRunner,
         K2Weights,
     )
+    from sgl_amd_mono.deepseek_v41.gfx950.token_par import token_par
 
     d = Dims(tp)
     w, _, _ = make_weights(tp, rank, dev)
@@ -347,6 +348,22 @@ def main():
             pair.append(runner.k2(aw, mw, M, pos, swa_raw, SWA_BLOCK, comp, COMP_BLOCK))
         torch.cuda.synchronize()
         checks["window only"] = all(torch.equal(a, b) for a, b in zip(*pair))
+        if token_par(M, tp):
+            # token parallel: this rank's rows of every output, bit for bit
+            n = M // tp
+            mine = slice(rank * n, (rank + 1) * n)
+            for index in (False, True):
+                runner.kt[: M * (WINDOW + TOPK)] = kt.reshape(-1)
+                runner.klen[: 2 * M] = klen
+                extra = dict(slot=slot, keys=keys, index=True) if index else {}
+                tpo = runner.k2(
+                    aw, mw, M, pos, swa_raw, SWA_BLOCK, comp_raw, COMP_BLOCK,
+                    tok_par=True, **extra,
+                )  # fmt: skip
+                torch.cuda.synchronize()
+                checks[f"token parallel{' index' if index else ''}"] = all(
+                    torch.equal(a[mine], b[mine]) for a, b in zip(tpo, outs)
+                )
         ref0 = out.clone()
         dist.broadcast(ref0, 0)
         checks["ranks agree"] = torch.equal(ref0, out)
@@ -362,14 +379,32 @@ def main():
                 flush=True,
             )
         fails += [f"M={M} {k}" for k in bad]
-        steps.append((M, pos, kt, klen, q, res, post, comb, pre, runner._outs(M, res)))
         steps.append(
-            (M, pos, (slot, keys), None, q, res, post, comb, pre, runner._outs(M, res))
+            (M, pos, kt, klen, q, res, post, comb, pre, False, runner._outs(M, res))
         )
+        steps.append(
+            (
+                M,
+                pos,
+                (slot, keys),
+                None,
+                q,
+                res,
+                post,
+                comb,
+                pre,
+                False,
+                runner._outs(M, res),
+            )
+        )
+        if token_par(M, tp):
+            steps.append(
+                (M, pos, kt, klen, q, res, post, comb, pre, True, runner._outs(M, res))
+            )
 
     # the hand-offs under replay: every width's K2 in one graph, bit for bit against eager
     def run_all():
-        for M, pos, kt, klen, q, res, post, comb, pre, outs in steps:
+        for M, pos, kt, klen, q, res, post, comb, pre, tok_par, outs in steps:
             runner.q[:M].copy_(q)
             runner.res_mid[:M].copy_(res)
             runner.post_a[:M].copy_(post)
@@ -385,9 +420,17 @@ def main():
             runner.kt[: M * (WINDOW + TOPK)].copy_(kt.reshape(-1))
             runner.klen[: 2 * M].copy_(klen)
             runner.k2(
-                aw, mw, M, pos, swa_raw, SWA_BLOCK, comp_raw, COMP_BLOCK, outs=outs
-            )
+                aw, mw, M, pos, swa_raw, SWA_BLOCK, comp_raw, COMP_BLOCK, outs=outs,
+                tok_par=tok_par,
+            )  # fmt: skip
 
+    # a token-parallel step writes its own rows alone: the others keep a sentinel
+    # (uninitialised memory may hold NaNs, which no equality check passes)
+    sentinel = -3.25
+    for st in steps:
+        if st[9]:
+            for t in st[-1]:
+                t.fill_(sentinel)
     run_all()
     torch.cuda.synchronize()
     eager = [t.clone() for s in steps for t in s[-1]]
@@ -401,6 +444,12 @@ def main():
             torch.cuda.synchronize()
             got = [t for s in steps for t in s[-1]]
             bad_replays += sum(not torch.equal(a, b) for a, b in zip(got, eager))
+    for M, *_, tok_par, outs in steps:
+        if tok_par:
+            others = torch.ones(M, dtype=torch.bool, device=dev)
+            others[rank * (M // tp) : (rank + 1) * (M // tp)] = False
+            if any((t[others].float() != sentinel).any().item() for t in outs):
+                fails.append(f"M={M} token parallel wrote another rank's rows")
     if rank == 0:
         print(f"replay check: {args.replays} replays of widths {WIDTHS} in one graph: "
               f"{bad_replays} mismatching checks", flush=True)  # fmt: skip

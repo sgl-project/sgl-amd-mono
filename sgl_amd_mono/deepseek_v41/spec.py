@@ -26,6 +26,10 @@ processor, with SGLang's own modules where SGLang owns the state.
   - A window-only layer (ratio 0) reads no compressed cache.
   - DSpark's target layers: the mean of the residual K1 rebuilds, the residual
     SGLang's loop captures.
+  - Token parallel (``gfx950/token_par.py``, from 12 rows and a multiple of the
+    TP size): each rank's residual and mix rows past its own are stale, so after
+    the last layer one all-gather brings every row of the residual, the last pre
+    mix and the DSpark captures from its owner.
 
 Every layer must be one of these; a model with another is refused. The FFN
 launch (``gfx950/layer.py``) runs in no forward: the kernel checks use it as the
@@ -276,6 +280,8 @@ SGLANG_READS = {
         "compress_ratio",
     ),
     "srt/configs/model_config.py": ("context_len",),
+    # a token-parallel step's rows from their owners (``_gather_rows``)
+    "srt/distributed/parallel_state.py": ("get_tp_group", "all_gather(dim)"),
     "srt/runtime_context.py": (
         "get_parallel",
         '"tp_rank"',
@@ -618,7 +624,15 @@ def _boundary_out(layer, defer_post, x, residual, post, comb, pre):
 
 
 def _launch(
-    runner, L, plan, positions, forward_batch, pending_post, prev_pre, capture=None
+    runner,
+    L,
+    plan,
+    positions,
+    forward_batch,
+    pending_post,
+    prev_pre,
+    capture=None,
+    tok_par=False,
 ):
     """K1, then K2, of layer ``L``: the previous layer's pending post (x, residual,
     post, comb) and pre in; K2's (x, residual, post, comb, pre) out, this layer's
@@ -659,7 +673,7 @@ def _launch(
             prev_pre = runner.first_pre[:M]
     _, res_mid, *_ = runner.k1(
         L.k1, x, residual, post, comb, prev_pre, pos, slot, L.swa, L.swa_block,
-        keys, index=L.index,
+        keys, index=L.index, tok_par=tok_par,
     )  # fmt: skip
     if capture is not None:
         capture(L, res_mid)
@@ -671,7 +685,7 @@ def _launch(
     # K2 reads K1's outputs from the runner's buffers
     return runner.k2(
         L.k2, L.ffn, M, pos, L.swa, L.swa_block, L.comp, L.comp_block,
-        slot=slot, keys=keys, index=L.index,
+        slot=slot, keys=keys, index=L.index, tok_par=tok_par,
     )  # fmt: skip
 
 
@@ -890,6 +904,7 @@ class _Built:
         if m.config.vision_n_layers > 0:
             image = (input_ids == m.config.image_token_id)[:, None, None]
         pending, pre = (None, hc_broadcast(x, m.hc_mult), None, None), None
+        plan.state["tok_par"] = self.runner.tok_par(x.shape[0])
         for i in range(m.start_layer, m.end_layer):
             engram = m.layers[i].engram
             if engram is not None:  # on the residual the last layer settled
@@ -907,6 +922,12 @@ class _Built:
             )
             pending = post if defer else (None, hidden, None, None)
         residual = pending[1]
+        if plan.state["tok_par"]:
+            # the head's combine reads every row's residual and pre, the drafter
+            # every row's captures
+            residual, pre, *taps = self._gather_rows([residual, pre, *(aux or ())])
+            if aux is not None:
+                aux[:] = taps
         pre_hc_head = residual.flatten(1)
         # mhc_combine widens x on load: no f32 copy first
         hidden = m.norm(mhc_combine(pre_hc_head, pre, m.hc_mult, residual.dtype))
@@ -923,8 +944,25 @@ class _Built:
         out = _launch(
             self.runner, L, plan, positions, forward_batch, pending_post, prev_pre,
             capture=lambda L, residual: self._capture(plan, L, residual),
+            tok_par=plan.state["tok_par"],
         )  # fmt: skip
         return _boundary_out(L.module, defer_post, *out)
+
+    def _gather_rows(self, tensors: list) -> list:
+        """A token-parallel step's ``tensors``, every row from its owner (each rank
+        computed its own rows alone): their bytes as bf16 rows, one all-gather."""
+        from sglang.srt.distributed import get_tp_group
+
+        r = self.runner
+        n = tensors[0].shape[0] // r.tp
+        rows = slice(r.rank * n, (r.rank + 1) * n)
+        mine = [t[rows].contiguous().view(n, -1).view(torch.bfloat16) for t in tensors]
+        every = get_tp_group().all_gather(torch.cat(mine, 1), dim=0)
+        out, at = [], 0
+        for t, m in zip(tensors, mine):
+            out.append(every[:, at : at + m.shape[1]].contiguous().view(t.dtype))
+            at += m.shape[1]
+        return [o.view(t.shape) for o, t in zip(out, tensors)]
 
     def _capture(self, plan, L, residual) -> None:
         """DSpark reads the mean of each target layer's input residual."""
@@ -988,7 +1026,7 @@ def _build(model, hf_config, ctx) -> _Built:
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
-        runner.precompile(m, k1=k1, k2=k2, k2i=k2i)
+        runner.precompile(m, k1=k1, k2=k2, k2i=k2i, tok_par=runner.tok_par(m))
     return _Built(model, runner, layers)
 
 

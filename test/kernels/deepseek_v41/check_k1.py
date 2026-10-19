@@ -1,6 +1,7 @@
 """Check that K1 stays bitwise equal to SGLang's decode chain for the seam and the SWA KV write on gfx950,
 in each variant: the owed post folded in, a settled residual (after an Engram write), the first
-layer (copy 0 of the broadcast embedding), and an index source's normed input and qr."""
+layer (copy 0 of the broadcast embedding), and an index source's normed input and qr; each also
+token parallel where the width allows (the seam's outputs on this rank's rows, the rest whole)."""
 
 import argparse
 import math
@@ -35,6 +36,8 @@ VARIANTS = (
     ("first", False, False, True),
     ("index", True, True, False),
 )
+# the token-parallel builds (``token_par``) of these, where the width allows
+TOKEN_PAR_VARIANTS = ("fold", "settled", "index")
 # the widths the variants other than fold run at (fold runs at every width)
 VARIANT_WIDTHS = (1, 6, 12, 24, 48)
 QR_REL = NUMERICS.bound("k1.qr.rel")
@@ -171,6 +174,7 @@ def main():
     from sgl_amd_mono.deepseek_v41.gfx950.runner import (
         DSV41MonoRunner,
     )
+    from sgl_amd_mono.deepseek_v41.gfx950.token_par import token_par
 
     w, _, _ = make_weights(tp, rank, dev, seed=0)
     m = mono_weights(w)
@@ -216,18 +220,29 @@ def main():
     fails = []
     widths = [int(v) for v in args.widths.split(",")]
     runs = [
-        (M, v)
+        (M, v, False)
         for M in widths
         for v in VARIANTS
         if v[0] == "fold" or M in VARIANT_WIDTHS
     ]
-    for M, (vname, fold, index, first) in runs:
+    runs += [
+        (M, v, True)
+        for M, v, _ in list(runs)
+        if v[0] in TOKEN_PAR_VARIANTS and token_par(M, tp)
+    ]
+    for M, (vname, fold, index, first), tok_par in runs:
         ok, route = check_wqkv_route(M)
         route = r.route_at(M)
         tl = r.timeline_on
         k1 = build_mono_k1(
-            MonoBuild(M, tp, fold=fold, index=index, timeline=tl, **route)
+            MonoBuild(
+                M, tp, fold=fold, index=index, timeline=tl, tok_par=tok_par, **route
+            )
         )
+        # the seam's rows this rank computes: its own, token parallel
+        n = M // tp if tok_par else M
+        own = slice(rank * n, (rank + 1) * n) if tok_par else slice(0, M)
+        vname += ":tp" if tok_par else ""
         lay = scratch_layout(M, tp, tl, **route)
         sc = r.scratch(M)
         static = [t.clone() for t in inputs(M)]
@@ -257,7 +272,7 @@ def main():
 
         launch()
         torch.cuda.synchronize()
-        if args.timeline and vname == "fold":
+        if args.timeline and vname in ("fold", "fold:tp"):
             for _ in range(5):
                 launch()
             torch.cuda.synchronize()
@@ -275,12 +290,12 @@ def main():
             launch()
             torch.cuda.synchronize()
             o = lay["x8"][0]
-            x8 = sc[o : o + M * HIDDEN].clone()
+            x8 = sc[o : o + n * HIDDEN].clone()
             o = lay["x8s"][0]
             x8s = (
-                sc[o : o + M * HIDDEN // 32 * 4]
+                sc[o : o + n * HIDDEN // 32 * 4]
                 .view(torch.int32)
-                .view(M, HIDDEN // 32)
+                .view(n, HIDDEN // 32)
                 .to(torch.uint8)
             )
             got = records(swa, slot.long())
@@ -297,8 +312,10 @@ def main():
                 t[:M] for t in (r.q, r.res_mid, r.post_a, r.comb_a, r.pre_a)
             ] + [records(swa, slot.long())]
             diff["replay"] += sum(
-                int((u.view(torch.uint8) != v.view(torch.uint8)).sum())
-                for u, v in zip(eager, replayed)
+                int((u[rows].view(torch.uint8) != v[rows].view(torch.uint8)).sum())
+                for u, v, rows in zip(
+                    eager, replayed, [slice(0, M)] + [own] * 4 + [slice(0, M)]
+                )
             )
 
             # SGLang's boundary: no x when nothing is owed, no pre_prev on the first
@@ -340,14 +357,15 @@ def main():
             want = records(ref, slot.long())
 
             diff["res"] += int(
-                (eager[1].view(torch.int16) != ro.view(torch.int16)).sum()
+                (eager[1][own].view(torch.int16) != ro[own].view(torch.int16)).sum()
             )
             diff["x8"] += int(
-                (x8 != xq.q[:M].contiguous().view(torch.uint8).flatten()).sum()
+                (x8 != xq.q[:M][own].contiguous().view(torch.uint8).flatten()).sum()
             )
             diff["x8s"] += int(
                 (
-                    x8s != xq.scale[:M].contiguous().view(torch.uint8).reshape(M, -1)
+                    x8s
+                    != xq.scale[:M][own].contiguous().view(torch.uint8).reshape(n, -1)
                 ).sum()
             )
             # byte 583 pads the 7 scales: no reader, and SGLang's store leaves it as it was
@@ -362,7 +380,8 @@ def main():
                 (eager[2], post_r),
                 (eager[3], comb_r),
             ):
-                mix = max(mix, (k1_t.reshape(ref_t.shape) - ref_t).abs().max().item())
+                d = (k1_t.reshape(ref_t.shape) - ref_t)[own]
+                mix = max(mix, d.abs().max().item())
             if index:
                 # an index source's outputs, its compressor and indexer's inputs
                 diff["normed"] += int(

@@ -42,7 +42,13 @@ from .attention import front as mb_front
 from .attention.plan import WINDOW, Dims, back_scratch, front_scratch
 from .stages import moe, seam
 from .stages.dims import Dims as StageDims
+from .stages.gemv import plus
 from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
+from .token_par import (
+    own_view,
+    peer_layout,
+    peer_offsets,
+)
 
 SOURCES = kernel_sources(__name__)
 
@@ -85,6 +91,8 @@ class MonoBuild(msgspec.Struct, frozen=True):
     swa_width: int = WINDOW
     # SGLANG_AMD_MONO_TIMELINE: each CTA marks its stages in a scratch timeline
     timeline: bool = False
+    # token parallel (``token_par``): each rank's seam, norm and qkv on its own rows
+    tok_par: bool = False
 
 
 ROUTE = ("experts", "topk", "ug_groups", "swa_width")
@@ -99,7 +107,7 @@ def _variant(key: MonoBuild) -> dict:
     base = MonoBuild(key.tokens, key.tp)
     short = {"experts": "e", "topk": "k", "ug_groups": "u", "swa_width": "w"}
     out = {short[f]: v for f, v in route_of(key).items() if v != getattr(base, f)}
-    return out | ({"tl": 1} if key.timeline else {})
+    return out | ({"tl": 1} if key.timeline else {}) | ({"p": 1} if key.tok_par else {})
 
 
 def _moe_key(key: MonoBuild) -> MoeBuild:
@@ -151,8 +159,8 @@ def scratch_bytes(
 
 
 def peer_half_bytes(tp: int) -> int:
-    """One parity's peer regions: the attention's partials, then the MoE's."""
-    return seam.attn_peer_bytes(MAX_TOKENS, tp) + moe.peer_bytes(MAX_TOKENS, tp)
+    """One parity's peer regions (``token_par.peer_layout``)."""
+    return max(o + n for o, n in peer_layout(MAX_TOKENS, tp).values())
 
 
 def _epoch(epoch):
@@ -201,9 +209,11 @@ def build_mono_k1(key: MonoBuild):
     layout = scratch_layout(s, tp, key.timeline, **route_of(key))
     fkey = _front_key(key)
     FrontLds = mb_front.front_lds(s, Dims(tp))
+    # token parallel: the seam, wqkv and qkv on this rank's rows
+    own_n = s // tp if key.tok_par else s
     NORM0 = SLICES  # the norms on the CTAs past the slices: the wqkv waits on them
-    GATE0 = SLICES + s
-    assert GATE0 + s <= BLOCKS
+    GATE0 = SLICES + own_n
+    assert GATE0 + own_n <= BLOCKS
 
     @fx.struct
     class SeamLds:
@@ -358,6 +368,15 @@ def build_mono_k1(key: MonoBuild):
             }
             for region in ("lin", "pmix"):
                 ca[region] = sreg(scratch, layout[region][0], region)
+            t0 = 0
+            if const_expr(key.tok_par):
+                t0 = rank * own_n
+                ca = own_view(ca, t0, own_n)
+                ca["rank"] = rank
+                par = fx.Int64(ep & 1) * fx.Int64(half)
+                bases = [b + par for b in peer_bases(peers, tp)]
+                pl = peer_offsets(s, tp)
+                mb_front.token_par_context(c, own_n, t0, rank, bases, sym + par, pl)
 
             def seam_slice():
                 stamp(c, 32)
@@ -366,14 +385,16 @@ def build_mono_k1(key: MonoBuild):
                 gpu.barrier()
                 stamp(c, 33)
 
-            def store(*v):
-                store_x8(c, *v)
+            def store(t, col, ys, live):
+                store_x8(c, t, col, ys, live)
                 if const_expr(key.index):
                     # the normed input, SGLang's compressor and indexer's input
-                    store_normed(normed_out, *v)
+                    store_normed(normed_out, plus(t0, t), col, ys, live)
+                    if const_expr(key.tok_par):
+                        push_bf_row(ca, bases, pl["nbg"], plus(t0, t), col, ys, live)
 
             def seam_norm():
-                for t in range(first_task(bid, NORM0), s, BLOCKS):
+                for t in range(first_task(bid, NORM0), own_n, BLOCKS):
                     seam.stage_norm(ca, t, store)
                     publish_x8(c, t)
                 gpu.barrier()
@@ -383,7 +404,7 @@ def build_mono_k1(key: MonoBuild):
                 # the seam's mixes, in the wait on q (ROCm/ATOM): only K2 reads
                 # them; the gate's LDS aliases the front's, its wqkv done by now
                 gpu.barrier()
-                for t in range(first_task(bid, GATE0), s, BLOCKS):
+                for t in range(first_task(bid, GATE0), own_n, BLOCKS):
                     seam.stage_gate(ca, t)
 
             mb_front.run_front(
@@ -395,6 +416,16 @@ def build_mono_k1(key: MonoBuild):
                 after_wqkv=seam_norm,
                 before_wqb=seam_gate,
             )
+            if const_expr(key.tok_par):
+                # the other ranks' rows of what this launch hands on: the window
+                # records (K2's keys), an index source's normed rows and qr
+                own = sym + par
+                for t in range(first_task(bid, 0), s, BLOCKS):
+                    if t // own_n != rank:
+                        mb_front.record_from(c, preg(own, pl["kg"], "kg"), t)
+                        if const_expr(key.index):
+                            gather_row(ca, preg(own, pl["nbg"], "nbg"), t, normed_out)
+                            mb_front.qr_from(c, preg(own, pl["qrg"], "qrg"), t)
             stamp(c, 40)
 
     @flyc.jit
@@ -502,6 +533,48 @@ def store_normed(normed, t, col, ys, live):
             )
 
 
+@flyc.jit
+def push_attn_pair(c, bases, own, s, t, col, vs):
+    """This rank's wo_b partial pair of row t at ``col`` to every rank's ATTN region
+    (``seam.stage_push``'s pairs); token parallel (``own`` rows a rank), to the
+    row's owner alone, at its row there."""
+    for p in range_constexpr(len(bases)):
+        dst = preg(bases[p], 0, "attn")
+        if const_expr(own is None):
+            c["put_bf"](dst, 2 * seam.attn_region_pair(c["rank"], t, s, col), vs)
+        else:
+            if t // own == p:
+                pair = seam.attn_region_pair(c["rank"], t - p * own, own, col)
+                c["put_bf"](dst, 2 * pair, vs)
+
+
+@flyc.jit
+def push_bf_row(c, bases, off, t, col, ys, live):
+    """Row t's 8 bf16 values at ``col`` to every other rank's peer region ``off``."""
+    if live:
+        for p in range_constexpr(c["d"].tp):
+            if c["rank"] != p:
+                dst = preg(bases[p], off, "gather")
+                c["put_bf"](dst, t * HIDDEN + col, ys[0:4])
+                c["put_bf"](dst, t * HIDDEN + col + 4, ys[4:8])
+
+
+@flyc.jit
+def gather_row(c, src, t, dst):
+    """Row t of a bf16 [row][HIDDEN] peer region ``src`` -> ``dst`` (device scope)."""
+    tid = c["tid"]
+    for k in range_constexpr(-(-(HIDDEN // 4) // THREADS)):
+        q = tid + THREADS * k
+        if q < HIDDEN // 4:
+            (w,) = c["poll"]([(src, t * (HIDDEN // 2) + 2 * q, 2)])
+            bo.buffer_store(
+                fx.Vector.from_elements([w[0], w[1]], fx.Int32),
+                rsrc(dst),
+                t * (HIDDEN // 2) + 2 * q,
+                cache_modifier=CM_DEV,
+            )
+
+
 def _seam_lds(s):
     @fx.struct
     class SeamLds:
@@ -520,8 +593,12 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
     layout = scratch_layout(s, tp, key.timeline, **route_of(key))
     mkey = _moe_key(key)
     rs = route_shape(mkey)
+    # token parallel: the seam, norm and gates on this rank's rows, t0 ..
+    own_n = s // tp if const_expr(key.tok_par) else s
     GATE0 = SLICES
-    NORM0 = SLICES + s
+    NORM0 = SLICES + own_n
+    GATHER0 = NORM0 + own_n  # the other ranks' MoE input rows (token parallel)
+    assert not key.tok_par or GATHER0 + s <= BLOCKS
     bid = fx.block_idx.x
     tid = fx.thread_idx.x
     sl = lds.seam.peek()
@@ -562,6 +639,11 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
     if const_expr(key.timeline):
         ca["tl"] = timeline_row(scratch, layout["timeline"][0], bid)
     stamp(ca, 16)
+    t0 = 0
+    if const_expr(key.tok_par):
+        t0 = rank * own_n
+        ca = own_view(ca, t0, own_n)
+        xg = peer_offsets(s, tp)["xg"]
     normed = scratch + fx.Int64(layout["normed"][0])
     for region in ("lin", "pmix"):
         ca[region] = sreg(scratch, layout[region][0], region)
@@ -589,6 +671,11 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
         cb["tl"] = ca["tl"]
     for i, region in enumerate(COUNTERS):
         cb[region] = sreg(a["epoch"], 4 * (EPOCH_COUNTERS + i * moe.TAGS), region)
+    if const_expr(key.tok_par):
+        # the down sums reduce-scattered: each rank sums its own rows into ``out``
+        cb["own"] = own_n
+        out_own = a["out"] + fx.Int64(t0) * fx.Int64(HIDDEN * 2)
+        cb["own_view"] = {**cb, "S": own_n, "args": {**margs, "out": out_own}}
     for task in range(first_task(bid, 0), SLICES, BLOCKS):
         # the slice's own loads go out ahead of the wait on the ranks' partials
         pre = seam.slice_prefetch(ca, task)
@@ -597,9 +684,21 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
         seam.stage_reduce(ca, task)
         seam.stage_slice(ca, task, pre)
     stamp(ca, 17)
-    for t in range(first_task(bid, NORM0), s, BLOCKS):
-        seam.stage_norm(ca, t, lambda *v: store_normed(normed, *v))
-        publish(cb["put"], cb["xrdy"], t, 1, tid == 0)
+
+    def store(t, col, ys, live):
+        store_normed(normed, plus(t0, t), col, ys, live)
+        if const_expr(key.tok_par):
+            # the row for every other rank's MoE (``gather_row``)
+            push_bf_row(ca, bases, xg, plus(t0, t), col, ys, live)
+
+    for t in range(first_task(bid, NORM0), own_n, BLOCKS):
+        seam.stage_norm(ca, t, store)
+        publish(cb["put"], cb["xrdy"], plus(t0, t), 1, tid == 0)
+    if const_expr(key.tok_par):
+        for t in range(first_task(bid, GATHER0), s, BLOCKS):
+            if t // own_n != rank:
+                gather_row(ca, preg(own, xg, "xg"), t, normed)
+                publish(cb["put"], cb["xrdy"], t, 1, tid == 0)
     gpu.barrier()
     stamp(ca, 18)
 
@@ -608,7 +707,7 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
         # until this CTA's routing and shared expert are done. The gate's LDS
         # aliases the MoE's (a union), whose later stages reload theirs.
         gpu.barrier()
-        for t in range(first_task(bid, GATE0), s, BLOCKS):
+        for t in range(first_task(bid, GATE0), own_n, BLOCKS):
             seam.stage_gate(ca, t)
         stamp(ca, 23)
 
@@ -629,6 +728,7 @@ def build_mono_ffn(key: MonoBuild):
     """Build the FFN launch: push this rank's wo_b partial, then ``run_ffn``."""
     s, tp = key.tokens, key.tp
     assert 1 <= s <= MAX_TOKENS
+    assert not key.tok_par, "the FFN launch's partials arrive whole"
     rs = route_shape(_moe_key(key))
     assert rs.experts // 64 in SORT_NETS
     MoeLds = moe.moe_smem(s, rs)
@@ -927,13 +1027,10 @@ def build_mono_k2(key: MonoBuild):
                 c["tl"] = timeline_row(scratch, layout["timeline"][0], bid)
             amb = Mailbox(tag)
 
-            def push(t, col, v0, v1):
-                # this rank's bf16 partial pair to every rank's ATTN region (stage_push's pairs)
-                pair = 2 * seam.attn_region_pair(rank, t, s, col)
-                for p in range_constexpr(tp):
-                    amb.put_bf(preg(bases[p], 0, "attn"), pair, [v0, v1])
-
-            c["wob_out"] = push
+            cp = {"put_bf": amb.put_bf, "rank": rank}
+            c["wob_out"] = lambda t, col, v0, v1: push_attn_pair(
+                cp, bases, s // tp if key.tok_par else None, s, t, col, [v0, v1]
+            )
             epoch_begin({"bid": bid, "tid": fx.thread_idx.x}, epoch, ep)
             if const_expr(key.index):
                 # an index source's key table, from the top-k SGLang's indexer

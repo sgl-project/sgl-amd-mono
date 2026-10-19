@@ -86,10 +86,8 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.router import (
     router_weight_loads,
     router_x_loads,
 )
-from sgl_amd_mono.deepseek_v41.gfx950.stages.seam import (
-    HIDDEN,
-    attn_peer_bytes,
-)
+from sgl_amd_mono.deepseek_v41.gfx950.stages.seam import HIDDEN
+from sgl_amd_mono.deepseek_v41.gfx950.token_par import peer_offsets
 
 # a pick tile is a token tile's MFMA N: ``gather_x8r`` fills one from the other
 assert mplan.TILE == TILE
@@ -161,16 +159,6 @@ def scratch_layout(key: MoeBuild) -> dict[str, tuple[int, int]]:
         "dq": TAGS // 2,
     }
     return pair_layout(pairs.items())
-
-
-def peer_bytes(tokens: int, tp: int) -> int:
-    """FFN: ``[source rank][token][hidden / 2]`` bf16 pairs."""
-    return tp * tokens * HIDDEN // 2 * 8
-
-
-def ffn_offset(tokens: int, tp: int) -> int:
-    """FFN's byte offset in the peer buffer: past the ATTN region."""
-    return attn_peer_bytes(tokens, tp)
 
 
 def region_pair(src, t, s, col):
@@ -1189,9 +1177,16 @@ def down_combine(c, task, j, t0, n):
         v0 = fx.ptr_load(c["pair"] + (tl * ROWS + 2 * rp))
         v1 = fx.ptr_load(c["pair"] + (tl * ROWS + 2 * rp + 1))
         col = task * ROWS + 2 * rp
+        own = c["own"]
         for p in range_constexpr(d.tp):
             dst = preg(c["peer_addr"](p), c["ffn_off"], "ffn")
-            c["put_bf"](dst, 2 * region_pair(c["rank"], t, s, col), [v0, v1])
+            if const_expr(own is None):
+                c["put_bf"](dst, 2 * region_pair(c["rank"], t, s, col), [v0, v1])
+            else:
+                # token parallel: to the row's owner alone, at its row there
+                if t // own == p:
+                    pair = region_pair(c["rank"], t - p * own, own, col)
+                    c["put_bf"](dst, 2 * pair, [v0, v1])
     gpu.barrier()
 
 
@@ -1344,7 +1339,9 @@ def moe_context(s, rs, lds, mb, bases, layout, scratch, args, rank, sym):
         "peer_addr": lambda p: bases[p],
         "rank": rank,
         "sym": sym,
-        "ffn_off": ffn_offset(s, rs.tp),
+        "ffn_off": peer_offsets(s, rs.tp)["ffn"],
+        # token parallel: the down sums to each row's owner, ``own`` rows a rank
+        "own": None,
         "rs": rs,
         "d": rs.dims,
         "args": args,
@@ -1437,8 +1434,10 @@ def run_moe(c, key, bid, before_ug=None):
     else:
         stage_down(c, [down_task])
     stamp(c, 25)
+    # token parallel: this rank's rows' sums alone, ``out`` from its first row
+    cr = c if const_expr(c["own"] is None) else c["own_view"]
     for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
-        stage_reduce(c, task)
+        stage_reduce(cr, task)
     stamp(c, 26)
 
 

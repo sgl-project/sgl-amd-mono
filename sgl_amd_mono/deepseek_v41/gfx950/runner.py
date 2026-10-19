@@ -29,6 +29,7 @@ from .layer import (
 from .stages.dims import Dims as MoeDims
 from .stages.moe_shape import EXPERTS
 from .stages.moe_shape import TOPK as ROUTE_TOPK
+from .token_par import token_par
 
 __all__ = [
     "BLOCKS",
@@ -275,6 +276,8 @@ class DSV41MonoRunner:
         self.ug_groups = ug_groups
         # each launch marks its stages in its width's scratch (``timeline``)
         self.timeline_on = os.environ.get("SGLANG_AMD_MONO_TIMELINE") == "1"
+        # SGLANG_AMD_MONO_TOKEN_PAR=0: no target step runs token parallel
+        self.token_par_on = os.environ.get("SGLANG_AMD_MONO_TOKEN_PAR", "1") == "1"
         self.d = Dims(tp)
         dev = torch.device(device)
         if dev.index is None:
@@ -375,14 +378,20 @@ class DSV41MonoRunner:
             .view(BLOCKS, TL_POINTS)
         )
 
+    def tok_par(self, tokens: int) -> bool:
+        """Whether a target step of this width runs token parallel (``token_par``)."""
+        return self.token_par_on and token_par(tokens, self.tp)
+
     @staticmethod
     def supports(tokens: int) -> bool:
         return 1 <= tokens <= MAX_TOKENS
 
-    def k1_kernel(self, tokens: int, fold: bool = True, index: bool = False):
+    def k1_kernel(
+        self, tokens: int, fold: bool = True, index: bool = False, tok_par=False
+    ):
         """K1 at this width; it writes K2's key table unless the layer is an index
-        source (whose top-k comes after K1)."""
-        key = (tokens, "k1", fold, index)
+        source (whose top-k comes after K1). ``tok_par``: token parallel."""
+        key = (tokens, "k1", fold, index, tok_par)
         if key not in self._kernels:
             no_capture(f"K1 width {tokens}")
             self._kernels[key] = build_mono_k1(
@@ -395,20 +404,27 @@ class DSV41MonoRunner:
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
                     timeline=self.timeline_on,
+                    tok_par=tok_par,
                     **self.route_at(tokens),
                 )
             )
         return self._kernels[key]
 
     def precompile(
-        self, tokens: int, k1=(), k2=(), ffn: bool = False, k2i: bool = False
+        self,
+        tokens: int,
+        k1=(),
+        k2=(),
+        ffn: bool = False,
+        k2i: bool = False,
+        tok_par: bool = False,
     ) -> None:
         """Allocate this width's scratch and compile its launches without running
         them: K1 for each (fold, index) in ``k1``, K2 for each (compressed,
         index) in ``k2``, the FFN launch, and K2i (``enable_k2i`` first)."""
         self.scratch(tokens)
-        kernels = [self.k1_kernel(tokens, *v) for v in sorted(k1)]
-        kernels += [self.k2_kernel(tokens, *v) for v in sorted(k2)]
+        kernels = [self.k1_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k1)]
+        kernels += [self.k2_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k2)]
         if ffn:
             kernels.append(self.ffn_kernel(tokens))
         if k2i:
@@ -432,8 +448,10 @@ class DSV41MonoRunner:
             )
         return self._kernels[key]
 
-    def k2_kernel(self, tokens: int, compressed: bool = True, index: bool = False):
-        key = (tokens, "k2", compressed, index)
+    def k2_kernel(
+        self, tokens: int, compressed: bool = True, index: bool = False, tok_par=False
+    ):
+        key = (tokens, "k2", compressed, index, tok_par)
         if key not in self._kernels:
             no_capture(f"K2 width {tokens}")
             self._kernels[key] = build_mono_k2(
@@ -446,6 +464,7 @@ class DSV41MonoRunner:
                     fault_site=self.fault_site,
                     fault_after=self.fault_after,
                     timeline=self.timeline_on,
+                    tok_par=tok_par,
                     **self.route_at(tokens),
                 )
             )
@@ -553,6 +572,7 @@ class DSV41MonoRunner:
         swa_block: int,
         keys: tuple,  # int32 [>= M, ...]: window slots, window lengths, top-k slots, top-k lengths
         index: bool = False,
+        tok_par: bool = False,
     ):
         """Run K1: the pending post, this layer's attention seam and the attention
         front; it writes the step's SWA KV records and K2's key table. With ``x``
@@ -560,7 +580,8 @@ class DSV41MonoRunner:
         layer, after an Engram write). ``index``: an index source, whose top-k
         comes after K1: K1 writes its normed input and qr (``normed``, ``qr``)
         for the indexer and leaves the key table to K2. Returns (q, residual,
-        post, comb, pre) views of the runner's buffers."""
+        post, comb, pre) views of the runner's buffers. ``tok_par`` (``token_par``): the
+        residual, post, comb and pre rows in and out are this rank's alone."""
         M = residual.shape[0]
         if not self.supports(M):
             raise RuntimeError(f"DSv4.1 mono decode: {M} rows")
@@ -600,7 +621,7 @@ class DSV41MonoRunner:
                     + ("None" if t is None else f"{tuple(t.shape)} {t.dtype}")
                 )
         swa_idx, swa_lens, topk, topk_lens = (t.data_ptr() for t in keys)
-        self.k1_kernel(M, fold, index)(
+        self.k1_kernel(M, fold, index, tok_par)(
             residual.data_ptr(),
             x.data_ptr(),
             post.data_ptr(),
@@ -664,6 +685,7 @@ class DSV41MonoRunner:
         slot: torch.Tensor | None = None,  # an index source's: K1's slots and keys
         keys: tuple | None = None,
         index: bool = False,
+        tok_par: bool = False,
     ):
         """Run K2 on K1's q and attention-seam outputs: the attention back, its TP
         reduce, the FFN seam, the MoE and its all-reduce. ``comp`` None: a
@@ -704,7 +726,7 @@ class DSV41MonoRunner:
             table = (slot, *keys)
         else:  # unread
             table = (self.klen, self.klen, self.klen, self.no_topk, self.no_topk_lens)
-        self.k2_kernel(M, compressed, index)(
+        self.k2_kernel(M, compressed, index, tok_par)(
             self.q.data_ptr(),
             swa.data_ptr(),
             swa.stride(0),
