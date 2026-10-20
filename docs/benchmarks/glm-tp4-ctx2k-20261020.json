@@ -1,0 +1,570 @@
+{
+  "date": "2026-10-20",
+  "upstream_commit": "0bce1886519813a8086488e599dfa155a69e74a1",
+  "candidate_commit": "bdad3b2fb1743e79bc66591a7d12798e0df99f1e",
+  "node": "mi355-gpu-46",
+  "devices": [
+    4,
+    5,
+    6,
+    7
+  ],
+  "tp": 4,
+  "requests": 2,
+  "context_capacity": 2048,
+  "seed": 719,
+  "scope": "direct Glm53Runtime synthetic indexed layer; one layer call per timed block",
+  "context_definition": "2048 is compiled maximum context; per-query live keys are listed per row",
+  "timing": {
+    "graph_steps": 32,
+    "graph_replays": 10,
+    "trials_per_run": 4,
+    "rank_aggregation": "maximum",
+    "reported_aggregation": "median of all trials",
+    "reversed_source_order_rechecks": [
+      2,
+      4
+    ]
+  },
+  "serial_reference": "numerical oracle only; serial latency was not measured",
+  "latency": [
+    {
+      "query_tokens_per_request": 2,
+      "total_query_tokens": 4,
+      "origin_us": 147.2549285888672,
+      "current_cp_off_us": 151.85791778564453,
+      "current_cp_on_us": 146.46498107910156,
+      "speedup_cp_off": 0.9696888429401836,
+      "speedup_cp_on": 1.0053934223999865,
+      "live_keys": [
+        2044,
+        2045,
+        2043,
+        2044
+      ],
+      "max_rank_trials_us": {
+        "origin": [
+          147.29916381835938,
+          147.3748016357422,
+          147.35218811035156,
+          147.44554138183594,
+          147.210693359375,
+          147.1456756591797,
+          147.07568359375,
+          147.0222930908203
+        ],
+        "current_cp_off": [
+          152.32986450195312,
+          152.30223083496094,
+          152.27699279785156,
+          152.29698181152344,
+          151.4388427734375,
+          151.41921997070312,
+          151.37522888183594,
+          151.39085388183594
+        ],
+        "current_cp_on": [
+          145.8859100341797,
+          145.80477905273438,
+          145.74066162109375,
+          145.70553588867188,
+          147.37005615234375,
+          147.20254516601562,
+          147.21405029296875,
+          147.04405212402344
+        ]
+      },
+      "records": [
+        "ctx2k_origin_q2",
+        "ctx2k_recheck_origin_q2",
+        "ctx2k_current_q2_cp0",
+        "ctx2k_recheck_current_q2_cp0",
+        "ctx2k_current_q2_cp1",
+        "ctx2k_recheck_current_q2_cp1"
+      ],
+      "origin_status": "passed"
+    },
+    {
+      "query_tokens_per_request": 4,
+      "total_query_tokens": 8,
+      "origin_us": 269.66009521484375,
+      "current_cp_off_us": 255.86310577392578,
+      "current_cp_on_us": 258.6581726074219,
+      "speedup_cp_off": 1.053923325128042,
+      "speedup_cp_on": 1.0425346027017675,
+      "live_keys": [
+        2042,
+        2043,
+        2044,
+        2045,
+        2041,
+        2042,
+        2043,
+        2044
+      ],
+      "max_rank_trials_us": {
+        "origin": [
+          269.371337890625,
+          269.2267150878906,
+          269.35009765625,
+          269.2131042480469,
+          269.9536437988281,
+          270.12957763671875,
+          270.0122375488281,
+          269.9488525390625
+        ],
+        "current_cp_off": [
+          255.85450744628906,
+          255.79931640625,
+          255.8717041015625,
+          255.85145568847656,
+          256.0357971191406,
+          255.93380737304688,
+          255.95867919921875,
+          255.82745361328125
+        ],
+        "current_cp_on": [
+          258.28424072265625,
+          258.8102722167969,
+          258.5329895019531,
+          258.6479797363281,
+          258.65887451171875,
+          258.657470703125,
+          258.68035888671875,
+          258.7055969238281
+        ]
+      },
+      "records": [
+        "ctx2k_origin_q4",
+        "ctx2k_recheck_origin_q4",
+        "ctx2k_current_q4_cp0",
+        "ctx2k_recheck_current_q4_cp0",
+        "ctx2k_current_q4_cp1",
+        "ctx2k_recheck_current_q4_cp1"
+      ],
+      "origin_status": "passed"
+    },
+    {
+      "query_tokens_per_request": 6,
+      "total_query_tokens": 12,
+      "origin_us": null,
+      "current_cp_off_us": 353.6957550048828,
+      "current_cp_on_us": 345.26165771484375,
+      "speedup_cp_off": null,
+      "speedup_cp_on": null,
+      "live_keys": [
+        2040,
+        2041,
+        2042,
+        2043,
+        2044,
+        2045,
+        2039,
+        2040,
+        2041,
+        2042,
+        2043,
+        2044
+      ],
+      "max_rank_trials_us": {
+        "origin": [],
+        "current_cp_off": [
+          353.6212463378906,
+          353.7071228027344,
+          353.8190002441406,
+          353.68438720703125
+        ],
+        "current_cp_on": [
+          345.25714111328125,
+          345.26617431640625,
+          345.31256103515625,
+          345.16339111328125
+        ]
+      },
+      "records": [
+        "ctx2k_origin_q6",
+        "ctx2k_current_q6_cp0",
+        "ctx2k_current_q6_cp1"
+      ],
+      "origin_status": "replay_check_failed"
+    },
+    {
+      "query_tokens_per_request": 8,
+      "total_query_tokens": 16,
+      "origin_us": null,
+      "current_cp_off_us": 413.5070343017578,
+      "current_cp_on_us": 410.56629943847656,
+      "speedup_cp_off": null,
+      "speedup_cp_on": null,
+      "live_keys": [
+        2038,
+        2039,
+        2040,
+        2041,
+        2042,
+        2043,
+        2044,
+        2045,
+        2037,
+        2038,
+        2039,
+        2040,
+        2041,
+        2042,
+        2043,
+        2044
+      ],
+      "max_rank_trials_us": {
+        "origin": [],
+        "current_cp_off": [
+          413.50665283203125,
+          413.7055358886719,
+          413.498779296875,
+          413.5074157714844
+        ],
+        "current_cp_on": [
+          410.69744873046875,
+          410.5587463378906,
+          410.5738525390625,
+          410.55322265625
+        ]
+      },
+      "records": [
+        "ctx2k_origin_q8",
+        "ctx2k_current_q8_cp0",
+        "ctx2k_current_q8_cp1"
+      ],
+      "origin_status": "unsupported_width"
+    }
+  ],
+  "checks": [
+    {
+      "case": "ctx2k_current_q2_cp0",
+      "status": "passed",
+      "rows_per_launch": [
+        4
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_current_q2_cp1",
+      "status": "passed",
+      "rows_per_launch": [
+        4
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_current_q4_cp0",
+      "status": "passed",
+      "rows_per_launch": [
+        8
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_current_q4_cp1",
+      "status": "passed",
+      "rows_per_launch": [
+        8
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_current_q6_cp0",
+      "status": "passed",
+      "rows_per_launch": [
+        12
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_current_q6_cp1",
+      "status": "passed",
+      "rows_per_launch": [
+        12
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_current_q8_cp0",
+      "status": "passed",
+      "rows_per_launch": [
+        16
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_current_q8_cp1",
+      "status": "passed",
+      "rows_per_launch": [
+        16
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0,
+      "profiled_mono_launches": 1,
+      "profiled_gpu_kernels": {
+        "glm5_monokernel_0": 1,
+        "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul> >(int, at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul>)": 1
+      }
+    },
+    {
+      "case": "ctx2k_origin_q2",
+      "status": "passed",
+      "rows_per_launch": [
+        4
+      ],
+      "source_sha256": {
+        "kernel.py": "0e45e039412d111c0d92403268ecfc8dc9aa747250e3353c28e8f212c212f7ec",
+        "layout.py": "c00376701c81bbd32b5d46de18a9bba16b0abfe3c622f4631add79a400581789",
+        "runner.py": "b32844c11af27727c9b5373bc2d889d77134cff1ca039fd59e86fc79b106582a"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_origin_q4",
+      "status": "passed",
+      "rows_per_launch": [
+        8
+      ],
+      "source_sha256": {
+        "kernel.py": "0e45e039412d111c0d92403268ecfc8dc9aa747250e3353c28e8f212c212f7ec",
+        "layout.py": "c00376701c81bbd32b5d46de18a9bba16b0abfe3c622f4631add79a400581789",
+        "runner.py": "b32844c11af27727c9b5373bc2d889d77134cff1ca039fd59e86fc79b106582a"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_origin_q6",
+      "status": "failed",
+      "reason": "replay changed output",
+      "replay_observation": [
+        "REPLAY {\"input\": {\"changed\": 0, \"max_abs\": 0.0}, \"output\": {\"changed\": 4, \"max_abs\": 0.00048828125}, \"indices\": {\"changed\": 1875, \"max_abs\": 2879.0}, \"index_q\": {\"changed\": 0, \"max_abs\": 0.0}, \"q_lat\": {\"changed\": 0, \"max_abs\": 0.0}, \"a\": {\"changed\": 7, \"max_abs\": 0.000244140625}, \"o\": {\"changed\": 2351, \"max_abs\": 7.62939453125e-06}, \"cache_sha256\": false}"
+      ]
+    },
+    {
+      "case": "ctx2k_origin_q8",
+      "status": "unsupported",
+      "reason": "upstream builder restricts physical rows to 1..12; c2*q8 needs 16 rows",
+      "replay_observation": []
+    },
+    {
+      "case": "ctx2k_recheck_current_q2_cp0",
+      "status": "passed",
+      "rows_per_launch": [
+        4
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_recheck_current_q2_cp1",
+      "status": "passed",
+      "rows_per_launch": [
+        4
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_recheck_current_q4_cp0",
+      "status": "passed",
+      "rows_per_launch": [
+        8
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_recheck_current_q4_cp1",
+      "status": "passed",
+      "rows_per_launch": [
+        8
+      ],
+      "source_sha256": {
+        "kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+        "layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+        "runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_recheck_origin_q2",
+      "status": "passed",
+      "rows_per_launch": [
+        4
+      ],
+      "source_sha256": {
+        "kernel.py": "0e45e039412d111c0d92403268ecfc8dc9aa747250e3353c28e8f212c212f7ec",
+        "layout.py": "c00376701c81bbd32b5d46de18a9bba16b0abfe3c622f4631add79a400581789",
+        "runner.py": "b32844c11af27727c9b5373bc2d889d77134cff1ca039fd59e86fc79b106582a"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_recheck_origin_q4",
+      "status": "passed",
+      "rows_per_launch": [
+        8
+      ],
+      "source_sha256": {
+        "kernel.py": "0e45e039412d111c0d92403268ecfc8dc9aa747250e3353c28e8f212c212f7ec",
+        "layout.py": "c00376701c81bbd32b5d46de18a9bba16b0abfe3c622f4631add79a400581789",
+        "runner.py": "b32844c11af27727c9b5373bc2d889d77134cff1ca039fd59e86fc79b106582a"
+      },
+      "causal_isolation": "passed",
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "ctx2k_reference_q2",
+      "status": "passed",
+      "rows_per_launch": [
+        2,
+        2
+      ],
+      "source_sha256": {
+        "kernel.py": "0e45e039412d111c0d92403268ecfc8dc9aa747250e3353c28e8f212c212f7ec",
+        "layout.py": "c00376701c81bbd32b5d46de18a9bba16b0abfe3c622f4631add79a400581789",
+        "runner.py": "b32844c11af27727c9b5373bc2d889d77134cff1ca039fd59e86fc79b106582a"
+      },
+      "causal_isolation": "passed"
+    },
+    {
+      "case": "ctx2k_reference_q4",
+      "status": "passed",
+      "rows_per_launch": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "source_sha256": {
+        "kernel.py": "0e45e039412d111c0d92403268ecfc8dc9aa747250e3353c28e8f212c212f7ec",
+        "layout.py": "c00376701c81bbd32b5d46de18a9bba16b0abfe3c622f4631add79a400581789",
+        "runner.py": "b32844c11af27727c9b5373bc2d889d77134cff1ca039fd59e86fc79b106582a"
+      },
+      "causal_isolation": "passed"
+    },
+    {
+      "case": "ctx2k_reference_q6",
+      "status": "passed",
+      "rows_per_launch": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "source_sha256": {
+        "kernel.py": "0e45e039412d111c0d92403268ecfc8dc9aa747250e3353c28e8f212c212f7ec",
+        "layout.py": "c00376701c81bbd32b5d46de18a9bba16b0abfe3c622f4631add79a400581789",
+        "runner.py": "b32844c11af27727c9b5373bc2d889d77134cff1ca039fd59e86fc79b106582a"
+      },
+      "causal_isolation": "passed"
+    },
+    {
+      "case": "ctx2k_reference_q8",
+      "status": "passed",
+      "rows_per_launch": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "source_sha256": {
+        "kernel.py": "0e45e039412d111c0d92403268ecfc8dc9aa747250e3353c28e8f212c212f7ec",
+        "layout.py": "c00376701c81bbd32b5d46de18a9bba16b0abfe3c622f4631add79a400581789",
+        "runner.py": "b32844c11af27727c9b5373bc2d889d77134cff1ca039fd59e86fc79b106582a"
+      },
+      "causal_isolation": "passed"
+    }
+  ],
+  "host_dispatch_note": "upstream spec declares decode-only with TP4 row cap 4; raw 8/12-row kernel tests do not establish forward support"
+}

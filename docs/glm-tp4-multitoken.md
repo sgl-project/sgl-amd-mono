@@ -54,6 +54,9 @@ These host contracts have focused CPU tests. Synthetic layer tests do not
 establish checkpoint accuracy, acceptance rate or serving throughput; those
 still require the existing SGLang reference and end-to-end checkpoint tests.
 
+For the direct upstream-versus-adapted comparison with one layer call on
+both sides at context capacity 2K, see the [2K comparison](glm-tp4-ctx2k.md).
+
 ## Baselines and reproduction
 
 Use the unmodified repository at `0bce188` for the original implementation.
