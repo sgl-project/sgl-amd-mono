@@ -47,7 +47,42 @@ def test_indexer_cp_full_context(rows):
     _check(8, rows, 131072, False, pad_rows=0, full_context=True)
 
 
-def _check(tp, rows, capacity, ties, pad_rows=1, full_context=False):
+@pytest.mark.parametrize(
+    "rows,capacity", [(2, 65536), (4, 131072), (4, 262144), (4, 1048576)]
+)
+def test_indexer_cp_tp4_full_context(rows, capacity):
+    _check(4, rows, capacity, False, pad_rows=0, full_context=True)
+
+
+def test_indexer_cp_tp4_large_cache(tmp_path):
+    control = str(tmp_path / "cache_translation")
+    _check(
+        4,
+        2,
+        4096,
+        False,
+        pad_rows=0,
+        full_context=True,
+        extra_args=("--save-control", control, "--exact-control"),
+    )
+    _check(
+        4,
+        2,
+        4096,
+        False,
+        pad_rows=0,
+        full_context=True,
+        extra_args=(
+            "--check-control",
+            control,
+            "--exact-control",
+            "--slot-offset",
+            "4194304",
+        ),
+    )
+
+
+def _check(tp, rows, capacity, ties, pad_rows=1, full_context=False, extra_args=()):
     if _gfx950_gpus() < tp:
         pytest.skip(f"needs {tp} gfx950 GPUs")
     cmd = [
@@ -68,4 +103,5 @@ def _check(tp, rows, capacity, ties, pad_rows=1, full_context=False):
         cmd.append("--full-context")
     if ties:
         cmd.append("--ties")
+    cmd.extend(extra_args)
     subprocess.run(cmd, check=True, timeout=1800)

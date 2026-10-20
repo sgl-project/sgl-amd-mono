@@ -2037,6 +2037,14 @@ def build_glm5_monokernel(
             for s in range_constexpr(S):
                 pos = row_position(s)
                 slot = row_slot(s)
+                store_slot = slot
+                if const_expr(use_atom_kv_cache):
+                    # Paged slots can address more than 4 GiB. Buffer offsets are
+                    # 32-bit bytes, so put the complete row address in the base.
+                    cache_row_bytes = QK_DIM * (1 if cache_fp8 else 2)
+                    r_kv = _rsrc(kv_cache + fx.Int64(_uniform(slot)) * cache_row_bytes)
+                    r_pe = _rsrc(pe_cache + fx.Int64(_uniform(slot)) * cache_row_bytes)
+                    store_slot = fx.Int32(0)
                 active = row_writes_cache(s)
                 value = vs[s] * _rsq(ssq[s] * (1.0 / KV_LORA) + EPS) * g
                 if const_expr(cache_fp8):
@@ -2059,11 +2067,11 @@ def build_glm5_monokernel(
                                 bo.buffer_store(
                                     pair | (upper_pair << 16),
                                     r_kv,
-                                    slot * (QK_DIM // 4) + tid // 4,
+                                    store_slot * (QK_DIM // 4) + tid // 4,
                                 )
                         else:
                             bo.buffer_store(
-                                kvn.to(fx.BFloat16), r_kv, slot * QK_DIM + tid
+                                kvn.to(fx.BFloat16), r_kv, store_slot * QK_DIM + tid
                             )
                 else:
                     bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_LORA + tid)
@@ -2092,10 +2100,12 @@ def build_glm5_monokernel(
                                     bo.buffer_store(
                                         pair | (upper_pair << 16),
                                         r_pe,
-                                        slot * (QK_DIM // 4) + KV_LORA // 4 + tid // 2,
+                                        store_slot * (QK_DIM // 4)
+                                        + KV_LORA // 4
+                                        + tid // 2,
                                     )
                             else:
-                                pe_offset = slot * QK_DIM + KV_LORA + tid * 2
+                                pe_offset = store_slot * QK_DIM + KV_LORA + tid * 2
                                 bo.buffer_store(p0.to(fx.BFloat16), r_pe, pe_offset)
                                 bo.buffer_store(p1.to(fx.BFloat16), r_pe, pe_offset + 1)
                     else:
@@ -2762,32 +2772,40 @@ def build_glm5_monokernel(
                     get(mb("index_ready"), s)
                     if tid < INDEX_HEADS:
                         lds_st(keys, tid, get(mb("index_w"), s * INDEX_HEADS + tid))
-                    for b in range_constexpr((INDEX_Q_ROWS // 2) // THREADS):
-                        q_pair = tid + b * THREADS
-                        q_elem = q_pair * 2
-                        kq = q_elem % INDEX_DIM
-                        if const_expr(SHARD_INDEX_Q):
-                            word = poll(
-                                [
-                                    (
-                                        cp_buffer("index_cp_q", sym),
-                                        s * INDEX_Q_ROWS // 2 + q_pair,
-                                        1,
-                                    )
-                                ],
-                                scope="system",
-                            )[0][0]
-                            q0, q1 = bf2_f32(word)
-                        else:
-                            q0, q1 = get_bf2_many(
-                                [(mb("index_q"), s * INDEX_Q_ROWS + q_elem)]
-                            )[0]
-                        if kq < PE_DIM:
-                            c = ld_bf16(_rsrc(rope_cos), pos * (PE_DIM // 2) + kq // 2)
-                            sn = ld_bf16(_rsrc(rope_sin), pos * (PE_DIM // 2) + kq // 2)
-                            q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
-                        q0, q1 = fwht128(q0, q1)
-                        lds_st(xs, q_pair, bf16_pair(q0, q1))
+                    # Adapt the independent query polls from FlyDSL #1256.
+                    q_batch = (
+                        (INDEX_Q_ROWS // 2) // THREADS if indexer_cp and W == 4 else 1
+                    )
+                    for batch in range_constexpr(
+                        0, (INDEX_Q_ROWS // 2) // THREADS, q_batch
+                    ):
+                        q_pairs = [tid + (batch + b) * THREADS for b in range(q_batch)]
+                        q_source = (
+                            cp_buffer("index_cp_q", sym)
+                            if const_expr(SHARD_INDEX_Q)
+                            else mb("index_q")
+                        )
+                        q_words = poll(
+                            [
+                                (q_source, s * INDEX_Q_ROWS // 2 + pair, 1)
+                                for pair in q_pairs
+                            ],
+                            scope="system" if SHARD_INDEX_Q else "agent",
+                        )
+                        for q_pair, q_word in zip(q_pairs, q_words):
+                            q_elem = q_pair * 2
+                            kq = q_elem % INDEX_DIM
+                            q0, q1 = bf2_f32(q_word[0])
+                            if kq < PE_DIM:
+                                c = ld_bf16(
+                                    _rsrc(rope_cos), pos * (PE_DIM // 2) + kq // 2
+                                )
+                                sn = ld_bf16(
+                                    _rsrc(rope_sin), pos * (PE_DIM // 2) + kq // 2
+                                )
+                                q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
+                            q0, q1 = fwht128(q0, q1)
+                            lds_st(xs, q_pair, bf16_pair(q0, q1))
                     gpu.barrier()
                 for tile in range(first_tile, n_tiles, G):
                     tile = fx.Int32(tile)
@@ -2867,17 +2885,32 @@ def build_glm5_monokernel(
                                         score,
                                     )
                             if bound <= LOCAL_INDEX_CAPACITY:
-                                for peer in range_constexpr(CP_RANKS):
-                                    put(
-                                        cp_buffer(
-                                            "index_scores", cp_peer(fx.Int32(peer))
-                                        ),
-                                        s * score_stride + key_pos,
-                                        score,
-                                        CM_SYS,
-                                    )
+                                if const_expr(W == 4):
+                                    lds_st(red, 128 + key_group * 16 + lane, score)
+                                else:
+                                    for peer in range_constexpr(CP_RANKS):
+                                        put(
+                                            cp_buffer(
+                                                "index_scores", cp_peer(fx.Int32(peer))
+                                            ),
+                                            s * score_stride + key_pos,
+                                            score,
+                                            CM_SYS,
+                                        )
                         else:
                             put(score_base, s * index_max_seq + key_pos, score)
+                    if const_expr(indexer_cp and W == 4):
+                        if bound <= LOCAL_INDEX_CAPACITY:
+                            # One wave publishes the complete score tile to each peer.
+                            gpu.barrier()
+                            out_key = (tile_begin + tile) * INDEX_KEYS_PER_TASK + lane
+                            if (wave < CP_RANKS) & (out_key < bound):
+                                put(
+                                    cp_buffer("index_scores", cp_peer(wave)),
+                                    s * score_stride + out_key,
+                                    lds_ld(red, 128 + lane),
+                                    CM_SYS,
+                                )
                     gpu.barrier()
                     stamp("index_score", s * N_PAGED_SPLIT + tile, 4)
 
@@ -3796,50 +3829,126 @@ def build_glm5_monokernel(
             """Each wave copies its 8 keys' KV latent (1 KB) + k_pe (128 B) cache rows
             into the LDS tiles (rows of this launch are patched in by patch_new_kv)."""
             krows = [lds_ld(attn_keys, wave * KPW + jj) for jj in range(KPW)]
-            for jj in range_constexpr(KPW):
-                j = wave * KPW + jj
-                if const_expr(cache_fp8):
-                    row = krows[jj] * (QK_DIM // 4)
-                    raw = fx.Vector(
-                        bo.buffer_load(r_kv, row + lane * 2, vec_width=2, dtype=T.i32)
-                    )
-                    fx.ptr_store(
-                        _fp8_to_bf16x8(raw[0], raw[1]).bitcast(fx.Float32),
-                        ktile + (j * KS + lane * 4),
-                    )
-                    if lane < PE_DIM // 8:
-                        pe_raw = fx.Vector(
+            if const_expr(use_atom_kv_cache):
+                # Each gathered row is wave-uniform; retain two independent
+                # row loads while putting its full byte address in the base.
+                cache_row_bytes = QK_DIM * (1 if cache_fp8 else 2)
+                for gather_base in range_constexpr(0, KPW, 2):
+                    descriptors = [
+                        _rsrc(
+                            kv_cache
+                            + fx.Int64(_uniform(krows[gather_base + part]))
+                            * cache_row_bytes
+                        )
+                        for part in range(min(2, KPW - gather_base))
+                    ]
+                    raw_values = [
+                        fx.Vector(
                             bo.buffer_load(
-                                r_pe,
-                                row + KV_LORA // 4 + lane * 2,
-                                vec_width=2,
+                                descriptors[part],
+                                lane * (2 if cache_fp8 else 4),
+                                vec_width=2 if cache_fp8 else 4,
+                                dtype=T.i32,
+                            )
+                        )
+                        for part in range(min(2, KPW - gather_base))
+                    ]
+                    for part in range_constexpr(min(2, KPW - gather_base)):
+                        raw = raw_values[part]
+                        value = (
+                            _fp8_to_bf16x8(raw[0], raw[1])
+                            if const_expr(cache_fp8)
+                            else raw
+                        )
+                        fx.ptr_store(
+                            value.bitcast(fx.Float32),
+                            ktile + ((wave * KPW + gather_base + part) * KS + lane * 4),
+                        )
+                    if lane < (PE_DIM // 8 if const_expr(cache_fp8) else PE_DIM // 2):
+                        pe_values = [
+                            bo.buffer_load(
+                                _rsrc(
+                                    pe_cache
+                                    + fx.Int64(_uniform(krows[gather_base + part]))
+                                    * cache_row_bytes
+                                ),
+                                KV_LORA // (4 if cache_fp8 else 2)
+                                + lane * (2 if cache_fp8 else 1),
+                                vec_width=2 if cache_fp8 else 1,
+                                dtype=T.i32,
+                            )
+                            for part in range(min(2, KPW - gather_base))
+                        ]
+                        for part in range_constexpr(min(2, KPW - gather_base)):
+                            if const_expr(cache_fp8):
+                                raw = fx.Vector(pe_values[part])
+                                fx.ptr_store(
+                                    _fp8_to_bf16x8(raw[0], raw[1]).bitcast(fx.Float32),
+                                    petile
+                                    + (
+                                        (wave * KPW + gather_base + part) * PS
+                                        + lane * 4
+                                    ),
+                                )
+                            else:
+                                lds_st(
+                                    petile,
+                                    (wave * KPW + gather_base + part) * PS + lane,
+                                    fx.Int32(pe_values[part]).bitcast(fx.Float32),
+                                )
+            else:
+                for jj in range_constexpr(KPW):
+                    j = wave * KPW + jj
+                    if const_expr(cache_fp8):
+                        row = krows[jj] * (QK_DIM // 4)
+                        raw = fx.Vector(
+                            bo.buffer_load(
+                                r_kv, row + lane * 2, vec_width=2, dtype=T.i32
+                            )
+                        )
+                        fx.ptr_store(
+                            _fp8_to_bf16x8(raw[0], raw[1]).bitcast(fx.Float32),
+                            ktile + (j * KS + lane * 4),
+                        )
+                        if lane < PE_DIM // 8:
+                            pe_raw = fx.Vector(
+                                bo.buffer_load(
+                                    r_pe,
+                                    row + KV_LORA // 4 + lane * 2,
+                                    vec_width=2,
+                                    dtype=T.i32,
+                                )
+                            )
+                            fx.ptr_store(
+                                _fp8_to_bf16x8(pe_raw[0], pe_raw[1]).bitcast(
+                                    fx.Float32
+                                ),
+                                petile + (j * PS + lane * 4),
+                            )
+                    else:
+                        kv_row_words = (
+                            QK_DIM // 2
+                            if const_expr(use_atom_kv_cache)
+                            else KV_LORA // 2
+                        )
+                        kv8 = fx.Vector(
+                            bo.buffer_load(
+                                r_kv,
+                                krows[jj] * kv_row_words + lane * 4,
+                                vec_width=4,
                                 dtype=T.i32,
                             )
                         )
                         fx.ptr_store(
-                            _fp8_to_bf16x8(pe_raw[0], pe_raw[1]).bitcast(fx.Float32),
-                            petile + (j * PS + lane * 4),
+                            kv8.bitcast(fx.Float32), ktile + (j * KS + lane * 4)
                         )
-                else:
-                    kv_row_words = (
-                        QK_DIM // 2 if const_expr(use_atom_kv_cache) else KV_LORA // 2
-                    )
-                    kv8 = fx.Vector(
-                        bo.buffer_load(
-                            r_kv,
-                            krows[jj] * kv_row_words + lane * 4,
-                            vec_width=4,
-                            dtype=T.i32,
-                        )
-                    )
-                    fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * 4))
-                    if lane < PE_DIM // 2:
-                        pe_row = (
-                            krows[jj] * (QK_DIM // 2) + KV_LORA // 2 + lane
-                            if const_expr(use_atom_kv_cache)
-                            else krows[jj] * (PE_DIM // 2) + lane
-                        )
-                        lds_st(petile, j * PS + lane, ld_f32(r_pe, pe_row))
+                        if lane < PE_DIM // 2:
+                            pe_row = (
+                                krows[jj] * (QK_DIM // 2) + KV_LORA // 2 + lane
+                                if const_expr(use_atom_kv_cache)
+                                else krows[jj] * (PE_DIM // 2) + lane
+                            )
+                            lds_st(petile, j * PS + lane, ld_f32(r_pe, pe_row))
 
         def patch_new_kv():
             """Rows appended by this launch come from the cache task's kvnew / penew pairs."""

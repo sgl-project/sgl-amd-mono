@@ -176,13 +176,17 @@ in the isolated test environment because its SGLang MoE imports require
 
 ## Validation environment (2026-10-20)
 
+The results below describe the initial CP port, commit `1e795ce`. The
+[TP4 long-context follow-up](glm-tp4-long-context.md) covers subsequent
+cache-addressing fixes, tuning and validation.
+
 Tests use node 47, MI355X, Torch `2.9.1+rocm7.2.0.git7e1940d4`, ROCm
 `7.2.26015-fc0010cf6a`, FlyDSL `0.4.0` and AITER. FlyDSL `0.3.2` lacks the
 `generic_store` API already required by the unchanged baseline guard.
 Dependencies are isolated from existing shared installations. SGLang contract
 checks use source at `9e231077722f10671075a17c9bf7ee64b5ff0715`.
 
-The final source passed **108** partition/layout, forward-dispatch,
+The initial CP source passed **108** partition/layout, forward-dispatch,
 forward-spec and source-key tests, plus **6** GLM-specific SGLang source-contract
 checks. The expanded GPU suite passed **14 cases** in 517.79 seconds, covering
 TP4 and TP8, empty shards, exact ties at short and long context, mixed rows,
@@ -192,7 +196,7 @@ complete scores, ordered physical indices, full output and cache bytes were
 bitwise equal. The reported independent score relative L2 errors were below
 `1e-7`; all ranks passed the unchanged `0.01` bound.
 
-Final-source paired synthetic timings in microseconds (median of four
+Initial CP paired synthetic timings in microseconds (median of four
 max-rank trials; each trial alternates the two modes):
 
 | TP | Width (active) | Allocated context | CP off | CP on | Speedup |

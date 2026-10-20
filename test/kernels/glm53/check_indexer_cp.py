@@ -9,6 +9,7 @@ and head weights; it does not establish a full-layer independent golden.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -40,8 +41,8 @@ HIDDEN, INDEX_DIM, TOPK = 6144, 128, 2048
 LAYERS = 3  # odd count exercises slot parity across step boundaries
 
 
-def make_weights(tp, device, ties=False):
-    g = torch.Generator(device=device).manual_seed(719)
+def make_weights(tp, device, ties=False, seed=719):
+    g = torch.Generator(device=device).manual_seed(seed)
     heads, inter = 64 // tp, 2048 // tp
 
     def rnd(*shape, scale=1.0):
@@ -107,13 +108,17 @@ def make_weights(tp, device, ties=False):
     )
 
 
-def fixture(rows, capacity, device, pad_rows, full_context=False):
-    g = torch.Generator(device=device).manual_seed(720)
+def fixture(
+    rows, capacity, device, pad_rows, full_context=False, seed=720, slot_offset=0
+):
+    g = torch.Generator(device=device).manual_seed(seed)
     pages_per_request = capacity // 64
     pages = rows * pages_per_request + 1
     table = torch.zeros(rows, pages_per_request + 3, dtype=torch.int32, device=device)
     table[:, :pages_per_request] = (
-        torch.randperm(pages - 1, generator=g, device=device).reshape(rows, -1) + 1
+        torch.randperm(pages - 1, generator=g, device=device).reshape(rows, -1)
+        + 1
+        + slot_offset // 64
     )
     req = torch.arange(rows - 1, -1, -1, dtype=torch.int32, device=device)
     lengths = [max(1, capacity - 3), 65, 2049, 1, 4097, 127, 2048, 129][:rows]
@@ -154,6 +159,19 @@ def fixture(rows, capacity, device, pad_rows, full_context=False):
     scales = torch.ones(pages, 64, dtype=torch.float32, device=device)
     idx = torch.cat([shuffled.reshape(pages, -1), scales.view(torch.uint8)], dim=1)
     idx = idx.reshape(pages, 64, 132)
+    if slot_offset:
+        # Translate identical logical data past the 32-bit buffer byte limit.
+        # The unused prefix remains covered by check_untouched().
+        kv_storage = torch.zeros(
+            slot_offset + kv.shape[0], 576, dtype=kv.dtype, device=device
+        )
+        kv_storage[slot_offset:].copy_(kv)
+        kv = kv_storage
+        idx_storage = torch.zeros(
+            slot_offset // 64 + pages, 64, 132, dtype=idx.dtype, device=device
+        )
+        idx_storage[slot_offset // 64 :].copy_(idx)
+        idx = idx_storage
     step = Glm53Step(
         pos,
         slots,
@@ -286,6 +304,15 @@ def check_untouched(before, after, written_slots):
     assert not changed.any(), "untouched index-cache bytes changed"
 
 
+def tensor_digest(tensor):
+    """Hash full state on the test server without saving large cache tensors."""
+    raw = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+    digest = hashlib.sha256()
+    for chunk in raw.split(16 * 1024 * 1024):
+        digest.update(chunk.cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
 def run(args):
     rank, tp = dist.get_rank(), dist.get_world_size()
     local = int(os.environ["LOCAL_RANK"])
@@ -294,10 +321,17 @@ def run(args):
     assert tp in (4, 8) and args.rows in (2, 4, 8)
     assert 0 <= args.pad_rows < args.rows
     assert args.capacity >= 64 and args.capacity % 64 == 0
+    assert args.slot_offset >= 0 and args.slot_offset % 64 == 0
     assert "gfx950" in torch.cuda.get_device_properties(device).gcnArchName
-    weights = make_weights(tp, device, args.ties)
+    weights = make_weights(tp, device, args.ties, args.seed)
     h, cos, sin, initial, step, lengths = fixture(
-        args.rows, args.capacity, device, args.pad_rows, args.full_context
+        args.rows,
+        args.capacity,
+        device,
+        args.pad_rows,
+        args.full_context,
+        args.seed + 1,
+        args.slot_offset,
     )
     runtimes, caches, steps = [], [], []
     try:
@@ -424,7 +458,7 @@ def run(args):
                 outputs[which] = run_step(which)
             graphs.append(graph)
         compare()
-        generator = torch.Generator(device=device).manual_seed(723)
+        generator = torch.Generator(device=device).manual_seed(args.seed + 4)
         initial_lengths = list(lengths)
         written_slots = [step.slots.clone()]
 
@@ -488,6 +522,8 @@ def run(args):
             initial_live_keys=initial_lengths,
             final_live_keys=lengths,
             ties=args.ties,
+            seed=args.seed,
+            slot_offset=args.slot_offset,
             graph_replays=args.replays,
             replay_live_keys=replay_lengths,
             dispatch="forward_parameter",
@@ -501,7 +537,11 @@ def run(args):
             snapshot = {
                 "input": h.cpu(),
                 "output": outputs[0].cpu(),
-                "indices": steps[0].topk.cpu(),
+                "indices": torch.where(
+                    steps[0].topk >= 0,
+                    steps[0].topk - args.slot_offset,
+                    steps[0].topk,
+                ).cpu(),
             }
             for name, shape in (
                 ("a", (args.rows, HIDDEN)),
@@ -509,6 +549,23 @@ def run(args):
                 ("q_lat", (args.rows, 64 // tp, 512)),
             ):
                 snapshot[name] = pairs(runtimes[0], name, shape, bf16=True).cpu()
+            if args.exact_control:
+                full_scores = scores(runtimes[0], lengths)
+                snapshot["state_sha256"] = {
+                    "kv": tensor_digest(caches[0].kv[args.slot_offset :]),
+                    "index_cache": tensor_digest(
+                        caches[0].idx.reshape(-1)[
+                            args.slot_offset // 64 * INDEX_PAGE_BYTES :
+                        ]
+                    ),
+                    "index_q": tensor_digest(
+                        pairs(runtimes[0], "index_q", (args.rows, 32, 128), bf16=True)
+                    ),
+                    "scores": [
+                        tensor_digest(full_scores[row, :length])
+                        for row, length in enumerate(lengths)
+                    ],
+                }
             if args.save_control:
                 target = Path(f"{args.save_control}.rank{rank}.pt")
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -519,11 +576,20 @@ def run(args):
                 )
                 metrics = {}
                 for name in snapshot:
+                    if name == "state_sha256":
+                        assert snapshot[name] == control[name], (
+                            "source control changed cache, query or score bytes"
+                        )
+                        continue
                     if name in ("input", "indices"):
                         assert torch.equal(snapshot[name], control[name]), (
                             f"source control changed {name}"
                         )
                     else:
+                        if args.exact_control:
+                            assert torch.equal(snapshot[name], control[name]), (
+                                f"source control changed {name} bytes"
+                            )
                         actual, expected = snapshot[name].float(), control[name].float()
                         relative = (
                             actual - expected
@@ -542,35 +608,57 @@ def run(args):
                     name: [max(m[name][i] for m in gathered) for i in range(2)]
                     for name in metrics
                 }
+                result["source_control_exact"] = args.exact_control
         if args.bench_iters:
+            assert args.bench_steps >= 1
+            timing_graphs = graphs
+            if args.bench_steps > 1:
+                timing_graphs = []
+                for which in (0, 1):
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        for _ in range(args.bench_steps):
+                            run_step(which)
+                    timing_graphs.append(graph)
             trials = [[], []]
             for trial in range(4):
                 for which in (0, 1) if trial % 2 == 0 else (1, 0):
                     for _ in range(10):
-                        graphs[which].replay()
+                        timing_graphs[which].replay()
                     torch.cuda.synchronize()
                     dist.barrier()
                     start, end = (
                         torch.cuda.Event(enable_timing=True),
                         torch.cuda.Event(enable_timing=True),
                     )
+                    # Queue one untimed TP-synchronized graph before the start
+                    # event, so host scheduling skew does not set the boundary.
+                    if args.bench_steps > 1:
+                        timing_graphs[which].replay()
                     start.record()
                     for _ in range(args.bench_iters):
-                        graphs[which].replay()
+                        timing_graphs[which].replay()
                     end.record()
                     end.synchronize()
                     us = torch.tensor(
-                        [start.elapsed_time(end) * 1000 / (args.bench_iters * LAYERS)]
+                        [
+                            start.elapsed_time(end)
+                            * 1000
+                            / (args.bench_iters * args.bench_steps * LAYERS)
+                        ]
                     )
                     dist.all_reduce(us, op=dist.ReduceOp.MAX)
                     trials[which].append(float(us))
             medians = [statistics.median(t) for t in trials]
             result.update(
                 benchmark="synthetic_shared_weights",
+                bench_graph_steps=args.bench_steps,
+                bench_graph_replays=args.bench_iters,
                 max_rank_us=trials,
                 median_us=medians,
                 speedup=medians[0] / medians[1],
             )
+            compare()
         if rank == 0:
             print("RESULT " + json.dumps(result), flush=True)
     finally:
@@ -585,12 +673,25 @@ if __name__ == "__main__":
     parser.add_argument("--pad-rows", type=int, default=1)
     parser.add_argument("--replays", type=int, default=8)
     parser.add_argument("--ties", action="store_true")
+    parser.add_argument("--seed", type=int, default=719)
+    parser.add_argument(
+        "--slot-offset",
+        type=int,
+        default=0,
+        help="Translate the physical cache by this many slots (a multiple of 64).",
+    )
     parser.add_argument(
         "--full-context",
         action="store_true",
         help="Start every active request near the compiled context limit.",
     )
     parser.add_argument("--bench-iters", type=int, default=0)
+    parser.add_argument(
+        "--bench-steps",
+        type=int,
+        default=1,
+        help="Three-layer steps per timing graph; increase to amortize host submission.",
+    )
     parser.add_argument(
         "--save-control",
         help="Remote prefix for small control tensors, one file per rank.",
@@ -599,8 +700,16 @@ if __name__ == "__main__":
         "--check-control",
         help="Compare output and selected intermediates to a saved source control.",
     )
+    parser.add_argument(
+        "--exact-control",
+        action="store_true",
+        help="Require exact source-control tensors and full cache/query/score hashes.",
+    )
+    args = parser.parse_args()
+    if args.exact_control and not (args.save_control or args.check_control):
+        parser.error("--exact-control requires --save-control or --check-control")
     dist.init_process_group("gloo")
     try:
-        run(parser.parse_args())
+        run(args)
     finally:
         dist.destroy_process_group()
