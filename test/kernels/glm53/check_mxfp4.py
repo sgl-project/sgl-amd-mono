@@ -10,6 +10,7 @@ import hashlib
 import inspect
 import json
 import os
+import statistics
 from collections import Counter
 from pathlib import Path
 
@@ -268,6 +269,37 @@ def check(args):
                 tensor_digest(caches.idx),
             ), "graph caches"
         assert not rt.epoch[3:6].any(), "replay guard error"
+        trials = []
+        if args.bench:
+            timed = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(timed):
+                for _ in range(32):
+                    run()
+            for _ in range(8):
+                for _ in range(10):
+                    timed.replay()
+                torch.cuda.synchronize()
+                dist.barrier()
+                start, end = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                timed.replay()
+                start.record()
+                for _ in range(10):
+                    timed.replay()
+                end.record()
+                end.synchronize()
+                duration = torch.tensor([start.elapsed_time(end) * 1000 / 320])
+                dist.all_reduce(duration, op=dist.ReduceOp.MAX)
+                trials.append(float(duration))
+            assert not rt.epoch[3:6].any(), "timing guard error"
+            assert torch.equal(first, rt.outs[0]), "timing changed output"
+            assert torch.equal(initial_indices, step.topk), "timing changed indices"
+            assert cache_hash == (
+                tensor_digest(caches.kv),
+                tensor_digest(caches.idx),
+            ), "timing changed caches"
         launch_counts = None
         if args.profile_launches:
             dist.barrier()
@@ -303,6 +335,14 @@ def check(args):
                 name: hashlib.sha256((source / name).read_bytes()).hexdigest()
                 for name in ("kernel.py", "layout.py", "runner.py")
             },
+            max_rank_us=trials,
+            median_us=statistics.median(trials) if trials else None,
+            graph_steps=32 if trials else None,
+            graph_replays=10 if trials else None,
+            requests=2,
+            query_tokens=args.rows // 2,
+            live_lengths=lengths,
+            benchmark="synthetic_one_layer_query_block" if trials else None,
             rows=args.rows,
             activation="fp4",
             cp=args.cp,
@@ -340,6 +380,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-control")
     parser.add_argument("--check-control")
     parser.add_argument("--profile-launches", action="store_true")
+    parser.add_argument("--bench", action="store_true")
     dist.init_process_group("gloo")
     try:
         check(parser.parse_args())

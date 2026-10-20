@@ -101,7 +101,9 @@ The pytest long-context test removes its controls automatically.
 A8W8 regression uses `check_multitoken.py --check-routing` with identical
 fixtures under the accepted and candidate source paths. This compares outputs,
 attention/MoE intermediates, ordered routes and top-k, and cache hashes.
-Performance and serving throughput are not measured by these checks.
+The optional `--bench` flag measures GPU latency after the correctness checks;
+[the A4W4 timing report](glm-tp4-a4w4-performance.md) defines its scope.
+Serving throughput is not measured by this harness.
 
 
 ## Results (2026-10-20)
