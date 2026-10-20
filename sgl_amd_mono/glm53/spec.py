@@ -175,11 +175,14 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     if cfg.page_size not in (None, PAGE_SIZE):
         reasons.append(f"--page-size {cfg.page_size}: the DSA caches need {PAGE_SIZE}")
     quant = getattr(hf_config, "quantization_config", None) or {}
-    if quant.get("quant_method") != "fp8" or list(
+    block_fp8 = quant.get("quant_method") == "fp8" and list(
         quant.get("weight_block_size") or ()
-    ) != [128, 128]:
+    ) == [128, 128]
+    # Quark supports per-layer formats. Check actual loaded projections and
+    # expert tensors below; its name alone does not imply a compatible layout.
+    if not block_fp8 and quant.get("quant_method") != "quark":
         reasons.append(
-            "needs the FP8 block-128 checkpoint, got "
+            "needs FP8 block-128 or Quark with block-FP8 attention, got "
             f"{quant.get('quant_method')!r} {quant.get('weight_block_size')!r}"
         )
     if importlib.util.find_spec("flydsl") is None:
@@ -194,6 +197,7 @@ def _where(ids: list) -> str:
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     from sgl_amd_mono.glm53.gfx950.weights import (
         experts_reason,
+        projection_format_reasons,
         unshuffled_projections,
     )
 
@@ -205,6 +209,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         why = experts_reason(layer.mlp)
         if why is not None:
             reasons.append(f"layer {i}: {why}")
+        reasons.extend(f"layer {i}: {why}" for why in projection_format_reasons(layer))
         for name in unshuffled_projections(layer):
             row_major.setdefault(name, []).append(i)
         indexer = layer.self_attn.indexer
@@ -252,6 +257,11 @@ class _Built:
         self._layers, self.runtimes = layers, runtimes
         self.first, self.last = min(layers), max(layers)
         self.tp = tp
+        self.moe_activation_dtype = (
+            "fp4"
+            if getattr(getattr(layers[self.first], "w", None), "expert_mxfp4", False)
+            else "fp8"
+        )
         self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         self.cos, self.sin = cos, sin
@@ -280,15 +290,30 @@ class _Built:
         pp_proxy_tensors=None,
         *,
         indexer_cp: bool = False,
+        moe_activation_dtype: str | None = None,
     ):
         """Run a decode step with an explicit, capture-time CP choice.
 
         Both variants are built at initialization. A captured graph retains its
         choice; callers selecting both modes must keep distinct graph instances.
         All TP ranks must pass the same Python bool.
+        ``moe_activation_dtype=None`` follows the loaded expert weights: FP8
+        for A8W8 and FP4 for A4W4. An explicit value must match that format;
+        forward does not convert weights or build a different quantization path.
         """
         if type(indexer_cp) is not bool:
             raise TypeError("indexer_cp must be a Python bool")
+        dtype = getattr(self, "moe_activation_dtype", "fp8")
+        if moe_activation_dtype is not None:
+            if type(moe_activation_dtype) is not str or moe_activation_dtype not in (
+                "fp8",
+                "fp4",
+            ):
+                raise ValueError("moe_activation_dtype must be fp8 or fp4")
+            if moe_activation_dtype != dtype:
+                raise ValueError(
+                    f"loaded experts require {dtype} activations; only A8W8 and A4W4 are supported"
+                )
         lm = self.lm
         if plan.key.rows > self.max_rows:
             return type(lm).forward(
@@ -567,6 +592,10 @@ def _build(model, hf_config, ctx) -> _Built:
             f"GLM-5.3 monokernel: TP{tp} runs at most {cap} rows on the kernels, and "
             f"this server's decode graphs route {sorted(ctx.widths)}"
         )
+    formats = {getattr(L.w, "expert_mxfp4", False) for L in layers.values()}
+    if len(formats) != 1:
+        raise ValueError("covered GLM layers must use one expert weight format")
+    expert_mxfp4 = formats.pop()
     runtimes = {}
     # each runtime's peer handshake is collective: every rank builds them in one order
     for w in widths:
@@ -583,6 +612,8 @@ def _build(model, hf_config, ctx) -> _Built:
                     fault_site=fault_site,
                     fault_after=fault_after,
                     indexer_cp=cp,
+                    expert_mxfp4=expert_mxfp4,
+                    moe_activation_dtype="fp4" if expert_mxfp4 else "fp8",
                 )
                 rt = Glm53Runtime(key, rank, p.tp_group.cpu_group, device)
                 rt.set_deadline(ctx.deadline_s)

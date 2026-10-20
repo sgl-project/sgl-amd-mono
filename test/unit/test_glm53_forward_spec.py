@@ -8,7 +8,8 @@ import torch
 from sgl_amd_mono.glm53.spec import _Built
 
 
-def test_build_prepares_both_indexer_modes_before_forward(monkeypatch):
+@pytest.mark.parametrize("w4", [False, True])
+def test_build_prepares_only_matching_quantization_and_both_cp_modes(monkeypatch, w4):
     from sglang.srt import runtime_context
 
     from sgl_amd_mono.common import guard
@@ -46,7 +47,15 @@ def test_build_prepares_both_indexer_modes_before_forward(monkeypatch):
     modules = [
         SimpleNamespace(
             input_layernorm=SimpleNamespace(weight=torch.empty(0)),
-            w=SimpleNamespace(index=object() if i == 3 else None, shuffled=True),
+            w=SimpleNamespace(
+                index=object() if i == 3 else None,
+                shuffled=True,
+                expert_mxfp4=w4,
+                w_ug=torch.empty(257, 1024, 3072, dtype=torch.uint8, device="meta"),
+                w_dn=torch.empty(257, 6144, 256, dtype=torch.uint8, device="meta"),
+                s_ug=torch.empty(257, 1024, 192, dtype=torch.uint8, device="meta"),
+                s_dn=torch.empty(257, 6144, 16, dtype=torch.uint8, device="meta"),
+            ),
         )
         for i in range(5)
     ]
@@ -55,6 +64,11 @@ def test_build_prepares_both_indexer_modes_before_forward(monkeypatch):
         lm,
         SimpleNamespace(first_k_dense_replace=3, num_hidden_layers=5),
         SimpleNamespace(widths=(2, 4, 6, 8, 12, 16), copies={}, deadline_s=30),
+    )
+    assert built.moe_activation_dtype == ("fp4" if w4 else "fp8")
+    assert all(
+        rt.key.moe_activation_dtype == built.moe_activation_dtype
+        for rt in built.runtimes.values()
     )
     assert list(built.runtimes) == [
         (w, kind)
@@ -88,15 +102,19 @@ def test_only_selected_width_and_mode_consume_epochs():
 
 
 @pytest.mark.parametrize("cp", [False, True])
-def test_fallback_does_not_receive_the_monokernel_only_argument(cp):
+@pytest.mark.parametrize("mode", ["fp8", "fp4"])
+def test_fallback_does_not_receive_the_monokernel_only_argument(cp, mode):
     class Model:
         def forward(self, *args, **kwargs):
             return args, kwargs
 
     built = object.__new__(_Built)
     built.lm, built.max_rows = Model(), 4
+    built.moe_activation_dtype = mode
     plan = SimpleNamespace(key=SimpleNamespace(rows=5))
-    args, kwargs = built.forward(plan, "ids", "pos", "batch", indexer_cp=cp)
+    args, kwargs = built.forward(
+        plan, "ids", "pos", "batch", indexer_cp=cp, moe_activation_dtype=mode
+    )
     assert args == ("ids", "pos", "batch", None, None)
     assert kwargs == {}
 

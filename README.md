@@ -86,6 +86,13 @@ top-k for long contexts and query projection sharding for short compiled
 contexts. It defaults to `False`; see
 [the scope and comparison tests](docs/glm-indexer-cp.md).
 
+At TP4, GLM also supports [A8W8 and A4W4 MoE paths](docs/glm-tp4-mxfp4.md).
+The loaded expert weights select the activation format; an explicit
+`moe_activation_dtype="fp8"` or `"fp4"` forward argument must match them.
+A4W4 requires Quark MXFP4 experts with the existing block-FP8 attention
+format. Layer tests cover up to 16 query tokens; full A4W4 checkpoint and
+serving validation remain separate.
+
 ## Repository Structure
 
 ```text

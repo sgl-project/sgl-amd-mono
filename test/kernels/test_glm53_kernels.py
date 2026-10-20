@@ -190,3 +190,56 @@ def _check(tp, rows, capacity, ties, pad_rows=1, full_context=False, extra_args=
         cmd.append("--ties")
     cmd.extend(extra_args)
     subprocess.run(cmd, check=True, timeout=1800)
+
+
+@pytest.mark.parametrize("rows", [2, 4, 6, 8, 12, 16])
+def test_a4w4_tp4(rows):
+    _check_a4w4(["--rows", str(rows)])
+
+
+@pytest.mark.parametrize("rows", [12, 16])
+def test_a4w4_external_topk_tp4(rows):
+    _check_a4w4(["--rows", str(rows), "--external"])
+
+
+def test_a4w4_quantization_edges_tp4():
+    _check_a4w4(["--rows", "4", "--quant-edges"])
+
+
+def test_a4w4_long_context_cp_tp4(tmp_path):
+    control = str(tmp_path / "a4_cp")
+    args = [
+        "--rows",
+        "16",
+        "--capacity",
+        "131072",
+        "--pad-rows",
+        "3",
+        "--ties",
+        "--seed",
+        "823",
+    ]
+    try:
+        _check_a4w4(args + ["--save-control", control])
+        _check_a4w4(args + ["--cp", "--check-control", control, "--profile-launches"])
+    finally:
+        for path in tmp_path.glob("a4_cp.rank*.pt"):
+            path.unlink()
+
+
+def _check_a4w4(args):
+    if _gfx950_gpus() < 4:
+        pytest.skip("needs 4 gfx950 GPUs")
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=4",
+            str(CHECK.with_name("check_mxfp4.py")),
+            *args,
+        ],
+        check=True,
+        timeout=1800,
+    )

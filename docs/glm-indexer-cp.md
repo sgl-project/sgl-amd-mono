@@ -156,8 +156,9 @@ unmodified server call sites currently exercise `indexer_cp=False`.
 
 The [multi-token follow-up](glm-tp4-multitoken.md) adapts the row/cohort and
 grouped-expert scheduling to SGLang's FP8 path through 16 total query tokens.
-Native FP4 MFMA and GLM-5.2 MXFP4 checkpoint loading still require a different
-weight contract. Their format guards remain in place.
+The [A4W4 follow-up](glm-tp4-mxfp4.md) adds native FP4 arithmetic and an
+in-place Quark MXFP4 expert loader under a separate weight contract. Full
+checkpoint and serving compatibility remain unverified.
 
 The upstream TP8/width-8 sparse-attention tile32 change was tested separately
 against tile64. CP off/on remained exact within the tile32 candidate, but the

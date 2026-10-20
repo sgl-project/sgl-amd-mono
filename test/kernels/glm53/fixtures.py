@@ -16,7 +16,7 @@ from sgl_amd_mono.glm53.gfx950.runner import (
 HIDDEN, INDEX_DIM, TOPK = 6144, 128, 2048
 
 
-def make_weights(tp, device, ties=False, seed=719):
+def make_weights(tp, device, ties=False, seed=719, expert_factory=None):
     g = torch.Generator(device=device).manual_seed(seed)
     heads, inter = 64 // tp, 2048 // tp
 
@@ -39,8 +39,11 @@ def make_weights(tp, device, ties=False, seed=719):
     uk, suk = fp8(heads * 512, 192, packed=True, scale_k=64)
     uv, suv = fp8(heads * 256, 512, packed=True)
     wo, so = fp8(HIDDEN, heads * 256)
-    ug, sug = fp8(2 * inter, HIDDEN, experts=257)
-    dn, sdn = fp8(HIDDEN, inter, experts=257)
+    if expert_factory is None:
+        ug, sug = fp8(2 * inter, HIDDEN, experts=257)
+        dn, sdn = fp8(HIDDEN, inter, experts=257)
+    else:
+        ug, sug, dn, sdn = expert_factory(inter, HIDDEN, g, device)
     ik, sik = fp8(INDEX_DIM, HIDDEN)
     iq, siq = fp8(32 * INDEX_DIM, 2048)
     iw = pack_bf16(rnd(32, HIDDEN, scale=0.0 if ties else HIDDEN**-0.5).bfloat16())

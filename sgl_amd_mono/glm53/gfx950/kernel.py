@@ -197,6 +197,7 @@ def build_glm5_monokernel(
     scale: float = SOFTMAX_SCALE,
     uv_scale_rows: int = 128,
     native_fp4_mfma: bool = False,
+    moe_activation_dtype: str = "fp8",
     timeline: bool = False,
     index_paged: bool = False,
     index_block_size: int = 64,
@@ -237,6 +238,19 @@ def build_glm5_monokernel(
     dimension is stored as that many expert-shaped slices, every row routes to all
     of them with weight 1, and the router GEMV is skipped.
     """
+    if moe_activation_dtype not in ("fp8", "fp4"):
+        raise ValueError("moe_activation_dtype must be fp8 or fp4")
+    if moe_activation_dtype == "fp4" and not (
+        native_fp4_mfma and atom_experts and expert_mxfp4
+    ):
+        raise ValueError("A4W4 requires native MFMA and ATOM MXFP4 expert weights")
+    if expert_mxfp4 and moe_activation_dtype != "fp4":
+        raise ValueError("MXFP4 experts require FP4 activations; A8W4 is unsupported")
+    if native_fp4_mfma and npes != 4:
+        raise ValueError("SGL native MXFP4 is supported at TP4")
+    if native_fp4_mfma and S not in (2, 4, 6, 8, 12, 16):
+        raise ValueError("native MXFP4 needs physical widths 2,4,6,8,12,16")
+    activation_fp4 = moe_activation_dtype == "fp4"
     keyed = key_tuple(locals(), SOURCES)
     total_samples = S
     S = row_tile_size(total_samples)
@@ -1168,15 +1182,20 @@ def build_glm5_monokernel(
 
             def lds_mxfp8(chunk_word):
                 """One scaled-MFMA B operand from a row-major 128-value MXFP8 tile."""
+                if const_expr(activation_fp4):
+                    # FP4 uses contiguous K[32*g:32*g+32] for lane group g.
+                    return fx.ptr_load(
+                        xs + chunk_word + 4 * (lane // 16), result_type=v4f
+                    ).bitcast(fx.Int32)
                 words = [
                     fx.ptr_load(
-                        xs + chunk_word + 16 * half + 4 * (lane // 16), result_type=v4f
+                        xs + chunk_word + 16 * half + 4 * (lane // 16),
+                        result_type=v4f,
                     ).bitcast(fx.Int32)
                     for half in range(2)
                 ]
                 return fx.Vector.from_elements(
-                    [words[half][e] for half in range(2) for e in range(4)],
-                    fx.Int32,
+                    [words[half][e] for half in range(2) for e in range(4)], fx.Int32
                 )
 
             def unit_bf16(w_rsrc, rg, kc, NKC, b_word, ln=None):
@@ -1289,7 +1308,7 @@ def build_glm5_monokernel(
                                     lds_mxfp8(bw),
                                     c,
                                     4,
-                                    0,
+                                    4 if activation_fp4 else 0,
                                     0,
                                     weight_scale,
                                     0,
@@ -1641,19 +1660,74 @@ def build_glm5_monokernel(
 
             def quant_mxfp8(a0, a1):
                 """Per-32 E4M3 values and E8M0 scale used by ATOM/AITER W4A8."""
+                if const_expr(activation_fp4):
+                    # Match the BF16 input boundary of the native A4 quantizer.
+                    a0, a1 = bf16_round(a0), bf16_round(a1)
                 amax = fx.max(fmath.absf(a0), fmath.absf(a1))
+                if const_expr(activation_fp4):
+                    amax = fx.max(amax, fx.Float32(1e-10))
                 for offset in (1, 2, 4, 8):
                     amax = _xred(amax, offset, fx.max)
-                bits = (amax * fx.Float32(1.0 / FP8_MAX)).bitcast(fx.Int32)
+                bits = (
+                    amax * fx.Float32(1.0 / (6.0 if activation_fp4 else FP8_MAX))
+                ).bitcast(fx.Int32)
                 exponent = (bits >> 23) & fx.Int32(0xFF)
                 exponent = exponent + ((bits & fx.Int32(0x7FFFFF)) != 0).select(
                     fx.Int32(1), fx.Int32(0)
                 )
                 exponent = fx.max(fx.min(exponent, fx.Int32(254)), fx.Int32(1))
                 inverse = _rcp((exponent << 23).bitcast(fx.Float32))
-                q0 = fx.min(fx.max(a0 * inverse, -FP8_MAX), FP8_MAX)
-                q1 = fx.min(fx.max(a1 * inverse, -FP8_MAX), FP8_MAX)
+                mx = 6.0 if activation_fp4 else FP8_MAX
+                q0 = fx.min(fx.max(a0 * inverse, -mx), mx)
+                q1 = fx.min(fx.max(a1 * inverse, -mx), mx)
                 return q0, q1, exponent
+
+            def pack_moe4(q0, q1):
+                pair4 = fx.Int32(
+                    rocdl.cvt_scalef32_pk_fp4_f32(
+                        T.i32, fx.Int32(0), q0, q1, fx.Float32(1.0), 0
+                    )
+                ) & fx.Int32(255)
+                word4 = (
+                    pair4
+                    | (_xshfl(pair4, 1) << 8)
+                    | (_xshfl(pair4, 2) << 16)
+                    | (_xshfl(_xshfl(pair4, 1), 2) << 24)
+                )
+                return word4
+
+            def publish_moe_quant(ptr, k, q0, q1):
+                if const_expr(activation_fp4):
+                    word4 = pack_moe4(q0, q1)
+                    if lane % 4 == 0:
+                        address4 = (k // 128) * 32 + (k % 128) // 8
+                        put(ptr, address4, word4)
+                        put(ptr, address4 + 16, fx.Int32(0))
+                else:
+                    word8 = (
+                        fx.Int32(
+                            rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)
+                        )
+                        & 0xFFFF
+                    )
+                    neighbor8 = _xshfl(word8, 1)
+                    if lane % 2 == 0:
+                        put(ptr, k // 4, word8 | (neighbor8 << 16))
+
+            def moe_roundtrip(q0, q1):
+                if const_expr(activation_fp4):
+                    p4 = fx.Int32(
+                        rocdl.cvt_scalef32_pk_fp4_f32(
+                            T.i32, fx.Int32(0), q0, q1, fx.Float32(1.0), 0
+                        )
+                    )
+                    out4 = fx.Vector(
+                        rocdl.cvt_scalef32_pk_bf16_fp4(
+                            T.vec(2, T.bf16), p4, fx.Float32(1.0), 0
+                        )
+                    ).to(fx.Float32)
+                    return out4[0], out4[1]
+                return _fp8_roundtrip(q0, q1)
 
             def quant_block(a0, a1):
                 """quant_scaled, values returned as the FP8-rounded f32s."""
@@ -1729,7 +1803,14 @@ def build_glm5_monokernel(
                     lds_st(xs, f8_word(k), (w | (nb << 16)).bitcast(fx.Float32))
 
             def st_mxfp8(k, q0, q1):
-                """Store one row-major MXFP8 pair for the scaled MFMA."""
+                """Store a native A8/A4 operand in padded 128-value blocks."""
+                if const_expr(activation_fp4):
+                    word4 = pack_moe4(q0, q1)
+                    if lane % 4 == 0:
+                        address4 = (k // 128) * 32 + (k % 128) // 8
+                        lds_st(xs, address4, word4.bitcast(fx.Float32))
+                        lds_st(xs, address4 + 16, fx.Float32(0.0))
+                    return
                 w = (
                     fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False))
                     & 0xFFFF
@@ -5442,16 +5523,8 @@ def build_glm5_monokernel(
                         q0, q1, qs = quant_scaled(
                             a0 * x_rstd * xg[0], a1 * x_rstd * xg[1]
                         )
-                    w8 = (
-                        fx.Int32(
-                            rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)
-                        )
-                        & 0xFFFF
-                    )
-                    w8n = _xshfl(w8, 1)
-                    if lane % 2 == 0:  # FP8 bytes k .. k + 3 in one tagged word
-                        put(mb("xq"), (x_s * HIDDEN + xk) // 4, w8 | (w8n << 16))
-                    d0, d1 = _fp8_roundtrip(q0, q1)
+                    publish_moe_quant(mb("xq"), x_s * HIDDEN + xk, q0, q1)
+                    d0, d1 = moe_roundtrip(q0, q1)
                     qscale = (
                         (qs << 23).bitcast(fx.Float32)
                         if const_expr(native_fp4_mfma)

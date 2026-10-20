@@ -32,8 +32,9 @@ and arithmetic. The PR's native FP4 instructions, E8M0 scale packing,
 MXFP4 checkpoint loader, native-FP4 grouped down-projection, alternative
 attention/cache formats and widths above 16 are outside this FP8 contract.
 The TP8-only paired split-attention path is also outside this TP4 change.
-The port does not remove their
-format guards or claim full GLM-5.2 checkpoint compatibility.
+The [A4W4 follow-up](glm-tp4-mxfp4.md) subsequently adds native FP4
+arithmetic, E8M0 handling and a Quark MXFP4 expert loader. Native-FP4 grouped
+down-projection and full GLM-5.2 checkpoint compatibility remain separate.
 
 ## Request and runtime contract
 

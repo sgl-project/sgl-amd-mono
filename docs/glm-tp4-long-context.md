@@ -39,7 +39,8 @@ Two additional adaptations preserve the existing score arithmetic and layout:
 These scheduling choices are restricted to TP4. The distributed selector
 threshold remains 114,688 live keys per row. The later
 [multi-token port](glm-tp4-multitoken.md) extends TP4 to 16 total query tokens.
-Native FP4 checkpoint loading and full serving validation remain separate.
+The [A4W4 follow-up](glm-tp4-mxfp4.md) adds native FP4 arithmetic and a
+Quark MXFP4 expert loader; full checkpoint and serving validation remain separate.
 
 ## Reproduction and measurement
 

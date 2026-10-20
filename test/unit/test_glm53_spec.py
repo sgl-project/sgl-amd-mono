@@ -116,7 +116,7 @@ def test_config_reasons_name_each_mismatch():
             **vars(GLM53),
             "index_topk_freq": 8,
             "moe_layer_freq": 2,
-            "quantization_config": {"quant_method": "quark"},
+            "quantization_config": {"quant_method": "int4"},
             "rope_parameters": {"rope_type": "yarn", "factor": 4.0},
         }
     )
@@ -130,12 +130,32 @@ def test_config_reasons_name_each_mismatch():
 
 
 def _linear(shuffled=True):
-    # SGLang marks only the block-FP8 linears it rewrote into AITER's layout
-    if not shuffled:
-        return SimpleNamespace(weight=SimpleNamespace())
     return SimpleNamespace(
-        aiter_bpreshuffled=True, weight=SimpleNamespace(is_shuffled=True)
+        aiter_bpreshuffled=shuffled,
+        weight=torch.empty(256, 256, dtype=torch.float8_e4m3fn, device="meta"),
+        weight_scale_inv=torch.empty(2, 2, device="meta"),
     )
+
+
+def test_quark_config_defers_to_loaded_tensor_formats():
+    cfg = SimpleNamespace(
+        **(vars(GLM53) | {"quantization_config": {"quant_method": "quark"}})
+    )
+    assert glm53._config_disable_reasons(SimpleNamespace(page_size=64), cfg) == []
+
+
+@pytest.mark.parametrize(
+    "dtype, scale",
+    [(torch.uint8, True), (torch.bfloat16, True), (torch.float8_e4m3fn, False)],
+)
+def test_attention_still_requires_block_fp8(dtype, scale):
+    layers = _layers()
+    projection = layers[3].self_attn.q_b_proj
+    projection.weight = torch.empty(256, 256, device="meta", dtype=dtype)
+    if not scale:
+        projection.weight_scale_inv = torch.empty(256, 1, device="meta")
+    reasons = glm53._model_disable_reasons(_model(layers), GLM53, {})
+    assert any("layer 3:" in why and "q_b_proj" in why for why in reasons)
 
 
 def _layer(
