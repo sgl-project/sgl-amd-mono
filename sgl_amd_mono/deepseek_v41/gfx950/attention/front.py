@@ -640,7 +640,12 @@ def run_front(
     chains = c.get("iq_chains")
     if const_expr(chains is not None):
         assert iqm.IQ_TASKS == BLOCKS
-        iq_batch = iqm.iq_weights(c, a["iq_w"], a["iq_ws"], bid, chains)
+        iq_load = iqm.iq_weights(c, a["iq_w"], a["iq_ws"], bid, chains)
+        # every step's weights in flight through the wait on q (ROCm/ATOM's iq_ops)
+        iq_ops = [iq_load(b0) for b0 in range(0, len(chains[0]), iqm.IQ_BATCH)]
+
+        def iq_batch(b0):
+            return iq_ops[b0 // iqm.IQ_BATCH]
 
     def index_tile(ti, t0, n):
         if const_expr(chains is not None):
