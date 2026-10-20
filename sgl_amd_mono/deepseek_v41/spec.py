@@ -937,18 +937,22 @@ class _Built:
             )
             pending = post if defer else (None, hidden, None, None)
         residual = pending[1]
-        if plan.state["tok_par"]:
-            # the head's combine reads every row's residual and pre, the drafter
-            # every row's captures
-            residual, pre, *taps = self._gather_rows([residual, pre, *(aux or ())])
-            if aux is not None:
-                aux[:] = taps
+        tok_par = plan.state["tok_par"]
+        if tok_par and aux is None:
+            # the head's combine reads every row's residual and pre
+            residual, pre = self._gather_rows([residual, pre])
         pre_hc_head = residual.flatten(1)
         # mhc_combine widens x on load: no f32 copy first
         hidden = m.norm(mhc_combine(pre_hc_head, pre, m.hc_mult, residual.dtype))
-        if aux is not None:
-            return (hidden, pre_hc_head), aux
-        return hidden, pre_hc_head
+        if aux is None:
+            return hidden, pre_hc_head
+        if tok_par:
+            # the drafter reads no residual: each rank's own rows of the head's
+            # output cross ranks with its captures, as ROCm/ATOM gathers them
+            hidden, *taps = self._gather_rows([hidden, *aux])
+            aux[:] = taps
+            pre_hc_head = None
+        return (hidden, pre_hc_head), aux
 
     def _layer(
         self, L, plan, positions, forward_batch, pending_post, prev_pre, defer_post
