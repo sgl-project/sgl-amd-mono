@@ -124,6 +124,10 @@ def front_scratch(s: int, d: Dims) -> dict:
             ("qx8", s * Q_RANK),  # e4m3 words
             ("qx8s", s * Q_RANK // 32 * 4),  # an i32 code a group
             ("qrdy", s * PAIR),
+            # an index source's index query (``index_query``): bf16 IQ, a flag a
+            # (token tile, 16-column task)
+            ("iq", s * 4096 * 2),
+            ("iqrdy", cdiv(s, 16) * 256 * PAIR),
         ]
     )
 

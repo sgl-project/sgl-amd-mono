@@ -34,6 +34,7 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
 )
 from sgl_amd_mono.deepseek_v41.gfx950.token_par import KG_WORDS, QX_GROUPS
 
+from . import index_query as iqm
 from .device import (
     BLOCKS,
     CM_DEV,
@@ -634,6 +635,18 @@ def run_front(
     if const_expr(before_wqb is not None):
         # work that does not wait on q: it runs while the qkv stage finishes
         before_wqb()
+    # an index source's index query (``index_query``): its wq_b task a CTA, on
+    # the q rows wq_b reads
+    chains = c.get("iq_chains")
+    if const_expr(chains is not None):
+        assert iqm.IQ_TASKS == BLOCKS
+        iq_batch = iqm.iq_weights(c, a["iq_w"], a["iq_ws"], bid, chains)
+
+    def index_tile(ti, t0, n):
+        if const_expr(chains is not None):
+            iqm.stage_iq(c, bid, chains, iq_batch, c["qxl"], c["qxsl"], c["iq"], t0, n)
+            publish(c, c["iqrdy"], ti * iqm.IQ_TASKS + bid)
+
     if const_expr(c.get("tok_par", False)):
         # every row's q latent from QG / QGS, where its owner's qkv put it
         for ti in range_constexpr(len(tiles)):
@@ -663,6 +676,7 @@ def run_front(
             if const_expr(ti == 0):
                 stamp(c, 38)
             stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
+            index_tile(ti, t0, n)
     else:
         await_flags(c, c["qrdy"], s, lambda u: u)
         stamp(c, 38)
@@ -674,4 +688,7 @@ def run_front(
             if const_expr(ti + 1 < len(tiles)):
                 regs = rows_loads(c, *qx, *tiles[ti + 1])
             stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
+            index_tile(ti, t0, n)
+    if const_expr(chains is not None):
+        iqm.run_iquant(c, a, s)
     stamp(c, 39)

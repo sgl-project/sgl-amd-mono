@@ -39,6 +39,7 @@ from sgl_amd_mono.common.sync import Mailbox, preg, publish, sreg
 
 from .attention import back as mb_back
 from .attention import front as mb_front
+from .attention import index_query as iqm
 from .attention.plan import WINDOW, Dims, back_scratch, front_scratch
 from .stages import moe, seam
 from .stages.dims import Dims as StageDims
@@ -93,6 +94,9 @@ class MonoBuild(msgspec.Struct, frozen=True):
     timeline: bool = False
     # token parallel (``token_par``): each rank's seam, norm and qkv on its own rows
     tok_par: bool = False
+    # an index source with an indexer: K1 computes its index query
+    # (``attention.index_query``) where that is reproduced at this width
+    iq: bool = False
 
 
 ROUTE = ("experts", "topk", "ug_groups", "swa_width")
@@ -226,6 +230,9 @@ def build_mono_k1(key: MonoBuild):
         seam: SeamLds
         front: FrontLds  # type: ignore[valid-type]
 
+    # the index query here (``index_query``) only where it is reproduced
+    assert not key.iq or (key.index and iqm.fused(s, key.tok_par)), key
+    IW0 = (GATE0 + own_n) % BLOCKS  # the head weights' CTAs, past the gates'
     name = kernel_symbol(
         "dsv41_mono_k1",
         s=s,
@@ -233,6 +240,7 @@ def build_mono_k1(key: MonoBuild):
         kt=key.kt,
         f=key.fold,
         i=key.index,
+        **({"q": 1} if key.iq else {}),
         **_variant(key),
     )
     keyed = key_tuple(key, SOURCES)
@@ -274,6 +282,14 @@ def build_mono_k1(key: MonoBuild):
         q: Int64,
         normed_out: Int64,
         qr_out: Int64,
+        iq_w: Int64,
+        iq_ws: Int64,
+        iw_w: Int64,
+        iw_scale: Int32,
+        num_pos: Int32,
+        iq_out: Int64,
+        iqs_out: Int64,
+        iw_out: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -323,12 +339,23 @@ def build_mono_k1(key: MonoBuild):
                 "klen": klen,
                 "q": q,
                 "qr_out": qr_out,
+                "normed_out": normed_out,
+                "iq_w": iq_w,
+                "iq_ws": iq_ws,
+                "iw_w": iw_w,
+                "iw_scale": iw_scale.bitcast(fx.Float32),
+                "num_pos": num_pos,
+                "iq_out": iq_out,
+                "iqs_out": iqs_out,
+                "iw_out": iw_out,
             }
             flayout = {n: layout[n] for n in front_scratch(s, Dims(tp))}
             c = mb_front.front_context(
                 fkey, lds.front.peek(), fargs, scratch, tag, flayout
             )
             c["index"] = key.index
+            if const_expr(key.iq):
+                c["iq_chains"] = iqm.iq_chains(s)
             if const_expr(key.timeline):
                 c["tl"] = timeline_row(scratch, layout["timeline"][0], bid)
             amb = Mailbox(tag)
@@ -406,6 +433,17 @@ def build_mono_k1(key: MonoBuild):
                 gpu.barrier()
                 for t in range(first_task(bid, GATE0), own_n, BLOCKS):
                     seam.stage_gate(ca, t)
+                if const_expr(key.iq):
+                    # the index query's head weights, on the normed rows: in the
+                    # same wait, past the gates' CTAs (the wqkv's LDS is free);
+                    # token parallel, this rank's rows, handed to the others (IWG)
+                    push = None
+                    if const_expr(key.tok_par):
+                        cp = {"put_bf": amb.put_bf, "rank": rank, "d": ca["d"]}
+                        push = lambda row, h, w0, w1: push_head_pair(  # noqa: E731
+                            cp, bases, pl["iwg"], row, h, [w0, w1]
+                        )
+                    iqm.run_iw(c, c["args"], own_n, IW0, c["xl"], t0, push)
 
             mb_front.run_front(
                 c,
@@ -426,6 +464,8 @@ def build_mono_k1(key: MonoBuild):
                         if const_expr(key.index):
                             gather_row(ca, preg(own, pl["nbg"], "nbg"), t, normed_out)
                             mb_front.qr_from(c, preg(own, pl["qrg"], "qrg"), t)
+                        if const_expr(key.iq):
+                            iqm.iw_from(c, preg(own, pl["iwg"], "iwg"), t)
             stamp(c, 40)
 
     @flyc.jit
@@ -464,6 +504,14 @@ def build_mono_k1(key: MonoBuild):
         q: Int64,
         normed_out: Int64,
         qr_out: Int64,
+        iq_w: Int64,
+        iq_ws: Int64,
+        iw_w: Int64,
+        iw_scale: Int32,
+        num_pos: Int32,
+        iq_out: Int64,
+        iqs_out: Int64,
+        iw_out: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -507,6 +555,14 @@ def build_mono_k1(key: MonoBuild):
             q,
             normed_out,
             qr_out,
+            iq_w,
+            iq_ws,
+            iw_w,
+            iw_scale,
+            num_pos,
+            iq_out,
+            iqs_out,
+            iw_out,
             scratch,
             sym,
             peers,
@@ -546,6 +602,14 @@ def push_attn_pair(c, bases, own, s, t, col, vs):
             if t // own == p:
                 pair = seam.attn_region_pair(c["rank"], t - p * own, own, col)
                 c["put_bf"](dst, 2 * pair, vs)
+
+
+@flyc.jit
+def push_head_pair(c, bases, off, t, h, vs):
+    """Row t's index head weights h, h + 1 to every other rank's IWG."""
+    for p in range_constexpr(c["d"].tp):
+        if c["rank"] != p:
+            c["put_bf"](preg(bases[p], off, "iwg"), t * iqm.HEADS + h, vs)
 
 
 @flyc.jit

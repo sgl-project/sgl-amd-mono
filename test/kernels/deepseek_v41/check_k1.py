@@ -6,6 +6,7 @@ token parallel where the width allows (the seam's outputs on this rank's rows, t
 import argparse
 import math
 import os
+import struct
 
 import torch
 import torch.distributed as dist
@@ -148,6 +149,11 @@ def main():
     ap.add_argument("--widths", default=WIDTHS)
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument(
+        "--variants-at",
+        default=",".join(map(str, VARIANT_WIDTHS)),
+        help="the widths the variants other than fold run at",
+    )
+    ap.add_argument(
         "--timeline", action="store_true", help="print each width's stage timeline"
     )
     args = ap.parse_args()
@@ -156,16 +162,22 @@ def main():
     dev = torch.device("cuda", rank)
     dist.init_process_group("nccl")
     cpu = dist.new_group(backend="gloo")
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        index_q_rope_pack_weights_flydsl,
+    )
     from sglang.kernels.ops.attention.dsv4.norm_rope import fused_k_norm_rope_flashmla
+    from sglang.kernels.ops.gemm.mxfp8_aiter_gfx95 import aiter_mxfp8_blockscaled_linear
     from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
         mxfp8_native_blockscaled_linear,
         prepare_mxfp8_native_weight,
     )
+    from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_boundary_fused_deferred,
         rmsnorm_with_sinkhorn,
     )
 
+    from sgl_amd_mono.deepseek_v41.gfx950.attention.index_query import fused as iq_fused
     from sgl_amd_mono.deepseek_v41.gfx950.layer import (
         MonoBuild,
         build_mono_k1,
@@ -189,6 +201,22 @@ def main():
         (torch.randn(HIDDEN, generator=g, device=dev) * 1.5).exp().to(m.ffn_norm.dtype)
     )
     cos_sin = rope_table(dev)
+    # an indexer (replicated on every rank): wq_b [4096, 1280] e4m3 with E8M0
+    # 32 x 32 blocks, weights_proj [32, 5120] bf16, the head-weight scale 2^-6
+    gi = torch.Generator(device=dev).manual_seed(29)
+    iq_w = (torch.randn(4096, Q_RANK, generator=gi, device=dev) * 64).clamp(-448, 448)
+    iq_w = iq_w.to(torch.float8_e4m3fn)
+    iq_ws = torch.randint(
+        116,
+        124,
+        (4096 // 32, Q_RANK // 32),
+        generator=gi,
+        device=dev,
+        dtype=torch.uint8,
+    )
+    iw_w = (torch.randn(32, HIDDEN, generator=gi, device=dev) * 0.02).bfloat16()
+    iw_scale = 128**-0.5 * 32**-0.5
+    iw_bits = struct.unpack("<i", struct.pack("<f", iw_scale))[0]
     freqs = torch.complex(cos_sin[:, :32], cos_sin[:, 32:])  # SGLang's freqs_cis
     w_sh, w_su = prepare_mxfp8_native_weight(
         a["wqkv"], torch.exp2(a["wqkv_s"].float() - 127), (32, 32)
@@ -219,11 +247,12 @@ def main():
 
     fails = []
     widths = [int(v) for v in args.widths.split(",")]
+    variants_at = {int(v) for v in args.variants_at.split(",")}
     runs = [
         (M, v, False)
         for M in widths
         for v in VARIANTS
-        if v[0] == "fold" or M in VARIANT_WIDTHS
+        if v[0] == "fold" or M in variants_at
     ]
     runs += [
         (M, v, True)
@@ -234,11 +263,13 @@ def main():
         ok, route = check_wqkv_route(M)
         route = r.route_at(M)
         tl = r.timeline_on
+        iq = index and iq_fused(M, tok_par)
         k1 = build_mono_k1(
             MonoBuild(
-                M, tp, fold=fold, index=index, timeline=tl, tok_par=tok_par, **route
+                M, tp, fold=fold, index=index, timeline=tl, tok_par=tok_par, iq=iq,
+                **route,
             )
-        )
+        )  # fmt: skip
         # the seam's rows this rank computes: its own, token parallel
         n = M // tp if tok_par else M
         own = slice(rank * n, (rank + 1) * n) if tok_par else slice(0, M)
@@ -265,7 +296,9 @@ def main():
                 a["wqkv"].data_ptr(), a["wqkv_s"].data_ptr(), a["q_norm"].data_ptr(), a["kv_norm"].data_ptr(),
                 a["wqb"].data_ptr(), a["wqb_s"].data_ptr(), cos_sin.data_ptr(), pos.data_ptr(),
                 slot.data_ptr(), swa.data_ptr(), swa.stride(0), BLOCK, 0, 0, 0, 0, 0, 0, r.q.data_ptr(),
-                r.normed.data_ptr(), r.qr.data_ptr(), sc.data_ptr(),
+                r.normed.data_ptr(), r.qr.data_ptr(), iq_w.data_ptr(), iq_ws.data_ptr(),
+                iw_w.data_ptr(), iw_bits, cos_sin.shape[0], r.iq.data_ptr(),
+                r.iqs.data_ptr(), r.iw.data_ptr(), sc.data_ptr(),
                 r.peer.local, r.peer.addresses.data_ptr(), r.rank, r.epoch.data_ptr(),
                 stream=torch.cuda.current_stream(),
             )  # fmt: skip
@@ -282,6 +315,8 @@ def main():
         with torch.cuda.graph(graph):
             launch()
         diff = dict(res=0, x8=0, x8s=0, nope=0, scale=0, rope=0, replay=0, normed=0)
+        if iq:
+            diff |= dict(iq=0, iqs=0, iw=0)
         mix, q_cos, q_rel, qr_rel = 0.0, 1.0, 0.0, 0.0
         for _ in range(args.trials):
             for t, v in zip(static, inputs(M)):
@@ -396,6 +431,26 @@ def main():
                     qr_rel,
                     ((r.qr[:M].float() - qr_ref).norm() / qr_ref.norm()).item(),
                 )
+            if iq:
+                # the index query: K1's against SGLang's chain on K1's own qr and
+                # normed input (``spec._index_query``), bit for bit
+                ref = index_q_rope_pack_weights_flydsl(
+                    q=aiter_mxfp8_blockscaled_linear(r.qr[:M], iq_w, iq_ws),
+                    freqs_cis=freqs,
+                    positions=pos,
+                    rope_dim=64,
+                    head_weight_partials=rocm_router_gemv_split_k(
+                        x=r.normed[:M], w=iw_w
+                    ),
+                    weight_scale=iw_scale,
+                    num_heads=32,
+                )
+                for name, got_t, want_t in zip(
+                    ("iq", "iqs", "iw"), (r.iq, r.iqs, r.iw), ref
+                ):
+                    diff[name] += int(
+                        (got_t[:M].view(torch.uint8) != want_t.view(torch.uint8)).sum()
+                    )
             qr, qk = (
                 query_ref(qkv, a, cos_sin, pos.long()).flatten(),
                 eager[0].double().flatten(),

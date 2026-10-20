@@ -49,7 +49,7 @@ def peer_layout(s: int, tp: int) -> dict[str, tuple[int, int]]:
     ATTN and FFN, the sublayers' partials ``[source rank][row][hidden / 2]``; then
     the token-parallel gathers, ``[row][..]`` each: XG the MoE input rows, QG / QGS
     the q latent's MXFP8 words / codes, KG the window records, NBG and QRG an index
-    source's normed rows and qr (bf16 pairs)."""
+    source's normed rows and qr, and IWG its index head weights (bf16 pairs)."""
     row = s * HIDDEN // 2
     return pair_layout(
         [
@@ -61,6 +61,7 @@ def peer_layout(s: int, tp: int) -> dict[str, tuple[int, int]]:
             ("kg", s * KG_WORDS),
             ("nbg", row),
             ("qrg", s * Q_RANK // 2),
+            ("iwg", s * 16),
         ]
     )
 

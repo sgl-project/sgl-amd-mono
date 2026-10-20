@@ -16,7 +16,9 @@ processor, with SGLang's own modules where SGLang owns the state.
     owed (the first layer's broadcast embedding; an Engram layer, whose Engram
     write runs on the settled residual) it takes the residual as it is, collapsed
     with the previous pre (copy 0 on the first).
-  - An index source (ratio 1 or 2): K1 also writes its normed input and qr.
+  - An index source (ratio 1 or 2): K1 also writes its normed input and qr, and,
+    where its indexer's chain is reproduced at the step's width, the index query
+    itself (``gfx950/attention/index_query.py``; else SGLang's ``_index_query``).
     Between the launches, SGLang's ``forward_low_ratio_sources`` runs the layer's
     compressor (the KV sources) on them, as SGLang runs it before the attention;
     then K2i (``gfx950/indexer``) scores the index keys and SGLang's top-k
@@ -586,6 +588,13 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         wqb_s=_codes(copies, i, "wq_b", a.wq_b),
         cos_sin=cos_sin,
     )
+    ix = getattr(a, "indexer", None)
+    if ix is not None and ix.wq_b.weight.dtype == e4m3:
+        # K1 computes the index query (``attention/index_query``) where it can
+        L.k1.iq_w = ix.wq_b.weight
+        L.k1.iq_ws = _codes(copies, i, "index wq_b", ix.wq_b)
+        L.k1.iw_w = ix.weights_proj.weight
+        L.k1.iw_scale = float(ix.head_weight_scale)
     L.k1.check(d)
     if a.wo_a.weight.dtype == e4m3:
         woa, woa_s = a.wo_a.weight, _codes(copies, i, "wo_a", a.wo_a)
@@ -760,14 +769,18 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
         # the step's walk plan of this ratio: its FULL and producer layers share it
         k2i.walk_plan(ratio=r, bounds=bounds, rows=M, per_req=per_req)
         plan.state["k2i plan", r] = True
+    if L.k1.iq_w is not None and runner.iq_fused(M, plan.state["tok_par"]):
+        query = (runner.iq[:M], runner.iqs[:M], runner.iw[:M])  # K1 computed it
+    else:
+        query = _index_query(
+            attn=attn, x=runner.normed[:M], q_lora=runner.qr[:M], positions=pos
+        )
     published = k2i.select(
         kind=kind,
         rows=M,
         per_req=per_req,
         ratio=r,
-        query=_index_query(
-            attn=attn, x=runner.normed[:M], q_lora=runner.qr[:M], positions=pos
-        ),
+        query=query,
         plane=L.plane,
         page_table=meta.page_table,
         bounds=bounds,
@@ -1019,7 +1032,11 @@ def _build(model, hf_config, ctx) -> _Built:
         runner.enable_k2i(_longest_context(hf_config))
     # K1 with and without the owed post (the residual arrives settled on the
     # first layer and after an Engram write), K2 with and without top-k rows
-    k1 = {(fold, L.index) for L in layers.values() for fold in (True, False)}
+    k1 = {
+        (fold, L.index, L.k1.iq_w is not None)
+        for L in layers.values()
+        for fold in (True, False)
+    }
     k2 = {(L.ratio > 0, L.index) for L in layers.values()}
     # Every rank builds every width. FlyDSL's disk cache hands a rank the kernels
     # another rank built (a lock per kernel), so each rank starts at its own share.

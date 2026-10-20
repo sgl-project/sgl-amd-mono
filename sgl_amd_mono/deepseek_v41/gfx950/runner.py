@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import struct
 from pathlib import Path
 
 import msgspec
@@ -13,6 +14,9 @@ import torch
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.plan import BLOCKS
 
+from .attention.index_query import DIM as IQ_DIM
+from .attention.index_query import HEADS as IQ_HEADS
+from .attention.index_query import fused as iq_fused
 from .attention.plan import DATA, HEAD_DIM, KEYS, Q_RANK, TOPK, WINDOW, Dims
 from .layer import (
     EPOCH_WORDS,
@@ -186,6 +190,12 @@ class K1Weights(msgspec.Struct):
     wqb: torch.Tensor  # [heads * 512, 1280] e4m3, row-major
     wqb_s: torch.Tensor  # [heads * 16, 40] E8M0
     cos_sin: torch.Tensor  # [positions, 64] f32: 32 cos, then 32 sin
+    # an index source's indexer (replicated), for K1's index query: wq_b and its
+    # E8M0 blocks, weights_proj and the head-weight scale; None without one
+    iq_w: torch.Tensor | None = None  # [4096, 1280] e4m3
+    iq_ws: torch.Tensor | None = None  # [128, 40] E8M0
+    iw_w: torch.Tensor | None = None  # [32, 5120] bf16
+    iw_scale: float = 0.0
 
     def check(self, d: Dims) -> None:
         """One rank's attention-front tensors in K1's layout."""
@@ -206,6 +216,12 @@ class K1Weights(msgspec.Struct):
             "wqb": ((d.heads * HEAD_DIM, 1280), e4m3),
             "wqb_s": ((d.heads * HEAD_DIM // 32, 1280 // 32), u8),
         }
+        if self.iq_w is not None:
+            want |= {
+                "iq_w": ((IQ_HEADS * IQ_DIM, 1280), e4m3),
+                "iq_ws": ((IQ_HEADS * IQ_DIM // 32, 1280 // 32), u8),
+                "iw_w": ((IQ_HEADS, HIDDEN), bf),
+            }
         _check_tensors(self, "K1", want)
         if not (
             self.norm.shape == (HIDDEN,)
@@ -311,6 +327,13 @@ class DSV41MonoRunner:
         # an index source's K1 outputs, its compressor and indexer's inputs
         self.normed = torch.zeros(MAX_TOKENS, HIDDEN, dtype=torch.bfloat16, device=dev)
         self.qr = torch.zeros(MAX_TOKENS, Q_RANK, dtype=torch.bfloat16, device=dev)
+        # an index source's index query as K1 computes it (``index_query``), in
+        # the layout SGLang's index_q_rope_pack_weights_flydsl returns
+        self.iq = torch.zeros(
+            MAX_TOKENS, IQ_HEADS, IQ_DIM // 2, dtype=torch.int8, device=dev
+        )
+        self.iqs = torch.zeros(MAX_TOKENS, 1, 4, 16, 4, dtype=torch.uint8, device=dev)
+        self.iw = torch.zeros(MAX_TOKENS, IQ_HEADS, dtype=torch.bfloat16, device=dev)
         # the record an absent key reads: zero data and scales, masked anyway
         self.zero_rec = torch.zeros(1024, dtype=torch.uint8, device=dev)
         self.qk_scale = (
@@ -386,12 +409,24 @@ class DSV41MonoRunner:
     def supports(tokens: int) -> bool:
         return 1 <= tokens <= MAX_TOKENS
 
+    def iq_fused(self, tokens: int, tok_par: bool = False) -> bool:
+        """Whether an index source's K1 at this width computes its index query
+        (``index_query``); else SGLang's chain does, after K1."""
+        return iq_fused(tokens, tok_par)
+
     def k1_kernel(
-        self, tokens: int, fold: bool = True, index: bool = False, tok_par=False
+        self,
+        tokens: int,
+        fold: bool = True,
+        index: bool = False,
+        iq: bool = False,
+        tok_par: bool = False,
     ):
         """K1 at this width; it writes K2's key table unless the layer is an index
-        source (whose top-k comes after K1). ``tok_par``: token parallel."""
-        key = (tokens, "k1", fold, index, tok_par)
+        source (whose top-k comes after K1). ``iq``: an indexer's index query too,
+        where ``iq_fused``. ``tok_par``: token parallel."""
+        iq = iq and self.iq_fused(tokens, tok_par)
+        key = (tokens, "k1", fold, index, iq, tok_par)
         if key not in self._kernels:
             no_capture(f"K1 width {tokens}")
             self._kernels[key] = build_mono_k1(
@@ -405,6 +440,7 @@ class DSV41MonoRunner:
                     fault_after=self.fault_after,
                     timeline=self.timeline_on,
                     tok_par=tok_par,
+                    iq=iq,
                     **self.route_at(tokens),
                 )
             )
@@ -420,7 +456,7 @@ class DSV41MonoRunner:
         tok_par: bool = False,
     ) -> None:
         """Allocate this width's scratch and compile its launches without running
-        them: K1 for each (fold, index) in ``k1``, K2 for each (compressed,
+        them: K1 for each (fold, index, iq) in ``k1``, K2 for each (compressed,
         index) in ``k2``, the FFN launch, and K2i (``enable_k2i`` first)."""
         self.scratch(tokens)
         kernels = [self.k1_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k1)]
@@ -621,7 +657,14 @@ class DSV41MonoRunner:
                     + ("None" if t is None else f"{tuple(t.shape)} {t.dtype}")
                 )
         swa_idx, swa_lens, topk, topk_lens = (t.data_ptr() for t in keys)
-        self.k1_kernel(M, fold, index, tok_par)(
+        iq = w.iq_w is not None and self.iq_fused(M, tok_par)
+        iqa = (
+            (w.iq_w.data_ptr(), w.iq_ws.data_ptr(), w.iw_w.data_ptr())
+            if iq
+            else (0, 0, 0)
+        )
+        iw_bits = struct.unpack("<i", struct.pack("<f", w.iw_scale))[0]
+        self.k1_kernel(M, fold, index, iq, tok_par)(
             residual.data_ptr(),
             x.data_ptr(),
             post.data_ptr(),
@@ -656,6 +699,12 @@ class DSV41MonoRunner:
             self.q.data_ptr(),
             self.normed.data_ptr(),
             self.qr.data_ptr(),
+            *iqa,
+            iw_bits,
+            w.cos_sin.shape[0],
+            self.iq.data_ptr(),
+            self.iqs.data_ptr(),
+            self.iw.data_ptr(),
             self.scratch(M).data_ptr(),
             self.peer.local,
             self.peer.addresses.data_ptr(),
