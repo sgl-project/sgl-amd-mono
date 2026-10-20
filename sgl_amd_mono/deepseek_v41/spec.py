@@ -222,7 +222,25 @@ SGLANG_READS = {
         "get_token_to_kv_pool",
     ),
     "srt/configs/deepseek_v4.py": ("vision_n_layers", "image_token_id"),
-    "srt/layers/engram.py": ("layer_hash_index", "forward(cp_all_tokens)"),
+    "srt/layers/engram.py": (
+        "layer_hash_index",
+        "forward(cp_all_tokens)",
+        "engram_gate",
+        "embed",
+        "wkv",
+        "q_weight",
+        "k_weight",
+        "eps",
+        "clamp_value",
+        "_shared",
+        "_table_ptrs",
+        "row_start",
+        "rows",
+        "tp_size",
+        "dim",
+    ),
+    "kernels/ops/embeddings/engram_gather.py": ("engram_gather",),
+    "kernels/ops/quantization/fp4_fake_quant.py": ("FP8_BLOCK_SIZE",),
     "srt/models/deepseek_common/amd/deepseek_v4_hip.py": ("hc_boundary_fused",),
     "srt/models/deepseek_v2.py": (
         "experts",
@@ -283,7 +301,11 @@ SGLANG_READS = {
     ),
     "srt/configs/model_config.py": ("context_len",),
     # a token-parallel step's rows from their owners (``_gather_rows``)
-    "srt/distributed/parallel_state.py": ("get_tp_group", "all_gather(dim)"),
+    "srt/distributed/parallel_state.py": (
+        "get_tp_group",
+        "all_gather(dim)",
+        "inplace_all_reduce",
+    ),
     "srt/runtime_context.py": (
         "get_parallel",
         '"tp_rank"',
@@ -908,8 +930,10 @@ class _Built:
             if hasattr(forward_batch, attr):
                 delattr(forward_batch, attr)
         hash_ids = None
+        engram_rows = {}
         if m.engram_hasher is not None:
             hash_ids = m.engram_hasher(input_ids, forward_batch)
+            engram_rows = self._engram_rows(hash_ids)
         aux = None if m.dspark_layers_to_capture is None else []
         plan.state["dspark_aux"] = aux
         # every image-token row keeps its residual through an Engram write, as in
@@ -924,9 +948,23 @@ class _Built:
             engram = m.layers[i].engram
             if engram is not None:  # on the residual the last layer settled
                 before = pending[1]
-                residual = engram(
-                    before, hash_ids[:, engram.layer_hash_index], forward_batch
-                )
+                rows = engram_rows.get(engram.layer_hash_index)
+                if rows is None:
+                    residual = engram(
+                        before, hash_ids[:, engram.layer_hash_index], forward_batch
+                    )
+                else:  # Engram.forward on the staged rows
+                    from sglang.srt.layers.engram import engram_gate
+
+                    kv, _ = engram.wkv(rows.flatten(-2))
+                    residual = engram_gate(
+                        before,
+                        kv,
+                        engram.q_weight,
+                        engram.k_weight,
+                        engram.eps,
+                        engram.clamp_value,
+                    )
                 if image is not None:
                     residual = torch.where(image, before, residual)
                 pending = (None, residual, None, None)
@@ -953,6 +991,55 @@ class _Built:
             aux[:] = taps
             pre_hc_head = None
         return (hidden, pre_hc_head), aux
+
+    def _engram_rows(self, hash_ids) -> dict:
+        """Every Engram layer's rows of the step by hash layer, as ROCm/ATOM stages
+        them ahead of the layers: each rank gathers its shards' rows (zeros for the
+        rest) and one all-reduce reassembles them all, where SGLang's lookup runs
+        an all-reduce an Engram layer. Empty where SGLang's lookup stays (one rank,
+        a shared host table)."""
+        from sglang.kernels.ops.embeddings.engram_gather import engram_gather
+        from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
+        from sglang.srt.distributed.parallel_state import inplace_all_reduce
+        from sglang.srt.runtime_context import get_parallel
+
+        m = self.model
+        engrams = [
+            m.layers[i].engram
+            for i in range(m.start_layer, m.end_layer)
+            if m.layers[i].engram is not None
+        ]
+        embeds = [e.embed for e in engrams]
+        if not embeds or hash_ids.shape[0] == 0:
+            return {}
+        if any(e.tp_size == 1 or e._shared for e in embeds):
+            return {}
+        dim = embeds[0].dim
+        out = torch.empty(
+            (len(engrams), *hash_ids.shape[:1], hash_ids.shape[-1], dim),
+            dtype=torch.bfloat16,
+            device=hash_ids.device,
+        )
+        for k, (engram, embed) in enumerate(zip(engrams, embeds)):
+            rows = out[k].view(-1, dim)
+            if embed.rows == 0:
+                rows.zero_()
+                continue
+            ids = hash_ids[:, engram.layer_hash_index].reshape(-1)
+            engram_gather(
+                *embed._table_ptrs(),
+                ids,
+                rows,
+                dim,
+                FP8_BLOCK_SIZE,
+                row_lo=embed.row_start,
+                row_hi=embed.row_start + embed.rows,
+            )
+        # integer addition keeps every bf16 bit: one shard owns each row
+        inplace_all_reduce(
+            out.view(torch.int32), group_name=get_parallel().tp_group.unique_name
+        )
+        return {e.layer_hash_index: out[k] for k, e in enumerate(engrams)}
 
     def _layer(
         self, L, plan, positions, forward_batch, pending_post, prev_pre, defer_post
