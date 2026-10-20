@@ -129,7 +129,7 @@ def stage_kt(c, t):
     a = c["args"]
     cm = CM_DEV if const_expr(c.get("dev", False)) else 0
     sw = c.get("swa_width", WINDOW)  # the window index slots of a row
-    live = ld_i32(a["slot"], 2 * t) >= 0
+    live = ld_i32(a["slot"], a["slot_words"] * t) >= 0
     nswa = live.select(fx.min(ld_i32(a["swa_lens"], t), fx.Int32(sw)), fx.Int32(0))
     ntopk = live.select(fx.min(ld_i32(a["topk_lens"], t), fx.Int32(TOPK)), fx.Int32(0))
     kv_len = ntopk + nswa
@@ -191,7 +191,7 @@ def stage_qkv(c, t):
     tok_par = c.get("tok_par", False)
     tg = plus(c["t0"], t) if const_expr(tok_par) else t
     pos = ld_i32(a["pos"], 2 * tg)
-    slot = ld_i32(a["slot"], 2 * tg)
+    slot = ld_i32(a["slot"], a["slot_words"] * tg)
     jr = tt - NOPE // 2
     is_rope = jr >= 0
     jj = fx.max(jr, 0)
@@ -358,7 +358,7 @@ def record_from(c, kg, t):
     a = c["args"]
     if tid < KG_WORDS:
         (w,) = c["mb"].poll([(kg, t * KG_WORDS + tid, 1)])
-        slot = ld_i32(a["slot"], 2 * t)
+        slot = ld_i32(a["slot"], a["slot_words"] * t)
         if slot >= 0:
             blk = a["swa_block"]
             soff = slot % blk

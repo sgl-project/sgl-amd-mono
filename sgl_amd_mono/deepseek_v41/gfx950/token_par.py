@@ -29,6 +29,7 @@ KG_WORDS = DATA // 4 + 2  # a window record's data words, then its two scale wor
 ROW_BYTES = {
     "res_in": HC * HIDDEN * 2,
     "res_out": HC * HIDDEN * 2,
+    "aux_out": HIDDEN * 2,
     "pend": HIDDEN * 2,
     "post_in": HC * 4,
     "pre_in": HC * 4,

@@ -653,6 +653,8 @@ def _launch(
         get_token_to_kv_pool,
     )
 
+    from sgl_amd_mono.deepseek_v41.gfx950.runner import SLOT_DTYPES
+
     x, residual, post, comb = pending_post
     if L.swa is None:  # the layer's caches, at its first launch
         pool = get_token_to_kv_pool()
@@ -663,12 +665,11 @@ def _launch(
             L.comp_block = pool.get_extra_key_page_size(L.i)
     backend, M = get_attn_backend(), residual.shape[0]
     if "k1" not in plan.state:
-        # the forward's first K1 converts them; a graph records the copies
-        slot = backend.get_swa_out_cache_loc(forward_batch)
-        plan.state["k1"] = (
-            positions[:M].long().contiguous(),
-            slot[:M].long().contiguous(),
-        )
+        # the forward's first K1 converts them where needed; a graph records the copies
+        slot = backend.get_swa_out_cache_loc(forward_batch)[:M]
+        if not (slot.dtype in SLOT_DTYPES and slot.is_contiguous()):
+            slot = slot.long().contiguous()
+        plan.state["k1"] = (positions[:M].long().contiguous(), slot)
     pos, slot = plan.state["k1"]
     md = backend.forward_metadata.core_attn_metadata
     if L.ratio:  # the top-k of the layer's index source (its own, after K1)
@@ -680,12 +681,11 @@ def _launch(
         residual = residual.contiguous()  # the broadcast embedding may be a view
         if prev_pre is None:
             prev_pre = runner.first_pre[:M]
-    _, res_mid, *_ = runner.k1(
+    runner.k1(
         L.k1, x, residual, post, comb, prev_pre, pos, slot, L.swa, L.swa_block,
         keys, index=L.index, tok_par=tok_par,
+        aux=None if capture is None else capture(L, M),
     )  # fmt: skip
-    if capture is not None:
-        capture(L, res_mid)
     if L.index:
         _select(
             runner=runner, L=L, plan=plan, backend=backend, positions=positions,
@@ -860,6 +860,8 @@ class _Built:
     def __init__(self, lm, runner, layers: dict):
         self.lm, self.model, self.runner, self._layers = lm, lm.model, runner, layers
         self._normal_moe = lm.model.layers[min(layers)].mlp
+        # DSpark's captured layers -> the buffer K1 writes their capture into
+        self._captures: dict[int, torch.Tensor] = {}
 
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
@@ -956,7 +958,7 @@ class _Built:
         self._warm_normal_moe()
         out = _launch(
             self.runner, L, plan, positions, forward_batch, pending_post, prev_pre,
-            capture=lambda L, residual: self._capture(plan, L, residual),
+            capture=lambda L, M: self._capture(plan, L, M),
             tok_par=plan.state["tok_par"],
         )  # fmt: skip
         return _boundary_out(L.module, defer_post, *out)
@@ -977,11 +979,23 @@ class _Built:
             at += m.shape[1]
         return [o.view(t.shape) for o, t in zip(out, tensors)]
 
-    def _capture(self, plan, L, residual) -> None:
-        """DSpark reads the mean of each target layer's input residual."""
+    def _capture(self, plan, L, M):
+        """Where K1 writes layer ``L``'s DSpark capture, the mean of its input
+        residual's streams; None for a layer DSpark does not read."""
+        from sgl_amd_mono.deepseek_v41.gfx950.runner import no_capture
+
         targets = self.model.dspark_layers_to_capture
-        if targets is not None and L.i in targets:
-            plan.state["dspark_aux"].append(residual.mean(dim=1))
+        if targets is None or L.i not in targets:
+            return None
+        buf = self._captures.get(L.i)
+        if buf is None:
+            no_capture("DSpark's capture buffers")
+            buf = self._captures[L.i] = self.runner.res_mid.new_empty(
+                MAX_ROWS, self.runner.res_mid.shape[-1]
+            )
+        aux = buf[:M]
+        plan.state["dspark_aux"].append(aux)
+        return aux
 
     def _warm_normal_moe(self) -> None:
         """At the first eager forward, run the normal MoE at 1 to MAX_ROWS rows: the

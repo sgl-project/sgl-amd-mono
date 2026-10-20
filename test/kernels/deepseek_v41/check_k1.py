@@ -242,7 +242,8 @@ def main():
         pos = torch.randint(0, POSITIONS, (M,), generator=g, device=dev)
         pos[: min(M, 2)] = torch.tensor([POSITIONS - 1, 65536], device=dev)[: min(M, 2)]
         perm = torch.randperm(PAGES * BLOCK, generator=g, device=dev)
-        slot = torch.cat([edges, perm[~torch.isin(perm, edges)]])[:M]
+        # int32, as SGLang's HIP backend hands the SWA slots out
+        slot = torch.cat([edges, perm[~torch.isin(perm, edges)]])[:M].int()
         return res, x, post, comb, pre, pos, slot
 
     fails = []
@@ -283,6 +284,8 @@ def main():
             pre = r.first_pre[:M]
         # a settled residual: no post owed, the seam reads only the residual
         xk, postk, combk = (x, post, comb) if fold else (res, res, res)
+        # DSpark's capture of the layer, which K1 writes beside its residual
+        aux = torch.full((M, HIDDEN), float("nan"), dtype=torch.bfloat16, device=dev)
 
         def launch():
             r.epoch[0] += (
@@ -292,10 +295,10 @@ def main():
                 res.data_ptr(), xk.data_ptr(), postk.data_ptr(), combk.data_ptr(), pre.data_ptr(),
                 m.hc_ffn_fn.data_ptr(), m.hc_ffn_scale.data_ptr(), m.hc_ffn_base.data_ptr(),
                 m.ffn_norm.data_ptr(),
-                r.res_mid.data_ptr(), r.post_a.data_ptr(), r.comb_a.data_ptr(), r.pre_a.data_ptr(),
-                a["wqkv"].data_ptr(), a["wqkv_s"].data_ptr(), a["q_norm"].data_ptr(), a["kv_norm"].data_ptr(),
+                r.res_mid.data_ptr(), aux.data_ptr(), r.post_a.data_ptr(), r.comb_a.data_ptr(),
+                r.pre_a.data_ptr(), a["wqkv"].data_ptr(), a["wqkv_s"].data_ptr(), a["q_norm"].data_ptr(), a["kv_norm"].data_ptr(),
                 a["wqb"].data_ptr(), a["wqb_s"].data_ptr(), cos_sin.data_ptr(), pos.data_ptr(),
-                slot.data_ptr(), swa.data_ptr(), swa.stride(0), BLOCK, 0, 0, 0, 0, 0, 0, r.q.data_ptr(),
+                slot.data_ptr(), 1, swa.data_ptr(), swa.stride(0), BLOCK, 0, 0, 0, 0, 0, 0, r.q.data_ptr(),
                 r.normed.data_ptr(), r.qr.data_ptr(), iq_w.data_ptr(), iq_ws.data_ptr(),
                 iw_w.data_ptr(), iw_bits, cos_sin.shape[0], r.iq.data_ptr(),
                 r.iqs.data_ptr(), r.iw.data_ptr(), sc.data_ptr(),
@@ -314,7 +317,9 @@ def main():
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             launch()
-        diff = dict(res=0, x8=0, x8s=0, nope=0, scale=0, rope=0, replay=0, normed=0)
+        diff = dict(
+            res=0, aux=0, x8=0, x8s=0, nope=0, scale=0, rope=0, replay=0, normed=0
+        )
         if iq:
             diff |= dict(iq=0, iqs=0, iw=0)
         mix, q_cos, q_rel, qr_rel = 0.0, 1.0, 0.0, 0.0
@@ -334,6 +339,11 @@ def main():
                 .to(torch.uint8)
             )
             got = records(swa, slot.long())
+            # the mean SGLang's DSpark takes of the layer's input residual
+            want_aux = r.res_mid[:M][own].mean(dim=1)
+            diff["aux"] += int(
+                (aux[own].view(torch.int16) != want_aux.view(torch.int16)).sum()
+            )
             eager = [
                 t[:M].clone() for t in (r.q, r.res_mid, r.post_a, r.comb_a, r.pre_a)
             ] + [got.clone()]

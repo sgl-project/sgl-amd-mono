@@ -113,6 +113,15 @@ def check_rows(tag: str, rows: int, device, want: dict) -> None:
             )
 
 
+# SWA cache slots as SGLang's backends hand them out; the kernels read the low word
+SLOT_DTYPES = (torch.int32, torch.int64)
+
+
+def slot_words(slot: torch.Tensor) -> int:
+    """A slot's stride in int32 words."""
+    return slot.element_size() // 4
+
+
 def check_cache(tag: str, cache: torch.Tensor, block: int) -> None:
     """Raise unless ``cache`` is uint8 [pages, page bytes] with ``block`` records a page."""
     if not (
@@ -603,12 +612,13 @@ class DSV41MonoRunner:
         comb: torch.Tensor | None,  # [M, 4, 4] f32
         pre: torch.Tensor,  # [M, 4] f32: the incoming pre mix (its FFN pre mix)
         pos: torch.Tensor,  # [>= M] int64 positions
-        slot: torch.Tensor,  # [>= M] int64 SWA cache slots
+        slot: torch.Tensor,  # [>= M] int32 or int64 SWA cache slots
         swa: torch.Tensor,  # the layer's SWA cache: uint8 [pages, page bytes]
         swa_block: int,
         keys: tuple,  # int32 [>= M, ...]: window slots, window lengths, top-k slots, top-k lengths
         index: bool = False,
         tok_par: bool = False,
+        aux: torch.Tensor | None = None,  # [>= M, 5120] bf16: DSpark's capture
     ):
         """Run K1: the pending post, this layer's attention seam and the attention
         front; it writes the step's SWA KV records and K2's key table. With ``x``
@@ -617,7 +627,8 @@ class DSV41MonoRunner:
         comes after K1: K1 writes its normed input and qr (``normed``, ``qr``)
         for the indexer and leaves the key table to K2. Returns (q, residual,
         post, comb, pre) views of the runner's buffers. ``tok_par`` (``token_par``): the
-        residual, post, comb and pre rows in and out are this rank's alone."""
+        residual, post, comb and pre rows in and out are this rank's alone. ``aux``
+        receives the mean of the residual's streams, which DSpark captures."""
         M = residual.shape[0]
         if not self.supports(M):
             raise RuntimeError(f"DSv4.1 mono decode: {M} rows")
@@ -633,11 +644,16 @@ class DSV41MonoRunner:
                 "post": (post, HC, f32),
                 "comb": (comb, HC * HC, f32),
             }
+        if aux is not None:
+            want["aux"] = (aux, HIDDEN, bf)
         check_rows("K1", M, self.device, want)
         if not fold:  # unread: the seam takes the residual as it is
             x = post = comb = residual
-        for name, t in (("positions", pos), ("slots", slot)):
-            if not (t.dtype == torch.int64 and t.numel() >= M and t.is_contiguous()):
+        for name, t, dtypes in (
+            ("positions", pos, (torch.int64,)),
+            ("slots", slot, SLOT_DTYPES),
+        ):
+            if not (t.dtype in dtypes and t.numel() >= M and t.is_contiguous()):
                 raise RuntimeError(f"K1 {name}: {tuple(t.shape)} {t.dtype}")
         check_cache("K1 SWA cache", swa, swa_block)
         for name, t, width in zip(
@@ -675,6 +691,7 @@ class DSV41MonoRunner:
             w.hc_base.data_ptr(),
             w.norm.data_ptr(),
             self.res_mid.data_ptr(),
+            0 if aux is None else aux.data_ptr(),
             self.post_a.data_ptr(),
             self.comb_a.data_ptr(),
             self.pre_a.data_ptr(),
@@ -687,6 +704,7 @@ class DSV41MonoRunner:
             w.cos_sin.data_ptr(),
             pos.data_ptr(),
             slot.data_ptr(),
+            slot_words(slot),
             swa.data_ptr(),
             swa.stride(0),
             swa_block,
@@ -775,6 +793,7 @@ class DSV41MonoRunner:
             table = (slot, *keys)
         else:  # unread
             table = (self.klen, self.klen, self.klen, self.no_topk, self.no_topk_lens)
+        slot_ptr, *key_ptrs = (t.data_ptr() for t in table)
         self.k2_kernel(M, compressed, index, tok_par)(
             self.q.data_ptr(),
             swa.data_ptr(),
@@ -785,7 +804,9 @@ class DSV41MonoRunner:
             comp_block,
             self.kt.data_ptr(),
             self.klen.data_ptr(),
-            *(t.data_ptr() for t in table),
+            slot_ptr,
+            slot_words(table[0]),
+            *key_ptrs,
             pos.data_ptr(),
             aw.sink.data_ptr(),
             self.qk_scale,

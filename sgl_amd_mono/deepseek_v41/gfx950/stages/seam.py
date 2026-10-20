@@ -93,21 +93,36 @@ def pend_value(c, t, col, cc):
 # ---------------------------------------------------------------- slice
 @flyc.jit
 def slice_input(c, task, idx):
-    """Return thread ``idx``'s pair of the layer input."""
+    """Return thread ``idx``'s pair of the layer input; with ``aux_on``, also store
+    the pair's mean over the R_new streams, as DSpark captures a target layer."""
     s, rl = c["S"], c["rl"]
     a = c["args"]
+    # read before the dynamic branch: a method call on c inside one carries c
+    aux_on = c.get("aux_on")
     c0 = task * COLS
     if idx < s * COLS // 2:
         t = idx // (COLS // 2)
         cc = 2 * (idx % (COLS // 2))
-        outs = []
+        outs, means = [], []
         for d in range_constexpr(2):
             acc = fx.Float32(0.0)
+            total = fx.Float32(0.0)
             for h in range_constexpr(HC):
                 rb = fx.ptr_load(rl + (t * KT + h * COLS + cc + d))
                 acc = acc + ld_f32(a["pre_in"], t * HC + h) * rb
+                # torch's mean over the streams: summed in order, then times 1/HC
+                total = rb if h == 0 else total + rb
             outs.append(acc)
+            means.append(total * fx.Float32(1.0 / HC))
         c["put_bf"](c["lin"], t * HIDDEN + c0 + cc, outs)
+        if const_expr(aux_on is not None):
+            if aux_on:
+                for k in range_constexpr(2):
+                    bo.buffer_store(
+                        means[k].to(fx.BFloat16),
+                        rsrc(a["aux_out"]),
+                        t * HIDDEN + c0 + cc + k,
+                    )
 
 
 def slice_at(c0, e):
