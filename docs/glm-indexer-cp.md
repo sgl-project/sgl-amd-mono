@@ -11,8 +11,9 @@ The keyword defaults to `False` and accepts only a Python bool. CP remains
 part of the kernel's compilation key; the plugin builds and precompiles both
 indexer variants before any forward or graph capture. The earlier
 `SGLANG_AMD_MONO_GLM_INDEXER_CP` environment variable is no longer read.
-Existing model/configuration checks and row limits still apply: TP4 up to
-4 rows, TP8 up to 8 rows, with one-row requests padded to width 2.
+The [multi-token follow-up](glm-tp4-multitoken.md) extends TP4 to 16 total
+query tokens. TP8 retains its eight-row range and existing width buckets;
+one-row requests are padded to width 2.
 
 ```python
 # built is the object returned by the GLM-5.3 spec's build().
@@ -153,10 +154,10 @@ unmodified server call sites currently exercise `indexer_cp=False`.
 
 ## Remaining port scope and rejected probe
 
-Native FP4 MFMA, GLM-5.2 MXFP4 checkpoint loading, wider rows, MTP and the
-native-FP4 grouped-expert/cohort paths need different loader or request
-contracts. This port retains the ordinary GLM-5.3 FP8 contract and its row
-limits; it does not enable those paths by removing their format guards.
+The [multi-token follow-up](glm-tp4-multitoken.md) adapts the row/cohort and
+grouped-expert scheduling to SGLang's FP8 path through 16 total query tokens.
+Native FP4 MFMA and GLM-5.2 MXFP4 checkpoint loading still require a different
+weight contract. Their format guards remain in place.
 
 The upstream TP8/width-8 sparse-attention tile32 change was tested separately
 against tile64. CP off/on remained exact within the tile32 candidate, but the

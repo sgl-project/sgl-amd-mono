@@ -30,6 +30,7 @@ import msgspec
 import torch
 from sglang.srt.monokernels.spec import (
     DeviceLimits,
+    Feature,
     MonoSpec,
     Numerics,
     NumericsKind,
@@ -41,19 +42,20 @@ from sgl_amd_mono.glm53 import HF_CONFIG
 
 # kernel widths; a step of fewer rows runs at the next width, the rest pad rows (a
 # one-row launch never completes on gfx950)
-WIDTHS = (2, 4, 8)
+WIDTHS = (2, 4, 6, 8, 12, 16)
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (4, 8)
-# the rows a step runs on the kernels at most at this TP size: on MI355X an 8-row
-# launch at TP4 is slower than the model's forward, so wider steps run that
-TP_MAX_ROWS = {4: 4}
+# TP4 uses the bounded row/cohort schedule through sixteen total query tokens.
+# Retain the existing TP8 support range; this port is validated at TP4.
+TP_MAX_ROWS = {4: 16, 8: 8}
 # SGLang's DSA cache on ROCm: 64-token pages
 PAGE_SIZE = 64
 TOPK = 2048
 
 
-def _width(rows: int) -> int:
-    return next(w for w in WIDTHS if w >= rows)
+def _width(rows: int, tp: int = 4) -> int:
+    widths = (2, 4, 8) if tp == 8 else WIDTHS
+    return next(w for w in widths if w >= rows)
 
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -62,6 +64,7 @@ SGLANG_READS = {
         "page_size",
         "enable_hisparse",
         "expert_distribution_recorder_mode",
+        "speculative_eagle_topk",
     ),
     "srt/distributed/parallel_state.py": ("cpu_group",),
     "srt/environ.py": (
@@ -72,6 +75,7 @@ SGLANG_READS = {
     "srt/configs/model_config.py": ("context_len",),
     "srt/layers/attention/dsa/dsa_indexer.py": ("use_gfx950_fused_indexer",),
     "srt/layers/attention/dsa_backend.py": ("forward_metadata", "real_page_table"),
+    "srt/layers/aux_hidden_states.py": ("AuxHiddenStatePacker", "capture", "finalize"),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": ("maybe_input_scattered",),
     "srt/layers/layer_boundary/residual/batch.py": (
@@ -105,12 +109,15 @@ SGLANG_READS = {
         "indexer",
         "gemm_output_zero_allocator_size",
         "next_full_attention_layer_id",
+        "layers_to_capture",
         "logits_processor",
         "lm_head",
         "forward(prev_topk_indices)",
+        "forward(captured_last_layer_outputs)",
     ),
     "srt/monokernels/spec.py": (
         "DeviceLimits",
+        "Feature",
         "MonoSpec",
         "Numerics",
         "NumericsKind",
@@ -154,6 +161,8 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     ]
     if getattr(hf_config, "moe_layer_freq", 1) != 1:
         reasons.append("needs every layer after the dense ones to be MoE")
+    if (getattr(cfg, "speculative_eagle_topk", None) or 1) != 1:
+        reasons.append("GLM mono-kernel needs a linear speculative chain (topk=1)")
     # SGLang scales the softmax by YaRN's mscale; the kernel's scale is fixed
     rope = (
         getattr(hf_config, "rope_parameters", None)
@@ -242,6 +251,7 @@ class _Built:
         self.lm, self.model = lm, lm.model
         self._layers, self.runtimes = layers, runtimes
         self.first, self.last = min(layers), max(layers)
+        self.tp = tp
         self.max_rows = TP_MAX_ROWS.get(tp, max(WIDTHS))
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         self.cos, self.sin = cos, sin
@@ -287,16 +297,17 @@ class _Built:
         from sglang.srt.layers.layer_boundary import get_attn_tp_context
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden = self._backbone(
+            hidden, aux = self._backbone(
                 plan, input_ids, positions, forward_batch, input_embeds, indexer_cp
             )
-        return lm.logits_processor(input_ids, hidden, lm.lm_head, forward_batch, None)
+        return lm.logits_processor(input_ids, hidden, lm.lm_head, forward_batch, aux)
 
     def _backbone(
         self, plan, input_ids, positions, forward_batch, input_embeds, indexer_cp
     ):
         """``DeepseekV2Model.forward``: the embedding and dense layers on SGLang's
         path, the covered ones as launches, then the final norm."""
+        from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
         from sglang.srt.layers.layer_boundary.residual.batch import (
             complete_output,
             final_norm,
@@ -305,6 +316,8 @@ class _Built:
         from sglang.srt.utils.common import BumpAllocator
 
         m = self.model
+        capture_layers = getattr(m, "layers_to_capture", ())
+        aux = AuxHiddenStatePacker(len(capture_layers))
         hidden = m.embed_tokens(input_ids) if input_embeds is None else input_embeds
         start(forward_batch)
         zero = BumpAllocator(
@@ -324,7 +337,14 @@ class _Built:
             L = self._layers.get(i)
             if L is not None:
                 hidden = self._layer(
-                    L, plan, positions, hidden, forward_batch, topk_indices, indexer_cp
+                    L,
+                    plan,
+                    positions,
+                    hidden,
+                    forward_batch,
+                    topk_indices,
+                    indexer_cp,
+                    aux if i in capture_layers else None,
                 )
                 topk_indices = None
                 continue
@@ -336,12 +356,13 @@ class _Built:
                 gemm_zero,
                 None,
                 prev_topk_indices=topk_indices,
+                captured_last_layer_outputs=aux if i in capture_layers else None,
                 next_full_attention_layer_id=m.next_full_attention_layer_id.get(i),
             )
         hidden = complete_output(hidden, forward_batch)
         if not forward_batch.forward_mode.is_idle():
             hidden = final_norm(hidden, forward_batch, m.norm)
-        return hidden
+        return hidden, aux.finalize() if len(aux) else None
 
     def _layer(
         self,
@@ -352,6 +373,7 @@ class _Built:
         forward_batch,
         topk_indices,
         indexer_cp,
+        aux=None,
     ):
         """The stream the previous layer wrote (the first covered layer) or the
         previous launch's output in; the launch's output, or the written stream
@@ -363,7 +385,7 @@ class _Built:
         )
 
         S = plan.key.rows
-        W = _width(S)
+        W = _width(S, self.tp)
         step = self._step(plan, positions, forward_batch, S, W)
         if L.i == self.first:
             # layer 2's output still owes its residual add (to the next input norm)
@@ -377,6 +399,10 @@ class _Built:
                 self._take_topk(topk_indices, step, S, W)
         else:
             h = hidden
+        if aux is not None:
+            # SGLang captures the input residual before this layer's norm.
+            # Copy now: subsequent launches reuse the same output arenas.
+            aux.capture(h[:S])
         self._bind(L)
         checking = self.check_layers and not torch.cuda.is_current_stream_capturing()
         if checking:
@@ -467,7 +493,9 @@ class _Built:
             st.slots[S:] = -1
             st.positions[:S] = positions[:S].to(torch.int64)
             st.positions[S:] = 0
-            seq = forward_batch.seq_lens[:S].to(torch.int32)
+            # Verify has several query tokens per request. seq_lens is per
+            # request; each query's causal extent is its absolute position + 1.
+            seq = positions[:S].to(torch.int32) + 1
             count = torch.where(valid, seq.clamp(max=TOPK), 0)
             # indptr[0] stays 0 from its allocation
             st.indptr[1 : S + 1] = torch.cumsum(count, 0, dtype=torch.int32)
@@ -475,9 +503,15 @@ class _Built:
             st.req_ids[:S] = torch.arange(S, dtype=torch.int32, device=loc.device)
             st.req_ids[S:] = 0
             md = get_attn_backend().forward_metadata
-            plan.state["step"] = msgspec.structs.replace(
-                st, page_table=md.real_page_table[:S]
-            )
+            page_table = md.real_page_table
+            if page_table.shape[0] < S:
+                requests = plan.key.batch_size
+                if page_table.shape[0] < requests:
+                    raise ValueError("GLM page table does not cover every request")
+                st.req_ids[:S] = torch.arange(
+                    requests, dtype=torch.int32, device=loc.device
+                ).repeat_interleave(plan.key.tokens_per_request)
+            plan.state["step"] = msgspec.structs.replace(st, page_table=page_table[:S])
         return plan.state["step"]
 
 
@@ -527,7 +561,7 @@ def _build(model, hf_config, ctx) -> _Built:
     tasks = -(-context_len // INDEX_KEYS_PER_TASK)
     max_seq = tasks * INDEX_KEYS_PER_TASK
     cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
-    widths = sorted({_width(r) for r in ctx.widths if r <= cap})
+    widths = sorted({_width(r, tp) for r in ctx.widths if r <= cap})
     if not widths:
         raise ValueError(
             f"GLM-5.3 monokernel: TP{tp} runs at most {cap} rows on the kernels, and "
@@ -574,7 +608,7 @@ SPEC = MonoSpec(
     devices={
         "gfx950": DeviceLimits(widths=ROWS, tp_sizes=TP_SIZES, resident_blocks=BLOCKS)
     },
-    features=frozenset(),
+    features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsa"}),

@@ -41,6 +41,8 @@ are distributed under the Apache License 2.0.
 
 The GLM-5.3 indexer context partitioning, query projection sharding,
 distributed radix selection, batched query reads, peer score exchange and
-paged KV row addressing/gathers are adapted from ROCm/FlyDSL
+paged KV row addressing/gathers, row/cohort scheduling, shared input
+normalization and projections, latent reuse, and grouped expert scheduling
+are adapted from ROCm/FlyDSL
 (https://github.com/ROCm/FlyDSL), PR #1256 at cd335a8d9080, Copyright (c) 2025
 FlyDSL Project Contributors, distributed under the Apache License 2.0.

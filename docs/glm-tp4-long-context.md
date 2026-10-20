@@ -37,8 +37,9 @@ Two additional adaptations preserve the existing score arithmetic and layout:
   before publication and another before workspace reuse.
 
 These scheduling choices are restricted to TP4. The distributed selector
-threshold remains 114,688 live keys per row. The native FP4, wider-row, MTP
-and serving integration gaps described in the CP guide remain open.
+threshold remains 114,688 live keys per row. The later
+[multi-token port](glm-tp4-multitoken.md) extends TP4 to 16 total query tokens.
+Native FP4 checkpoint loading and full serving validation remain separate.
 
 ## Reproduction and measurement
 

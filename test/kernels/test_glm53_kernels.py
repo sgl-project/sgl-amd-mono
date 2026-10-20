@@ -11,6 +11,7 @@ import pytest
 import torch
 
 CHECK = Path(__file__).with_name("glm53") / "check_indexer_cp.py"
+MULTITOKEN_CHECK = CHECK.with_name("check_multitoken.py")
 
 
 def _gfx950_gpus():
@@ -79,6 +80,90 @@ def test_indexer_cp_tp4_large_cache(tmp_path):
             "--slot-offset",
             "4194304",
         ),
+    )
+
+
+@pytest.mark.parametrize("query", [4, 6, 8])
+def test_multitoken_tp4(tmp_path, query):
+    if _gfx950_gpus() < 4:
+        pytest.skip("needs 4 gfx950 GPUs")
+    control = str(tmp_path / "serial")
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=4",
+        str(MULTITOKEN_CHECK),
+        "--query-tokens",
+        str(query),
+    ]
+    if query == 8:
+        command.append("--check-routing")
+    try:
+        subprocess.run(
+            command + ["--schedule", "serial", "--save-control", control],
+            check=True,
+            timeout=1800,
+        )
+        for cp in ([], ["--indexer-cp"]):
+            subprocess.run(
+                command + ["--check-control", control, "--check-causality"] + cp,
+                check=True,
+                timeout=1800,
+            )
+    finally:
+        for path in tmp_path.glob("serial.rank*.pt"):
+            path.unlink()
+
+
+@pytest.mark.parametrize("external,ties", [(True, False), (False, True)])
+def test_multitoken_reuse_and_routes_tp4(tmp_path, external, ties):
+    if _gfx950_gpus() < 4:
+        pytest.skip("needs 4 gfx950 GPUs")
+    indexed = str(tmp_path / "indexed")
+    control = str(tmp_path / "serial")
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=4",
+        str(MULTITOKEN_CHECK),
+        "--query-tokens",
+        "8",
+        "--check-routing",
+        "--check-causality",
+    ]
+    if ties:
+        command.append("--route-ties")
+
+    def run(args):
+        subprocess.run(command + args, check=True, timeout=1800)
+
+    try:
+        if external:
+            run(["--schedule", "serial", "--save-control", indexed])
+            command += ["--external-control", indexed]
+        run(["--schedule", "serial", "--save-control", control])
+        run(["--check-control", control] + ([] if external else ["--indexer-cp"]))
+    finally:
+        for path in tmp_path.glob("*.rank*.pt"):
+            path.unlink()
+
+
+@pytest.mark.parametrize(
+    "capacity,pad_rows,ties", [(64, 3, False), (4096, 0, True), (131072, 0, False)]
+)
+def test_multitoken_cp_boundaries_tp4(capacity, pad_rows, ties):
+    _check(
+        4,
+        16,
+        capacity,
+        ties,
+        pad_rows=pad_rows,
+        full_context=True,
+        extra_args=("--request-width", "8", "--layers", "1", "--replays", "4"),
     )
 
 

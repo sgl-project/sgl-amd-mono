@@ -57,21 +57,55 @@ class _Lm:
         return "the model's forward"
 
 
-def test_a_step_runs_at_the_next_width_and_tp4_takes_four_rows():
+def test_a_step_runs_at_the_next_width_and_tp4_takes_sixteen_rows():
     # a one-row launch never completes on gfx950: one row runs at width 2
-    assert [glm53._width(r) for r in glm53.ROWS] == [2, 2, 4, 4, 8, 8, 8, 8]
-    # TP4 builds no 8-row launch: a wider step runs the model's own forward
-    runtimes = {(w, k): None for w in (2, 4) for k in ("index", "shared")}
+    assert [glm53._width(r) for r in glm53.ROWS] == [
+        2,
+        2,
+        4,
+        4,
+        6,
+        6,
+        8,
+        8,
+        12,
+        12,
+        12,
+        12,
+        16,
+        16,
+        16,
+        16,
+    ]
+    runtimes = {(w, k): None for w in glm53.WIDTHS for k in ("index", "shared")}
     layers = {i: SimpleNamespace(i=i) for i in range(3, 78)}
     lm = _Lm()
     built = glm53._Built(lm, layers, runtimes, None, None, tp=4, device="cpu")
-    key = registry.ShapeKey(forward_mode="decode", batch_size=5, tokens_per_request=1)
+    assert built.max_rows == 16
+    assert [glm53._width(r, tp=8) for r in range(1, 9)] == [2, 2, 4, 4, 8, 8, 8, 8]
+    key = registry.ShapeKey(
+        forward_mode="target_verify", batch_size=2, tokens_per_request=9
+    )
     out = built.forward(registry.Plan(key=key), "ids", "positions", "batch")
     assert out == "the model's forward"
     assert lm.ran == [("ids", "positions", "batch", None, None)]
     assert (
         glm53._Built(lm, layers, runtimes, None, None, tp=8, device="cpu").max_rows == 8
     )
+
+
+def test_speculation_requires_a_linear_chain():
+    assert registry.Feature.SPECULATIVE_DECODING in glm53.SPEC.features
+    assert (
+        glm53._config_disable_reasons(
+            SimpleNamespace(page_size=64, speculative_eagle_topk=1), GLM53
+        )
+        == []
+    )
+    reasons = glm53._config_disable_reasons(
+        SimpleNamespace(page_size=64, speculative_eagle_topk=2), GLM53
+    )
+    assert "linear speculative chain" in " ".join(reasons)
 
 
 def test_config_reasons_name_each_mismatch():

@@ -1,0 +1,635 @@
+{
+  "date": "2026-10-20",
+  "baseline_commit": "0bce188",
+  "flydsl_reference": "cd335a8d908094e2296d68d052260624bf6a8465",
+  "sglang_reference": "9e231077722f10671075a17c9bf7ee64b5ff0715",
+  "node": "mi355-gpu-46",
+  "devices": [
+    4,
+    5,
+    6,
+    7
+  ],
+  "tp": 4,
+  "torch": "2.9.1+ROCm7.2",
+  "flydsl": "0.4.0",
+  "seed": 719,
+  "benchmark": "synthetic one-layer query block",
+  "timing": {
+    "graph_steps": 32,
+    "graph_replays": 10,
+    "trials": 4,
+    "rank_aggregation": "maximum",
+    "trial_aggregation": "median",
+    "order": "candidate CP on, candidate CP off, origin serial"
+  },
+  "source_sha256": {
+    "sgl_amd_mono/glm53/gfx950/kernel.py": "831a3f3d8ef8212e36da3a2f7c76b00c7fd100ffad9e48e7f45442a6ba52ca01",
+    "sgl_amd_mono/glm53/gfx950/layout.py": "cbb54d29fb1ad1f27553d5c06349db6f78d79c275e8fb195a966bb69e6bcfd99",
+    "sgl_amd_mono/glm53/gfx950/runner.py": "989c676b58945fe6c7fc7da59bb965bf49d94cad61363f3d8cf33eecc86fb880",
+    "sgl_amd_mono/glm53/spec.py": "899e8e24d38819a8448ae7e1650013128a7c7baa5cfe0d9ab589f84def35bf7e",
+    "test/kernels/glm53/check_multitoken.py": "e0fa066d60d28f1524a5ca17cb49a06b06426ac3f6b1a5f8071b3cb3652ca15c",
+    "test/kernels/glm53/check_indexer_cp.py": "3070d1971f86bfe7e28d20106e344a29ea06adefbb2abcf3d634ebfba4a9ec62",
+    "test/kernels/glm53/fixtures.py": "b3900463a0c88ebd0ccef3266534c4c3a170e35b78f103dc2dbaa023933d73ed"
+  },
+  "host_tests_passed": 142,
+  "sglang_glm_contract_tests_passed": 12,
+  "latency": [
+    {
+      "context_capacity": 4096,
+      "requests": 2,
+      "query_tokens_per_request": 4,
+      "total_query_tokens": 8,
+      "origin_calls": 4,
+      "candidate_calls": 1,
+      "origin_us": 399.85475158691406,
+      "cp_off_us": 259.8050994873047,
+      "cp_on_us": 255.00430297851562,
+      "speedup_cp_off": 1.5390565942546208,
+      "speedup_cp_on": 1.5680313897314988,
+      "max_rank_trials_us": {
+        "origin": [
+          399.8079528808594,
+          399.7469177246094,
+          399.90155029296875,
+          400.1141662597656
+        ],
+        "cp_off": [
+          260.0124816894531,
+          259.8388366699219,
+          259.7713623046875,
+          259.7468566894531
+        ],
+        "cp_on": [
+          255.09918212890625,
+          255.01156616210938,
+          254.99703979492188,
+          254.752685546875
+        ]
+      }
+    },
+    {
+      "context_capacity": 4096,
+      "requests": 2,
+      "query_tokens_per_request": 6,
+      "total_query_tokens": 12,
+      "origin_calls": 6,
+      "candidate_calls": 1,
+      "origin_us": 598.5619201660156,
+      "cp_off_us": 360.33424377441406,
+      "cp_on_us": 345.18348693847656,
+      "speedup_cp_off": 1.6611297163883851,
+      "speedup_cp_on": 1.7340398449381784,
+      "max_rank_trials_us": {
+        "origin": [
+          598.3878173828125,
+          598.511474609375,
+          598.6845703125,
+          598.6123657226562
+        ],
+        "cp_off": [
+          360.2232971191406,
+          360.34716796875,
+          360.3213195800781,
+          360.462158203125
+        ],
+        "cp_on": [
+          345.2554931640625,
+          345.2559814453125,
+          345.1114807128906,
+          345.10687255859375
+        ]
+      }
+    },
+    {
+      "context_capacity": 4096,
+      "requests": 2,
+      "query_tokens_per_request": 8,
+      "total_query_tokens": 16,
+      "origin_calls": 8,
+      "candidate_calls": 1,
+      "origin_us": 800.5573425292969,
+      "cp_off_us": 411.19236755371094,
+      "cp_on_us": 401.8116760253906,
+      "speedup_cp_off": 1.946916834308035,
+      "speedup_cp_on": 1.9923695360179363,
+      "max_rank_trials_us": {
+        "origin": [
+          800.4414672851562,
+          800.626953125,
+          800.7051391601562,
+          800.4877319335938
+        ],
+        "cp_off": [
+          411.3811950683594,
+          411.2579345703125,
+          411.1268005371094,
+          411.01226806640625
+        ],
+        "cp_on": [
+          401.7524719238281,
+          401.72900390625,
+          401.8708801269531,
+          401.9026184082031
+        ]
+      }
+    },
+    {
+      "context_capacity": 131072,
+      "requests": 2,
+      "query_tokens_per_request": 4,
+      "total_query_tokens": 8,
+      "origin_calls": 4,
+      "candidate_calls": 1,
+      "origin_us": 908.7311706542969,
+      "cp_off_us": 471.2297821044922,
+      "cp_on_us": 395.24658203125,
+      "speedup_cp_off": 1.9284247413139766,
+      "speedup_cp_on": 2.2991499786896283,
+      "max_rank_trials_us": {
+        "origin": [
+          908.828369140625,
+          908.6185302734375,
+          908.7568359375,
+          908.7055053710938
+        ],
+        "cp_off": [
+          471.2900085449219,
+          471.11273193359375,
+          471.2294921875,
+          471.2300720214844
+        ],
+        "cp_on": [
+          395.2456970214844,
+          395.2113037109375,
+          395.2474670410156,
+          395.565185546875
+        ]
+      }
+    },
+    {
+      "context_capacity": 131072,
+      "requests": 2,
+      "query_tokens_per_request": 6,
+      "total_query_tokens": 12,
+      "origin_calls": 6,
+      "candidate_calls": 1,
+      "origin_us": 1366.6104736328125,
+      "cp_off_us": 673.0968933105469,
+      "cp_on_us": 543.3552551269531,
+      "speedup_cp_off": 2.030332463594211,
+      "speedup_cp_on": 2.515132522852859,
+      "max_rank_trials_us": {
+        "origin": [
+          1366.7125244140625,
+          1366.5084228515625,
+          1386.72900390625,
+          1366.0782470703125
+        ],
+        "cp_off": [
+          673.0916748046875,
+          673.1021118164062,
+          673.32861328125,
+          672.9959106445312
+        ],
+        "cp_on": [
+          543.401123046875,
+          543.4227294921875,
+          543.2960205078125,
+          543.3093872070312
+        ]
+      }
+    },
+    {
+      "context_capacity": 131072,
+      "requests": 2,
+      "query_tokens_per_request": 8,
+      "total_query_tokens": 16,
+      "origin_calls": 8,
+      "candidate_calls": 1,
+      "origin_us": 1824.6610717773438,
+      "cp_off_us": 725.5049438476562,
+      "cp_on_us": 543.5598449707031,
+      "speedup_cp_off": 2.515022243818771,
+      "speedup_cp_on": 3.356872456013909,
+      "max_rank_trials_us": {
+        "origin": [
+          1825.168212890625,
+          1824.620849609375,
+          1824.7012939453125,
+          1824.0406494140625
+        ],
+        "cp_off": [
+          725.3172607421875,
+          725.960693359375,
+          725.376953125,
+          725.6329345703125
+        ],
+        "cp_on": [
+          543.4352416992188,
+          543.6063232421875,
+          543.5133666992188,
+          543.698974609375
+        ]
+      }
+    }
+  ],
+  "checks": [
+    {
+      "case": "confirmed_batched_c131072_q4_cp0",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 471.2297821044922,
+      "max_rank_us": [
+        471.2900085449219,
+        471.11273193359375,
+        471.2294921875,
+        471.2300720214844
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_batched_c131072_q4_cp1",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 395.24658203125,
+      "max_rank_us": [
+        395.2456970214844,
+        395.2113037109375,
+        395.2474670410156,
+        395.565185546875
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_batched_c131072_q6_cp0",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 673.0968933105469,
+      "max_rank_us": [
+        673.0916748046875,
+        673.1021118164062,
+        673.32861328125,
+        672.9959106445312
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_batched_c131072_q6_cp1",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 543.3552551269531,
+      "max_rank_us": [
+        543.401123046875,
+        543.4227294921875,
+        543.2960205078125,
+        543.3093872070312
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_batched_c131072_q8_cp0",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 725.5049438476562,
+      "max_rank_us": [
+        725.3172607421875,
+        725.960693359375,
+        725.376953125,
+        725.6329345703125
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_batched_c131072_q8_cp1",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 543.5598449707031,
+      "max_rank_us": [
+        543.4352416992188,
+        543.6063232421875,
+        543.5133666992188,
+        543.698974609375
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_batched_c4096_q4_cp0",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 259.8050994873047,
+      "max_rank_us": [
+        260.0124816894531,
+        259.8388366699219,
+        259.7713623046875,
+        259.7468566894531
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_batched_c4096_q4_cp1",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 255.00430297851562,
+      "max_rank_us": [
+        255.09918212890625,
+        255.01156616210938,
+        254.99703979492188,
+        254.752685546875
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_batched_c4096_q6_cp0",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 360.33424377441406,
+      "max_rank_us": [
+        360.2232971191406,
+        360.34716796875,
+        360.3213195800781,
+        360.462158203125
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_batched_c4096_q6_cp1",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 345.18348693847656,
+      "max_rank_us": [
+        345.2554931640625,
+        345.2559814453125,
+        345.1114807128906,
+        345.10687255859375
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_batched_c4096_q8_cp0",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 411.19236755371094,
+      "max_rank_us": [
+        411.3811950683594,
+        411.2579345703125,
+        411.1268005371094,
+        411.01226806640625
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_batched_c4096_q8_cp1",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 401.8116760253906,
+      "max_rank_us": [
+        401.7524719238281,
+        401.72900390625,
+        401.8708801269531,
+        401.9026184082031
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_cp_protocol_s12_c64_pad2_ties0",
+      "exit_code": 0,
+      "correctness": "passed",
+      "score_oracle_rel": 1.1986620052084618e-07
+    },
+    {
+      "case": "confirmed_cp_protocol_s16_c131072_pad0_ties0",
+      "exit_code": 0,
+      "correctness": "passed",
+      "score_oracle_rel": 9.26389134292549e-08
+    },
+    {
+      "case": "confirmed_cp_protocol_s16_c4096_pad0_ties1",
+      "exit_code": 0,
+      "correctness": "passed",
+      "score_oracle_rel": 0.0
+    },
+    {
+      "case": "confirmed_cp_protocol_s16_c64_pad3_ties0",
+      "exit_code": 0,
+      "correctness": "passed",
+      "score_oracle_rel": 1.518111929499355e-07
+    },
+    {
+      "case": "confirmed_launches_q8",
+      "exit_code": 0,
+      "correctness": "passed",
+      "profiled_mono_launches": 1,
+      "routing_checked": false,
+      "route_ties": false,
+      "profiled_gpu_kernels": {
+        "glm5_monokernel_0": 1,
+        "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul> >(int, at::native::CUDAFunctorOnSelf_add<int>, std::array<char*, 2ul>)": 1
+      },
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_routing_ties0",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": true,
+      "route_ties": false,
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_routing_ties1",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": true,
+      "route_ties": true,
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_serial_c131072_q4",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 908.7311706542969,
+      "max_rank_us": [
+        908.828369140625,
+        908.6185302734375,
+        908.7568359375,
+        908.7055053710938
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_serial_c131072_q6",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 1366.6104736328125,
+      "max_rank_us": [
+        1366.7125244140625,
+        1366.5084228515625,
+        1386.72900390625,
+        1366.0782470703125
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_serial_c131072_q8",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 1824.6610717773438,
+      "max_rank_us": [
+        1825.168212890625,
+        1824.620849609375,
+        1824.7012939453125,
+        1824.0406494140625
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_serial_c4096_q4",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 399.85475158691406,
+      "max_rank_us": [
+        399.8079528808594,
+        399.7469177246094,
+        399.90155029296875,
+        400.1141662597656
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_serial_c4096_q6",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 598.5619201660156,
+      "max_rank_us": [
+        598.3878173828125,
+        598.511474609375,
+        598.6845703125,
+        598.6123657226562
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_serial_c4096_q8",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": false,
+      "route_ties": false,
+      "median_us": 800.5573425292969,
+      "max_rank_us": [
+        800.4414672851562,
+        800.626953125,
+        800.7051391601562,
+        800.4877319335938
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_shared_q8",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": true,
+      "route_ties": false,
+      "median_us": 354.6141662597656,
+      "max_rank_us": [
+        354.6057434082031,
+        354.6225891113281,
+        354.8532409667969,
+        354.57647705078125
+      ],
+      "all_compared_values_exact": true,
+      "max_relative_l2": 0.0
+    },
+    {
+      "case": "confirmed_shared_serial",
+      "exit_code": 0,
+      "correctness": "passed",
+      "future_token_and_request_isolation": "passed",
+      "routing_checked": true,
+      "route_ties": false,
+      "median_us": 585.8079223632812,
+      "max_rank_us": [
+        585.7789916992188,
+        585.9638671875,
+        585.8368530273438,
+        585.4609375
+      ]
+    }
+  ]
+}

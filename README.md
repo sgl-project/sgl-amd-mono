@@ -16,7 +16,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | 41 of the 42 MoE layers, all but the last (one launch each), in decode steps of up to 8 rows (4 at TP2) |
-| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode steps of up to 8 rows (4 at TP4) |
+| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), up to 16 total query tokens at TP4 and 8 decode rows at TP8; [TP4 multi-token details](docs/glm-tp4-multitoken.md) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 
 ### Design

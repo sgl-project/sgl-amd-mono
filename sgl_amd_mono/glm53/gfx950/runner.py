@@ -45,6 +45,12 @@ class Glm53Build(msgspec.Struct, frozen=True):
     stop: bool = True
     indexer_cp: bool = False
 
+    def __post_init__(self):
+        if self.rows not in (*range(1, 13), 16):
+            raise ValueError("GLM needs 1-12 or 16 physical rows; pad 13-15 to 16")
+        if self.rows == 16 and self.tp != 4:
+            raise ValueError("the sixteen-row GLM schedule requires TP4")
+
     @property
     def heads(self) -> int:
         return GLM5_GLOBAL_HEADS // self.tp
@@ -151,6 +157,9 @@ class Glm53Runtime:
 
         ensure_writable_flydsl_cache()
         self.key, self.width, self.rank = key, key.rows, rank
+        if key.tp == 4 and key.rows >= 8:
+            if torch.cuda.get_device_properties(device).multi_processor_count != 256:
+                raise ValueError("the wide GLM schedule requires a full 256-CU MI355X")
         self.sc, self.sy = layout(
             key.rows,
             key.heads,
