@@ -268,8 +268,17 @@ class _Built:
         forward_batch,
         input_embeds=None,
         pp_proxy_tensors=None,
+        *,
+        indexer_cp: bool = False,
     ):
-        """``DeepseekV2ForCausalLM.forward`` for a routed decode step."""
+        """Run a decode step with an explicit, capture-time CP choice.
+
+        Both variants are built at initialization. A captured graph retains its
+        choice; callers selecting both modes must keep distinct graph instances.
+        All TP ranks must pass the same Python bool.
+        """
+        if type(indexer_cp) is not bool:
+            raise TypeError("indexer_cp must be a Python bool")
         lm = self.lm
         if plan.key.rows > self.max_rows:
             return type(lm).forward(
@@ -279,11 +288,13 @@ class _Built:
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden = self._backbone(
-                plan, input_ids, positions, forward_batch, input_embeds
+                plan, input_ids, positions, forward_batch, input_embeds, indexer_cp
             )
         return lm.logits_processor(input_ids, hidden, lm.lm_head, forward_batch, None)
 
-    def _backbone(self, plan, input_ids, positions, forward_batch, input_embeds):
+    def _backbone(
+        self, plan, input_ids, positions, forward_batch, input_embeds, indexer_cp
+    ):
         """``DeepseekV2Model.forward``: the embedding and dense layers on SGLang's
         path, the covered ones as launches, then the final norm."""
         from sglang.srt.layers.layer_boundary.residual.batch import (
@@ -313,7 +324,7 @@ class _Built:
             L = self._layers.get(i)
             if L is not None:
                 hidden = self._layer(
-                    L, plan, positions, hidden, forward_batch, topk_indices
+                    L, plan, positions, hidden, forward_batch, topk_indices, indexer_cp
                 )
                 topk_indices = None
                 continue
@@ -332,7 +343,16 @@ class _Built:
             hidden = final_norm(hidden, forward_batch, m.norm)
         return hidden
 
-    def _layer(self, L: _Layer, plan, positions, hidden, forward_batch, topk_indices):
+    def _layer(
+        self,
+        L: _Layer,
+        plan,
+        positions,
+        hidden,
+        forward_batch,
+        topk_indices,
+        indexer_cp,
+    ):
         """The stream the previous layer wrote (the first covered layer) or the
         previous launch's output in; the launch's output, or the written stream
         after the last covered layer."""
@@ -368,15 +388,20 @@ class _Built:
             ref = check.reference(L, positions, h[:S].clone(), forward_batch, S, prev)
             if ref["topk"] is not None:
                 plan.state["ref_topk"] = ref["topk"]
-        out = L.ops[W].launch(h, L.caches, self.cos, self.sin, step)
+        out = L.ops[W].forward(
+            h, L.caches, self.cos, self.sin, step, indexer_cp=indexer_cp
+        )
         if checking:
             check.compare(L, ref, out[:S], positions, forward_batch, S)
         if L.i != self.last:
             return out
-        for (w, _), rt in self.runtimes.items():
-            if w == W:
-                rt.advance_step()
+        self._advance_step(W, indexer_cp)
         return set_written(out[:S], forward_batch)
+
+    def _advance_step(self, width: int, indexer_cp: bool) -> None:
+        """Only runtimes launched by this forward consume an epoch."""
+        for kind in ("index_cp" if indexer_cp else "index", "shared"):
+            self.runtimes[width, kind].advance_step()
 
     def _take_topk(self, topk_indices, step, S: int, W: int) -> None:
         """Layer 2's top-k (SGLang's [S, 2048] KV slots, -1 past each row's keys)
@@ -512,27 +537,34 @@ def _build(model, hf_config, ctx) -> _Built:
     # each runtime's peer handshake is collective: every rank builds them in one order
     for w in widths:
         for kind, ids in kinds.items():
-            key = Glm53Build(
-                rows=w,
-                tp=tp,
-                launches_per_step=len(ids),
-                with_indexer=kind == "index",
-                # an unpaged launch keeps index_max_seq words in LDS
-                index_max_seq=max_seq if kind == "index" else 0,
-                fp8_shuffled=fp8_shuffled,
-                fault_site=fault_site,
-                fault_after=fault_after,
-            )
-            rt = Glm53Runtime(key, rank, p.tp_group.cpu_group, device)
-            rt.set_deadline(ctx.deadline_s)
-            runtimes[w, kind] = rt
+            for cp in (False, True) if kind == "index" else (False,):
+                key = Glm53Build(
+                    rows=w,
+                    tp=tp,
+                    launches_per_step=len(ids),
+                    with_indexer=kind == "index",
+                    # an unpaged launch keeps index_max_seq words in LDS
+                    index_max_seq=max_seq if kind == "index" else 0,
+                    fp8_shuffled=fp8_shuffled,
+                    fault_site=fault_site,
+                    fault_after=fault_after,
+                    indexer_cp=cp,
+                )
+                rt = Glm53Runtime(key, rank, p.tp_group.cpu_group, device)
+                rt.set_deadline(ctx.deadline_s)
+                runtimes[w, "index_cp" if cp else kind] = rt
             for n, i in enumerate(ids):
-                layers[i].ops[w] = Glm53LayerOp(rt, layers[i].w, n)
+                layers[i].ops[w] = Glm53LayerOp(
+                    runtimes[w, kind],
+                    layers[i].w,
+                    n,
+                    cp_runtime=runtimes[w, "index_cp"] if kind == "index" else None,
+                )
     # Every rank builds every width. FlyDSL's disk cache hands a rank the kernels
     # another rank built (a lock per kernel), so each rank starts at its own share.
     start = len(widths) * rank // tp
     for w in widths[start:] + widths[:start]:
-        for kind in kinds:
+        for kind in ("index", "index_cp", "shared"):
             runtimes[w, kind].precompile()
     return _Built(model, layers, runtimes, cos, sin, tp, device)
 

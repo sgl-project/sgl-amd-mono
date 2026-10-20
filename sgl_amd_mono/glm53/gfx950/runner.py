@@ -2,7 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Adapted from ROCm/aiter#6173 at 56d6390def (Apache-2.0):
 # aiter/ops/flydsl/kernels/glm5_mono/glm/op.py
-"""Host side of the GLM-5.3 layer launch: one runtime per (width, kind), shared by
+"""Host side of the GLM-5.3 layer launch: one runtime per (width, kind, CP), shared by
 every covered layer of that kind in a step, and one op per layer holding its
 weights. The kinds are the layers that run the indexer and those that reuse the
 previous top-k."""
@@ -43,6 +43,7 @@ class Glm53Build(msgspec.Struct, frozen=True):
     fault_site: int = 0
     fault_after: int = 0
     stop: bool = True
+    indexer_cp: bool = False
 
     @property
     def heads(self) -> int:
@@ -159,6 +160,7 @@ class Glm53Runtime:
             key.index_max_seq,
             inter=key.inter,
             output_heads=key.heads,
+            indexer_cp=key.indexer_cp,
         )
         self.launch = build_glm5_monokernel(
             key.rows,
@@ -183,6 +185,7 @@ class Glm53Runtime:
             fault_site=key.fault_site,
             fault_after=key.fault_after,
             stop=key.stop,
+            indexer_cp=key.indexer_cp,
         )
         self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
         self.peer.bytes.zero_()
@@ -222,9 +225,20 @@ def _check(name: str, t: torch.Tensor, shape: tuple, dtype: torch.dtype) -> None
 
 
 class Glm53LayerOp:
-    """One covered layer: its weights and its ordinal among its kind's layers."""
+    """One layer's weights and ordinal, with prebuilt forward variants.
 
-    def __init__(self, runtime: Glm53Runtime, weights: Glm53Weights, layer: int):
+    ``launch`` uses the original runtime. ``forward(indexer_cp=...)`` selects
+    a prebuilt runtime without allocation, compilation or a host collective.
+    """
+
+    def __init__(
+        self,
+        runtime: Glm53Runtime,
+        weights: Glm53Weights,
+        layer: int,
+        *,
+        cp_runtime: Optional[Glm53Runtime] = None,
+    ):
         key = runtime.key
         if (weights.index is not None) != key.with_indexer:
             raise ValueError("an indexer runtime needs indexer weights, and only it")
@@ -234,6 +248,42 @@ class Glm53LayerOp:
                 f"fp8_shuffled={key.fp8_shuffled}"
             )
         self.rt, self.w, self.layer = runtime, weights, layer
+        self._runtimes = {key.indexer_cp: runtime}
+        if cp_runtime is not None:
+            if (
+                not key.with_indexer
+                or key.indexer_cp
+                or cp_runtime.key != msgspec.structs.replace(key, indexer_cp=True)
+                or cp_runtime.rank != runtime.rank
+                or cp_runtime.scratch.device != runtime.scratch.device
+            ):
+                raise ValueError(
+                    "CP runtime must match the base runtime except for indexer_cp"
+                )
+            self._runtimes[True] = cp_runtime
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        caches: Glm53Caches,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        step: Glm53Step,
+        *,
+        indexer_cp: bool = False,
+    ) -> torch.Tensor:
+        """Select CP for this invocation; capture fixes the choice for its graph.
+
+        All ranks must pass the same Python bool. Reuse-only layers always use
+        their original runtime. The caller advances only the selected runtimes
+        once after the step's layer launches.
+        """
+        if type(indexer_cp) is not bool:
+            raise TypeError("indexer_cp must be a Python bool")
+        cp = indexer_cp and self.rt.key.with_indexer
+        if cp not in self._runtimes:
+            raise ValueError(f"indexer_cp={cp} was not built before forward")
+        return self._launch(self._runtimes[cp], h, caches, cos, sin, step)
 
     def launch(
         self,
@@ -245,7 +295,10 @@ class Glm53LayerOp:
     ) -> torch.Tensor:
         """The previous layer's hidden stream ``h`` [W, HIDDEN] in; this layer's out
         (h plus its attention and MoE)."""
-        rt, w, W = self.rt, self.w, self.rt.width
+        return self._launch(self.rt, h, caches, cos, sin, step)
+
+    def _launch(self, rt, h, caches, cos, sin, step):
+        w, W = self.w, rt.width
         _check("h", h, (W, HIDDEN), torch.bfloat16)
         _check("positions", step.positions, (W,), torch.int64)
         _check("slots", step.slots, (W,), torch.int64)

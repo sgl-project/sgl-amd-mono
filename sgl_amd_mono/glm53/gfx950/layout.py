@@ -2,8 +2,11 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Adapted from ROCm/aiter#6173 at 56d6390def (Apache-2.0):
 # aiter/ops/flydsl/kernels/glm5_mono/glm/layout.py
+# Indexer CP planning adapted from ROCm/FlyDSL#1256 at cd335a8d9080.
 
 """Compile-time storage layout and CTA schedule for the GLM-5 MonoKernel."""
+
+from sgl_amd_mono.common.plan import cdiv, imin
 
 from .config import (
     HIDDEN,
@@ -35,7 +38,50 @@ INDEX_DIM = 128
 INDEX_Q_ROWS = INDEX_HEADS * INDEX_DIM
 INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
+INDEX_CP_TILE = 4096
+INDEX_RADIX_DIGITS = 4
+INDEX_RADIX_BINS = 256
+# SGLang's paged selector already streams scores without a context-sized LDS
+# allocation. Retain full-score exchange through 112K; below this boundary its
+# latency beats the four distributed histogram rounds on the validated FP8 path.
+INDEX_LOCAL_CAPACITY = 114688
 DCP_SUMMARY_PAIRS = KV_LORA // 2 + 2
+
+
+def index_shard_tiles(live_keys, rank, npes: int):
+    """A contiguous shard of the live 64-key tiles, including empty ranks.
+
+    Adapted from ROCm/FlyDSL#1256 at cd335a8d9080. Query/head arithmetic and
+    the replicated cache are unchanged; each complete score has one owner.
+    Works with both Python integers and traced Int32 values.
+    """
+    tiles = cdiv(live_keys, INDEX_KEYS_PER_TASK)
+    per_rank = cdiv(tiles, npes)
+    return imin(rank * per_rank, tiles), imin((rank + 1) * per_rank, tiles)
+
+
+def index_score_capacity(max_seq: int, npes: int) -> int:
+    """Maximum keys scored by one rank, rounded to complete scoring tiles."""
+    return cdiv(cdiv(max_seq, INDEX_KEYS_PER_TASK), npes) * INDEX_KEYS_PER_TASK
+
+
+def index_cp_partitions(max_seq: int, npes: int) -> int:
+    return cdiv(index_score_capacity(max_seq, npes), INDEX_CP_TILE)
+
+
+def index_cp_world(samples: int, npes: int, max_seq: int) -> int:
+    """Two CP4 groups for the TP8 width-two decode bucket at medium context.
+
+    SGLang pads a single active row to width two. Both groups process the same
+    rows; attention and experts still use all eight TP ranks. This is also
+    valid when both rows are active and never depends on graph-capture data.
+    """
+    return 4 if npes == 8 and samples <= 2 and 16384 < max_seq <= 131072 else npes
+
+
+def index_q_sharded(max_seq: int, indexer_cp: bool) -> bool:
+    # The upstream Q-projection split is tuned for short compiled contexts.
+    return indexer_cp and max_seq <= 16384
 
 
 def split_acc_head(head_group, lane_group: int, element: int):
@@ -142,10 +188,14 @@ def layout(
     output_heads: int | None = None,
     dcp_size: int = 1,
     native_fp4_mfma: bool = False,
+    indexer_cp: bool = False,
 ):
     """Return byte offsets for per-rank scratch and symmetric peer buffers."""
     from sgl_amd_mono.common.guard import FLAG_BYTES
 
+    if indexer_cp and (not with_indexer or npes not in (4, 8)):
+        raise ValueError("indexer CP requires an indexed TP4 or TP8 launch")
+    cp_ranks = index_cp_world(samples, npes, index_max_seq)
     split_count = sparse_attention_topk // sparse_keys_per_task(samples, heads)
     output_heads = heads if output_heads is None else output_heads
     pair_bytes = 8
@@ -182,7 +232,30 @@ def layout(
             ("index_ready", samples * pair_bytes),
             ("index_w", samples * INDEX_HEADS * pair_bytes),
             ("index_q", samples * INDEX_Q_ROWS // 2 * pair_bytes),
-            ("index_scores", samples * index_max_seq * pair_bytes),
+        ]
+        if indexer_cp and index_max_seq > INDEX_LOCAL_CAPACITY:
+            parts = index_cp_partitions(index_max_seq, cp_ranks)
+            items += [
+                (
+                    "index_scores",
+                    samples
+                    * index_score_capacity(index_max_seq, cp_ranks)
+                    * pair_bytes,
+                ),
+                (
+                    "index_cp_hist",
+                    INDEX_RADIX_DIGITS
+                    * samples
+                    * parts
+                    * INDEX_RADIX_BINS
+                    * pair_bytes,
+                ),
+                ("index_cp_counts", samples * parts * 3 * pair_bytes),
+                ("index_cp_offsets", samples * parts * 3 * pair_bytes),
+            ]
+        elif not indexer_cp:
+            items += [("index_scores", samples * index_max_seq * pair_bytes)]
+        items += [
             ("indices", samples * sparse_attention_topk * 4),
             ("indices_ready", samples * pair_bytes),
         ]
@@ -200,16 +273,42 @@ def layout(
         if dcp_size > 1
         else 0
     )
+    offset = 2 * region + 2 * dcp_part
     symmetric = {
         "attn": 0,
         "ffn": region,
         "dcp": 2 * region,
-        # the guard's error flags: rank r writes word r of every rank's flags
-        "flags": 2 * region + 2 * dcp_part,
         "_part_stride": part,
         "_dcp_part_stride": dcp_part,
-        "_bytes": 2 * region + 2 * dcp_part + FLAG_BYTES,
     }
+    if indexer_cp:
+        # Only short rows exchange complete score vectors. Long rows exchange
+        # radix summaries and the final top-k; their scores stay in local shards.
+        cp_items = [
+            ("index_scores", samples * min(index_max_seq, INDEX_LOCAL_CAPACITY))
+        ]
+        if index_q_sharded(index_max_seq, indexer_cp):
+            cp_items += [("index_cp_q", samples * INDEX_Q_ROWS // 2)]
+        if index_max_seq > INDEX_LOCAL_CAPACITY:
+            cp_items += [
+                (
+                    "index_cp_hist",
+                    cp_ranks * INDEX_RADIX_DIGITS * samples * INDEX_RADIX_BINS,
+                ),
+                # Prefix, remaining ties, and candidate count (12/24-bit bin).
+                ("index_cp_threshold", INDEX_RADIX_DIGITS * samples * 3),
+                ("index_cp_counts", cp_ranks * samples * 3),
+                ("index_cp_offsets", samples * 4),
+                ("index_cp_indices", samples * sparse_attention_topk),
+            ]
+        for name, count in cp_items:
+            stride = _align(count * pair_bytes)
+            symmetric[name] = offset
+            symmetric[f"_{name}_stride"] = stride
+            offset += 2 * stride
+    # Keep the guard outside every payload arena, including both CP slots.
+    symmetric["flags"] = offset
+    symmetric["_bytes"] = offset + FLAG_BYTES
     return scratch, symmetric
 
 
@@ -221,9 +320,12 @@ def stage_tasks(
     index_max_seq: int = 4096,
     expert_mxfp4: bool = False,
     inter: int = INTER,
+    indexer_cp: bool = False,
+    npes: int = 1,
 ):
     """Return ``(stage name, task count)`` pairs in execution order."""
 
+    cp_ranks = index_cp_world(samples, npes, index_max_seq)
     tasks = [
         ("qkv_a", N_QKV_A),
         ("q_norm", samples),
@@ -231,17 +333,41 @@ def stage_tasks(
         ("q_b", heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
     ]
     if with_indexer:
-        tasks += [("index_q", INDEX_Q_ROWS // INDEX_TILE)]
+        tasks += [
+            (
+                "index_q",
+                INDEX_Q_ROWS
+                // INDEX_TILE
+                // (npes if index_q_sharded(index_max_seq, indexer_cp) else 1),
+            )
+        ]
     tasks += [("uk", heads * KV_LORA // UK_TILE)]
     if with_indexer:
         tasks += [
             (
                 "index_score",
                 samples
-                * ((index_max_seq + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK),
+                * cdiv(
+                    index_score_capacity(index_max_seq, cp_ranks)
+                    if indexer_cp
+                    else index_max_seq,
+                    INDEX_KEYS_PER_TASK,
+                ),
             ),
-            ("index_select", samples),
         ]
+        if indexer_cp and index_max_seq > INDEX_LOCAL_CAPACITY:
+            parts = samples * index_cp_partitions(index_max_seq, cp_ranks)
+            for digit in range(INDEX_RADIX_DIGITS):
+                tasks += [
+                    (f"index_hist_{digit}", parts),
+                    (f"index_prefix_{digit}", samples),
+                ]
+            tasks += [
+                ("index_count", parts),
+                ("index_offsets", samples),
+                ("index_emit", parts),
+            ]
+        tasks += [("index_select", samples)]
     tasks += [
         (
             "split",

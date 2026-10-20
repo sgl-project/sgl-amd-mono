@@ -80,6 +80,12 @@ SGLANG_USE_AITER=1 SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1 python -m sglang.launch_s
 
 If the model, GPU or configuration is not supported, the server refuses to start and lists every reason.
 
+GLM-5.3's mono-kernel forward accepts an experimental `indexer_cp=True`
+keyword for partitioning indexer score work across TP ranks, with distributed
+top-k for long contexts and query projection sharding for short compiled
+contexts. It defaults to `False`; see
+[the scope and comparison tests](docs/glm-indexer-cp.md).
+
 ## Repository Structure
 
 ```text
