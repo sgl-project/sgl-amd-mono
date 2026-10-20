@@ -81,69 +81,79 @@ def fused(s: int, tok_par: bool = False) -> bool:
 # ---------------------------------------------------------------- iw
 
 
-def _iw_chain(c, x, w, t0, n, split, ht):
-    """One head-weight partial: rows t0 .. t0 + n of x [T, HIDDEN] bf16 against
-    heads 16 ht .. of w [HEADS, HIDDEN], K 512 split .. in 32-K MFMA steps."""
+def _iw_chains(c, x, w, t0, n, splits, ht, lds):
+    """Head-weight partials, a chain each, their steps interleaved (one load
+    trip for all): rows t0 .. t0 + n of x [T, HIDDEN] bf16 against heads 16 ht ..
+    of w [HEADS, HIDDEN], K 512 split .. in 32-K MFMA steps -> ``lds``
+    [split][16 rows][16 heads] f32."""
     lane = c["lane"]
     row = lane % 16
     k8 = 8 * (lane // 16)
     live = row < n
     t = plus(t0, fx.min(row, n - 1))
-    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in splits]
     for st in range_constexpr(IW_STEPS):
-        k = split * IW_SPLIT + st * 32 + k8
-        xv = fx.Vector(
-            bo.buffer_load(
-                rsrc(x),
-                (t * HIDDEN + k) // 2,
-                vec_width=4,
-                dtype=T.i32,
-                cache_modifier=CM_DEV,
+        for j in range_constexpr(len(splits)):
+            k = splits[j] * IW_SPLIT + st * 32 + k8
+            xv = fx.Vector(
+                bo.buffer_load(
+                    rsrc(x),
+                    (t * HIDDEN + k) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
             )
-        )
-        xv = live.select(xv, fx.Vector.filled(4, 0, fx.Int32))
-        wv = fx.Vector(
-            bo.buffer_load(
-                rsrc(w), ((16 * ht + row) * HIDDEN + k) // 2, vec_width=4, dtype=T.i32
+            xv = live.select(xv, fx.Vector.filled(4, 0, fx.Int32))
+            wv = fx.Vector(
+                bo.buffer_load(
+                    rsrc(w),
+                    ((16 * ht + row) * HIDDEN + k) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
             )
-        )
-        acc = mfma_bf16(xv.bitcast(fx.BFloat16), wv.bitcast(fx.BFloat16), acc)
-    return acc
+            accs[j] = mfma_bf16(
+                xv.bitcast(fx.BFloat16), wv.bitcast(fx.BFloat16), accs[j]
+            )
+    for j in range_constexpr(len(splits)):
+        # D[row 4 (lane / 16) + q][head lane % 16]
+        for q in range_constexpr(4):
+            r = 4 * (lane // 16) + q
+            at = (splits[j] * 16 + r) * 16 + lane % 16
+            fx.ptr_store(accs[j][q].bitcast(fx.Int32), lds + at)
 
 
 @flyc.jit
-def stage_iw(c, x, w, out, scale, t0, n, lds, push=None):
-    """The head weights of rows t0 .. t0 + n -> ``out`` [T, HEADS] bf16; ``lds``
-    holds the partials [split][16 rows][HEADS] f32. ``push(row, head, w0, w1)``
-    (token parallel) hands a head pair on to the other ranks."""
-    tid, lane, wave = c["tid"], c["lane"], c["wave"]
-    for i in range_constexpr(0, IW_CHAINS, 8):
-        if i + 8 <= IW_CHAINS or wave < IW_CHAINS - i:
-            ch = fx.min(wave + i, IW_CHAINS - 1)
-            split, ht = ch // 2, ch % 2
-            acc = _iw_chain(c, x, w, t0, n, split, ht)
-            # D[row 4 (lane / 16) + q][head lane % 16]
-            for q in range_constexpr(4):
-                r = 4 * (lane // 16) + q
-                at = (split * 16 + r) * HEADS + 16 * ht + lane % 16
-                fx.ptr_store(acc[q].bitcast(fx.Int32), lds + at)
+def stage_iw(c, x, w, out, scale, t0, n, ht, lds, push=None):
+    """Head tile ht's head weights of rows t0 .. t0 + n -> ``out`` [T, HEADS]
+    bf16: its IW_SPLITS partials, split s on wave s % WAVES (waves 0 .. take two,
+    interleaved), summed in split order; ``lds`` holds them [split][16 rows][16
+    heads] f32. ``push(row, head, w0, w1)`` (token parallel) hands a head pair on
+    to the other ranks."""
+    tid, wave = c["tid"], c["wave"]
+    twice = IW_SPLITS - WAVES  # the waves with a second split
+    if wave < twice:
+        _iw_chains(c, x, w, t0, n, [wave, wave + WAVES], ht, lds)
+    else:
+        _iw_chains(c, x, w, t0, n, [wave], ht, lds)
     gpu.barrier()
-    if tid < n * HEADS // 2:
-        r, h = tid // (HEADS // 2), 2 * (tid % (HEADS // 2))
+    if tid < n * 8:
+        r, h = tid // 8, 2 * (tid % 8)
         ws = []
         for d in range_constexpr(2):
-            acc = fx.ptr_load(lds + (r * HEADS + h + d)).bitcast(fx.Float32)
+            acc = fx.ptr_load(lds + (r * 16 + h + d)).bitcast(fx.Float32)
             for sp in range_constexpr(1, IW_SPLITS):
-                at = (sp * 16 + r) * HEADS + h + d
+                at = (sp * 16 + r) * 16 + h + d
                 acc = acc + fx.ptr_load(lds + at).bitcast(fx.Float32)
             ws.append(bf16_round(bf16_round(acc) * scale))
         word = (
             fx.Vector.from_elements(ws, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
         )
         row = plus(t0, r)
-        bo.buffer_store(word, rsrc(out), (row * HEADS + h) // 2)
+        bo.buffer_store(word, rsrc(out), (row * HEADS + 16 * ht + h) // 2)
         if const_expr(push is not None):
-            push(row, h, ws[0], ws[1])
+            push(row, 16 * ht + h, ws[0], ws[1])
     gpu.barrier()
 
 
@@ -306,18 +316,19 @@ def stage_iquant(c, a, iq, t, h, num_pos):
 @flyc.jit
 def run_iw(c, a, rows, iw0, lds, row0=0, push=None):
     """The head weights of rows row0 .. row0 + rows (the step's, or token
-    parallel this rank's), a token tile a CTA from CTA ``iw0``, once its rows'
-    norms published them (``xrdy``: two flags a row, at its local index)."""
+    parallel this rank's), a (token tile, 16-head tile) a CTA from CTA ``iw0``,
+    once its rows' norms published them (``xrdy``: two flags a row, at its local
+    index)."""
     tiles = -(-rows // 16)
-    for tile in range(first_task(c["bid"], iw0), tiles, BLOCKS):
-        t0 = tile * 16
+    for task in range(first_task(c["bid"], iw0), 2 * tiles, BLOCKS):
+        t0 = (task // 2) * 16
         n = fx.min(fx.Int32(16), rows - t0)
         if c["tid"] < 2 * n:
             c["mb"].poll([(c["xrdy"], 2 * t0 + fx.min(c["tid"], 2 * n - 1), 1)])
         gpu.barrier()
         stage_iw(
             c, a["normed_out"], a["iw_w"], a["iw_out"], a["iw_scale"], plus(row0, t0),
-            n, lds, push,
+            n, task % 2, lds, push,
         )  # fmt: skip
 
 
