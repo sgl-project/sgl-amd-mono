@@ -57,6 +57,7 @@ def check(args):
     if args.ties:
         weights.w_r.zero_()
         weights.bias.zero_()
+    request_width = args.request_width or (args.rows // 2 if args.rows % 2 == 0 else 1)
     h, cos, sin, initial, step, lengths = fixture(
         args.rows,
         args.capacity,
@@ -64,8 +65,30 @@ def check(args):
         args.pad_rows,
         True,
         args.seed + 1,
-        request_width=args.rows // 2,
+        request_width=request_width,
     )
+    expected_routes = None
+    if args.route_pattern != "random":
+        from sgl_amd_mono.glm53.gfx950.packing import pack_bf16
+
+        assert not args.ties and not args.quant_edges
+        # With O=0 the router sees an orthogonal BF16 input basis. Each row
+        # selects a prescribed set without using the device routing algorithm.
+        weights.w_o.zero_()
+        weights.bias.zero_()
+        h.zero_()
+        h[torch.arange(args.rows), torch.arange(args.rows)] = 1
+        router = torch.zeros(256, HIDDEN, dtype=torch.bfloat16, device=device)
+        expected_routes = []
+        for row in range(args.rows):
+            chosen = (
+                list(range(row * 8, row * 8 + 8))
+                if args.route_pattern == "disjoint"
+                else list(range(4)) + list(range(4 + row * 4, 8 + row * 4))
+            )
+            router[chosen, row] = torch.linspace(4, 3, 8, device=device).bfloat16()
+            expected_routes.append([256, *chosen])
+        weights = replace(weights, w_r=pack_bf16(router))
     if args.quant_edges:
         # With O=0, a=h. Unit rows make normalized inputs round back to these
         # BF16-exact values, including E2M1 midpoints and E8M0 scale boundaries.
@@ -130,6 +153,8 @@ def check(args):
         assert torch.equal(first, root_output), "TP ranks disagree"
         a = read_pairs(rt, "a", HIDDEN)
         selected = read_pairs(rt, "sel", 9, torch.int32).long()
+        if expected_routes is not None:
+            assert selected.tolist() == expected_routes, "prescribed routes"
         probability = read_pairs(rt, "prob", 9, torch.float32)
         mid = read_pairs(rt, "mid", 9 * 512, torch.float32).reshape(args.rows, 9, 512)
         # Independently normalize the attention boundary and quantize it.
@@ -269,6 +294,24 @@ def check(args):
                 tensor_digest(caches.idx),
             ), "graph caches"
         assert not rt.epoch[3:6].any(), "replay guard error"
+        if args.check_causality:
+            saved_h = h.clone()
+            row = request_width - 1
+            h[row].add_(0.5)
+            caches.kv.copy_(initial.kv)
+            caches.idx.copy_(initial.idx)
+            run()
+            torch.cuda.synchronize()
+            others = torch.arange(args.rows, device=device) != row
+            assert torch.equal(first[others], rt.outs[0][others]), (
+                "cross-query causal leak"
+            )
+            h.copy_(saved_h)
+            caches.kv.copy_(initial.kv)
+            caches.idx.copy_(initial.idx)
+            run()
+            torch.cuda.synchronize()
+            assert torch.equal(first, rt.outs[0]), "causal test restoration"
         trials = []
         if args.bench:
             timed = torch.cuda.CUDAGraph()
@@ -339,8 +382,8 @@ def check(args):
             median_us=statistics.median(trials) if trials else None,
             graph_steps=32 if trials else None,
             graph_replays=10 if trials else None,
-            requests=2,
-            query_tokens=args.rows // 2,
+            requests=args.rows // request_width,
+            query_tokens=request_width,
             live_lengths=lengths,
             benchmark="synthetic_one_layer_query_block" if trials else None,
             rows=args.rows,
@@ -352,6 +395,8 @@ def check(args):
             pad_rows=args.pad_rows,
             ties=args.ties,
             quant_edges=args.quant_edges,
+            route_pattern=args.route_pattern,
+            causality="passed" if args.check_causality else "not_run",
             input_codes_exact=True,
             input_scales_exact=True,
             metrics=metrics,
@@ -369,7 +414,12 @@ def check(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=2, choices=(2, 4, 6, 8, 12, 16))
+    parser.add_argument("--rows", type=int, default=2, choices=range(1, 17))
+    parser.add_argument("--request-width", type=int)
+    parser.add_argument(
+        "--route-pattern", choices=("random", "disjoint", "overlap"), default="random"
+    )
+    parser.add_argument("--check-causality", action="store_true")
     parser.add_argument("--capacity", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=821)
     parser.add_argument("--pad-rows", type=int, default=0)

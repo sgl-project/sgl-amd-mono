@@ -40,8 +40,8 @@ from sglang.srt.monokernels.spec import (
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.glm53 import HF_CONFIG
 
-# kernel widths; a step of fewer rows runs at the next width, the rest pad rows (a
-# one-row launch never completes on gfx950)
+# A8W8 padding buckets. Native FP4 uses exact widths through 12; both formats
+# retain the 16-row cohort bucket for 13-16 logical tokens.
 WIDTHS = (2, 4, 6, 8, 12, 16)
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (4, 8)
@@ -53,7 +53,9 @@ PAGE_SIZE = 64
 TOPK = 2048
 
 
-def _width(rows: int, tp: int = 4) -> int:
+def _width(rows: int, tp: int = 4, expert_mxfp4: bool = False) -> int:
+    if expert_mxfp4 and tp == 4 and rows <= 12:
+        return rows
     widths = (2, 4, 8) if tp == 8 else WIDTHS
     return next(w for w in widths if w >= rows)
 
@@ -410,7 +412,7 @@ class _Built:
         )
 
         S = plan.key.rows
-        W = _width(S, self.tp)
+        W = _width(S, self.tp, getattr(L.w, "expert_mxfp4", False))
         step = self._step(plan, positions, forward_batch, S, W)
         if L.i == self.first:
             # layer 2's output still owes its residual add (to the next input norm)
@@ -585,17 +587,17 @@ def _build(model, hf_config, ctx) -> _Built:
     # the keys an indexer row scores at most: the served context's, in whole tasks
     tasks = -(-context_len // INDEX_KEYS_PER_TASK)
     max_seq = tasks * INDEX_KEYS_PER_TASK
+    formats = {getattr(L.w, "expert_mxfp4", False) for L in layers.values()}
+    if len(formats) != 1:
+        raise ValueError("covered GLM layers must use one expert weight format")
+    expert_mxfp4 = formats.pop()
     cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
-    widths = sorted({_width(r, tp) for r in ctx.widths if r <= cap})
+    widths = sorted({_width(r, tp, expert_mxfp4) for r in ctx.widths if r <= cap})
     if not widths:
         raise ValueError(
             f"GLM-5.3 monokernel: TP{tp} runs at most {cap} rows on the kernels, and "
             f"this server's decode graphs route {sorted(ctx.widths)}"
         )
-    formats = {getattr(L.w, "expert_mxfp4", False) for L in layers.values()}
-    if len(formats) != 1:
-        raise ValueError("covered GLM layers must use one expert weight format")
-    expert_mxfp4 = formats.pop()
     runtimes = {}
     # each runtime's peer handshake is collective: every rank builds them in one order
     for w in widths:

@@ -2,7 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Adapted from ROCm/aiter#6173 at 56d6390def (Apache-2.0):
 # aiter/ops/flydsl/kernels/glm5_mono/glm/layout.py
-# Indexer CP and multi-token planning adapted from ROCm/FlyDSL#1256 at cd335a8d9080.
+# Indexer CP and multi-token planning adapted from ROCm/FlyDSL#1256 at 032072c94064.
 
 """Compile-time storage layout and CTA schedule for the GLM-5 MonoKernel."""
 
@@ -51,7 +51,7 @@ DCP_SUMMARY_PAIRS = KV_LORA // 2 + 2
 def index_shard_tiles(live_keys, rank, npes: int):
     """A contiguous shard of the live 64-key tiles, including empty ranks.
 
-    Adapted from ROCm/FlyDSL#1256 at cd335a8d9080. Query/head arithmetic and
+    Adapted from ROCm/FlyDSL#1256 at 032072c94064. Query/head arithmetic and
     the replicated cache are unchanged; each complete score has one owner.
     Works with both Python integers and traced Int32 values.
     """
@@ -119,10 +119,12 @@ def dn_tile(samples: int, expert_mxfp4: bool = False) -> int:
     return 32 if samples == 1 or (samples > 4 and expert_mxfp4) else HIDDEN // BLOCKS
 
 
-def row_tile_size(samples: int) -> int:
+def row_tile_size(samples: int, native_fp4_mfma: bool = False) -> int:
     """Bound resident query state as in FlyDSL #1256's sixteen-token path."""
     if not 1 <= samples <= 16:
         raise ValueError("GLM mono-kernel supports 1 to 16 total query tokens")
+    if native_fp4_mfma and samples > 12:
+        return next(tile for tile in range(12, 0, -1) if samples % tile == 0)
     return samples if samples <= 12 else 8
 
 
@@ -150,11 +152,15 @@ def ug_task_rounds(inter: int, blocks: int = BLOCKS) -> int:
     return (inter + blocks - 1) // blocks
 
 
-def down_prefetch_batch(samples: int, native_fp4_mfma: bool = False) -> int:
+def down_prefetch_batch(
+    samples: int, native_fp4_mfma: bool = False, inter: int = INTER
+) -> int:
     if samples <= 4:
         return 9
     if native_fp4_mfma:
-        return 4 if samples <= 6 else 3
+        return (
+            4 if samples <= 6 else 2 if inter > INTER and samples in (8, 10, 12) else 3
+        )
     return 4
 
 
@@ -212,9 +218,9 @@ def layout(
 
     if indexer_cp and (not with_indexer or npes not in (4, 8)):
         raise ValueError("indexer CP requires an indexed TP4 or TP8 launch")
-    tile = row_tile_size(samples)
+    tile = row_tile_size(samples, native_fp4_mfma)
     if tile != samples:
-        if samples != 16 or npes != 4:
+        if (samples != 16 and not native_fp4_mfma) or npes != 4:
             raise ValueError("tiled GLM launches require 16 rows at TP4")
         scratch, symmetric = layout(
             tile,
@@ -232,7 +238,9 @@ def layout(
         count = samples // tile
         scratch = dict(scratch, _tile_rows=tile, _tile_count=count)
         scratch["_tile_barriers"] = count * scratch["_tile_stride"]
-        scratch["_bytes"] = scratch["_tile_barriers"] + _align((BLOCKS + 1) * 8)
+        scratch["_bytes"] = scratch["_tile_barriers"] + _align(
+            max(2, count - 1) * (BLOCKS + 1) * 8
+        )
         symmetric = dict(symmetric)
         symmetric["flags"] = count * symmetric["_tile_stride"]
         symmetric["_bytes"] = symmetric["flags"] + FLAG_BYTES
@@ -275,9 +283,10 @@ def layout(
             ("index_w", samples * INDEX_HEADS * pair_bytes),
             ("index_q", samples * INDEX_Q_ROWS // 2 * pair_bytes),
         ]
-        if npes == 4 and samples >= 8:
+        if npes == 4 and (samples >= 8 or (native_fp4_mfma and samples == 7)):
             # Separate tags from normalized input and later MoE scratch reuse.
-            # Cohorts publish SGL's RoPE+Hadamard query here once per row.
+            # Cohorts (including native 14 = 2 x 7 rows) publish SGL's
+            # RoPE+Hadamard query here once per row.
             items += [("index_q_rot", samples * INDEX_Q_ROWS // 2 * pair_bytes)]
         if indexer_cp and index_max_seq > INDEX_LOCAL_CAPACITY:
             parts = index_cp_partitions(index_max_seq, cp_ranks)
@@ -374,13 +383,14 @@ def stage_tasks(
     indexer_cp: bool = False,
     npes: int = 1,
     dcp_size: int = 1,
+    cohort_rows: bool = False,
 ):
     """Return ``(stage name, task count)`` pairs in execution order."""
 
     cp_ranks = index_cp_world(samples, npes, index_max_seq)
-    tile = row_tile_size(samples)
+    tile = row_tile_size(samples, expert_mxfp4)
     if tile != samples:
-        if samples != 16 or npes != 4:
+        if (samples != 16 and not expert_mxfp4) or npes != 4:
             raise ValueError("tiled GLM launches require 16 rows at TP4")
         stages = stage_tasks(
             tile,
@@ -393,6 +403,7 @@ def stage_tasks(
             indexer_cp,
             npes,
             dcp_size,
+            (samples // tile == 2),
         )
         return [
             (f"tile{part}/{name}", count)
@@ -445,7 +456,17 @@ def stage_tasks(
         (
             "split",
             samples
-            * (heads // WAVES)
+            * (
+                heads
+                // (
+                    16
+                    if expert_mxfp4
+                    and npes == 4
+                    and heads == 16
+                    and (samples == 12 or cohort_rows)
+                    else WAVES
+                )
+            )
             * (sparse_attention_topk // sparse_keys_per_task(samples, heads)),
         ),
         (
@@ -457,7 +478,7 @@ def stage_tasks(
         (
             "ug",
             (
-                BLOCKS
+                max(BLOCKS, inter)
                 if samples == 1
                 else samples
                 * max(
@@ -468,9 +489,14 @@ def stage_tasks(
         ),
         ("down", HIDDEN // dn_tile(samples, expert_mxfp4)),
     ]
-    if npes == 4 and samples >= 8 and not expert_mxfp4:
+    if npes == 4 and samples >= 8:
         union_tasks = (samples * TOP_K + 1) * (inter // 8)
         capacity = cdiv(union_tasks, BLOCKS) * BLOCKS
+        if expert_mxfp4 and cohort_rows:
+            width = 64 if with_indexer else 128
+            chunks = 2 * samples * TOP_K + 2
+            rounds = cdiv(chunks * (inter // width), BLOCKS)
+            capacity = max(capacity, rounds * (BLOCKS // 2) * (width // 8))
         tasks = [
             (name, max(count, capacity) if name == "ug" else count)
             for name, count in tasks

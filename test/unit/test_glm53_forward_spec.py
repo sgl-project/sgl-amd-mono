@@ -9,7 +9,10 @@ from sgl_amd_mono.glm53.spec import _Built
 
 
 @pytest.mark.parametrize("w4", [False, True])
-def test_build_prepares_only_matching_quantization_and_both_cp_modes(monkeypatch, w4):
+@pytest.mark.parametrize("odd_rows", [False, True])
+def test_build_prepares_only_matching_quantization_and_both_cp_modes(
+    monkeypatch, w4, odd_rows
+):
     from sglang.srt import runtime_context
 
     from sgl_amd_mono.common import guard
@@ -60,10 +63,16 @@ def test_build_prepares_only_matching_quantization_and_both_cp_modes(monkeypatch
         for i in range(5)
     ]
     lm = SimpleNamespace(model=SimpleNamespace(layers=modules))
+    requested = (1, 3, 5, 7, 10, 11, 13, 15) if odd_rows else (2, 4, 6, 8, 12, 16)
+    expected = (
+        ((1, 3, 5, 7, 10, 11, 16) if w4 else (2, 4, 6, 8, 12, 16))
+        if odd_rows
+        else requested
+    )
     built = spec._build(
         lm,
         SimpleNamespace(first_k_dense_replace=3, num_hidden_layers=5),
-        SimpleNamespace(widths=(2, 4, 6, 8, 12, 16), copies={}, deadline_s=30),
+        SimpleNamespace(widths=requested, copies={}, deadline_s=30),
     )
     assert built.moe_activation_dtype == ("fp4" if w4 else "fp8")
     assert all(
@@ -71,12 +80,12 @@ def test_build_prepares_only_matching_quantization_and_both_cp_modes(monkeypatch
         for rt in built.runtimes.values()
     )
     assert list(built.runtimes) == [
-        (w, kind)
-        for w in (2, 4, 6, 8, 12, 16)
-        for kind in ("index", "index_cp", "shared")
+        (w, kind) for w in expected for kind in ("index", "index_cp", "shared")
     ]
-    assert [event[0] for event in events] == ["build"] * 18 + ["compile"] * 18
-    for width in (2, 4, 6, 8, 12, 16):
+    assert [event[0] for event in events] == ["build"] * (3 * len(expected)) + [
+        "compile"
+    ] * (3 * len(expected))
+    for width in expected:
         assert built._layers[3].ops[width]._runtimes == {
             False: built.runtimes[width, "index"],
             True: built.runtimes[width, "index_cp"],

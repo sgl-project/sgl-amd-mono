@@ -2,9 +2,10 @@
 
 The GLM plugin supports the existing block-FP8 A8W8 MoE and a native
 MXFP4 A4W4 MoE adapted from [FlyDSL PR #1256](https://github.com/ROCm/FlyDSL/pull/1256)
-at `cd335a8d908094e2296d68d052260624bf6a8465`. A8W4 is rejected before
-runtime allocation. This change is on top of the CP, long-context and
-multi-token port, whose accepted kernel baseline is `bdad3b2`.
+at `032072c9406475cde47cf2017506f7c2604d5cce`. A8W4 is rejected before
+runtime allocation. The initial A4W4 port used `cd335a8d9080`; the subsequent
+grouped/cohort port is compared with SGL commit `ff5c64a`; see its
+[scope and regression results](glm-tp4-flydsl1256-sync.md).
 
 ## Selecting the path
 
@@ -25,9 +26,11 @@ and needs separate captured graphs for its two choices.
 
 Direct layer tests construct `Glm53Build(..., expert_mxfp4=True,
 moe_activation_dtype="fp4")` and `Glm53Weights(..., expert_mxfp4=True)`.
-The default build remains A8W8. A4W4 is restricted to TP4 and physical widths
-2, 4, 6, 8, 12 and 16. The plugin pads logical rows to these widths, including
-13–15 to 16; more than 16 rows use the model fallback.
+The default build remains A8W8. A4W4 is restricted to TP4. Its builder accepts
+every physical width from 1 through 16. The plugin uses exact widths through
+12 and the 16-row cohort bucket for 13–16 logical rows; more than 16 rows use
+the model fallback. Direct 13/14/15-row builds use 13 sequential one-row tiles,
+two seven-row cohorts and three sequential five-row tiles, respectively.
 
 ## Loaded-weight contract
 
@@ -67,10 +70,15 @@ reference uses the E2M1 value table, ties-to-even thresholds and `frexp`
 scale calculation, with no kernel quantization helper or native MFMA call.
 
 Activation tiles retain the existing scratch/LDS stride: each 128-value
-FP4 block occupies 16 data words plus 16 zero words. This port connects the
-native arithmetic and SGL weight interface; it does not yet port every
-native-FP4 grouped down-projection/cohort optimization from the PR. Alternative
-attention/cache formats and widths above 16 also remain outside this change.
+FP4 block occupies 16 data words plus 16 zero words. Native grouped/global
+up-gate and grouped/union down-projection reuse expert weights across rows;
+the 16-row external-index path also shares down weights across cohorts.
+The port includes 16-head sparse-KV reuse, native staging and prefetch,
+global UV, paired router and owner reductions, and deferred cache publication
+with explicit reader lifetime checks. Their compile-time shape and arena
+conditions determine which body executes. Alternative attention/cache
+formats, external-index DCP and widths above 16 remain outside the SGL entry
+point.
 
 ## Validation and reproduction
 

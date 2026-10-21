@@ -91,7 +91,9 @@ The loaded expert weights select the activation format; an explicit
 `moe_activation_dtype="fp8"` or `"fp4"` forward argument must match them.
 A4W4 requires Quark MXFP4 experts with the existing block-FP8 attention
 format. Layer tests cover up to 16 query tokens; full A4W4 checkpoint and
-serving validation remain separate.
+serving validation remain separate. See the [FlyDSL #1256 synchronization and
+TP4 regression results](docs/glm-tp4-flydsl1256-sync.md) for grouped/cohort
+scheduling and performance against the initial A4W4 port.
 
 ## Repository Structure
 

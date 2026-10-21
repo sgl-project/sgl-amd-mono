@@ -55,8 +55,15 @@ def main(args):
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     total = args.requests * args.query_tokens
-    assert 1 < total <= 16 and args.requests >= 2
-    weights = make_weights(tp, device, seed=args.seed)
+    assert 1 <= total <= 16 and args.requests >= 1
+    factory = None
+    if args.activation == "fp4":
+        from mxfp4_reference import expert_factory
+
+        factory = expert_factory({}, rank)
+    weights = make_weights(tp, device, seed=args.seed, expert_factory=factory)
+    if args.activation == "fp4":
+        weights = replace(weights, expert_mxfp4=True)
     if args.route_ties:
         weights.w_r.zero_()
         weights.bias.zero_()
@@ -114,6 +121,8 @@ def main(args):
                 index_max_seq=args.capacity if external is None else 0,
                 fp8_shuffled=True,
             )
+            if args.activation == "fp4":
+                options.update(expert_mxfp4=True, moe_activation_dtype="fp4")
             if "indexer_cp" in Glm53Build.__struct_fields__:
                 options["indexer_cp"] = args.indexer_cp
             else:
@@ -271,6 +280,7 @@ def main(args):
             routing_checked=args.check_routing,
             route_ties=args.route_ties,
             control_metrics=metrics,
+            activation=args.activation,
         )
         if args.check_causality:
             # Change only the final token of request 0. Earlier tokens and the
@@ -376,6 +386,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--activation", choices=("fp8", "fp4"), default="fp8")
     parser.add_argument("--requests", type=int, default=2)
     parser.add_argument("--query-tokens", type=int, default=4)
     parser.add_argument("--capacity", type=int, default=4096)

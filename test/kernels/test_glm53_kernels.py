@@ -192,9 +192,47 @@ def _check(tp, rows, capacity, ties, pad_rows=1, full_context=False, extra_args=
     subprocess.run(cmd, check=True, timeout=1800)
 
 
-@pytest.mark.parametrize("rows", [2, 4, 6, 8, 12, 16])
+@pytest.mark.parametrize("rows", range(1, 17))
 def test_a4w4_tp4(rows):
     _check_a4w4(["--rows", str(rows)])
+
+
+@pytest.mark.parametrize("requests,query", [(1, 13), (2, 7), (3, 5), (2, 8)])
+def test_a4w4_tiled_rows_match_serial_tp4(tmp_path, requests, query):
+    if _gfx950_gpus() < 4:
+        pytest.skip("needs 4 gfx950 GPUs")
+    control = str(tmp_path / "serial")
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=4",
+        str(MULTITOKEN_CHECK),
+        "--activation",
+        "fp4",
+        "--requests",
+        str(requests),
+        "--query-tokens",
+        str(query),
+        "--capacity",
+        "2048",
+        "--check-routing",
+    ]
+    try:
+        subprocess.run(
+            command + ["--schedule", "serial", "--save-control", control],
+            check=True,
+            timeout=1800,
+        )
+        subprocess.run(
+            command + ["--check-control", control, "--check-causality"],
+            check=True,
+            timeout=1800,
+        )
+    finally:
+        for path in tmp_path.glob("serial.rank*.pt"):
+            path.unlink()
 
 
 @pytest.mark.parametrize("rows", [12, 16])

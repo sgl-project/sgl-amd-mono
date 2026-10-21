@@ -114,8 +114,8 @@ def test_build_key_includes_weight_and_activation_formats(mode, w4):
         ({"expert_mxfp4": True}, "A8W4 is unsupported"),
         ({"tp": 8, "expert_mxfp4": True, "moe_activation_dtype": "fp4"}, "TP4"),
         (
-            {"rows": 1, "expert_mxfp4": True, "moe_activation_dtype": "fp4"},
-            "pad logical rows",
+            {"rows": 17, "expert_mxfp4": True, "moe_activation_dtype": "fp4"},
+            "1 to 16",
         ),
     ],
 )
@@ -161,3 +161,21 @@ def test_model_accepts_mxfp4_experts_with_block_fp8_attention():
     for layer in layers[3:]:
         layer.mlp.experts = experts()
     assert _model_disable_reasons(_model(layers), GLM53, {}) == []
+
+
+@pytest.mark.parametrize("rows", range(1, 17))
+def test_native_physical_rows_have_complete_tiles_and_separate_epochs(rows):
+    from sgl_amd_mono.glm53.gfx950.layout import layout
+
+    key = Glm53Build(
+        rows, 4, 1, True, 4096, True, expert_mxfp4=True, moe_activation_dtype="fp4"
+    )
+    sc, sy = layout(key.rows, 16, 4, 2048, True, 4096, inter=512, native_fp4_mfma=True)
+    tile, count = sc["_tile_rows"], sc["_tile_count"]
+    assert tile <= 12 and tile * count == rows
+    if count == 2:
+        assert sc["index_q_rot"] + tile * 4096 // 2 * 8 <= sc["_tile_stride"]
+    if count > 1:
+        assert sc["_tile_barriers"] >= count * sc["_tile_stride"]
+        assert sc["_bytes"] - sc["_tile_barriers"] >= (count - 1) * 257 * 8
+        assert sy["flags"] == count * sy["_tile_stride"]

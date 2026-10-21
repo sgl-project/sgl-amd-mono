@@ -48,10 +48,12 @@ class Glm53Build(msgspec.Struct, frozen=True):
     moe_activation_dtype: str = "fp8"
 
     def __post_init__(self):
-        if self.rows not in (*range(1, 13), 16):
-            raise ValueError("GLM needs 1-12 or 16 physical rows; pad 13-15 to 16")
-        if self.rows == 16 and self.tp != 4:
-            raise ValueError("the sixteen-row GLM schedule requires TP4")
+        if not 1 <= self.rows <= 16:
+            raise ValueError("GLM supports 1 to 16 physical rows")
+        if not self.expert_mxfp4 and self.rows in (13, 14, 15):
+            raise ValueError("A8W8 needs 1-12 or 16 physical rows; pad 13-15 to 16")
+        if self.rows > 12 and self.tp != 4:
+            raise ValueError("tiled GLM schedules require TP4")
         if self.moe_activation_dtype not in ("fp8", "fp4"):
             raise ValueError("moe_activation_dtype must be fp8 or fp4")
         if self.moe_activation_dtype == "fp4" and not self.expert_mxfp4:
@@ -62,10 +64,6 @@ class Glm53Build(msgspec.Struct, frozen=True):
             )
         if self.expert_mxfp4 and self.tp != 4:
             raise ValueError("SGL native MXFP4 is supported at TP4")
-        if self.expert_mxfp4 and self.rows not in (2, 4, 6, 8, 12, 16):
-            raise ValueError(
-                "native MXFP4 needs physical widths 2,4,6,8,12,16; pad logical rows"
-            )
 
     @property
     def heads(self) -> int:
