@@ -77,8 +77,20 @@ def _alloc_uncached(nbytes: int) -> int:
         _hip().hipExtMallocWithFlags(ctypes.byref(ptr), size, _DEVICE_MALLOC_UNCACHED),
         "hipExtMallocWithFlags",
     )
-    _check(_hip().hipMemset(ptr, 0, size), "hipMemset")
+    try:
+        _check(_hip().hipMemset(ptr, 0, size), "hipMemset")
+    except Exception:
+        _hip().hipFree(ptr)
+        raise
     return int(ptr.value)
+
+
+def _close_mapping(base: int) -> None:
+    _check(_hip().hipIpcCloseMemHandle(ctypes.c_void_p(base)), "hipIpcCloseMemHandle")
+
+
+def _free_allocation(base: int) -> None:
+    _check(_hip().hipFree(ctypes.c_void_p(base)), "hipFree")
 
 
 def _handle(ptr: int) -> bytes:
@@ -118,7 +130,9 @@ class PeerBuffer:
     on the device). ``group`` is a CPU (gloo) group of the ``npes`` ranks."""
 
     def __init__(self, nbytes: int, group, rank: int, npes: int, device: torch.device):
-        self.rank = rank
+        self.rank, self.npes, self.group, self.device = rank, npes, group, device
+        self._quiesced = False
+        self._closed = False
         self.local = _alloc_uncached(nbytes)
         # a view, not an owner: close() frees the memory under it
         self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
@@ -153,11 +167,56 @@ class PeerBuffer:
         self.addresses = torch.tensor(addresses, dtype=torch.int64, device=device)
 
     def close(self) -> None:
-        """Unmap the peers and free the local buffer (idempotent)."""
-        opened, self._opened = self._opened, []
-        for base in opened:
-            _hip().hipIpcCloseMemHandle(ctypes.c_void_p(base))
+        """Collectively unmap peers, then free local storage; repeated calls are safe.
+
+        Every rank must close buffers in the same order before destroying its
+        process group. A failed close leaves the buffer usable only for a close
+        retry: all ranks retry, including those whose own HIP operations passed.
+        """
+        if self._closed:
+            return
+        if not self._quiesced:
+            if self.npes > 1 and not dist.is_initialized():
+                raise PeerMemoryError(
+                    "close peer buffers before destroying the process group"
+                )
+            torch.cuda.synchronize(self.device)
+            if self.npes > 1:
+                dist.barrier(group=self.group)
+            self._quiesced = True
+
+        def agree(error):
+            if self.npes > 1:
+                errors = [None] * self.npes
+                dist.all_gather_object(
+                    errors, str(error) if error is not None else None, group=self.group
+                )
+                if any(item is not None for item in errors):
+                    raise PeerMemoryError(
+                        f"peer buffer close failed; all ranks must retry: {errors}"
+                    ) from error
+            elif error is not None:
+                raise error
+
+        failed, error = [], None
+        for base in self._opened:
+            try:
+                _close_mapping(base)
+            except Exception as exc:
+                failed.append(base)
+                error = error or exc
+        self._opened = failed
+        # No exporter can free storage while another rank retains its mapping.
+        agree(error)
+        error = None
         if self.local:
-            self.bytes = None
-            _hip().hipFree(ctypes.c_void_p(self.local))
-            self.local = 0
+            try:
+                _free_allocation(self.local)
+            except Exception as exc:
+                error = exc
+            else:
+                self.bytes = None
+                self.local = 0
+        # Ranks which freed successfully still participate in a peer's retry.
+        agree(error)
+        self._closed = True
