@@ -287,9 +287,7 @@ def rows_store(c, regs, words, groups, xl, xsl, n, row_w=None, row_g=None):
     gpu.barrier()
 
 
-# ---- the GEMV of a bf16 activation: the FP8 weight widened to bf16 in registers, at
-# its 32 x 32 block scales (exact), on the bf16 MFMA. The rows stage through LDS one K
-# half at a time, and each wave of a row tile takes a quarter of each half.
+# ---- bf16 activations: the FP8 weight widened to bf16 at its 32 x 32 block scales (exact)
 
 
 def _half_steps(c, nsteps, split):

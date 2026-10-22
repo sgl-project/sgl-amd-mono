@@ -93,8 +93,7 @@ class FrontBuild(msgspec.Struct, frozen=True):
     tokens: int
     tp: int
     kt: bool = False  # also write K2's key table
-    # a row's window index slots: the window, or for the DSpark draft the window
-    # plus the block's keys
+    # a row's window index slots: the window, plus the block's keys for the DSpark draft
     swa_width: int = WINDOW
     shuffled: bool = False  # wqkv and wq_b in aiter's (16, 16) preshuffle
 
@@ -129,7 +128,7 @@ def stage_kt(c, t):
     tid = c["tid"]
     a = c["args"]
     cm = CM_DEV if const_expr(c.get("dev", False)) else 0
-    sw = c.get("swa_width", WINDOW)  # the window index slots of a row
+    sw = c.get("swa_width", WINDOW)
     live = ld_i32(a["slot"], a["slot_words"] * t) >= 0
     nswa = live.select(fx.min(ld_i32(a["swa_lens"], t), fx.Int32(sw)), fx.Int32(0))
     ntopk = live.select(fx.min(ld_i32(a["topk_lens"], t), fx.Int32(TOPK)), fx.Int32(0))
@@ -532,8 +531,7 @@ def run_front(
         task = fx.min(wqkv_unit, n_wqkv - 1)
         kt_from, kt_step = n_wqkv, BLOCKS - n_wqkv
     else:
-        # past one token tile, a row tile's tiles spread over the CTAs task, task +
-        # n_wqkv, ... (ROCm/ATOM's tile tasks): no CTA runs every tile in turn
+        # a row tile's token tiles on CTAs task, task + n_wqkv, .. (ROCm/ATOM), not one in turn
         task = bid % n_wqkv
         group = bid // n_wqkv
         ctas = (BLOCKS - 1 - task) // n_wqkv + 1
@@ -636,7 +634,6 @@ def run_front(
         bops = wqb_weights()
 
     stamp(c, 36)
-    # ---- q / kv norms, KV insert
     for t in range(first_task(bid, QKV0), own, BLOCKS):
         stage_qkv(c, t)
     stamp(c, 37)
@@ -646,8 +643,7 @@ def run_front(
     if const_expr(before_wqb is not None):
         # work that does not wait on q: it runs while the qkv stage finishes
         before_wqb()
-    # an index source's index query (``index_query``): its wq_b task a CTA, on
-    # the q rows wq_b reads
+    # an index source's index query (``index_query``): a wq_b task a CTA, on wq_b's q rows
     chains = c.get("iq_chains")
     if const_expr(chains is not None):
         assert index_query.IQ_TASKS == BLOCKS

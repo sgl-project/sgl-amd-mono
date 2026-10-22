@@ -1,20 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""An index source's indexer query in K1, bit for bit SGLang's decode chain
-(``spec._index_query``), whose four launches it replaces:
+"""An index source's indexer query in K1, bit for bit SGLang's decode chain.
 
-    iq      the index wq_b ([4096, 1280] e4m3, an E8M0 per 32 x 32 block): aiter's
-            group-32 GEMM of the q latent K1 quantized for its own wq_b (the same
-            MXFP8 bytes as ``mxfp8_operand``), its K chains as the GEMM's gfx950
-            config lays them at the step's rows (``iq_chains``) -> bf16 -> IQ
-    iw      the head weights: ``rocm_router_gemv_split_k`` of the normed input
-            (10 split-K partials, each 16 bf16 16x16x32 MFMAs in K order), summed
-            in split order, bf16, times the head-weight scale, bf16
-    iquant  ``_index_q_pack_weights_kernel`` a (token, head): RoPE on dims 64.. of
-            the bf16 query (separate products and sums, as the Triton kernel
-            compiles), the FP4 fake-quant (rope_tail_fake_quant_fp4_row), bf16,
-            then quantize_fp4_indexer_row (RNE) into the MQA-logits layout
-
-The indexer is replicated: every rank computes every head."""
+It replaces the four launches of ``spec._index_query``: qr's MXFP8 quant and
+aiter's group-32 GEMM with the index wq_b (``iq``, on the bytes K1 already quantized
+for its own wq_b, the same as ``mxfp8_operand``'s), the head weights (``iw``:
+``rocm_router_gemv_split_k``) and ``_index_q_pack_weights_kernel`` (``iquant``:
+RoPE, the FP4 fake-quant, the FP4 query in the MQA-logits layout). The indexer
+is replicated: every rank computes every head."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -259,6 +251,7 @@ def stage_iquant(c, a, iq, t, h, num_pos):
     cs = ld_f32(a["cos_sin"], pos * ROPE + j)
     sn = ld_f32(a["cos_sin"], pos * ROPE + ROPE // 2 + j)
     tail = lane >= DIM // 4
+    # separate products and sums, as the Triton kernel compiles
     re = bf16_round(v0 * cs - v1 * sn)
     im = bf16_round(v0 * sn + v1 * cs)
     v0 = tail.select(re, v0)
