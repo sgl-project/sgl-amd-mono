@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """DeepSeek-V4.1-Flash's DSpark draft on gfx950: its spec and forward (RFC #43949).
 
-SGLang attaches the draft model as it does the target: a routed draft step (a
-block of rows a request, run as a TARGET_VERIFY batch) runs ``_Draft.forward``,
-which takes and returns what ``DeepseekV4ForCausalLMDSpark.forward`` does. Each
-stage is the target's K1 and K2 on the draft's route (128 experts, top-3, a FP4
-group an ug task) and window (the 128-token window plus the block's keys), then
-SGLang's ``hc_post``; the head's combine reads the last stage's pre, as SGLang's
-forward does. The stages' seams follow the fused mHC boundary's arithmetic where
-SGLang's draft runs the unfused one: within the kernels' bounds, so DSpark's
-acceptance with and without the switch is the gate.
+A routed draft step (a block of rows a request, run as a TARGET_VERIFY batch) runs
+``_Draft.forward``, which takes and returns what ``DeepseekV4ForCausalLMDSpark.forward``
+does. Each stage is the target's K1 and K2 on the draft's route (128 experts, top-3, a
+FP4 group an ug task) and window (the 128-token window plus the block's keys); the
+last stage settles its post with SGLang's ``hc_post`` and the head's combine reads its
+pre, as SGLang's forward does. The stages' seams follow the fused mHC boundary's
+arithmetic where SGLang's draft runs the unfused one; the two agree within the
+kernels' bounds, so DSpark's acceptance with and without the switch is the gate.
 """
 
 from __future__ import annotations
@@ -43,8 +42,7 @@ _CKPT_SHARED = re.compile(
     r"mtp\.(?P<i>\d+)\.ffn\.shared_experts\.(?P<w>w[123])\.(?P<kind>weight|scale)"
 )
 
-# The SGLang names this module reads, by file under the sglang package (``f(p)``: a
-# parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
+# by file under sglang/ (``f(p)``: a parameter, ``"x"``: a literal); test_contract.py pins them
 SGLANG_READS = {
     "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "DeviceLimits",
@@ -197,8 +195,7 @@ class _Draft:
                 )
             x = target.embed(lm.embed_tokens, input_ids).unsqueeze(1)
             x = x.repeat(1, lm.hc_mult, 1)
-        # a stage's post folds into the next stage's K1 (as the target's layers do);
-        # the last stage settles its own
+        # a stage's post folds into the next stage's K1; the last stage settles its own
         pending, pre = (None, x, None, None), None
         for j, L in enumerate(self.stages):
             out = target._launch(
@@ -240,8 +237,7 @@ def _build(model, hf_config, ctx) -> _Draft:
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
-        # K1 on the first stage's settled residual, then folding the stage before's
-        # post; K2 on the window: no index source, no top-k
+        # K1 with and without an owed post; K2 on the window: no index source, no top-k
         runner.precompile(m, k1={(False, False), (True, False)}, k2={(False, False)})
     return _Draft(model, runner, stages)
 
@@ -256,7 +252,7 @@ SPEC = MonoSpec(
         )
     },
     features=frozenset({Feature.SPECULATIVE_DECODING}),
-    # the launcher checks the target's requirements; the capture check, this
+    # the launcher checks the target's; SGLang checks the draft runner's at its first routed step
     requires=Requirements(attention_backends=target.SPEC.requires.attention_backends),
     numerics=target.NUMERICS,
     model_disable_reasons=_model_disable_reasons,

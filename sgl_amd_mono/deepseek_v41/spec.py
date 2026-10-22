@@ -1,50 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 """DeepSeek-V4.1-Flash on gfx950: the monokernel spec and its forward (RFC #43949).
 
-SGLang's runtime switches the model's forward at attach: a routed decode or DSpark
-verify step runs ``_Built.forward`` here, which takes and returns what
-``DeepseekV4ForCausalLM.forward`` does: SGLang's input preparation, the embedding,
+A routed decode or DSpark verify step runs ``_Built.forward``, which takes and returns
+what ``DeepseekV4ForCausalLM.forward`` does: SGLang's input preparation, the embedding,
 every layer in two launches, the head's combine and norm, and SGLang's logits
 processor, with SGLang's own modules where SGLang owns the state.
 
-- Each layer is K1, then K2. K1 runs the attention seam and front and writes the
-  step's SWA KV records and K2's key table; K2 runs the attention core, wo_a,
-  wo_b, the FFN seam, the MoE and both all-reduces. The core reads KV records that
-  every workgroup of K1 wrote, and each gfx950 XCD has its own L2: a launch
-  boundary is the cheapest device-wide release.
-  - K1 folds the previous layer's pending post into the residual. Where none is
-    owed (the first layer's broadcast embedding; an Engram layer, whose Engram
-    write runs on the settled residual) it takes the residual as it is, collapsed
-    with the previous pre (copy 0 on the first).
-  - An index source (ratio 1 or 2): K1 also writes its normed input and qr, and,
-    where its indexer's chain is reproduced at the step's width, the index query
-    itself (``gfx950/attention/index_query.py``; else SGLang's ``_index_query``).
-    Between the launches, SGLang's ``forward_low_ratio_sources`` runs the layer's
-    compressor (the KV sources) on them, as SGLang runs it before the attention;
-    then K2i (``gfx950/indexer``) scores the index keys and SGLang's top-k
-    kernels write the layer's top-512 into SGLang's sparse indices of its ratio,
-    as SGLang's decode indexer decides (``_select``), and K2 builds the key table
-    from them.
-  - A window-only layer (ratio 0) reads no compressed cache.
-  - DSpark's target layers: the mean of the residual K1 rebuilds, the residual
-    SGLang's loop captures.
-  - Token parallel (``gfx950/token_par.py``, from 12 rows and a multiple of the
-    TP size): each rank's residual and mix rows past its own are stale, so after
-    the last layer one all-gather brings every row of the residual, the last pre
-    mix and the DSpark captures from its owner.
+- Every layer is K1, then K2. K1 runs the attention seam and front and writes the
+  step's SWA KV records and K2's key table; K2 runs the attention core, wo_a, wo_b,
+  the FFN seam, the MoE and both all-reduces. The core reads KV records from every K1
+  workgroup and each gfx950 XCD has its own L2, so a launch boundary is the
+  device-wide release. K1 folds the previous layer's pending post into the residual;
+  where none is owed (the first layer's broadcast embedding; an Engram layer, whose
+  write runs on the settled residual) it takes the residual as is, collapsed with the
+  previous pre (copy 0 on the first).
+- An index source (ratio 1 or 2): K1 also writes its normed input, its qr and, where
+  its indexer's chain is reproduced at the step's width, the index query
+  (``gfx950/attention/index_query.py``; else SGLang's ``_index_query``). Between the
+  launches SGLang's ``forward_low_ratio_sources`` runs a KV source's compressor on
+  them, as SGLang does before the attention; K2i (``gfx950/indexer``) scores the index
+  keys and SGLang's top-k kernels write the top-512 into SGLang's sparse indices as
+  its decode indexer decides (``_select``); K2 builds the key table from them.
+- A window-only layer (ratio 0) reads no compressed cache.
+- DSpark's target layers: K1 also writes the mean of the residual it rebuilds, the
+  residual SGLang's loop captures.
+- Token parallel (``gfx950/token_par.py``, from 12 rows and a multiple of the TP
+  size): a rank's residual and mix rows past its own are stale, so after the last
+  layer one all-gather brings every row of the residual, the last pre and the DSpark
+  captures from its owner.
 
-Every layer must be one of these; a model with another is refused. The FFN
-launch (``gfx950/layer.py``) runs in no forward: the kernel checks use it as the
-reference for K2's FFN half.
-
-The kernels read SGLang's weights in place, except the copies logged at startup:
-each covered layer's FP8 shared expert (this rank's shard, kept at load, because
-``--enforce-shared-experts-fusion`` converts it to MXFP4), the E8M0 codes of the
-f32 block scales, the f32 router bias, this rank's f32 attention sinks, the RoPE
-table (one per table: layers 0 and 1 have their own), and wo_a as MXFP8 where
-SGLang dequantized it to bf16 (K2 widens it back to bf16 in registers and keeps
-the attention output in bf16, as the normal path's wo_a does). Pad rows write KV
-slot 0, the reserved dummy slot, as the normal path does.
+A model with a layer of another kind is refused. The FFN launch (``gfx950/layer.py``)
+runs in no forward: the kernel checks use it as the reference for K2's FFN half. The
+kernels read SGLang's weights in place except the copies logged at startup: this
+rank's shard of each covered layer's FP8 shared expert
+(``--enforce-shared-experts-fusion`` converts SGLang's to MXFP4), the E8M0 codes of
+the f32 block scales, the f32 router bias, this rank's f32 attention sinks, one RoPE
+table per distinct table (layers 0 and 1 have their own), and wo_a as MXFP8 where
+SGLang dequantized it to bf16 (K2 widens it back to bf16 in registers and keeps the
+attention output in bf16, as the normal path's wo_a does). Pad rows write KV slot 0,
+the reserved dummy slot, as the normal path does.
 """
 
 from __future__ import annotations
@@ -88,12 +82,10 @@ _CKPT_SHARED = re.compile(
     r"layers\.(?P<i>\d+)\.ffn\.shared_experts\.(?P<w>w[123])\.(?P<kind>weight|scale)"
 )
 _CKPT_PROJ = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
-# the (freqs_cis, table) pairs built in this process: the target's and the DSpark
-# draft's equal tables share one copy
+# (freqs_cis, table) pairs per process, so the target and the draft share equal tables
 ROPE_TABLES: list = []
 
-# The SGLang names this glue reads, by file under the sglang package (``f(p)``: a
-# parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
+# by file under sglang/ (``f(p)``: a parameter, ``"x"``: a literal); test_contract.py pins them
 SGLANG_READS = {
     "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "MONOKERNEL_API_VERSION",
@@ -330,7 +322,7 @@ SGLANG_READS = {
     "srt/utils/common.py": ("get_bool_env_var",),
 }
 
-# Per launch output against the normal path on the same GPU (the kernel tests)
+# each launch's output against the normal path on the same GPU (the kernel tests)
 NUMERICS = Numerics(
     NumericsKind.TOLERANCE,
     {
@@ -340,9 +332,9 @@ NUMERICS = Numerics(
         # wq_b summed in another order; bf16 rounding flips only
         "k1.q.cosine": 0.99999,
         "k1.q.rel": 5e-3,
-        # an index source's normed input as the normal path's norm writes it, and
-        # its qr (q_norm's sum of squares in another order: bf16 flips)
+        # an index source's normed input as the normal path's norm writes it
         "k1.normed.max_abs": 0.0,
+        # its qr: q_norm's sum of squares in another order, so bf16 flips
         "k1.qr.rel": 4e-3,
         # K2: the attention core output, wo_a's MXFP8 output and wo_b's partial
         "k2.attn_out.cosine": 0.9998,
@@ -354,12 +346,9 @@ NUMERICS = Numerics(
         "ffn.normed.rel": 0.012,
         "ffn.moe.cosine": 0.9999,
         "ffn.moe.rel": 0.015,
-        # K2i: the index logits against SGLang's aiter FP4 logits, a row's largest
-        # difference over its largest logit (the per-lane FMA chain sums the heads
-        # in another rounding); a candidate consumer's top-512 of its candidate
-        # columns are the rows SGLang's top-k within the candidate blocks picks of
-        # the same logits, as sets
+        # K2i: a row's max difference over its max logit vs aiter's FP4 (FMA order differs)
         "k2i.logits.rel": 1e-5,
+        # a candidate consumer's top-512 as a set: SGLang's top-k in the candidate blocks
         "k2i.sel.max_abs": 0.0,
     },
 )
@@ -515,7 +504,7 @@ def _indexer_reasons(*, i: int, attn) -> list[str]:
     return reasons
 
 
-FULL_EMBEDDING = "_mono_full_embedding"  # the embedding module's whole table
+FULL_EMBEDDING = "_mono_full_embedding"
 
 
 def embed(module, input_ids: torch.Tensor) -> torch.Tensor:
@@ -534,9 +523,7 @@ def _load_tensor(copies: dict, model, name: str, tensor: torch.Tensor) -> None:
     from sglang.srt.runtime_context import get_parallel
 
     if name == "embed.weight":
-        # every rank's own copy of the vocabulary: a routed step (and the draft,
-        # which shares the module) looks a token up without the vocab-parallel
-        # embedding's all-reduce, which only adds zeros to the owning rank's row
+        # a whole copy per rank skips the vocab-parallel all-reduce, which only adds zeros
         model.model.embed_tokens.__dict__[FULL_EMBEDDING] = tensor.to(
             torch.cuda.current_device(), copy=True
         )
@@ -610,7 +597,7 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
     d, e, u8, e4m3 = Dims(p.tp_size), moe.experts, torch.uint8, torch.float8_e4m3fn
     n = moe.gate.weight.shape[0]  # the routed experts, before a fused shared one
 
-    def gate_up(kind):  # the shared expert's gate and up projections, one tensor
+    def gate_up(kind):
         parts = [copies.pop(("shared expert fp8", i, q, kind)) for q in _SHARED[:2]]
         return _keep(copies, torch.cat(parts), "shared expert fp8", i, "gate_up", kind)
 
@@ -670,7 +657,6 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
     )
     ix = getattr(a, "indexer", None)
     if ix is not None and _iq_readable(a):
-        # K1 computes the index query (``attention/index_query``) where it can
         L.k1.iq_w = ix.wq_b.weight
         L.k1.iq_ws = _codes(copies, i, "index wq_b", ix.wq_b)
         L.k1.iw_w = ix.weights_proj.weight
@@ -754,7 +740,7 @@ def _launch(
     md = backend.forward_metadata.core_attn_metadata
     if L.ratio:  # the top-k of the layer's index source (its own, after K1)
         topk = (md.sparse_page_indices(L.ratio), md.sparse_topk_lengths(L.ratio))
-    else:  # the window only
+    else:
         topk = (runner.no_topk, runner.no_topk_lens)
     keys = (md.swa_page_indices, md.swa_topk_lengths, *topk)
     if x is None:
@@ -779,16 +765,16 @@ def _launch(
 
 
 def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> None:
-    """An index source between K1 and K2. SGLang's compressor runs on K1's normed
-    input, as SGLang's low-ratio path runs it before the attention (the KV sources;
-    the other index sources read their keys). Then the layer's top-512 lands in
-    SGLang's sparse indices of its ratio as SGLang's decode indexer
-    (``low_ratio_index_topk_hip_decode``) decides, from SGLang's own functions (a
-    captured variant's answer under a graph): every row in order where SGLang
-    scores nothing; else K2i's logits of SGLang's query, then SGLang's top-k
-    kernels (``K2iRunner.select``): a FULL step's every layer, or on a two-level
-    step the candidate source (``producer``) and the layers after it inside its
-    blocks (``reindex``)."""
+    """An index source between K1 and K2.
+
+    A KV source's compressor runs on K1's normed input, as SGLang's low-ratio path
+    runs it before the attention (the other index sources read its keys). The top-512
+    then lands in SGLang's sparse indices of the ratio as SGLang's decode indexer
+    (``low_ratio_index_topk_hip_decode``) decides, asking SGLang's own functions (a
+    captured variant's answer under a graph): every row in order where SGLang scores
+    nothing, else SGLang's top-k of K2i's logits (``K2iRunner.select``) -- every layer
+    of a FULL step, or on a two-level step the candidate source (``producer``) and the
+    layers after it, inside its blocks (``reindex``)."""
     from sglang.kernels.ops.attention.dsv4 import topk_transform_paged
     from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
         low_ratio_decode_rows_are_identity,
@@ -836,8 +822,7 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
     kind = "full" if not two_level else "reindex" if ix.uses_candidates else "producer"
     if L.plane is None:  # the layer's index plane, at its first launch (eager)
         L.plane = _index_plane(L=L, M=M, meta=meta, raw_idx=raw_idx)
-    # the step's bounds of this ratio, as int32: every index source of the ratio
-    # shares them
+    # the step's int32 bounds of this ratio, shared by all its index sources
     bounds = plan.state.get(("k2i bounds", r))
     if bounds is None:
         bounds = meta.compressed_seq_lens
@@ -868,8 +853,7 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
         page_out=page_idx,
         # the candidate source's blocks of this step, for the layers after it
         candidates=plan.state["k2i candidates"] if kind == "reindex" else None,
-        # the step's REINDEX layers share their table (same blocks, page table and
-        # bounds): built at the first
+        # the step's REINDEX layers share one table (same blocks, page table, bounds)
         reindex_table_built=kind == "reindex" and ("k2i reindex", r) in plan.state,
     )
     if kind == "reindex":
@@ -994,9 +978,7 @@ class _Built:
             engram_rows = self._engram_rows(hash_ids)
         aux = None if m.dspark_layers_to_capture is None else []
         plan.state["dspark_aux"] = aux
-        # every image-token row keeps its residual through an Engram write, as in
-        # SGLang's forward: a captured graph cannot branch on whether the batch has
-        # mm inputs
+        # image rows bypass Engram on every step, as in SGLang: a graph cannot branch on mm inputs
         image = None
         if m.config.vision_n_layers > 0:
             image = (input_ids == m.config.image_token_id)[:, None, None]
@@ -1043,19 +1025,19 @@ class _Built:
         if aux is None:
             return hidden, pre_hc_head
         if tok_par:
-            # the drafter reads no residual: each rank's own rows of the head's
-            # output cross ranks with its captures, as ROCm/ATOM gathers them
+            # the drafter needs only the head's output and captures, gathered as ROCm/ATOM does
             hidden, *taps = self._gather_rows([hidden, *aux])
             aux[:] = taps
             pre_hc_head = None
         return (hidden, pre_hc_head), aux
 
     def _engram_rows(self, hash_ids) -> dict:
-        """Every Engram layer's rows of the step by hash layer, as ROCm/ATOM stages
-        them ahead of the layers: each rank gathers its shards' rows (zeros for the
-        rest) and one all-reduce reassembles them all, where SGLang's lookup runs
-        an all-reduce an Engram layer. Empty where SGLang's lookup stays (one rank,
-        a shared host table)."""
+        """Every Engram layer's rows of the step by hash layer, staged ahead of the
+        layers as ROCm/ATOM does.
+
+        Each rank gathers its shards' rows (zeros for the rest) and one all-reduce
+        reassembles them all, in place of SGLang's all-reduce per Engram layer. Empty
+        where SGLang's lookup stays (one rank, a shared host table)."""
         from sglang.kernels.ops.embeddings.engram_gather import engram_gather
         from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
         from sglang.srt.distributed.parallel_state import inplace_all_reduce
@@ -1148,8 +1130,8 @@ class _Built:
 
     def _warm_normal_moe(self) -> None:
         """At the first eager forward, run the normal MoE at 1 to MAX_ROWS rows: the
-        decode graphs no longer run it, so no later extend step compiles its
-        kernels (per rank, no collective)."""
+        decode graphs run the monokernels instead, so no later extend step compiles
+        its kernels (per rank, no collective)."""
         moe = self._normal_moe
         if moe is None or torch.cuda.is_current_stream_capturing():
             return
@@ -1199,16 +1181,14 @@ def _build(model, hf_config, ctx) -> _Built:
     if k2i:
         # the indexer's buffers, sized here: before SGLang sizes the KV cache
         runner.enable_k2i(_longest_context(hf_config))
-    # K1 with and without the owed post (the residual arrives settled on the
-    # first layer and after an Engram write), K2 with and without top-k rows
+    # K1 with and without an owed post (none on the first layer and after an Engram write)
     k1 = {
         (fold, L.index, L.k1.iq_w is not None)
         for L in layers.values()
         for fold in (True, False)
     }
     k2 = {(L.ratio > 0, L.index) for L in layers.values()}
-    # Every rank builds every width. FlyDSL's disk cache hands a rank the kernels
-    # another rank built (a lock per kernel), so each rank starts at its own share.
+    # ranks share FlyDSL's disk cache (a lock per kernel), so each starts at its own slice
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
@@ -1232,8 +1212,7 @@ SPEC = MonoSpec(
         server_args={
             "kv_cache_dtype": frozenset({"fp8_e4m3"}),
             "moe_runner_backend": frozenset({"auto", "aiter"}),
-            # the other FP8 GEMM backends reorder wqkv_a, wq_b and wo_b in place;
-            # K1 and K2 read them row-major
+            # other backends reorder wqkv_a, wq_b, wo_b in place; K1 and K2 read them row-major
             "fp8_gemm_runner_backend": frozenset({"aiter"}),
             # DSpark's target steps are uniform verify steps; other drafts differ
             "speculative_algorithm": frozenset({None, "DSPARK"}),
