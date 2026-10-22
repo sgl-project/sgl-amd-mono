@@ -102,7 +102,8 @@ sgl-amd-mono/
 │   │   ├── spec.py      # spec and forward
 │   │   ├── weights.py   # the layer views the kernels read
 │   │   └── gfx950/      # kernels and launch runner
-│   └── qwen/            # Qwen series; each model lands in its own PR
+│   ├── qwen38_moe/          # Qwen3.8 MoE; spec and kernels land in its PR
+│   └── qwen38_flash_next/   # Qwen3.8-Flash-Next; spec and kernels land in its PR
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
     ├── kernels/         # GPU: each launch against SGLang's reference ops
