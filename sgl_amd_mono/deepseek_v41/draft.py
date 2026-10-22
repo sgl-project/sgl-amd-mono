@@ -17,12 +17,21 @@ from __future__ import annotations
 import re
 
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    Feature,
-    MonoSpec,
-    Requirements,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.deepseek_v41 import spec as target
@@ -37,7 +46,12 @@ _CKPT_SHARED = re.compile(
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
-    "srt/monokernels/spec.py": ("DeviceLimits", "Feature", "MonoSpec", "Requirements"),
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
+        "DeviceLimits",
+        "Feature",
+        "MonoSpec",
+        "Requirements",
+    ),
     "kernels/ops/layernorm/mhc.py": ("mhc_combine",),
     "srt/environ.py": ("envs", "SGLANG_DSPARK_EMBED_IN_GRAPH"),
     "srt/layers/logits_processor.py": (
@@ -250,7 +264,7 @@ SPEC = MonoSpec(
     numerics=target.NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     load_tensor=_load_tensor,
     tokens_per_request=_tokens_per_request,
 )

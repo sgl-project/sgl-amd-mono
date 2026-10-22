@@ -3,7 +3,7 @@
 persistent kernels that run most of a decoder layer, including its TP
 all-reduce, in one or two launches.
 
-SGLang holds the interface (``sglang.srt.monokernels``). This package
+SGLang holds the interface (``sglang.kernels.plugin_kernels.amd``). This package
 holds the HIP device runtime (``common``) and, per model, its specs and their
 forwards (``<model>/spec.py``, ``<model>/draft.py``) and its kernels per ISA
 (``<model>/<isa>/``). SGLang loads the package as a general plugin
@@ -27,12 +27,17 @@ SPECS = {
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
-SGLANG_READS = {"srt/monokernels/spec.py": ("register",)}
+SGLANG_READS = {
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": ("register",)
+}
 
 
 def register_specs() -> None:
     """The plugin entry point, which SGLang runs in every process."""
-    from sglang.srt.monokernels.spec import register
+    try:
+        from sglang.kernels.plugin_kernels.amd.spec import register
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.monokernels.spec import register
 
     for architecture, path in SPECS.items():
         register(backend=BACKEND, architecture=architecture, path=path)

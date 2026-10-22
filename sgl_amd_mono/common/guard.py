@@ -12,7 +12,7 @@ that step's data, so its tokens are correct; nothing is checked on the host.
 
 The deadline comes from ``--watchdog-timeout`` (half of it, at most 60 s), and
 one under 5 s is refused, so that a normal delay on one rank is not a failure
-(SGLang's ``sglang.srt.monokernels.guards``). A satisfied wait costs nothing
+(SGLang's ``sglang.srt.kernel_plugins.amd.binding``). A satisfied wait costs nothing
 more, and so does a pending one that the data reaches within ``CHECK_POLLS``
 polls; a longer one checks the failure flags every ``CHECK_POLLS`` polls and its
 deadline on the 100 MHz ``s_memrealtime`` clock from the first of those checks.

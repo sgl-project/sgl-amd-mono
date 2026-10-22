@@ -34,7 +34,7 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
 )
 from sgl_amd_mono.deepseek_v41.gfx950.token_par import KG_WORDS, QX_GROUPS
 
-from . import index_query as iqm
+from . import index_query
 from .device import (
     BLOCKS,
     CM_DEV,
@@ -639,18 +639,20 @@ def run_front(
     # the q rows wq_b reads
     chains = c.get("iq_chains")
     if const_expr(chains is not None):
-        assert iqm.IQ_TASKS == BLOCKS
-        iq_load = iqm.iq_weights(c, a["iq_w"], a["iq_ws"], bid, chains)
+        assert index_query.IQ_TASKS == BLOCKS
+        iq_load = index_query.iq_weights(c, a["iq_w"], a["iq_ws"], bid, chains)
         # every step's weights in flight through the wait on q (ROCm/ATOM's iq_ops)
-        iq_ops = [iq_load(b0) for b0 in range(0, len(chains[0]), iqm.IQ_BATCH)]
+        iq_ops = [iq_load(b0) for b0 in range(0, len(chains[0]), index_query.IQ_BATCH)]
 
         def iq_batch(b0):
-            return iq_ops[b0 // iqm.IQ_BATCH]
+            return iq_ops[b0 // index_query.IQ_BATCH]
 
     def index_tile(ti, t0, n):
         if const_expr(chains is not None):
-            iqm.stage_iq(c, bid, chains, iq_batch, c["qxl"], c["qxsl"], c["iq"], t0, n)
-            publish(c, c["iqrdy"], ti * iqm.IQ_TASKS + bid)
+            index_query.stage_iq(
+                c, bid, chains, iq_batch, c["qxl"], c["qxsl"], c["iq"], t0, n
+            )
+            publish(c, c["iqrdy"], ti * index_query.IQ_TASKS + bid)
 
     if const_expr(c.get("tok_par", False)):
         # every row's q latent from QG / QGS, where its owner's qkv put it
@@ -695,5 +697,5 @@ def run_front(
             stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
             index_tile(ti, t0, n)
     if const_expr(chains is not None):
-        iqm.run_iquant(c, a, s)
+        index_query.run_iquant(c, a, s)
     stamp(c, 39)

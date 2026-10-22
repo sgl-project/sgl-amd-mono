@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """An index source's indexer query in K1, bit for bit SGLang's decode chain
 (``spec._index_query``), whose four launches it replaces:
 
