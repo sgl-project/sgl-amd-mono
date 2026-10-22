@@ -95,14 +95,14 @@ SCALE = 1.5
 LIMIT = 10.0  # swiglu_limit
 LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
-DOWN_TASKS = HIDDEN // ROWS  # 320
-# (task, slot) scale blocks a down wave holds a round: 4 spills
+DOWN_TASKS = HIDDEN // ROWS
+# (task, slot) scale blocks a down wave holds a round: at 4 the wave spills
 DOWN_R_MAX = 2
 # a down slot's K steps on this many independent MFMA accumulators
 DOWN_CHAINS = 2
 # a reduce task's columns: 32 keeps each thread's poll to 1-2 passes
 RED_COLS = 32
-RED_TASKS = HIDDEN // RED_COLS  # 160
+RED_TASKS = HIDDEN // RED_COLS
 # CTA b polls route copy b % ROUTE_COPIES, so CTAs do not serialize on one region
 ROUTE_COPIES = 8
 X8_WORDS = HIDDEN // 4
@@ -168,13 +168,13 @@ def region_pair(src, t, s, col):
 # ---------------------------------------------------------------- xq
 @flyc.jit
 def stage_xq(c, t):
-    """Token t, a group of 32 a thread."""
+    """Quantize token t's x into X8R and X8, a group of 32 a thread."""
     tid = c["tid"]
     a = c["args"]
     # thread g < 160 owns the 32 values of group g; the rest mirror thread 159
     g = fx.min(tid, HIDDEN // 32 - 1)
     mine = tid < HIDDEN // 32
-    # 32 bf16 as four 16-byte loads (a load an element made the stage issue bound)
+    # 32 bf16 as four 16-byte loads: a load an element leaves the stage issue bound
     words = [
         fx.Vector(
             bo.buffer_load(
@@ -319,7 +319,7 @@ def _score(x):
 
 @flyc.jit
 def stage_route(c, t):
-    """VLLM's topk_hash_softplus_sqrt for token t on wave 0 (f32 logits)."""
+    """vLLM's topk_hash_softplus_sqrt for token t on wave 0 (f32 logits)."""
     lane, wave = c["lane"], c["wave"]
     experts, topk = c["rs"].experts, c["rs"].topk
     a = c["args"]
@@ -439,14 +439,14 @@ def load_route(c, tab):
         for k in range_constexpr(3):
             fx.ptr_store(totals[k].bitcast(fx.Float32), sums + (wave * 3 + k))
     gpu.barrier()
-    below_c = [fx.Int32(0), fx.Int32(0), fx.Int32(0)]  # n_u, first, tile0
+    below_c = [fx.Int32(0), fx.Int32(0), fx.Int32(0)]
     for j in range_constexpr(chunks - 1):
         for k in range_constexpr(3):
             v = fx.ptr_load(sums + (j * 3 + k)).bitcast(fx.Int32)
             below_c[k] = below_c[k] + (j < wave).select(v, fx.Int32(0))
     n_u, first, tile0 = below_c
     slot = n_u + lanes_below(ball, lane)
-    # e afresh: hoisted, its address held a VGPR across the prefix sums (spill)
+    # e afresh: hoisted, its address would hold a VGPR across the prefix sums and spill
     e_at = fresh(e)
     if wave < chunks:
         fx.ptr_store(slot, tab + (rs.expert_slot0 + e_at))
@@ -607,10 +607,12 @@ def gemv_fp4_pair(c, w, ws, e, n_rows, k, rg0, ks, xl, xsl, scale_cols, col):
 
 
 def ug_rounds(k, ks, slices):
-    """Return K slice ``ks``'s rounds: (first scale step loaded, first step, steps,
-    scale steps loaded). Halves: the 8-step scale blocks 2 r + ks, an odd last
-    block split 4 + 4. Quarters: steps 8 i + 2 ks and + 1 of each block i, a round
-    loading only their scales (the shuffled layout keeps 2 steps' together)."""
+    """Return K slice ``ks``'s rounds (first scale step loaded, first step, steps, scale steps loaded).
+
+    Halves: the 8-step scale blocks 2 r + ks, an odd last block split 4 + 4. Quarters: steps
+    8 i + 2 ks and + 1 of each block i, a round loading only their scales (the shuffled
+    layout keeps 2 steps' together).
+    """
     blocks = k // 128 // 8
     if slices == 4:
         return [(fx.Int32(8 * i) + ks * 2,) * 2 + (2, 2) for i in range(blocks)]
@@ -735,7 +737,7 @@ def fp4_pair_mfma(c, k, xl, xsl, st0, n, avs, sas, accs, col):
 
 
 def fp8_operand(halves):
-    """Load a lane's MXFP8 MFMA operand of a K step."""
+    """Pack a lane's MXFP8 MFMA operand of a K step from its two 16-byte halves."""
     return fx.Vector.from_elements(
         [h[d] for h in halves for d in range(4)],
         fx.Int32,
@@ -748,7 +750,7 @@ def down_lds_words(n):
 
 
 def st_dev(v, region, i):
-    """Load word i of scratch ``region`` at device scope."""
+    """Store v at word i of scratch ``region`` at device scope."""
     bo.buffer_store(v, rsrc(region.value), i, cache_modifier=CM_DEV)
 
 
@@ -796,7 +798,7 @@ def ug_red_slot(rs, p, bb, ks, t):
 
 
 def pairwise_sum(vs):
-    """Vs summed as a balanced tree, neighbours first: (v0 + v1) + (v2 + v3)."""
+    """Sum ``vs`` as a balanced tree, neighbours first: (v0 + v1) + (v2 + v3)."""
     while len(vs) > 1:
         vs = [vs[i] + vs[i + 1] for i in range(0, len(vs), 2)]
     return vs[0]
@@ -903,7 +905,7 @@ def gather_x8r(c, first, count):
 
 @flyc.jit
 def ug_epilogue(c, part0, idx, first, count):
-    """Return thread ``idx``'s silu x up value, its group's MXFP8 scale and its MID byte."""
+    """Quantize thread ``idx``'s silu x up value into MID, its group's scale code into MIDS."""
     lane, red, d, rs = c["lane"], c["red"], c["d"], c["rs"]
     cols = rs.tile_picks
     if idx < rs.ug_groups * cols * UG_PART:
@@ -957,8 +959,7 @@ def stage_down(c, tasks):
     slots = DOWN_R_MAX // n
     per_round = WAVES * slots
     rounds = (nu + per_round - 1) // per_round
-    # round 0's loads go out before the shared expert's down, and each later
-    # round's while the one before it multiplies (a round past U reloads the last)
+    # round r + 1's loads go out while round r multiplies, round 0's before the shared down
     loads = down_weights(c, tasks, 0, slots, nu)
     # the shared expert's down projection first: its input is ready long before the routed results
     down_shared(c, tasks)
@@ -1023,7 +1024,7 @@ def take_down_rank(c):
 
 
 def down_weights(c, tasks, rnd, slots, nu):
-    """Issue round ``rnd``'s scale blocks and weight loads of ``stage_down``."""
+    """Issue ``stage_down`` round ``rnd``'s scale and weight loads; a slot past U reloads the last."""
     s, wave, tab, a, d = c["S"], c["wave"], c["tab"], c["args"], c["d"]
     us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
     es = [c["rs"].union_expert(tab, s, fx.min(u, nu - 1)) for u in us]
@@ -1064,7 +1065,7 @@ def mid_operands(c, first, count):
                 )
             )
             if const_expr(st * 128 + 64 * h + 48 >= d.inter_real):
-                # MID columns past the real intermediate hold stale bytes: zero them, as a NaN passes zero weights
+                # MID past the real intermediate is stale: zero it, as NaN * a zero weight is NaN
                 past = st * 128 + 64 * h + 16 * j >= d.inter_real
                 v = past.select(fx.Vector.filled(4, 0, fx.Int32), v)
             halves.append(v)
@@ -1101,7 +1102,7 @@ def mid_code_index(d, row, group):
 
 
 def down_ug_flags(c, ucs):
-    """Poll this lane's ug flags of a down round's slots."""
+    """Return this lane's ug flags of a down round's slots."""
     rs = c["rs"]
     ug_parts = rs.ug_parts
     per_slot = rs.slot_tiles * ug_parts if rs.multi else ug_parts
@@ -1252,7 +1253,7 @@ def load_smid_tile(c, t0, n, groups):
 # ---------------------------------------------------------------- reduce
 @flyc.jit
 def stage_reduce(c, task):
-    """Sum columns 128 task .. of the TP partials in rank order, fp32 -> bf16 -> ``out``."""
+    """Sum columns ``RED_COLS`` task .. of the TP partials in rank order, fp32 -> bf16 -> ``out``."""
     s, tid = c["S"], c["tid"]
     for pas in range_constexpr(0, s * RED_COLS // 2, THREADS):
         reduce_pair(c, task, pas + tid)
@@ -1260,7 +1261,7 @@ def stage_reduce(c, task):
 
 @flyc.jit
 def reduce_pair(c, task, idx):
-    """Thread ``idx``'s column pair of token idx / 64."""
+    """Thread ``idx``'s column pair of token ``idx // (RED_COLS // 2)``."""
     s, tp = c["S"], c["d"].tp
     a = c["args"]
     if idx < s * RED_COLS // 2:
@@ -1408,9 +1409,7 @@ def run_moe(c, key, bid, before_ug=None):
         while task < ug_total:
             task = stage_ug_tile(c, task, ug_total)
     else:
-        # one token tile: every task placed (its x in LDS once a CTA), on the CTAs
-        # without a shared unit: those reach ug ~10 us later and, given tasks,
-        # ended last (``ug0`` puts them at the last offsets)
+        # one token tile: every task placed; shared-unit CTAs reach ug late, so take none (``ug0``)
         loaded = fx.Int32(0)
         free = BLOCKS - c["rs"].shared_units
         at = first_task(bid, c["rs"].ug0)
@@ -1426,7 +1425,7 @@ def run_moe(c, key, bid, before_ug=None):
             load_route(c, c["tab"])
     stamp(c, 24)
     assert BLOCKS < DOWN_TASKS <= 2 * BLOCKS
-    # every CTA its tile; the first CTAs here take the DOWN_TASKS - BLOCKS extra tiles
+    # every CTA its tile; the first DOWN_TASKS - BLOCKS CTAs to arrive take the extra tiles
     down_task = first_task(bid, DOWN0)
     rank = take_down_rank(c)
     if rank < DOWN_TASKS - BLOCKS:
