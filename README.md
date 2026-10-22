@@ -18,6 +18,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | 41 of the 42 MoE layers, all but the last (one launch each), in decode steps of up to 8 rows (4 at TP2) |
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
+| Qwen3.8-27B (Quark MXFP4) | MI350X, MI355X (gfx950) | 1, 2 | The FFN of every layer and the gated delta net of the linear-attention layers, in decode steps of up to 4 rows at TP1 and 8 at TP2 |
 
 ### Design
 
@@ -114,10 +115,14 @@ sgl-amd-mono/
 │   │   ├── spec.py      # spec and forward
 │   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
 │   │   └── gfx950/      # kernels and launch runner
-│   └── minimax_m3/
+│   ├── minimax_m3/
+│   │   ├── spec.py      # spec and forward
+│   │   ├── weights.py   # the layer views the kernels read
+│   │   └── gfx950/      # kernels and launch runner
+│   └── qwen3_8_dense/
 │       ├── spec.py      # spec and forward
-│       ├── weights.py   # the layer views the kernels read
-│       └── gfx950/      # kernels and launch runner
+│       ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
+│       └── gfx950/      # kernels, weights and launch runner
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
     ├── kernels/         # GPU: each launch against SGLang's reference ops
@@ -127,11 +132,12 @@ sgl-amd-mono/
 ## Testing
 
 ```bash
-pytest test/unit                                                # CPU only
-pytest test/kernels test/e2e -k "not glm53 and not minimax_m3"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
-pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
-pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
-pytest test/kernels test/e2e -k minimax_m3                      # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
+pytest test/unit                                                                      # CPU only
+pytest test/kernels test/e2e -k "not glm53 and not minimax_m3 and not qwen3_8_dense"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k glm53_flash                                           # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
+pytest test/e2e -k "glm53 and not glm53_flash"                                        # GLM_53_MODEL_PATH set: server at TP8
+pytest test/kernels test/e2e -k minimax_m3                                            # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
+pytest test/kernels test/e2e -k qwen3_8_dense                                         # 2 x MI350X or MI355X, QWEN3_8_27B_MODEL_PATH set
 ```
 
 ## Contributing
