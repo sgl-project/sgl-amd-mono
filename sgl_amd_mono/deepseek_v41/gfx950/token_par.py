@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at 5e8d913, MIT License,
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/models/deepseek_v41/mono/kernels/token_par.py and peer_layout.py
