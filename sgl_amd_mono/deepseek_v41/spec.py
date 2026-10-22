@@ -55,15 +55,27 @@ from typing import Any
 
 import msgspec
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    Feature,
-    MonoSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-    StepMetadata,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+        StepMetadata,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+        StepMetadata,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.deepseek_v41 import CANDIDATES, HF_CONFIG
@@ -83,7 +95,7 @@ ROPE_TABLES: list = []
 # The SGLang names this glue reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
-    "srt/monokernels/spec.py": (
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "MONOKERNEL_API_VERSION",
         "DeviceLimits",
         "Feature",
@@ -1093,7 +1105,7 @@ SPEC = MonoSpec(
     numerics=NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
     load_tensor=_load_tensor,
     # a routed step scores every index source with K2i (_select)

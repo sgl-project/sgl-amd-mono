@@ -699,6 +699,8 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
         "sym": own,
         "args": {n: a[n] for n in seam_args} | {"norm_w": a["ffn_w"]},
         "d": StageDims(tp),
+        # SGLang's Triton boundary + rmsnorm arithmetic (seam.slice_row, stage_norm)
+        "sgl": True,
     }
     if const_expr(key.timeline):
         ca["tl"] = timeline_row(scratch, layout["timeline"][0], bid)

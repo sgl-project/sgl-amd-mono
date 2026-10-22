@@ -33,13 +33,23 @@ import os
 
 import msgspec
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    MonoSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.glm53_flash import (
@@ -138,7 +148,7 @@ SGLANG_READS = {
         "lm_head",
         "forward(prev_topk_indices)",
     ),
-    "srt/monokernels/spec.py": (
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "DeviceLimits",
         "MonoSpec",
         "Numerics",
@@ -736,6 +746,6 @@ SPEC = MonoSpec(
     numerics=NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
 )

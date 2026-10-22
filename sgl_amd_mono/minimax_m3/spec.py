@@ -27,14 +27,25 @@ import logging
 import os
 
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    Feature,
-    MonoSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.minimax_m3 import HF_CONFIG, LAYER_LIMIT, SWIGLU_ALPHA
@@ -51,7 +62,7 @@ SHARED_WEIGHT = 1.0
 # The SGLang names this glue reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
-    "srt/monokernels/spec.py": (
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "MONOKERNEL_API_VERSION",
         "DeviceLimits",
         "Feature",
@@ -63,7 +74,9 @@ SGLANG_READS = {
         "tokens_per_request",
         "forward_mode",
     ),
-    "srt/monokernels/runtime.py": ('"target_verify"',),
+    "srt/kernel_plugins/amd/binding.py|srt/monokernels/runtime.py": (
+        '"target_verify"',
+    ),
     "srt/arg_groups/fields/*.py": (
         "kv_cache_dtype",
         "page_size",
@@ -531,6 +544,6 @@ SPEC = MonoSpec(
     numerics=NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
 )
