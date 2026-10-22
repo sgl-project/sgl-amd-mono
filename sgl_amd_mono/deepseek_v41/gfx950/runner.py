@@ -298,6 +298,11 @@ class DSV41MonoRunner:
 
         self.tp, self.rank = tp, rank
         self.route = dict(experts=experts, topk=topk, swa_width=swa_width)
+        if ug_groups not in (None, 1, 2):
+            raise ValueError(
+                f"ug_groups is the FP4 groups an ug task takes, 1 or 2 (None: by "
+                f"width), got {ug_groups}"
+            )
         self.ug_groups = ug_groups
         # each launch marks its stages in its width's scratch (``timeline``)
         self.timeline_on = os.environ.get("SGLANG_AMD_MONO_TIMELINE") == "1"
@@ -394,7 +399,9 @@ class DSV41MonoRunner:
         """The route every launch and the scratch of this width share: below
         ``FINE_UG_ROWS`` rows an ug task takes one FP4 group, so twice the tasks end
         closer together (ROCm/ATOM's fine ug); the draft fixes its own."""
-        ug = self.ug_groups or (1 if tokens < FINE_UG_ROWS else 2)
+        ug = self.ug_groups
+        if ug is None:
+            ug = 1 if tokens < FINE_UG_ROWS else 2
         return {**self.route, "ug_groups": ug}
 
     def timeline(self, tokens: int) -> torch.Tensor:

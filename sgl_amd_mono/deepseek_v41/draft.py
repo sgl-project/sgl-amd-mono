@@ -180,6 +180,11 @@ class _Draft:
         lm = self.lm
         x = input_embeds
         if x is None:  # ``forward_embed``, from the target's whole table
+            if lm.embed_tokens is None:
+                raise ValueError(
+                    "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
+                    "(call attach_shared_modules first)."
+                )
             x = target.embed(lm.embed_tokens, input_ids).unsqueeze(1)
             x = x.repeat(1, lm.hc_mult, 1)
         # a stage's post folds into the next stage's K1 (as the target's layers do);
