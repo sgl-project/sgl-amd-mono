@@ -18,10 +18,11 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | 41 of the 42 MoE layers, all but the last (one launch each), in decode steps of up to 8 rows (4 at TP2) |
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
+| Qwen3.8 MoE (MXFP4) | MI355X (gfx950) | 8 | All 92 layers in decode steps of up to 8 rows, and the layer tail (K2) of all 92 in NEXTN verify steps of up to 8 rows |
 
 ### Design
 
-- **One or two launches per layer.** DeepSeek-V4.1-Flash runs two. K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits. GLM-5.3-Flash and GLM-5.3 run each covered layer as one launch. MiniMax-M3 runs one too: K1 (the input norm, the fused qkv and index projection, the q / k norms, RoPE, the KV and index-key writes and the index scores) runs in front of the block selection, the sparse attention, o_proj, the router, the MoE and both all-reduces, in one launch.
+- **One or two launches per layer.** DeepSeek-V4.1-Flash runs two. K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits. GLM-5.3-Flash and GLM-5.3 run each covered layer as one launch. MiniMax-M3 runs one too: K1 (the input norm, the fused qkv and index projection, the q / k norms, RoPE, the KV and index-key writes and the index scores) runs in front of the block selection, the sparse attention, o_proj, the router, the MoE and both all-reduces, in one launch. Qwen3.8 MoE runs two on its 69 Gated DeltaNet layers: K1 runs the input norm, the GDN projections, the conv and the gated delta rule with their state updates, and the gated norm. K2 runs out_proj (o_proj on the attention layers), the post-attention norm, the router, the experts and both all-reduces. Its 23 full-attention layers run SGLang's attention, then K2.
 - **Graph-safe routing.** Each step is routed by its CUDA graph key alone, so every rank makes the same decision and a captured graph replays the decision made at capture.
 - **Fail-stop synchronization.** Every wait on another workgroup or GPU has a deadline. A failed wait stops the launch on every rank, so no token from a failed step is returned.
 - **In-place weights.** The kernels read the weights SGLang loaded. The few weights that need another layout or precision (MiniMax-M3's attention projections run in FP8) are copied once at startup, and each copy is logged.
@@ -34,6 +35,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 - ROCm with FlyDSL and AITER, as included in SGLang's ROCm images
 - AMD Instinct MI350X or MI355X
 - MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--monokernel-backend amd` refuses MiniMax-M3 and names them.
+- Qwen3.8 MoE refuses the fused shared expert (`--enforce-shared-experts-fusion`) until [sgl-project/sglang#41899](https://github.com/sgl-project/sglang/pull/41899) merges, and the MXFP4 GDN projections until [sgl-project/sglang#43839](https://github.com/sgl-project/sglang/pull/43839) merges.
 
 ### Installation
 
@@ -114,9 +116,13 @@ sgl-amd-mono/
 │   │   ├── spec.py      # spec and forward
 │   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
 │   │   └── gfx950/      # kernels and launch runner
-│   └── minimax_m3/
+│   ├── minimax_m3/
+│   │   ├── spec.py      # spec and forward
+│   │   ├── weights.py   # the layer views the kernels read
+│   │   └── gfx950/      # kernels and launch runner
+│   └── qwen38_moe/
 │       ├── spec.py      # spec and forward
-│       ├── weights.py   # the layer views the kernels read
+│       ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
 │       └── gfx950/      # kernels and launch runner
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
@@ -128,10 +134,11 @@ sgl-amd-mono/
 
 ```bash
 pytest test/unit                                                # CPU only
-pytest test/kernels test/e2e -k "not glm53 and not minimax_m3"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k "not glm53 and not minimax_m3 and not qwen38"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
 pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k minimax_m3                      # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
+pytest test/kernels test/e2e -k qwen38                          # 8 x MI355X, QWEN38_MOE_MODEL_PATH set: K1 on 1 GPU, K2 on 8, server at TP8
 ```
 
 ## Contributing
