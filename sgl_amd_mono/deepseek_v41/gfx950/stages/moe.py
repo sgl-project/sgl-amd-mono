@@ -52,6 +52,7 @@ from sgl_amd_mono.common.plan import (
     first_task,
     pair_layout,
 )
+from sgl_amd_mono.common.stamps import stamp
 from sgl_amd_mono.common.sync import (
     preg,
     publish,
@@ -85,10 +86,8 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.router import (
     router_weight_loads,
     router_x_loads,
 )
-from sgl_amd_mono.deepseek_v41.gfx950.stages.seam import (
-    HIDDEN,
-    attn_peer_bytes,
-)
+from sgl_amd_mono.deepseek_v41.gfx950.stages.seam import HIDDEN
+from sgl_amd_mono.deepseek_v41.gfx950.token_par import peer_offsets
 
 # a pick tile is a token tile's MFMA N: ``gather_x8r`` fills one from the other
 assert mplan.TILE == TILE
@@ -160,16 +159,6 @@ def scratch_layout(key: MoeBuild) -> dict[str, tuple[int, int]]:
         "dq": TAGS // 2,
     }
     return pair_layout(pairs.items())
-
-
-def peer_bytes(tokens: int, tp: int) -> int:
-    """FFN: ``[source rank][token][hidden / 2]`` bf16 pairs."""
-    return tp * tokens * HIDDEN // 2 * 8
-
-
-def ffn_offset(tokens: int, tp: int) -> int:
-    """FFN's byte offset in the peer buffer: past the ATTN region."""
-    return attn_peer_bytes(tokens, tp)
 
 
 def region_pair(src, t, s, col):
@@ -263,8 +252,20 @@ def put_mxfp8_group_vllm(c, words_mb, codes_mb, t, g, v, amax):
 
 
 # ---------------------------------------------------------------- router
+ROUTER_EARLY_FROM = 12  # rows from which the router loads its gate rows early
+
+
+def router_weights(c, task):
+    """The router task's gate rows, loaded (``stage_router`` takes them early)."""
+    per_group = c["rs"].experts // ROWS * ROUTER_PARTS
+    tile, part = task % per_group // ROUTER_PARTS, task % ROUTER_PARTS
+    return router_weight_loads(
+        c["args"]["gate_w"], tile, part, c["lane"], c["wave"], CM_NT
+    )
+
+
 @flyc.jit
-def stage_router(c, task):
+def stage_router(c, task, wvs=None):
     """Router task: K part ``part`` of gate rows 16 ``tile`` .. times the group's tokens -> f32 sum."""
     s, tid, red, lane, wave = c["S"], c["tid"], c["red"], c["lane"], c["wave"]
     a = c["args"]
@@ -283,7 +284,8 @@ def stage_router(c, task):
         )
         for j0 in range(0, per, TILE)
     ]
-    wvs = router_weight_loads(a["gate_w"], tile, part, lane, wave, CM_NT)
+    if const_expr(wvs is None):
+        wvs = router_weights(c, task)
     xs = [router_x_loads(a["x"], part, n, lane, wave, CM_DEV, t0) for t0, n in tiles]
     for (t0, n), xvs in zip(tiles, xs):
         router_tile_mfma(wvs, xvs, lane, wave, red)
@@ -323,6 +325,8 @@ def stage_route(c, t):
     a = c["args"]
     if wave == 0:
         ept = experts // 64
+        # the bias in flight before the logits' wait
+        bias = [ld_f32(a["bias"], lane + 64 * i) for i in range(ept)]
         # each logit's router part sums, added in part order (vLLM's gate: f32 out)
         assert ROUTER_PARTS == 4
         got = c["poll"](
@@ -345,7 +349,7 @@ def stage_route(c, t):
             sc = _score(logits[i])
             # aiter's NaN guards: a NaN score weighs 0 and never wins
             orig.append(fx.isnan(sc).select(fx.Float32(0.0), sc))
-            vals.append(fx.max(sc + ld_f32(a["bias"], e), fx.Float32(float("-inf"))))
+            vals.append(fx.max(sc + bias[i], fx.Float32(float("-inf"))))
             idxs.append(e)
         for p, q in c["rs"].sort_net:
             sw = vals[p] < vals[q]
@@ -952,20 +956,24 @@ def stage_down(c, tasks):
     # slots of U a round: the loads of a round stay the same
     slots = DOWN_R_MAX // n
     per_round = WAVES * slots
+    rounds = (nu + per_round - 1) // per_round
+    # round 0's loads go out before the shared expert's down, and each later
+    # round's while the one before it multiplies (a round past U reloads the last)
+    loads = down_weights(c, tasks, 0, slots, nu)
     # the shared expert's down projection first: its input is ready long before the routed results
     down_shared(c, tasks)
-    for rnd in range(0, (nu + per_round - 1) // per_round, 1):
-        # issue every load of the round's slots before the first wait (a slot past U reloads the last)
+    for rnd in range(0, rounds, 1):
+        svs, avs = loads
         us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
         ucs = [fx.min(u, nu - 1) for u in us]
         firsts = [c["rs"].slot_first(tab, u) for u in ucs]
-        svs, avs = down_weights(c, tasks, rnd, slots, nu)
         # wait only on this round's slots' ug tasks
         c["poll"]([(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)])
         counts = [c["rs"].slot_first(tab, u + 1) - f for u, f in zip(ucs, firsts)]
         mids = [mid_operands(c, f, k) for f, k in zip(firsts, counts)]
         for q in range_constexpr(len(svs)):
             scale_block_store(c, svs[q], sl + q * sw)
+        loads = down_weights(c, tasks, rnd + 1, slots, nu)
         for i in range_constexpr(slots):
             for j in range_constexpr(n):
                 down_mfma(
@@ -1169,9 +1177,16 @@ def down_combine(c, task, j, t0, n):
         v0 = fx.ptr_load(c["pair"] + (tl * ROWS + 2 * rp))
         v1 = fx.ptr_load(c["pair"] + (tl * ROWS + 2 * rp + 1))
         col = task * ROWS + 2 * rp
+        own = c["own"]
         for p in range_constexpr(d.tp):
             dst = preg(c["peer_addr"](p), c["ffn_off"], "ffn")
-            c["put_bf"](dst, 2 * region_pair(c["rank"], t, s, col), [v0, v1])
+            if const_expr(own is None):
+                c["put_bf"](dst, 2 * region_pair(c["rank"], t, s, col), [v0, v1])
+            else:
+                # token parallel: to the row's owner alone, at its row there
+                if t // own == p:
+                    pair = region_pair(c["rank"], t - p * own, own, col)
+                    c["put_bf"](dst, 2 * pair, [v0, v1])
     gpu.barrier()
 
 
@@ -1324,7 +1339,9 @@ def moe_context(s, rs, lds, mb, bases, layout, scratch, args, rank, sym):
         "peer_addr": lambda p: bases[p],
         "rank": rank,
         "sym": sym,
-        "ffn_off": ffn_offset(s, rs.tp),
+        "ffn_off": peer_offsets(s, rs.tp)["ffn"],
+        # token parallel: the down sums to each row's owner, ``own`` rows a rank
+        "own": None,
         "rs": rs,
         "d": rs.dims,
         "args": args,
@@ -1349,12 +1366,17 @@ def run_moe(c, key, bid, before_ug=None):
         await_x(c, [t])
         stage_xq(c, t)
         publish(c["put"], c["x8rdy"], t, 1, tid == 0)
+    stamp(c, 19)
     multi = len(token_tiles(s)) > 1
     for task in range(first_task(bid, c["rs"].router0), router_tasks, BLOCKS):
+        # wide, the gate rows go out before x's wait (narrower it is slower: ROCm/ATOM)
+        wvs = router_weights(c, task) if const_expr(s >= ROUTER_EARLY_FROM) else None
         await_x(c, list(range(s)))
-        stage_router(c, task)
+        stage_router(c, task, wvs)
+    stamp(c, 20)
     for t in range(first_task(bid, route0), s, BLOCKS):
         stage_route(c, t)
+    stamp(c, 21)
     c["xl"], c["xsl"] = c["x8l"], c["x8sl"]
     # one shared unit a CTA at most: straight-line code, so LLVM does not hoist its loads
     assert c["rs"].shared_units <= BLOCKS
@@ -1373,6 +1395,7 @@ def run_moe(c, key, bid, before_ug=None):
             n = fx.min(fx.Int32(TILE), s - t0)
             load_x8_rows(c, "x8", "x8s", c["x8l"], c["x8sl"], lambda j: t0 + j, n)
             stage_shared(c, unit % shared_tasks, gops, t0, n)
+    stamp(c, 22)
     if const_expr(before_ug is not None):
         before_ug()
     c["xl"], c["xsl"] = c["x8rl"], c["x8rsl"]
@@ -1385,19 +1408,24 @@ def run_moe(c, key, bid, before_ug=None):
         while task < ug_total:
             task = stage_ug_tile(c, task, ug_total)
     else:
-        # one token tile: every task placed (its x in LDS once a CTA)
+        # one token tile: every task placed (its x in LDS once a CTA), on the CTAs
+        # without a shared unit: those reach ug ~10 us later and, given tasks,
+        # ended last (``ug0`` puts them at the last offsets)
         loaded = fx.Int32(0)
-        for task in range(first_task(bid, c["rs"].ug0), ug_tasks, BLOCKS):
+        free = BLOCKS - c["rs"].shared_units
+        at = first_task(bid, c["rs"].ug0)
+        for task in range(at, (at < free).select(fx.Int32(ug_tasks), at), free):
             if loaded == 0:
                 # X8R first: it is ready long before the routing
                 load_x8_rows(c, "x8r", "x8rs", c["x8rl"], c["x8rsl"], lambda j: j, s)
                 load_route(c, c["tab"])
             loaded = fx.Int32(1)
             stage_ug(c, task)
+        if loaded == 0:
+            # no ug task here: the down stage still reads the route table
+            load_route(c, c["tab"])
+    stamp(c, 24)
     assert BLOCKS < DOWN_TASKS <= 2 * BLOCKS
-    # load the route table unless an earlier stage of this CTA loaded it
-    if const_expr(not multi and ug_tasks <= BLOCKS):
-        load_route(c, c["tab"])
     # every CTA its tile; the first CTAs here take the DOWN_TASKS - BLOCKS extra tiles
     down_task = first_task(bid, DOWN0)
     rank = take_down_rank(c)
@@ -1405,8 +1433,12 @@ def run_moe(c, key, bid, before_ug=None):
         stage_down(c, [down_task, BLOCKS + rank])
     else:
         stage_down(c, [down_task])
+    stamp(c, 25)
+    # token parallel: this rank's rows' sums alone, ``out`` from its first row
+    cr = c if const_expr(c["own"] is None) else c["own_view"]
     for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
-        stage_reduce(c, task)
+        stage_reduce(cr, task)
+    stamp(c, 26)
 
 
 def await_x(c, tokens):

@@ -16,7 +16,9 @@ processor, with SGLang's own modules where SGLang owns the state.
     owed (the first layer's broadcast embedding; an Engram layer, whose Engram
     write runs on the settled residual) it takes the residual as it is, collapsed
     with the previous pre (copy 0 on the first).
-  - An index source (ratio 1 or 2): K1 also writes its normed input and qr.
+  - An index source (ratio 1 or 2): K1 also writes its normed input and qr, and,
+    where its indexer's chain is reproduced at the step's width, the index query
+    itself (``gfx950/attention/index_query.py``; else SGLang's ``_index_query``).
     Between the launches, SGLang's ``forward_low_ratio_sources`` runs the layer's
     compressor (the KV sources) on them, as SGLang runs it before the attention;
     then K2i (``gfx950/indexer``) scores the index keys and SGLang's top-k
@@ -26,6 +28,10 @@ processor, with SGLang's own modules where SGLang owns the state.
   - A window-only layer (ratio 0) reads no compressed cache.
   - DSpark's target layers: the mean of the residual K1 rebuilds, the residual
     SGLang's loop captures.
+  - Token parallel (``gfx950/token_par.py``, from 12 rows and a multiple of the
+    TP size): each rank's residual and mix rows past its own are stale, so after
+    the last layer one all-gather brings every row of the residual, the last pre
+    mix and the DSpark captures from its owner.
 
 Every layer must be one of these; a model with another is refused. The FFN
 launch (``gfx950/layer.py``) runs in no forward: the kernel checks use it as the
@@ -49,15 +55,27 @@ from typing import Any
 
 import msgspec
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    Feature,
-    MonoSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-    StepMetadata,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+        StepMetadata,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+        StepMetadata,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.deepseek_v41 import CANDIDATES, HF_CONFIG
@@ -77,7 +95,7 @@ ROPE_TABLES: list = []
 # The SGLang names this glue reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
-    "srt/monokernels/spec.py": (
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "MONOKERNEL_API_VERSION",
         "DeviceLimits",
         "Feature",
@@ -219,7 +237,25 @@ SGLANG_READS = {
         "get_token_to_kv_pool",
     ),
     "srt/configs/deepseek_v4.py": ("vision_n_layers", "image_token_id"),
-    "srt/layers/engram.py": ("layer_hash_index", "forward(cp_all_tokens)"),
+    "srt/layers/engram.py": (
+        "layer_hash_index",
+        "forward(cp_all_tokens)",
+        "engram_gate",
+        "embed",
+        "wkv",
+        "q_weight",
+        "k_weight",
+        "eps",
+        "clamp_value",
+        "_shared",
+        "_table_ptrs",
+        "row_start",
+        "rows",
+        "tp_size",
+        "dim",
+    ),
+    "kernels/ops/embeddings/engram_gather.py": ("engram_gather",),
+    "kernels/ops/quantization/fp4_fake_quant.py": ("FP8_BLOCK_SIZE",),
     "srt/models/deepseek_common/amd/deepseek_v4_hip.py": ("hc_boundary_fused",),
     "srt/models/deepseek_v2.py": (
         "experts",
@@ -279,6 +315,12 @@ SGLANG_READS = {
         "compress_ratio",
     ),
     "srt/configs/model_config.py": ("context_len",),
+    # a token-parallel step's rows from their owners (``_gather_rows``)
+    "srt/distributed/parallel_state.py": (
+        "get_tp_group",
+        "all_gather(dim)",
+        "inplace_all_reduce",
+    ),
     "srt/runtime_context.py": (
         "get_parallel",
         '"tp_rank"',
@@ -459,12 +501,32 @@ def _indexer_reasons(*, i: int, attn) -> list[str]:
     return reasons
 
 
+FULL_EMBEDDING = "_mono_full_embedding"  # the embedding module's whole table
+
+
+def embed(module, input_ids: torch.Tensor) -> torch.Tensor:
+    """The tokens' embeddings: from the whole table kept at load, else the module."""
+    full = module.__dict__.get(FULL_EMBEDDING)
+    if full is None:
+        return module(input_ids)
+    return torch.nn.functional.embedding(input_ids, full)
+
+
 def _load_tensor(copies: dict, model, name: str, tensor: torch.Tensor) -> None:
-    """Keep this rank's shard of each covered layer's FP8 shared expert, by its
-    checkpoint name (``layers.{i}.ffn.shared_experts.{w1,w2,w3}.{weight,scale}``;
-    the checkpoint's ``mtp.*`` layers do not match)."""
+    """Keep the whole embedding table, and this rank's shard of each covered
+    layer's FP8 shared expert, by its checkpoint name
+    (``layers.{i}.ffn.shared_experts.{w1,w2,w3}.{weight,scale}``; the checkpoint's
+    ``mtp.*`` layers do not match)."""
     from sglang.srt.runtime_context import get_parallel
 
+    if name == "embed.weight":
+        # every rank's own copy of the vocabulary: a routed step (and the draft,
+        # which shares the module) looks a token up without the vocab-parallel
+        # embedding's all-reduce, which only adds zeros to the owning rank's row
+        model.model.embed_tokens.__dict__[FULL_EMBEDDING] = tensor.to(
+            torch.cuda.current_device(), copy=True
+        )
+        return
     m = _CKPT_SHARED.fullmatch(name)
     if m is None or int(m["i"]) not in _covered_layers(model.config):
         return
@@ -592,6 +654,13 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         wqb_s=_codes(copies, i, "wq_b", a.wq_b),
         cos_sin=cos_sin,
     )
+    ix = getattr(a, "indexer", None)
+    if ix is not None and ix.wq_b.weight.dtype == e4m3:
+        # K1 computes the index query (``attention/index_query``) where it can
+        L.k1.iq_w = ix.wq_b.weight
+        L.k1.iq_ws = _codes(copies, i, "index wq_b", ix.wq_b)
+        L.k1.iw_w = ix.weights_proj.weight
+        L.k1.iw_scale = float(ix.head_weight_scale)
     L.k1.check(d)
     if a.wo_a.weight.dtype == e4m3:
         woa, woa_s = a.wo_a.weight, _codes(copies, i, "wo_a", a.wo_a)
@@ -630,7 +699,15 @@ def _boundary_out(layer, defer_post, x, residual, post, comb, pre):
 
 
 def _launch(
-    runner, L, plan, positions, forward_batch, pending_post, prev_pre, capture=None
+    runner,
+    L,
+    plan,
+    positions,
+    forward_batch,
+    pending_post,
+    prev_pre,
+    capture=None,
+    tok_par=False,
 ):
     """K1, then K2, of layer ``L``: the previous layer's pending post (x, residual,
     post, comb) and pre in; K2's (x, residual, post, comb, pre) out, this layer's
@@ -642,6 +719,8 @@ def _launch(
         get_token_to_kv_pool,
     )
 
+    from sgl_amd_mono.deepseek_v41.gfx950.runner import SLOT_DTYPES
+
     x, residual, post, comb = pending_post
     if L.swa is None:  # the layer's caches, at its first launch
         pool = get_token_to_kv_pool()
@@ -652,12 +731,11 @@ def _launch(
             L.comp_block = pool.get_extra_key_page_size(L.i)
     backend, M = get_attn_backend(), residual.shape[0]
     if "k1" not in plan.state:
-        # the forward's first K1 converts them; a graph records the copies
-        slot = backend.get_swa_out_cache_loc(forward_batch)
-        plan.state["k1"] = (
-            positions[:M].long().contiguous(),
-            slot[:M].long().contiguous(),
-        )
+        # the forward's first K1 converts them where needed; a graph records the copies
+        slot = backend.get_swa_out_cache_loc(forward_batch)[:M]
+        if not (slot.dtype in SLOT_DTYPES and slot.is_contiguous()):
+            slot = slot.long().contiguous()
+        plan.state["k1"] = (positions[:M].long().contiguous(), slot)
     pos, slot = plan.state["k1"]
     md = backend.forward_metadata.core_attn_metadata
     if L.ratio:  # the top-k of the layer's index source (its own, after K1)
@@ -669,12 +747,11 @@ def _launch(
         residual = residual.contiguous()  # the broadcast embedding may be a view
         if prev_pre is None:
             prev_pre = runner.first_pre[:M]
-    _, res_mid, *_ = runner.k1(
+    runner.k1(
         L.k1, x, residual, post, comb, prev_pre, pos, slot, L.swa, L.swa_block,
-        keys, index=L.index,
+        keys, index=L.index, tok_par=tok_par,
+        aux=None if capture is None else capture(L, M),
     )  # fmt: skip
-    if capture is not None:
-        capture(L, res_mid)
     if L.index:
         _select(
             runner=runner, L=L, plan=plan, backend=backend, positions=positions,
@@ -683,7 +760,7 @@ def _launch(
     # K2 reads K1's outputs from the runner's buffers
     return runner.k2(
         L.k2, L.ffn, M, pos, L.swa, L.swa_block, L.comp, L.comp_block,
-        slot=slot, keys=keys, index=L.index,
+        slot=slot, keys=keys, index=L.index, tok_par=tok_par,
     )  # fmt: skip
 
 
@@ -745,22 +822,31 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
     kind = "full" if not two_level else "reindex" if ix.uses_candidates else "producer"
     if L.plane is None:  # the layer's index plane, at its first launch (eager)
         L.plane = _index_plane(L=L, M=M, meta=meta, raw_idx=raw_idx)
-    bounds = meta.compressed_seq_lens
-    if bounds.dtype != torch.int32 or not bounds.is_contiguous():
-        bounds = bounds.to(torch.int32).contiguous()
+    # the step's bounds of this ratio, as int32: every index source of the ratio
+    # shares them
+    bounds = plan.state.get(("k2i bounds", r))
+    if bounds is None:
+        bounds = meta.compressed_seq_lens
+        if bounds.dtype != torch.int32 or not bounds.is_contiguous():
+            bounds = bounds.to(torch.int32).contiguous()
+        plan.state["k2i bounds", r] = bounds
     k2i, per_req = runner.k2i, plan.key.tokens_per_request
     if kind != "reindex" and ("k2i plan", r) not in plan.state:
         # the step's walk plan of this ratio: its FULL and producer layers share it
         k2i.walk_plan(ratio=r, bounds=bounds, rows=M, per_req=per_req)
         plan.state["k2i plan", r] = True
+    if L.k1.iq_w is not None and runner.iq_fused(M, plan.state["tok_par"]):
+        query = (runner.iq[:M], runner.iqs[:M], runner.iw[:M])  # K1 computed it
+    else:
+        query = _index_query(
+            attn=attn, x=runner.normed[:M], q_lora=runner.qr[:M], positions=pos
+        )
     published = k2i.select(
         kind=kind,
         rows=M,
         per_req=per_req,
         ratio=r,
-        query=_index_query(
-            attn=attn, x=runner.normed[:M], q_lora=runner.qr[:M], positions=pos
-        ),
+        query=query,
         plane=L.plane,
         page_table=meta.page_table,
         bounds=bounds,
@@ -768,7 +854,12 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
         page_out=page_idx,
         # the candidate source's blocks of this step, for the layers after it
         candidates=plan.state["k2i candidates"] if kind == "reindex" else None,
+        # the step's REINDEX layers share their table (same blocks, page table and
+        # bounds): built at the first
+        reindex_table_built=kind == "reindex" and ("k2i reindex", r) in plan.state,
     )
+    if kind == "reindex":
+        plan.state["k2i reindex", r] = True
     if kind == "producer":
         plan.state["k2i candidates"] = published
 
@@ -835,6 +926,8 @@ class _Built:
     def __init__(self, lm, runner, layers: dict):
         self.lm, self.model, self.runner, self._layers = lm, lm.model, runner, layers
         self._normal_moe = lm.model.layers[min(layers)].mlp
+        # DSpark's captured layers -> the buffer K1 writes their capture into
+        self._captures: dict[int, torch.Tensor] = {}
 
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **__
@@ -871,29 +964,53 @@ class _Built:
 
         m = self.model
         self._warm_normal_moe()
-        x = m.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        x = (
+            input_embeds
+            if input_embeds is not None
+            else embed(m.embed_tokens, input_ids)
+        )
         # the compressor caches each step's rotary tables on the batch
         for attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, attr):
                 delattr(forward_batch, attr)
         hash_ids = None
+        engram_rows = {}
         if m.engram_hasher is not None:
             hash_ids = m.engram_hasher(input_ids, forward_batch)
+            engram_rows = self._engram_rows(hash_ids)
         aux = None if m.dspark_layers_to_capture is None else []
         plan.state["dspark_aux"] = aux
+        # every image-token row keeps its residual through an Engram write, as in
+        # SGLang's forward: a captured graph cannot branch on whether the batch has
+        # mm inputs
+        image = None
+        if m.config.vision_n_layers > 0:
+            image = (input_ids == m.config.image_token_id)[:, None, None]
         pending, pre = (None, hc_broadcast(x, m.hc_mult), None, None), None
+        plan.state["tok_par"] = self.runner.tok_par(x.shape[0])
         for i in range(m.start_layer, m.end_layer):
             engram = m.layers[i].engram
             if engram is not None:  # on the residual the last layer settled
                 before = pending[1]
-                residual = engram(
-                    before, hash_ids[:, engram.layer_hash_index], forward_batch
-                )
-                # every image-token row keeps its residual, as in SGLang's forward: a
-                # captured graph cannot branch on whether the batch has mm inputs
-                if m.config.vision_n_layers > 0:
-                    image = input_ids == m.config.image_token_id
-                    residual = torch.where(image[:, None, None], before, residual)
+                rows = engram_rows.get(engram.layer_hash_index)
+                if rows is None:
+                    residual = engram(
+                        before, hash_ids[:, engram.layer_hash_index], forward_batch
+                    )
+                else:  # Engram.forward on the staged rows
+                    from sglang.srt.layers.engram import engram_gate
+
+                    kv, _ = engram.wkv(rows.flatten(-2))
+                    residual = engram_gate(
+                        before,
+                        kv,
+                        engram.q_weight,
+                        engram.k_weight,
+                        engram.eps,
+                        engram.clamp_value,
+                    )
+                if image is not None:
+                    residual = torch.where(image, before, residual)
                 pending = (None, residual, None, None)
             # an Engram layer reads the settled residual: no post owed into it
             defer = i + 1 < m.end_layer and m.layers[i + 1].engram is None
@@ -902,13 +1019,71 @@ class _Built:
             )
             pending = post if defer else (None, hidden, None, None)
         residual = pending[1]
+        tok_par = plan.state["tok_par"]
+        if tok_par and aux is None:
+            # the head's combine reads every row's residual and pre
+            residual, pre = self._gather_rows([residual, pre])
         pre_hc_head = residual.flatten(1)
-        hidden = m.norm(
-            mhc_combine(pre_hc_head.float(), pre, m.hc_mult, residual.dtype)
+        # mhc_combine widens x on load: no f32 copy first
+        hidden = m.norm(mhc_combine(pre_hc_head, pre, m.hc_mult, residual.dtype))
+        if aux is None:
+            return hidden, pre_hc_head
+        if tok_par:
+            # the drafter reads no residual: each rank's own rows of the head's
+            # output cross ranks with its captures, as ROCm/ATOM gathers them
+            hidden, *taps = self._gather_rows([hidden, *aux])
+            aux[:] = taps
+            pre_hc_head = None
+        return (hidden, pre_hc_head), aux
+
+    def _engram_rows(self, hash_ids) -> dict:
+        """Every Engram layer's rows of the step by hash layer, as ROCm/ATOM stages
+        them ahead of the layers: each rank gathers its shards' rows (zeros for the
+        rest) and one all-reduce reassembles them all, where SGLang's lookup runs
+        an all-reduce an Engram layer. Empty where SGLang's lookup stays (one rank,
+        a shared host table)."""
+        from sglang.kernels.ops.embeddings.engram_gather import engram_gather
+        from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
+        from sglang.srt.distributed.parallel_state import inplace_all_reduce
+        from sglang.srt.runtime_context import get_parallel
+
+        m = self.model
+        engrams = [
+            m.layers[i].engram
+            for i in range(m.start_layer, m.end_layer)
+            if m.layers[i].engram is not None
+        ]
+        embeds = [e.embed for e in engrams]
+        if not embeds or hash_ids.shape[0] == 0:
+            return {}
+        if any(e.tp_size == 1 or e._shared for e in embeds):
+            return {}
+        dim = embeds[0].dim
+        out = torch.empty(
+            (len(engrams), *hash_ids.shape[:1], hash_ids.shape[-1], dim),
+            dtype=torch.bfloat16,
+            device=hash_ids.device,
         )
-        if aux is not None:
-            return (hidden, pre_hc_head), aux
-        return hidden, pre_hc_head
+        for k, (engram, embed) in enumerate(zip(engrams, embeds)):
+            rows = out[k].view(-1, dim)
+            if embed.rows == 0:
+                rows.zero_()
+                continue
+            ids = hash_ids[:, engram.layer_hash_index].reshape(-1)
+            engram_gather(
+                *embed._table_ptrs(),
+                ids,
+                rows,
+                dim,
+                FP8_BLOCK_SIZE,
+                row_lo=embed.row_start,
+                row_hi=embed.row_start + embed.rows,
+            )
+        # integer addition keeps every bf16 bit: one shard owns each row
+        inplace_all_reduce(
+            out.view(torch.int32), group_name=get_parallel().tp_group.unique_name
+        )
+        return {e.layer_hash_index: out[k] for k, e in enumerate(engrams)}
 
     def _layer(
         self, L, plan, positions, forward_batch, pending_post, prev_pre, defer_post
@@ -918,15 +1093,44 @@ class _Built:
         self._warm_normal_moe()
         out = _launch(
             self.runner, L, plan, positions, forward_batch, pending_post, prev_pre,
-            capture=lambda L, residual: self._capture(plan, L, residual),
+            capture=lambda L, M: self._capture(plan, L, M),
+            tok_par=plan.state["tok_par"],
         )  # fmt: skip
         return _boundary_out(L.module, defer_post, *out)
 
-    def _capture(self, plan, L, residual) -> None:
-        """DSpark reads the mean of each target layer's input residual."""
+    def _gather_rows(self, tensors: list) -> list:
+        """A token-parallel step's ``tensors``, every row from its owner (each rank
+        computed its own rows alone): their bytes as bf16 rows, one all-gather."""
+        from sglang.srt.distributed import get_tp_group
+
+        r = self.runner
+        n = tensors[0].shape[0] // r.tp
+        rows = slice(r.rank * n, (r.rank + 1) * n)
+        mine = [t[rows].contiguous().view(n, -1).view(torch.bfloat16) for t in tensors]
+        every = get_tp_group().all_gather(torch.cat(mine, 1), dim=0)
+        out, at = [], 0
+        for t, m in zip(tensors, mine):
+            out.append(every[:, at : at + m.shape[1]].contiguous().view(t.dtype))
+            at += m.shape[1]
+        return [o.view(t.shape) for o, t in zip(out, tensors)]
+
+    def _capture(self, plan, L, M):
+        """Where K1 writes layer ``L``'s DSpark capture, the mean of its input
+        residual's streams; None for a layer DSpark does not read."""
+        from sgl_amd_mono.deepseek_v41.gfx950.runner import no_capture
+
         targets = self.model.dspark_layers_to_capture
-        if targets is not None and L.i in targets:
-            plan.state["dspark_aux"].append(residual.mean(dim=1))
+        if targets is None or L.i not in targets:
+            return None
+        buf = self._captures.get(L.i)
+        if buf is None:
+            no_capture("DSpark's capture buffers")
+            buf = self._captures[L.i] = self.runner.res_mid.new_empty(
+                MAX_ROWS, self.runner.res_mid.shape[-1]
+            )
+        aux = buf[:M]
+        plan.state["dspark_aux"].append(aux)
+        return aux
 
     def _warm_normal_moe(self) -> None:
         """At the first eager forward, run the normal MoE at 1 to MAX_ROWS rows: the
@@ -983,14 +1187,18 @@ def _build(model, hf_config, ctx) -> _Built:
         runner.enable_k2i(_longest_context(hf_config))
     # K1 with and without the owed post (the residual arrives settled on the
     # first layer and after an Engram write), K2 with and without top-k rows
-    k1 = {(fold, L.index) for L in layers.values() for fold in (True, False)}
+    k1 = {
+        (fold, L.index, L.k1.iq_w is not None)
+        for L in layers.values()
+        for fold in (True, False)
+    }
     k2 = {(L.ratio > 0, L.index) for L in layers.values()}
     # Every rank builds every width. FlyDSL's disk cache hands a rank the kernels
     # another rank built (a lock per kernel), so each rank starts at its own share.
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
-        runner.precompile(m, k1=k1, k2=k2, k2i=k2i)
+        runner.precompile(m, k1=k1, k2=k2, k2i=k2i, tok_par=runner.tok_par(m))
     return _Built(model, runner, layers)
 
 
@@ -1040,7 +1248,7 @@ SPEC = MonoSpec(
     numerics=NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
     load_tensor=_load_tensor,
     # a routed step scores every index source with K2i (_select)

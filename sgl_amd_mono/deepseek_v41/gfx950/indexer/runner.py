@@ -139,6 +139,7 @@ class K2iRunner:
         raw_out: torch.Tensor,  # int32 [rows, 512]: sparse_raw_indices
         page_out: torch.Tensor,  # int32 [rows, 512]: sparse_page_indices
         candidates=None,  # a REINDEX layer's: the producer's CandidateBlocks
+        reindex_table_built=False,  # a later REINDEX layer of the step: table kept
     ):
         """An index source's top-512 of each row (``kind`` in KINDS). A FULL or
         producer layer reads the step's walk plan of ``ratio``; a producer returns
@@ -153,7 +154,9 @@ class K2iRunner:
             page_table=page_table, bounds=bounds,
         )  # fmt: skip
         if kind == "reindex":
-            compact, lens, ids = self.score_candidates(candidates=candidates, **inputs)
+            compact, lens, ids = self.score_candidates(
+                candidates=candidates, table_built=reindex_table_built, **inputs
+            )
             pos = self.compact_pos[:rows]
             topk_transform_paged_hip(
                 scores=compact,
@@ -207,8 +210,9 @@ class K2iRunner:
         return self.ilog[: rows * width].view(rows, width)
 
     def score_candidates(
-        self, *, candidates, rows, per_req, query, plane, page_table, bounds
-    ):
+        self, *, candidates, rows, per_req, query, plane, page_table, bounds,
+        table_built=False,
+    ):  # fmt: skip
         """A REINDEX layer's logits of its candidate blocks' columns: (compact
         [rows, COMPACT] f32, valid below ``lens``; lens [rows]; ids [rows,
         TOPK_BLOCKS]: ``candidates.ids`` with the newest block last, column j * 8 + i
@@ -219,15 +223,16 @@ class K2iRunner:
             )
         owners = self.owners[per_req - 1]
         ids, lens = self.cand_ids[:rows], self.cand_bound[:rows]
-        reindex_table(
-            ids=candidates.ids,
-            page_table=page_table,
-            owners=owners,
-            bounds=bounds,
-            ids_out=ids,
-            table=self.cand_table,
-            context=lens,
-        )
+        if not table_built:
+            reindex_table(
+                ids=candidates.ids,
+                page_table=page_table,
+                owners=owners,
+                bounds=bounds,
+                ids_out=ids,
+                table=self.cand_table,
+                context=lens,
+            )
         # a REINDEX launch takes its task from its CTA index, not a walk plan
         self._score(
             rows=rows, query=query, plane=plane, plan=self.plans[1], itab=self.cand_table,

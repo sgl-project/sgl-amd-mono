@@ -17,12 +17,21 @@ from __future__ import annotations
 import re
 
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    Feature,
-    MonoSpec,
-    Requirements,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.deepseek_v41 import spec as target
@@ -37,7 +46,12 @@ _CKPT_SHARED = re.compile(
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
-    "srt/monokernels/spec.py": ("DeviceLimits", "Feature", "MonoSpec", "Requirements"),
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
+        "DeviceLimits",
+        "Feature",
+        "MonoSpec",
+        "Requirements",
+    ),
     "kernels/ops/layernorm/mhc.py": ("mhc_combine",),
     "srt/environ.py": ("envs", "SGLANG_DSPARK_EMBED_IN_GRAPH"),
     "srt/layers/logits_processor.py": (
@@ -174,20 +188,27 @@ class _Draft:
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         lm = self.lm
-        x = lm.forward_embed(input_ids) if input_embeds is None else input_embeds
-        pre = None
-        for L in self.stages:  # each stage settles its post: what SGLang's returns
+        x = input_embeds
+        if x is None:  # ``forward_embed``, from the target's whole table
+            if lm.embed_tokens is None:
+                raise ValueError(
+                    "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
+                    "(call attach_shared_modules first)."
+                )
+            x = target.embed(lm.embed_tokens, input_ids).unsqueeze(1)
+            x = x.repeat(1, lm.hc_mult, 1)
+        # a stage's post folds into the next stage's K1 (as the target's layers do);
+        # the last stage settles its own
+        pending, pre = (None, x, None, None), None
+        for j, L in enumerate(self.stages):
             out = target._launch(
-                self.runner,
-                L,
-                plan,
-                positions,
-                forward_batch,
-                (None, x, None, None),
-                pre,
+                self.runner, L, plan, positions, forward_batch, pending, pre
             )
-            x, pre, _ = target._boundary_out(L.module, False, *out)
-        x = mhc_combine(x.flatten(1).float(), pre, lm.hc_mult, x.dtype)
+            defer = j + 1 < len(self.stages)
+            x, pre, post = target._boundary_out(L.module, defer, *out)
+            pending = post if defer else (None, x, None, None)
+        # mhc_combine widens x on load: no f32 copy first
+        x = mhc_combine(x.flatten(1), pre, lm.hc_mult, x.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 
@@ -219,8 +240,9 @@ def _build(model, hf_config, ctx) -> _Draft:
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // p.tp_size
     for m in widths[start:] + widths[:start]:
-        # K1 on a settled residual, K2 on the window: no index source, no top-k
-        runner.precompile(m, k1={(False, False)}, k2={(False, False)})
+        # K1 on the first stage's settled residual, then folding the stage before's
+        # post; K2 on the window: no index source, no top-k
+        runner.precompile(m, k1={(False, False), (True, False)}, k2={(False, False)})
     return _Draft(model, runner, stages)
 
 
@@ -239,7 +261,7 @@ SPEC = MonoSpec(
     numerics=target.NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     load_tensor=_load_tensor,
     tokens_per_request=_tokens_per_request,
 )

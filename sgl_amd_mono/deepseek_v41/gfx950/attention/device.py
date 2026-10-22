@@ -195,8 +195,3 @@ def fp8x8_bf16(w0, w1, scale):
             )
             out.append(fx.Vector(p).bitcast(fx.Int32)[0])
     return fx.Vector.from_elements(out, fx.Int32)
-
-
-def stamp(c, point):
-    """The attention back's stage marks; this build records no timeline."""
-    return

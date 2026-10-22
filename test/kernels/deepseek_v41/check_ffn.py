@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from sgl_amd_mono.deepseek_v41.spec import NUMERICS
+from sgl_amd_mono.deepseek_v41.spec import NUMERICS, SPEC
 
 HIDDEN, HC, MIX = 5120, 4, 24
 E, TOPK, SCALE, LIMIT = 384, 6, 1.5, 10.0
@@ -17,7 +17,7 @@ E, TOPK, SCALE, LIMIT = 384, 6, 1.5, 10.0
 DRAFT_ROUTE = dict(experts=128, topk=3, ug_groups=1)
 DRAFT_WIDTHS = (5, 10, 15, 20, 25, 30, 35, 40)
 INTER, PAD = 2304, 128
-WIDTHS = (1, 2, 4, 8, 12, 16, 24, 32, 40, 48)  # every decode graph width <= 48
+WIDTHS = SPEC.devices["gfx950"].widths  # every width the spec builds
 RMS_EPS, HC_EPS = 1e-20, 1e-6
 MIX_RTOL = NUMERICS.bound("ffn.mix.rel")
 FP4 = [
@@ -276,15 +276,50 @@ def sglang_ffn_seam(part, res, post, comb, pre, w):
     return res2, normed, co.post, co.comb, co.pre
 
 
+FFN_MARKS = {
+    16: "start", 17: "slices", 18: "norm", 19: "xq", 20: "router", 21: "route",
+    22: "shared", 23: "gates", 24: "ug", 25: "down", 26: "reduce", 27: "end",
+}  # fmt: skip
+
+
+def timeline_report(M, tl) -> str:
+    """Each mark: µs after the first CTA started (median CTA, last CTA); then each
+    stage's own µs across CTAs (median, max) and on the CTA that ends last."""
+    t0 = tl[:, 16].min()
+    marks = list(FFN_MARKS)
+    lines = [f"M={M} timeline, us after the first CTA's start (median CTA / last CTA):"]
+    for k in marks:
+        d = (tl[:, k] - t0).double() / 100.0  # 100 MHz ticks
+        name = FFN_MARKS[k]
+        lines.append(f"  {k} {name:7s} {d.median().item():7.2f} {d.max().item():7.2f}")
+    last = int(tl[:, marks[-1]].argmax())
+    lines.append(
+        f"M={M} stage us (median CTA / max CTA / CTA {last}, which ends last):"
+    )
+    for a, b in zip(marks, marks[1:]):
+        d = (tl[:, b] - tl[:, a]).double() / 100.0
+        lines.append(
+            f"  {FFN_MARKS[b]:7s} {d.median().item():7.2f} {d.max().item():7.2f}"
+            f" {d[last].item():7.2f}"
+        )
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replays", type=int, default=500)
     ap.add_argument("--draft", action="store_true", help="the DSpark draft's route")
+    ap.add_argument(
+        "--timeline", action="store_true", help="print each width's stage timeline"
+    )
+    ap.add_argument("--widths", default="", help="comma-separated widths to run")
     args = ap.parse_args()
     global E, TOPK, WIDTHS
     route = DRAFT_ROUTE if args.draft else {}
     if args.draft:
         E, TOPK, WIDTHS = route["experts"], route["topk"], DRAFT_WIDTHS
+    if args.widths:
+        WIDTHS = tuple(int(w) for w in args.widths.split(","))
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
     dev = torch.device("cuda", rank)
@@ -300,15 +335,23 @@ def main():
     w, inter, padded = make_weights(tp, rank, dev)
     mw = mono_weights(w)
     mw.check(tp, E)
+    if args.timeline:  # the runner builds its launches with stage marks
+        os.environ["SGLANG_AMD_MONO_TIMELINE"] = "1"
     runner = DSV41MonoRunner(tp, rank, cpu, dev, **route)
     fails, steps = [], []
     for M in WIDTHS:
         part, res, post, comb, pre = seam_inputs(M, tp, rank, dev)
         out, res_o, post_o, comb_o, pre_o = runner.ffn(mw, part, res, post, comb, pre)
+        if args.timeline:
+            for _ in range(5):
+                runner.ffn(mw, part, res, post, comb, pre)
+            torch.cuda.synchronize()
+            if rank == 0:
+                print(timeline_report(M, runner.timeline(M).cpu()), flush=True)
         res2, normed_ref, post2, comb2, pre2 = sglang_ffn_seam(
             part, res, post, comb, pre, w
         )
-        off = scratch_layout(M, tp, **route)["normed"][0]
+        off = scratch_layout(M, tp, **runner.route_at(M))["normed"][0]
         normed = (
             runner.scratch(M)[off : off + M * HIDDEN * 2]
             .view(torch.bfloat16)

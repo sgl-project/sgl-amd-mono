@@ -9,7 +9,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from sgl_amd_mono.common.ops import mfma_bf16, rsrc
+from sgl_amd_mono.common.ops import CM_NT, mfma_bf16, rsrc
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import lds_row
 
 from .device import THREADS, WAVES, fp8x8_bf16, mfma_scaled, pow2, tile_map
@@ -49,8 +49,13 @@ def _step_load(c, r_w, r_ws, k, row0, st, pred=None, shuffled=False):
     row = row0 + lane % 16
     col = 128 * st + 16 * j
     lo_at, hi_at = w_offset(row, k, col, shuffled), w_offset(row, k, col + 64, shuffled)
-    lo = fx.Vector(bo.buffer_load(r_w, lo_at // 4, vec_width=4, dtype=T.i32))
-    hi = fx.Vector(bo.buffer_load(r_w, hi_at // 4, vec_width=4, dtype=T.i32))
+    # weights are read once a launch: nontemporal, so they do not evict KV or scratch
+    lo = fx.Vector(
+        bo.buffer_load(r_w, lo_at // 4, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+    )
+    hi = fx.Vector(
+        bo.buffer_load(r_w, hi_at // 4, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+    )
     kg = k // 32
     wsi = (row0 // 32) * kg + st * 4 + j
     word = fx.Int32(bo.buffer_load(r_ws, wsi // 4, vec_width=1, dtype=T.i32))
@@ -314,9 +319,19 @@ def bf16_gemv_loads(c, w, ws, k, row0, split, pred=None):
         half = []
         for st in steps:
             base = row * k + 128 * st + 16 * j
-            lo = fx.Vector(bo.buffer_load(r_w, base // 4, vec_width=4, dtype=T.i32))
+            lo = fx.Vector(
+                bo.buffer_load(
+                    r_w, base // 4, vec_width=4, dtype=T.i32, cache_modifier=CM_NT
+                )
+            )
             hi = fx.Vector(
-                bo.buffer_load(r_w, (base + 64) // 4, vec_width=4, dtype=T.i32)
+                bo.buffer_load(
+                    r_w,
+                    (base + 64) // 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_NT,
+                )
             )
             word = fx.Int32(
                 bo.buffer_load(
