@@ -2,13 +2,13 @@
 # Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at 5e8d913, MIT License,
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/models/deepseek_v41/mono/kernels/token_par.py and peer_layout.py
-"""Token parallel: a step of S rows, S a multiple of TP, where rank r owns rows
-r S / TP .. (r + 1) S / TP. The sublayers' all-reduces become reduce-scatters to
-each row's owner, the per-row seam, norm and qkv stages run on the owner alone,
-and the rows every rank needs (the MoE input, the q latent, the window record,
-an index source's normed row and qr) reach the other ranks through the peer
-buffer's gather regions. The sums keep the all-reduce's rank order, so every
-output is the same to the bit."""
+"""Token parallel: rank r owns rows r S / TP .. (r + 1) S / TP of an S-row step.
+
+The sublayers' all-reduces become reduce-scatters to each row's owner, the per-row
+seam, norm and qkv stages run on the owner alone, and the rows every rank needs (the
+MoE input, the q latent, the window record, an index source's normed row and qr)
+reach the other ranks through the peer buffer's gather regions. The sums keep the
+all-reduce's rank order, so every output is the same to the bit."""
 
 import flydsl.expr as fx
 
@@ -17,8 +17,7 @@ from sgl_amd_mono.common.plan import pair_layout
 from .attention.plan import DATA, Q_RANK
 from .stages.seam import HC, HIDDEN
 
-# token parallel from this many rows (and a multiple of the TP size); below it
-# the gathers' extra hop costs more than a rank's few rows save (ROCm/ATOM)
+# below this many rows the gathers' extra hop costs more than a rank's few rows save (ROCm/ATOM)
 TOKEN_PAR_FROM = 12
 QX_WORDS = Q_RANK // 4  # the q latent's e4m3 words
 QX_GROUPS = Q_RANK // 32
@@ -45,9 +44,10 @@ def token_par(s: int, tp: int) -> bool:
 
 
 def peer_layout(s: int, tp: int) -> dict[str, tuple[int, int]]:
-    """The peer buffer's regions -> (byte offset, bytes), 8 B a (word, tag) pair:
-    ATTN and FFN, the sublayers' partials ``[source rank][row][hidden / 2]``; then
-    the token-parallel gathers, ``[row][..]`` each: XG the MoE input rows, QG / QGS
+    """Return the peer buffer's regions -> (byte offset, bytes), 8 B a (word, tag) pair.
+
+    ATTN and FFN hold the sublayers' partials ``[source rank][row][hidden / 2]``; the
+    token-parallel gathers follow, ``[row][..]`` each: XG the MoE input rows, QG / QGS
     the q latent's MXFP8 words / codes, KG the window records, NBG and QRG an index
     source's normed rows and qr, and IWG its index head weights (bf16 pairs)."""
     row = s * HIDDEN // 2

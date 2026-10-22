@@ -58,7 +58,7 @@ MAX_TOKENS = 48
 HIDDEN = seam.HIDDEN
 X_WORDS = HIDDEN // 4
 X_GROUPS = HIDDEN // 32
-SLICES = seam.SLICES  # 160
+SLICES = seam.SLICES
 # K1 and the MoE share the MXFP8 x region (plain words in both); other names get one region each
 SHARED_REGIONS = ("x8", "x8s")
 COUNTER_WORDS = 2 * 256  # the MoE's ug queue and down counts, a word a slot
@@ -72,20 +72,16 @@ class MonoBuild(msgspec.Struct, frozen=True):
     tokens: int
     tp: int
     kt: bool = False  # K1 also writes K2's key table
-    # K1's seam folds the previous layer's owed post into the residual; off where
-    # the residual arrives settled (the first layer, after an Engram write)
+    # K1 folds the owed post into the residual; off on the first layer and after an Engram write
     fold: bool = True
-    # an index source: K1 hands out its normed input and qr for SGLang's indexer,
-    # and K2 builds the key table from the top-k the indexer selected in between
+    # an index source: K1 hands normed and qr to SGLang's indexer, K2 builds the key table
     index: bool = False
     # K2's keys include top-k compressed rows (compress ratio 1 or 2), not only the window
     compressed: bool = True
-    # SGLANG_AMD_MONO_FAULT_INJECT: the wait this rank stalls at (0: none), once
-    # fault_after launches have run
+    # SGLANG_AMD_MONO_FAULT_INJECT: the wait to stall at (0: none) after fault_after launches
     fault_site: int = 0
     fault_after: int = 0
-    # the route and window: the target's, or the DSpark draft's (128 experts, top-3,
-    # a FP4 group an ug task, and the window plus the block's keys)
+    # the route and window: the target's, or the DSpark draft's (``DSV41MonoRunner``)
     experts: int = EXPERTS
     topk: int = TOPK
     ug_groups: int = 2
@@ -94,11 +90,9 @@ class MonoBuild(msgspec.Struct, frozen=True):
     timeline: bool = False
     # token parallel (``token_par``): each rank's seam, norm and qkv on its own rows
     tok_par: bool = False
-    # an index source with an indexer: K1 computes its index query
-    # (``attention.index_query``) where that is reproduced at this width
+    # K1 also computes an index source's index query, where ``index_query.fused``
     iq: bool = False
-    # wqkv, wq_b and wo_b in aiter's (16, 16) preshuffle (SGLang's MXFP8 aiter route
-    # with SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE); wo_a stays row-major
+    # wqkv, wq_b and wo_b in SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE's (16, 16) layout; wo_a row-major
     shuffled: bool = False
 
 
@@ -311,8 +305,7 @@ def build_mono_k1(key: MonoBuild):
         epoch: Int64,
     ):
         _ = keyed
-        # every wait of this launch runs under the guard (deadline, error words); K1
-        # exchanges no data, but a timeout here still flags every peer
+        # every wait runs under the guard, so a timeout flags every peer and stops the launch
         with guard.scope(
             guard.Guard(
                 epoch,
@@ -447,15 +440,12 @@ def build_mono_k1(key: MonoBuild):
                 stamp(c, 34)
 
             def seam_gate():
-                # the seam's mixes, in the wait on q (ROCm/ATOM): only K2 reads
-                # them; the gate's LDS aliases the front's, its wqkv done by now
+                # only K2 reads the mixes, so they fill q's wait; the gate's LDS aliases the front's
                 gpu.barrier()
                 for t in range(first_task(bid, GATE0), own_n, BLOCKS):
                     seam.stage_gate(ca, t)
                 if const_expr(key.iq):
-                    # the index query's head weights, on the normed rows: in the
-                    # same wait, past the gates' CTAs (the wqkv's LDS is free);
-                    # token parallel, this rank's rows, handed to the others (IWG)
+                    # the head weights fill the same wait: the wqkv's LDS is free by now
                     push = None
                     if const_expr(key.tok_par):
                         cp = {"put_bf": amb.put_bf, "rank": rank, "d": ca["d"]}
@@ -474,8 +464,7 @@ def build_mono_k1(key: MonoBuild):
                 before_wqb=seam_gate,
             )
             if const_expr(key.tok_par):
-                # the other ranks' rows of what this launch hands on: the window
-                # records (K2's keys), an index source's normed rows and qr
+                # K1's outputs hold every row: copy in the rows the other ranks computed
                 own = sym + par
                 for t in range(first_task(bid, 0), s, BLOCKS):
                     if t // own_n != rank:
@@ -614,9 +603,10 @@ def store_normed(normed, t, col, ys, live):
 
 @flyc.jit
 def push_attn_pair(c, bases, own, s, t, col, vs):
-    """This rank's wo_b partial pair of row t at ``col`` to every rank's ATTN region
-    (``seam.stage_push``'s pairs); token parallel (``own`` rows a rank), to the
-    row's owner alone, at its row there."""
+    """Push this rank's wo_b partial pair of row t at ``col`` to every rank's ATTN region.
+
+    The pairs are ``seam.stage_push``'s; token parallel (``own`` rows a rank), only the
+    row's owner gets it, at its row there."""
     for p in range_constexpr(len(bases)):
         dst = preg(bases[p], 0, "attn")
         if const_expr(own is None):
@@ -680,7 +670,7 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
     layout = scratch_layout(s, tp, key.timeline, **route_of(key))
     mkey = _moe_key(key)
     rs = route_shape(mkey)
-    # token parallel: the seam, norm and gates on this rank's rows, t0 ..
+    # token parallel: the seam, norm and gates on this rank's rows
     own_n = s // tp if const_expr(key.tok_par) else s
     GATE0 = SLICES
     NORM0 = SLICES + own_n
@@ -792,15 +782,12 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
     stamp(ca, 18)
 
     def gates():
-        # the next seam's mixes: only the next launch reads them, so they wait
-        # until this CTA's routing and shared expert are done. The gate's LDS
-        # aliases the MoE's (a union), whose later stages reload theirs.
+        # only the next launch reads the mixes; later MoE stages reload the LDS the gate clobbers
         gpu.barrier()
         for t in range(first_task(bid, GATE0), own_n, BLOCKS):
             seam.stage_gate(ca, t)
         stamp(ca, 23)
 
-    # ---- the MoE, its all-reduce into ``out``
     moe.run_moe(cb, mkey, bid, before_ug=gates)
     stamp(ca, 27)
 
@@ -866,7 +853,7 @@ def build_mono_ffn(key: MonoBuild):
         epoch: Int64,
     ):
         _ = keyed
-        # every wait of this launch runs under the guard (deadline, error words)
+        # every wait runs under the guard, so a timeout flags every peer and stops the launch
         with guard.scope(
             guard.Guard(
                 epoch,
@@ -987,8 +974,8 @@ def build_mono_ffn(key: MonoBuild):
 
 
 def build_mono_k2(key: MonoBuild):
-    """Build K2: the attention back from K1's q, its wo_b partial pushed to every
-    rank, then ``run_ffn`` (attention reduce, FFN seam, MoE and its all-reduce)."""
+    """Build K2: the attention back on K1's q, its wo_b partial pushed to every rank,
+    then ``run_ffn``."""
     s, tp = key.tokens, key.tp
     assert 1 <= s <= MAX_TOKENS
     layout = scratch_layout(s, tp, key.timeline, **route_of(key))
@@ -1070,7 +1057,7 @@ def build_mono_k2(key: MonoBuild):
         epoch: Int64,
     ):
         _ = keyed
-        # every wait of this launch runs under the guard (deadline, error words)
+        # every wait runs under the guard, so a timeout flags every peer and stops the launch
         with guard.scope(
             guard.Guard(
                 epoch,
@@ -1123,9 +1110,7 @@ def build_mono_k2(key: MonoBuild):
             )
             epoch_begin({"bid": bid, "tid": fx.thread_idx.x}, epoch, ep)
             if const_expr(key.index):
-                # an index source's key table, from the top-k SGLang's indexer
-                # selected after K1, on the last CTAs; each split task waits on
-                # its token's flag
+                # the indexer's top-k came after K1; each split task waits on its token's krdy
                 c["krdy"] = scratch + fx.Int64(layout["krdy"][0])
                 ckt = {
                     "S": s,

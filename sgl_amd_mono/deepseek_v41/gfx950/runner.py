@@ -49,9 +49,8 @@ HC = 4
 FINE_UG_ROWS = 7
 RECORD = DATA + 8  # a token's KV record: 576 B of data, then 8 B of scales
 _LOG2E = 1.4426950408889634
-DEFAULT_DEADLINE_S = (
-    60.0  # a wait's deadline until the framework sets one from the watchdog
-)
+# a wait's deadline until the framework sets one from its watchdog timeout
+DEFAULT_DEADLINE_S = 60.0
 
 
 def compile_only(launch) -> None:
@@ -100,7 +99,7 @@ def _check_tensors(owner, tag: str, want: dict) -> None:
 
 
 def check_rows(tag: str, rows: int, device, want: dict) -> None:
-    """Raise unless each tensor is contiguous on ``device`` with ``rows`` rows of (row size, dtype)."""
+    """Raise unless each (tensor, row size, dtype) is ``rows`` contiguous rows on ``device``."""
     for name, (t, size, dtype) in want.items():
         if not (
             t.dtype == dtype
@@ -163,7 +162,7 @@ class FFNWeights(msgspec.Struct):
     sw2_s: torch.Tensor
 
     def check(self, tp: int, experts: int = EXPERTS) -> None:
-        """One rank's MoE tensors in SGLang's loaded layout."""
+        """Raise unless the MoE tensors have SGLang's loaded layout."""
         d, fp4, e4m3, u8 = (
             MoeDims(tp),
             torch.float4_e2m1fn_x2,
@@ -199,15 +198,14 @@ class K1Weights(msgspec.Struct):
     wqb: torch.Tensor  # [heads * 512, 1280] e4m3, row-major
     wqb_s: torch.Tensor  # [heads * 16, 40] E8M0
     cos_sin: torch.Tensor  # [positions, 64] f32: 32 cos, then 32 sin
-    # an index source's indexer (replicated), for K1's index query: wq_b and its
-    # E8M0 blocks, weights_proj and the head-weight scale; None without one
-    iq_w: torch.Tensor | None = None  # [4096, 1280] e4m3
-    iq_ws: torch.Tensor | None = None  # [128, 40] E8M0
-    iw_w: torch.Tensor | None = None  # [32, 5120] bf16
+    # an index source's indexer (replicated), for K1's index query; None without one
+    iq_w: torch.Tensor | None = None  # wq_b [4096, 1280] e4m3
+    iq_ws: torch.Tensor | None = None  # its E8M0 blocks [128, 40]
+    iw_w: torch.Tensor | None = None  # weights_proj [32, 5120] bf16
     iw_scale: float = 0.0
 
     def check(self, d: Dims) -> None:
-        """One rank's attention-front tensors in K1's layout."""
+        """Raise unless the attention-front tensors have K1's layout."""
         e4m3, u8, f32, bf = (
             torch.float8_e4m3fn,
             torch.uint8,
@@ -261,7 +259,7 @@ class K2Weights(msgspec.Struct):
     cos_sin: torch.Tensor  # [positions, 64] f32: 32 cos, then 32 sin
 
     def check(self, d: Dims) -> None:
-        """One rank's attention-back tensors in K2's layout."""
+        """Raise unless the attention-back tensors have K2's layout."""
         g, e4m3, u8 = d.groups, torch.float8_e4m3fn, torch.uint8
         want = {
             "woa": ((g * 1024, d.group_k), e4m3),
@@ -277,10 +275,11 @@ class K2Weights(msgspec.Struct):
 
 
 class DSV41MonoRunner:
-    """The mono decode runner of one TP rank (``group``: a gloo group for the peer
-    handle exchange). The route and window are the target's by default; the DSpark
-    draft's runner has its own (128 experts, top-3, a FP4 group an ug task, and a
-    window of 128 plus the block's keys)."""
+    """The mono decode runner of one TP rank (``group``: gloo, for the peer handle exchange).
+
+    The route and window are the target's by default; the DSpark draft's runner has its
+    own (128 experts, top-3, a FP4 group an ug task, and a window of 128 plus the block's
+    keys)."""
 
     def __init__(
         self,
@@ -305,9 +304,7 @@ class DSV41MonoRunner:
                 f"width), got {ug_groups}"
             )
         self.ug_groups = ug_groups
-        # each launch marks its stages in its width's scratch (``timeline``)
         self.timeline_on = os.environ.get("SGLANG_AMD_MONO_TIMELINE") == "1"
-        # SGLANG_AMD_MONO_TOKEN_PAR=0: no target step runs token parallel
         self.token_par_on = os.environ.get("SGLANG_AMD_MONO_TOKEN_PAR", "1") == "1"
         # K1 / K2 read wqkv, wq_b and wo_b in aiter's (16, 16) preshuffle
         self.shuffled = shuffled
@@ -331,8 +328,7 @@ class DSV41MonoRunner:
         self.post_a = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
         self.comb_a = torch.zeros(MAX_TOKENS, HC, HC, dtype=torch.float32, device=dev)
         self.pre_a = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
-        # K2's key table, written by K1 (by K2 on an index source): a slot per
-        # key, then (kv_len, ntopk) per token
+        # K2's key table, by K1 (by K2 on an index source): a slot a key, (kv_len, ntopk) a token
         self.kt = torch.zeros(MAX_TOKENS * KEYS, dtype=torch.int32, device=dev)
         self.klen = torch.zeros(2 * MAX_TOKENS, dtype=torch.int32, device=dev)
         # a window-only layer's top-k: none (K1 reads the table, ntopk is 0)
@@ -344,8 +340,7 @@ class DSV41MonoRunner:
         # an index source's K1 outputs, its compressor and indexer's inputs
         self.normed = torch.zeros(MAX_TOKENS, HIDDEN, dtype=torch.bfloat16, device=dev)
         self.qr = torch.zeros(MAX_TOKENS, Q_RANK, dtype=torch.bfloat16, device=dev)
-        # an index source's index query as K1 computes it (``index_query``), in
-        # the layout SGLang's index_q_rope_pack_weights_flydsl returns
+        # K1's index query (``index_query``) in SGLang's index_q_rope_pack_weights_flydsl layout
         self.iq = torch.zeros(
             MAX_TOKENS, IQ_HEADS, IQ_DIM // 2, dtype=torch.int8, device=dev
         )
@@ -358,8 +353,7 @@ class DSV41MonoRunner:
             .view(torch.int32)
             .item()
         )
-        # two parity halves, then the error flags: rank r writes word r of every
-        # rank's flags when its wait fails, and every pending wait checks them
+        # two parity halves, then the guard's flags: rank r's failed wait sets word r on every rank
         half = peer_half_bytes(tp)
         self.peer = PeerBuffer(2 * half + guard.FLAG_BYTES, group, rank, tp, dev)
         self.peer.bytes.zero_()
@@ -399,9 +393,10 @@ class DSV41MonoRunner:
         return buf
 
     def route_at(self, tokens: int) -> dict:
-        """The route every launch and the scratch of this width share: below
-        ``FINE_UG_ROWS`` rows an ug task takes one FP4 group, so twice the tasks end
-        closer together (ROCm/ATOM's fine ug); the draft fixes its own."""
+        """The route every launch and the scratch of this width share.
+
+        Below ``FINE_UG_ROWS`` rows an ug task takes one FP4 group, so twice the tasks
+        end closer together (ROCm/ATOM's fine ug); the draft fixes its own."""
         ug = self.ug_groups
         if ug is None:
             ug = 1 if tokens < FINE_UG_ROWS else 2
@@ -442,8 +437,8 @@ class DSV41MonoRunner:
         tok_par: bool = False,
     ):
         """K1 at this width; it writes K2's key table unless the layer is an index
-        source (whose top-k comes after K1). ``iq``: an indexer's index query too,
-        where ``iq_fused``. ``tok_par``: token parallel."""
+        source (whose top-k comes after K1). ``iq``: the index query too, where
+        ``iq_fused``."""
         iq = iq and self.iq_fused(tokens, tok_par)
         key = (tokens, "k1", fold, index, iq, tok_par)
         if key not in self._kernels:
@@ -475,9 +470,10 @@ class DSV41MonoRunner:
         k2i: bool = False,
         tok_par: bool = False,
     ) -> None:
-        """Allocate this width's scratch and compile its launches without running
-        them: K1 for each (fold, index, iq) in ``k1``, K2 for each (compressed,
-        index) in ``k2``, the FFN launch, and K2i (``enable_k2i`` first)."""
+        """Allocate this width's scratch and compile its launches without running them.
+
+        K1 for each (fold, index, iq) in ``k1``, K2 for each (compressed, index) in
+        ``k2``, the FFN launch, and K2i (``enable_k2i`` first)."""
         self.scratch(tokens)
         kernels = [self.k1_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k1)]
         kernels += [self.k2_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k2)]
@@ -617,8 +613,7 @@ class DSV41MonoRunner:
     def k1(
         self,
         w: K1Weights,
-        x: torch.Tensor
-        | None,  # [M, 5120] bf16: the previous layer's pending MoE output
+        x: torch.Tensor | None,  # [M, 5120] bf16: the prior layer's pending MoE output
         residual: torch.Tensor,  # [M, 4, 5120] bf16: its pending residual
         post: torch.Tensor | None,  # [M, 4, 1] f32: its pending FFN post mix
         comb: torch.Tensor | None,  # [M, 4, 4] f32
@@ -632,15 +627,15 @@ class DSV41MonoRunner:
         tok_par: bool = False,
         aux: torch.Tensor | None = None,  # [>= M, 5120] bf16: DSpark's capture
     ):
-        """Run K1: the pending post, this layer's attention seam and the attention
-        front; it writes the step's SWA KV records and K2's key table. With ``x``
-        None the residual arrives settled and no post is folded in (the first
-        layer, after an Engram write). ``index``: an index source, whose top-k
-        comes after K1: K1 writes its normed input and qr (``normed``, ``qr``)
-        for the indexer and leaves the key table to K2. Returns (q, residual,
-        post, comb, pre) views of the runner's buffers. ``tok_par`` (``token_par``): the
-        residual, post, comb and pre rows in and out are this rank's alone. ``aux``
-        receives the mean of the residual's streams, which DSpark captures."""
+        """Run K1: the pending post, this layer's attention seam and the attention front.
+
+        It writes the step's SWA KV records and K2's key table, and returns (q, residual,
+        post, comb, pre) as views of the runner's buffers. ``x`` None: the residual
+        arrives settled, with no post to fold in (the first layer, after an Engram
+        write). ``index``: an index source, whose top-k comes after K1, so K1 writes
+        ``normed`` and ``qr`` for the indexer and leaves the key table to K2.
+        ``tok_par`` (``token_par``): the residual, post, comb and pre rows in and out
+        are this rank's alone. ``aux`` receives the residual streams' mean for DSpark."""
         M = residual.shape[0]
         if not self.supports(M):
             raise RuntimeError(f"DSv4.1 mono decode: {M} rows")
@@ -766,10 +761,10 @@ class DSV41MonoRunner:
         index: bool = False,
         tok_par: bool = False,
     ):
-        """Run K2 on K1's q and attention-seam outputs: the attention back, its TP
-        reduce, the FFN seam, the MoE and its all-reduce. ``comp`` None: a
-        window-only layer. ``index``: an index source; K2 first builds the key
-        table from ``keys``, whose top-k the indexer selected after K1."""
+        """Run K2 on K1's outputs: attention back, TP reduce, FFN seam, MoE and all-reduce.
+
+        ``comp`` None: a window-only layer. ``index``: an index source; K2 first builds
+        the key table from ``keys``, whose top-k the indexer selected after K1."""
         M = rows
         if not self.supports(M):
             raise RuntimeError(f"DSv4.1 mono decode: {M} rows")
