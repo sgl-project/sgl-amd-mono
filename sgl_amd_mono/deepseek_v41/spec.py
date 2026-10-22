@@ -467,6 +467,20 @@ def attn_layout_reasons(where: str, attn) -> list[str]:
     return []
 
 
+def _iq_readable(attn) -> bool:
+    """Whether K1 reads the indexer's wq_b for the index query: MXFP8 e4m3 in the
+    layout of the layer's own wq_b (row-major or aiter's (16, 16) preshuffle);
+    else SGLang's chain computes it (``_index_query``), which reads any layout."""
+    w = attn.indexer.wq_b
+    return (
+        w.weight.dtype == torch.float8_e4m3fn
+        and not getattr(w, "aiter_bpreshuffled", False)
+        and not getattr(w, "mxfp8_native_ready", False)
+        and getattr(w, "mxfp8_aiter_preshuffled", False)
+        == getattr(attn.wq_b, "mxfp8_aiter_preshuffled", False)
+    )
+
+
 def shuffled_layout(attns) -> bool | None:
     """Whether wqkv / wq_b / wo_b of these attentions are in aiter's (16, 16)
     preshuffle; None when they mix layouts."""
@@ -655,7 +669,7 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         cos_sin=cos_sin,
     )
     ix = getattr(a, "indexer", None)
-    if ix is not None and ix.wq_b.weight.dtype == e4m3:
+    if ix is not None and _iq_readable(a):
         # K1 computes the index query (``attention/index_query``) where it can
         L.k1.iq_w = ix.wq_b.weight
         L.k1.iq_ws = _codes(copies, i, "index wq_b", ix.wq_b)

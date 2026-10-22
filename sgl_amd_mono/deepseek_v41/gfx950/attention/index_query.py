@@ -161,7 +161,8 @@ def stage_iw(c, x, w, out, scale, t0, n, ht, lds, push=None):
 
 def iq_weights(c, w, ws, task, chains):
     """This wave's chain's weight operands, a batch of IQ_BATCH steps at a time
-    (waves past the chains read through a zero-size buffer)."""
+    (waves past the chains read through a zero-size buffer), in the layout of K1's
+    other weights (``shuffled``)."""
     wave = c["wave"]
     nb = (wave < len(chains)).select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
     r_w, r_ws = rsrc(w, nb), rsrc(ws, nb)
@@ -174,7 +175,9 @@ def iq_weights(c, w, ws, task, chains):
 
     def batch(b0):
         return [
-            _step_load(c, r_w, r_ws, Q_RANK, task * ROWS, step(i))
+            _step_load(
+                c, r_w, r_ws, Q_RANK, task * ROWS, step(i), shuffled=c["shuffled"]
+            )
             for i in range(b0, min(b0 + IQ_BATCH, len(chains[0])))
         ]
 

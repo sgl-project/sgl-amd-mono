@@ -224,6 +224,7 @@ def main():
         dtype=torch.uint8,
     )
     iw_w = (torch.randn(32, HIDDEN, generator=gi, device=dev) * 0.02).bfloat16()
+    kw["iq_w"] = shuffle_weight(iq_w, (16, 16)) if args.shuffled else iq_w
     iw_scale = 128**-0.5 * 32**-0.5
     iw_bits = struct.unpack("<i", struct.pack("<f", iw_scale))[0]
     freqs = torch.complex(cos_sin[:, :32], cos_sin[:, 32:])  # SGLang's freqs_cis
@@ -309,7 +310,7 @@ def main():
                 r.pre_a.data_ptr(), kw["wqkv"].data_ptr(), a["wqkv_s"].data_ptr(), a["q_norm"].data_ptr(), a["kv_norm"].data_ptr(),
                 kw["wqb"].data_ptr(), a["wqb_s"].data_ptr(), cos_sin.data_ptr(), pos.data_ptr(),
                 slot.data_ptr(), 1, swa.data_ptr(), swa.stride(0), BLOCK, 0, 0, 0, 0, 0, 0, r.q.data_ptr(),
-                r.normed.data_ptr(), r.qr.data_ptr(), iq_w.data_ptr(), iq_ws.data_ptr(),
+                r.normed.data_ptr(), r.qr.data_ptr(), kw["iq_w"].data_ptr(), iq_ws.data_ptr(),
                 iw_w.data_ptr(), iw_bits, cos_sin.shape[0], r.iq.data_ptr(),
                 r.iqs.data_ptr(), r.iw.data_ptr(), sc.data_ptr(),
                 r.peer.local, r.peer.addresses.data_ptr(), r.rank, r.epoch.data_ptr(),
