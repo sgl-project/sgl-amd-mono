@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Monokernels for SGLang on AMD Instinct GPUs (RFC sgl-project/sglang#43949):
 persistent kernels that run most of a decoder layer, including its TP
-all-reduce, in one or two launches.
+all-reduce, in one or two launches, or several layers in one launch.
 
 SGLang holds the interface (``sglang.srt.monokernels``). This package
 holds the HIP device runtime (``common``) and, per model, its specs and their
@@ -24,6 +24,9 @@ SPECS = {
     "GlmMoeDsaForCausalLM": "sgl_amd_mono.glm53.spec:SPEC",
     "MiniMaxM3SparseForCausalLM": "sgl_amd_mono.minimax_m3.spec:SPEC",
     "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax_m3.spec:SPEC",
+    # the MTP draft routes its own steps (qwen38_flash_next/draft.py)
+    "Qwen4ExpForCausalLMMTP": "sgl_amd_mono.qwen38_flash_next.draft:SPEC",
+    "Qwen4ExpForConditionalGeneration": "sgl_amd_mono.qwen38_flash_next.spec:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
