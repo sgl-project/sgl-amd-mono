@@ -39,7 +39,7 @@ from sgl_amd_mono.common.sync import Mailbox, preg, publish, sreg
 
 from .attention import back as mb_back
 from .attention import front as mb_front
-from .attention import index_query as iqm
+from .attention import index_query
 from .attention.plan import WINDOW, Dims, back_scratch, front_scratch
 from .stages import moe, seam
 from .stages.dims import Dims as StageDims
@@ -231,7 +231,7 @@ def build_mono_k1(key: MonoBuild):
         front: FrontLds  # type: ignore[valid-type]
 
     # the index query here (``index_query``) only where it is reproduced
-    assert not key.iq or (key.index and iqm.fused(s, key.tok_par)), key
+    assert not key.iq or (key.index and index_query.fused(s, key.tok_par)), key
     IW0 = (GATE0 + own_n) % BLOCKS  # the head weights' CTAs, past the gates'
     name = kernel_symbol(
         "dsv41_mono_k1",
@@ -355,7 +355,7 @@ def build_mono_k1(key: MonoBuild):
             )
             c["index"] = key.index
             if const_expr(key.iq):
-                c["iq_chains"] = iqm.iq_chains(s)
+                c["iq_chains"] = index_query.iq_chains(s)
             if const_expr(key.timeline):
                 c["tl"] = timeline_row(scratch, layout["timeline"][0], bid)
             amb = Mailbox(tag)
@@ -443,7 +443,7 @@ def build_mono_k1(key: MonoBuild):
                         push = lambda row, h, w0, w1: push_head_pair(  # noqa: E731
                             cp, bases, pl["iwg"], row, h, [w0, w1]
                         )
-                    iqm.run_iw(c, c["args"], own_n, IW0, c["xl"], t0, push)
+                    index_query.run_iw(c, c["args"], own_n, IW0, c["xl"], t0, push)
 
             mb_front.run_front(
                 c,
@@ -465,7 +465,7 @@ def build_mono_k1(key: MonoBuild):
                             gather_row(ca, preg(own, pl["nbg"], "nbg"), t, normed_out)
                             mb_front.qr_from(c, preg(own, pl["qrg"], "qrg"), t)
                         if const_expr(key.iq):
-                            iqm.iw_from(c, preg(own, pl["iwg"], "iwg"), t)
+                            index_query.iw_from(c, preg(own, pl["iwg"], "iwg"), t)
             stamp(c, 40)
 
     @flyc.jit
@@ -609,7 +609,7 @@ def push_head_pair(c, bases, off, t, h, vs):
     """Row t's index head weights h, h + 1 to every other rank's IWG."""
     for p in range_constexpr(c["d"].tp):
         if c["rank"] != p:
-            c["put_bf"](preg(bases[p], off, "iwg"), t * iqm.HEADS + h, vs)
+            c["put_bf"](preg(bases[p], off, "iwg"), t * index_query.HEADS + h, vs)
 
 
 @flyc.jit
