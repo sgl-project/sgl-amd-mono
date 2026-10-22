@@ -1,9 +1,9 @@
-"""Check K2 (the attention back fused into the FFN launch) stage by stage on gfx950
-(torchrun, TP2 or TP4): its XO (combine, inverse RoPE, bf16) against a torch attention,
-its X8B against wo_a of its own XO, the wo_b partial it pushed against wo_b of its own X8B,
-its output bit for bit against the FFN launch fed that partial; an index source's K2,
-which builds the key table itself, a window-only K2 and a token-parallel K2 (on this
-rank's rows) bit for bit against the K2 of the same keys; then its graph replay."""
+"""Check K2, the attention back fused into the FFN launch, stage by stage (torchrun, TP2 or TP4).
+
+XO against a torch attention, X8B and the pushed wo_b partial against wo_a / wo_b of K2's own
+XO / X8B, the output bit for bit against the FFN launch fed that partial; the index-source,
+window-only and token-parallel (this rank's rows) K2 bit for bit against the K2 of the same keys;
+then a graph replay."""
 
 import argparse
 import os
@@ -33,7 +33,7 @@ O_RANK = 1024
 SWA_BLOCK, COMP_BLOCK = 64, 128
 SWA_PAGES, COMP_PAGES = 48, 32
 POSITIONS = 4096
-WIDTHS = SPEC.devices["gfx950"].widths  # every width the spec builds
+WIDTHS = SPEC.devices["gfx950"].widths
 
 
 def page_bytes(block):
@@ -54,9 +54,7 @@ def make_cache(pages, block, g, dev):
     )
     scales = torch.cat([codes, torch.zeros_like(codes[..., :1])], -1)
     raw = torch.zeros(pages, page_bytes(block), dtype=torch.uint8, device=dev)
-    data = torch.cat(
-        [nope.view(torch.uint8), rope.view(torch.uint8)], -1
-    )  # [pages, block, 576]
+    data = torch.cat([nope.view(torch.uint8), rope.view(torch.uint8)], -1)
     raw[:, : block * DATA] = data.reshape(pages, -1)
     raw[:, block * DATA : block * REC] = scales.reshape(pages, -1)
     k_nope = nope.float() * torch.exp2(codes.float() - 127).repeat_interleave(64, -1)
@@ -172,9 +170,7 @@ def mx_region(scratch, layout, name, rows, cols):
 
 
 def k2_timeline(M, tl) -> str:
-    """Every mark K2 passed (the back's 0 .., the FFN's 16 ..), in median order:
-    its µs after the first CTA's start (median CTA, last CTA), and the CTA that
-    ends last's own steps."""
+    """Every mark K2 passed (the back's 0 .., the FFN's 16 ..) in median order, in µs."""
     marks = [k for k in range(28) if bool((tl[:, k] != 0).all())]
     t0 = tl[:, marks[0]].min()
     rel = (tl[:, marks] - t0).double() / 100.0  # 100 MHz ticks
@@ -261,9 +257,8 @@ def main():
     fails, steps = [], []
     widths = tuple(int(w) for w in args.widths.split(",")) if args.widths else WIDTHS
     for M in widths:
-        gk = torch.Generator().manual_seed(
-            1000 + M
-        )  # alike on every rank: the step's metadata
+        # alike on every rank: the step's metadata
+        gk = torch.Generator().manual_seed(1000 + M)
         pad = (M - 1,) if M >= 6 else ()
         kt, klen, lists = key_lists(M, gk, dev, pad_rows=pad)
         pos = torch.randint(0, POSITIONS, (M,), generator=gk).to(dev)
@@ -330,8 +325,7 @@ def main():
             "ffn stages": same,
         }
         outs = (out, res_o, post_o, comb_o, pre_o)
-        # an index source's K2 builds the table from K1's slots and the indexer's
-        # top-k: the same table, the same outputs bit for bit
+        # an index source's K2 builds the table from K1's slots and top-k: same table and outputs
         slot, keys = source_keys(M, lists, dev)
         runner.kt.fill_(-7)
         runner.klen.fill_(-7)
@@ -345,8 +339,7 @@ def main():
             and torch.equal(runner.kt[: M * (WINDOW + TOPK)], kt.reshape(-1))
             and torch.equal(runner.klen[: 2 * M], klen)
         )
-        # a window-only layer's K2 (no compressed cache) against the full K2 on a
-        # table of window keys only
+        # a window-only K2 (no compressed cache) against the full K2 on a window-keys-only table
         kt0, klen0 = window_only(M, lists, dev)
         pair = []
         for comp in (comp_raw, None):
@@ -431,8 +424,7 @@ def main():
                 tok_par=tok_par,
             )  # fmt: skip
 
-    # a token-parallel step writes its own rows alone: the others keep a sentinel
-    # (uninitialised memory may hold NaNs, which no equality check passes)
+    # token-parallel steps write only their rows; a sentinel elsewhere, as NaN never compares equal
     sentinel = -3.25
     for st in steps:
         if st[9]:

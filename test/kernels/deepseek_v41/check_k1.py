@@ -1,7 +1,9 @@
-"""Check that K1 stays bitwise equal to SGLang's decode chain for the seam and the SWA KV write on gfx950,
-in each variant: the owed post folded in, a settled residual (after an Engram write), the first
-layer (copy 0 of the broadcast embedding), and an index source's normed input and qr; each also
-token parallel where the width allows (the seam's outputs on this rank's rows, the rest whole)."""
+"""Check K1 bitwise against SGLang's decode chain for the seam and SWA KV write on gfx950.
+
+Variants: the owed post folded in, a settled residual (after an Engram write), the first layer
+(copy 0 of the broadcast embedding) and an index source (normed input, qr, index query); each
+also token parallel where the width allows (the seam's outputs on this rank's rows, the rest
+whole)."""
 
 import argparse
 import math
@@ -25,25 +27,24 @@ from sgl_amd_mono.deepseek_v41.spec import NUMERICS, SPEC
 
 RECORD, BLOCK, PAGES, POSITIONS = 584, 64, 64, 131072
 Q_RANK, NOPE, HEAD = 1280, 448, 512
-# the spec's bounds; measured: mixes <= 5.4e-7 (TP2 / TP4 synthetic, TP4 server)
+# the spec's bound; measured mixes <= 5.4e-7 (TP2 / TP4 synthetic, TP4 server)
 MIX_TOL = NUMERICS.bound("k1.mix.max_abs")
 # K1 rounds q as SGLang does but sums wq_b in another order: bf16 flips only
 Q_COS, Q_REL = NUMERICS.bound("k1.q.cosine"), NUMERICS.bound("k1.q.rel")
-# every width the spec builds
 WIDTHS = ",".join(str(m) for m in SPEC.devices["gfx950"].widths)
-# (name, fold, index, first): the variants, each against its SGLang chain
+# (name, fold, index, first), each against its own SGLang chain
 VARIANTS = (
     ("fold", True, False, False),
     ("settled", False, False, False),
     ("first", False, False, True),
     ("index", True, True, False),
 )
-# the token-parallel builds (``token_par``) of these, where the width allows
+# also run token parallel (``token_par``) where the width allows
 TOKEN_PAR_VARIANTS = ("fold", "settled", "index")
-# the widths the variants other than fold run at (fold runs at every width)
+# fold runs at every width, the other variants only at these
 VARIANT_WIDTHS = (1, 6, 12, 24, 48)
 QR_REL = NUMERICS.bound("k1.qr.rel")
-# SGLang's wqkv_a configs K1 is matched to: the GEMV per M bucket up to 32 rows, the split-K tile above
+# SGLang's wqkv_a configs K1 matches: the GEMV per M bucket up to 32 rows, the split-K tile above
 GEMV = {1: "w16s1r16t16k", 2: "w16s1r16t16k", 4: "w16s1r16t16k", 8: "w8s2r16t16k", 16: "w8s2r16t16k",
         32: "w8s1r16t32k"}  # fmt: skip
 LARGE_M = (64, 64, 256, 4, 5)
@@ -210,8 +211,7 @@ def main():
     else:
         kw = {n: a[n] for n in ("wqkv", "wqb")}
     cos_sin = rope_table(dev)
-    # an indexer (replicated on every rank): wq_b [4096, 1280] e4m3 with E8M0
-    # 32 x 32 blocks, weights_proj [32, 5120] bf16, the head-weight scale 2^-6
+    # an indexer, replicated on every rank: wq_b, weights_proj and the head-weight scale 2^-6
     gi = torch.Generator(device=dev).manual_seed(29)
     iq_w = (torch.randn(4096, Q_RANK, generator=gi, device=dev) * 64).clamp(-448, 448)
     iq_w = iq_w.to(torch.float8_e4m3fn)
@@ -232,9 +232,8 @@ def main():
         a["wqkv"], torch.exp2(a["wqkv_s"].float() - 127), (32, 32)
     )
     stride = math.ceil(BLOCK * RECORD / 576) * 576
-    edges = torch.tensor(
-        [BLOCK - 1, BLOCK, PAGES * BLOCK - 1], device=dev
-    )  # page edges, the last slot
+    # page edges and the last slot
+    edges = torch.tensor([BLOCK - 1, BLOCK, PAGES * BLOCK - 1], device=dev)
 
     def records(buf, s):
         """Return the 584 bytes of slots ``s``: 448 NOPE e4m3, 64 bf16 rope, then 8 scale bytes (7, pad)."""
@@ -299,9 +298,8 @@ def main():
         aux = torch.full((M, HIDDEN), float("nan"), dtype=torch.bfloat16, device=dev)
 
         def launch():
-            r.epoch[0] += (
-                1  # the FFN launch moves the epoch; K1 alone must not see the last launch's tags
-            )
+            # the FFN launch moves the epoch; K1 alone must not see the last launch's tags
+            r.epoch[0] += 1
             k1(
                 res.data_ptr(), xk.data_ptr(), postk.data_ptr(), combk.data_ptr(), pre.data_ptr(),
                 m.hc_ffn_fn.data_ptr(), m.hc_ffn_scale.data_ptr(), m.hc_ffn_base.data_ptr(),
@@ -374,8 +372,7 @@ def main():
                 )
             )
 
-            # SGLang's boundary: no x when nothing is owed, no pre_prev on the first
-            # layer (the collapse is copy 0)
+            # SGLang's boundary: no x when nothing is owed, no pre_prev on the first layer (copy 0)
             ro, y, co = hc_boundary_fused_deferred(
                 x if fold else None,
                 res,
@@ -453,8 +450,7 @@ def main():
                     ((r.qr[:M].float() - qr_ref).norm() / qr_ref.norm()).item(),
                 )
             if iq:
-                # the index query: K1's against SGLang's chain on K1's own qr and
-                # normed input (``spec._index_query``), bit for bit
+                # bit for bit vs SGLang's chain (``spec._index_query``) on K1's qr and normed input
                 ref = index_q_rope_pack_weights_flydsl(
                     q=aiter_mxfp8_blockscaled_linear(r.qr[:M], iq_w, iq_ws),
                     freqs_cis=freqs,
