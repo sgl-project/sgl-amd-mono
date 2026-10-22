@@ -2,8 +2,10 @@
 * @HaiShaw @kevin-mii @alexnails
 
 # Per model: one owner for its spec, forward, kernels and tests. Each new
-# model's PR adds its line.
+# model's PR adds its line. Qwen is one series, so one line owns every path
+# whose name contains qwen.
 **/*deepseek_v41* @kkHuang-amd
 **/*glm53* @jhinpan
 **/*glm53_flash* @jhinpan
 **/*minimax_m3* @zijiecode
+**/*qwen* @yichiche

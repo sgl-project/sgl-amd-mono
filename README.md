@@ -98,10 +98,11 @@ sgl-amd-mono/
 │   │   ├── spec.py      # spec and forward
 │   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
 │   │   └── gfx950/      # kernels and launch runner
-│   └── minimax_m3/
-│       ├── spec.py      # spec and forward
-│       ├── weights.py   # the layer views the kernels read
-│       └── gfx950/      # kernels and launch runner
+│   ├── minimax_m3/
+│   │   ├── spec.py      # spec and forward
+│   │   ├── weights.py   # the layer views the kernels read
+│   │   └── gfx950/      # kernels and launch runner
+│   └── qwen/            # Qwen series; each model lands in its own PR
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
     ├── kernels/         # GPU: each launch against SGLang's reference ops
