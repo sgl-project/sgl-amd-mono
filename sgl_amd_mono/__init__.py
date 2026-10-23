@@ -2,11 +2,12 @@
 """Monokernels for SGLang on AMD Instinct GPUs (RFC sgl-project/sglang#43949).
 
 Persistent kernels run most of a decoder layer, its TP collectives included, in one
-or two launches. SGLang holds the interface (``sglang.kernels.plugin_kernels.amd``);
-this package holds the HIP device runtime (``common``) and, per model, its specs and
-their forwards (``<model>/spec.py``, ``<model>/draft.py``) and its kernels per ISA
-(``<model>/<isa>/``). SGLang loads it as a general plugin (the ``sglang.srt.plugins``
-entry point in ``pyproject.toml``), which registers each spec.
+or two launches, or several layers in one launch. SGLang holds the interface
+(``sglang.kernels.plugin_kernels.amd``); this package holds the HIP device runtime
+(``common``) and, per model, its specs and their forwards (``<model>/spec.py``,
+``<model>/draft.py``) and its kernels per ISA (``<model>/<isa>/``). SGLang loads it
+as a general plugin (the ``sglang.srt.plugins`` entry point in ``pyproject.toml``),
+which registers each spec.
 """
 
 __version__ = "0.1.0.dev0"
@@ -21,6 +22,9 @@ SPECS = {
     "GlmMoeDsaForCausalLM": "sgl_amd_mono.glm53.spec:SPEC",
     "MiniMaxM3SparseForCausalLM": "sgl_amd_mono.minimax_m3.spec:SPEC",
     "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax_m3.spec:SPEC",
+    # the MTP draft routes its own steps (qwen38_flash_next/draft.py)
+    "Qwen4ExpForCausalLMMTP": "sgl_amd_mono.qwen38_flash_next.draft:SPEC",
+    "Qwen4ExpForConditionalGeneration": "sgl_amd_mono.qwen38_flash_next.spec:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
