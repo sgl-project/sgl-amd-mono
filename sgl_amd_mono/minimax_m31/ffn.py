@@ -56,10 +56,10 @@ from sgl_amd_mono.minimax_m31.vcommon.plan import (
     key_tuple,
     pair_layout,
 )
+from sgl_amd_mono.common.plan import kernel_sources
 from sgl_amd_mono.minimax_m31.vcommon.sync import Space, preg, sreg
 
 from .a16w4 import scale_f32, scale_loads, step_mfma, weight_loads
-from .sources import SOURCES
 from .sync import (
     ERROR_WORDS,
     WAIT_TICKS,
@@ -76,6 +76,7 @@ from .sync import (
     wave_sync,
 )
 
+SOURCES = kernel_sources(__name__)
 _STREAM = fx.Stream(None)
 HIDDEN = 6144
 INTER = 768  # a TP4 rank's expert intermediate
