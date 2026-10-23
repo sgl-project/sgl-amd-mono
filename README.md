@@ -120,7 +120,8 @@ sgl-amd-mono/
 │   │   ├── weights.py   # the layer views the kernels read
 │   │   └── gfx950/      # kernels and launch runner
 │   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4; spec and kernels land in its PR
-│   └── qwen38_flash_next/   # Qwen3.8-Flash-Next; spec and kernels land in its PR
+│   └── qwen38_flash_next/
+│       └── gfx950/      # kernel, layouts and packing (the spec lands in a later PR)
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
     ├── kernels/         # GPU: each launch against SGLang's reference ops
@@ -131,10 +132,11 @@ sgl-amd-mono/
 
 ```bash
 pytest test/unit                                                # CPU only
-pytest test/kernels test/e2e -k "not glm53 and not minimax_m3"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k "not glm53 and not minimax_m3 and not qwen38_flash_next"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
 pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k minimax_m3                      # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
+pytest test/kernels -k qwen38_flash_next                        # 1 x MI355X
 ```
 
 Kernel-only time of the GLM-5.3-Flash launches (no model needed): `torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8`.
