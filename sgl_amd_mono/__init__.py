@@ -13,19 +13,31 @@ __version__ = "0.1.0.dev0"
 
 # the backend name every spec registers under
 BACKEND = "amd"
-# each spec by HF architecture; its module imports only when a server runs this backend
+# each spec by (HF architecture, model type), None for any model type; its module
+# imports only when a server runs this backend. DeepSeek-V4-Pro and V4.1 share an
+# architecture in SGLang, so their specs name their model types
 SPECS = {
-    "DeepseekV4ForCausalLM": "sgl_amd_mono.deepseek_v41.spec:SPEC",
-    "DeepseekV4ForCausalLMDSpark": "sgl_amd_mono.deepseek_v41.draft:SPEC",
-    "Glm5NextForConditionalGeneration": "sgl_amd_mono.glm53_flash.spec:SPEC",
-    "GlmMoeDsaForCausalLM": "sgl_amd_mono.glm53.spec:SPEC",
-    "MiniMaxM3SparseForCausalLM": "sgl_amd_mono.minimax_m3.spec:SPEC",
-    "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax_m3.spec:SPEC",
+    ("DeepseekV4ForCausalLM", "deepseek_v4"): "sgl_amd_mono.deepseek_v4.spec:SPEC",
+    ("DeepseekV4ForCausalLM", "deepseek_v41"): "sgl_amd_mono.deepseek_v41.spec:SPEC",
+    (
+        "DeepseekV4ForCausalLMDSpark",
+        "deepseek_v41",
+    ): "sgl_amd_mono.deepseek_v41.draft:SPEC",
+    ("Glm5NextForConditionalGeneration", None): "sgl_amd_mono.glm53_flash.spec:SPEC",
+    ("GlmMoeDsaForCausalLM", None): "sgl_amd_mono.glm53.spec:SPEC",
+    ("MiniMaxM3SparseForCausalLM", None): "sgl_amd_mono.minimax_m3.spec:SPEC",
+    (
+        "MiniMaxM3SparseForConditionalGeneration",
+        None,
+    ): "sgl_amd_mono.minimax_m3.spec:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": ("register",)
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
+        "register",
+        "register(model_type)",
+    )
 }
 
 
@@ -36,5 +48,7 @@ def register_specs() -> None:
     except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         from sglang.srt.monokernels.spec import register
 
-    for architecture, path in SPECS.items():
-        register(backend=BACKEND, architecture=architecture, path=path)
+    for (architecture, model_type), path in SPECS.items():
+        register(
+            backend=BACKEND, architecture=architecture, path=path, model_type=model_type
+        )

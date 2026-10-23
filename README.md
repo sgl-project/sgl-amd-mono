@@ -15,26 +15,26 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | Model | GPU | Tensor parallel | Coverage |
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
+| DeepSeek-V4-Pro | MI355X (gfx950) | 8 | All 61 layers (one launch each) in decode steps of up to 8 rows, and DSpark verify steps of one request (5 to 8 tokens) |
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | 41 of the 42 MoE layers, all but the last (one launch each), in decode steps of up to 8 rows (4 at TP2) |
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 
 ### Design
 
-- **One or two launches per layer.** DeepSeek-V4.1-Flash runs two. K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits. GLM-5.3-Flash and GLM-5.3 run each covered layer as one launch. MiniMax-M3 runs one too: K1 (the input norm, the fused qkv and index projection, the q / k norms, RoPE, the KV and index-key writes and the index scores) runs in front of the block selection, the sparse attention, o_proj, the router, the MoE and both all-reduces, in one launch.
+- **One or two launches per layer.** DeepSeek-V4.1-Flash runs two. K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits. GLM-5.3-Flash and GLM-5.3 run each covered layer as one launch. MiniMax-M3 runs one too: K1 (the input norm, the fused qkv and index projection, the q / k norms, RoPE, the KV and index-key writes and the index scores) runs in front of the block selection, the sparse attention, o_proj, the router, the MoE and both all-reduces, in one launch. DeepSeek-V4-Pro runs each layer as one launch, its KV compressors and the CSA lightning indexer (its compressor, scores and an exact top-k) included, over SGLang's unified KV, compressor states and FP4 index keys.
 - **Graph-safe routing.** Each step is routed by its CUDA graph key alone, so every rank makes the same decision and a captured graph replays the decision made at capture.
 - **Fail-stop synchronization.** Every wait on another workgroup or GPU has a deadline. A failed wait stops the launch on every rank, so no token from a failed step is returned.
-- **In-place weights.** The kernels read the weights SGLang loaded. The few weights that need another layout or precision (MiniMax-M3's attention projections run in FP8) are copied once at startup, and each copy is logged.
+- **In-place weights.** The kernels read the weights SGLang loaded. The few weights that need another layout or precision (MiniMax-M3's attention projections run in FP8; DeepSeek-V4-Pro's attention and shared-expert matrices, packed from the checkpoint into its tiles, about 6 GB a rank) are copied once at startup, and each copy is logged.
 
 ## Quick Start
 
 ### Requirements
 
-- SGLang with the monokernel interface (`sglang.kernels.plugin_kernels.amd` and `sglang.srt.kernel_plugins.amd`; `sglang.srt.monokernels` before [sgl-project/sglang#45389](https://github.com/sgl-project/sglang/pull/45389))
+- SGLang with the monokernel interface (`sglang.kernels.plugin_kernels.amd` and `sglang.srt.kernel_plugins.amd`; `sglang.srt.monokernels` before [sgl-project/sglang#45389](https://github.com/sgl-project/sglang/pull/45389)) and its specs by model type (`register(..., model_type=...)`), which tell DeepSeek-V4-Pro and V4.1 apart under their shared architecture
 - ROCm with FlyDSL and AITER, as included in SGLang's ROCm images
 - AMD Instinct MI350X or MI355X
 - MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--enable-amd-monokernel` refuses MiniMax-M3 and names them.
-
 ### Installation
 
 ```bash
@@ -94,6 +94,25 @@ SGLANG_USE_AITER=1 SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1 python -m sglang.launch_s
   --monokernel-backend amd
 ```
 
+DeepSeek-V4-Pro, on SGLang's two-pool fp8 unified KV:
+
+```bash
+SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+AITER_BF16_FP8_MOE_BOUND=0 python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V4-Pro \
+  --tp 8 \
+  --attention-backend dsv4 \
+  --enable-deepseek-v4-fp4-indexer \
+  --page-size 256 \
+  --kv-cache-dtype fp8_e4m3 \
+  --disable-shared-experts-fusion \
+  --cuda-graph-max-bs-decode 8 \
+  --monokernel-backend amd
+```
+
+`AITER_BF16_FP8_MOE_BOUND=0` makes SGLang's decode run the routed experts on
+MXFP8 activations, as the kernels do.
+
 If the model, GPU or configuration is not supported, the server refuses to start and lists every reason.
 
 ## Repository Structure
@@ -102,7 +121,9 @@ If the model, GPU or configuration is not supported, the server refuses to start
 sgl-amd-mono/
 ├── sgl_amd_mono/
 │   ├── common/          # HIP device runtime: guarded waits, epochs, peer memory
-│   ├── deepseek_v4/     # DeepSeek-V4-Pro; spec and kernels land in its PR
+│   ├── deepseek_v4/
+│   │   ├── spec.py      # spec and forward
+│   │   └── gfx950/      # the layer kernel, weight packing and launch runner
 │   ├── deepseek_v41/
 │   │   ├── spec.py      # target model: spec and forward
 │   │   ├── draft.py     # DSpark draft model: spec and forward
@@ -132,6 +153,7 @@ sgl-amd-mono/
 ```bash
 pytest test/unit                                                # CPU only
 pytest test/kernels test/e2e -k "not glm53 and not minimax_m3"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
+pytest test/kernels -k "deepseek_v4 and not deepseek_v41"      # one MI355X: every DeepSeek-V4-Pro launch compiles
 pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k minimax_m3                      # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set

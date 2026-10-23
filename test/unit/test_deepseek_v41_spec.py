@@ -49,7 +49,10 @@ def test_the_plugin_registers_both_specs():
         ("DeepseekV4ForCausalLMDSpark", draft.SPEC),
     ):
         found, why = registry.find_spec(
-            backend=sgl_amd_mono.BACKEND, architectures=[arch], isa="gfx950"
+            backend=sgl_amd_mono.BACKEND,
+            architectures=[arch],
+            isa="gfx950",
+            model_type="deepseek_v41",
         )
         assert found is spec, why
 
