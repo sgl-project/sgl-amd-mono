@@ -142,10 +142,21 @@ class TestMonokernelCheck(CustomTestCase):
         # a row's earlier drafts from the cache misses some of them (layer.topk_own)
         self._check_layers(MTP, ((1, 200), (2, 200)), new_tokens=16, rows=(4, 8))
 
-    def _check_layers(self, extra_args, batches, new_tokens, rows):
+    def test_each_covered_layer_past_the_parallel_top_k(self):
+        # rows of about 36k keys (9 chunks, past the one-CTA path's 8) select their top-k
+        # on 9 CTAs each: 1, 3 and 8 such rows at widths 2, 4 and 8
+        self._check_layers(
+            [],
+            ((1, 3000), (3, 3000), (8, 3000)),
+            new_tokens=4,
+            rows=(1, 3, 8),
+            past=32768,
+        )
+
+    def _check_layers(self, extra_args, batches, new_tokens, rows, past=2048):
         """SGLANG_AMD_MONO_CHECK (eager) on one server, each (requests, repeats)
         batch of a record prompt in turn: both kinds of layer checked at every
-        count in ``rows``, an indexer layer past 2048 keys, and no violation."""
+        count in ``rows``, an indexer layer past ``past`` keys, and no violation."""
         para = "The river valley archive lists the flood height of every year. "
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
@@ -197,7 +208,7 @@ class TestMonokernelCheck(CustomTestCase):
         want = {(kind, n) for kind in ("indexer", "shared") for n in rows}
         self.assertTrue(want <= seen, seen)
         self.assertTrue(
-            any(k == "indexer" and int(hi) >= 2048 for k, _, hi, _ in checks)
+            any(k == "indexer" and int(hi) >= past for k, _, hi, _ in checks)
         )
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
