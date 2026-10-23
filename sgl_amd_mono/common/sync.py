@@ -20,6 +20,7 @@ from sgl_amd_mono.common.ops import (
     CM_SYS,
     bf16_pair,
     rsrc,
+    uniform,
 )
 
 POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
@@ -46,6 +47,31 @@ def _spin(load_all, pending):
     # bound before the traced loops: a local whose method a loop calls becomes loop state
     deadline_of, stopped, fail, note_peer = g.deadline, g.stopped, g.fail, g.note_peer
     v = load_all()
+    if const_expr(g.stop and g.fault_site != site):
+        # A failed wait stops the launch from inside the check, so the loop is the
+        # unguarded one plus a wave-uniform poll count: no second exit, no state
+        # next to the polled words, which then reload in place (a loop that
+        # carries a stop value copies them every poll: spills at large batches).
+        # The check is all scalar (the deadline by a scalar load, the time in
+        # 32-bit units), so it needs no VGPRs at the batch's peak either. Without
+        # peers it reads no error words: a wait on this GPU that failed stopped
+        # the whole launch already.
+        scalar_deadline, peers = g.scalar_deadline, g.own is not None
+        t0 = fx.Int64(0)
+        polls = fx.Int32(0)
+        while pending(v):
+            rocdl.s_sleep(1)
+            v = load_all()
+            polls = uniform(polls + 1)
+            if (polls & (CHECK_POLLS - 1)) == 0:
+                now = guard.clock()
+                t0 = (polls == CHECK_POLLS).select(now, t0)
+                if fx.Int32((now - t0) >> guard.TICK_SHIFT) > scalar_deadline():
+                    fail(site)
+                if const_expr(peers):
+                    if stopped():
+                        note_peer()
+        return v
     stop = fx.Int32(0)  # 1: this wait timed out; 2: a failure elsewhere
     if const_expr(g.fault_site == site):
         # SGLANG_AMD_MONO_FAULT_INJECT: once armed, this rank stalls here until the deadline

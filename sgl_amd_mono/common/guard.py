@@ -60,6 +60,9 @@ FLAG_WORDS = 8  # one a rank; TP 8 at most
 FLAG_BYTES = 256  # the peer buffer's flags region, padded to a cache line pair
 
 CLOCK_HZ = 100_000_000  # s_memrealtime: the constant 100 MHz reference clock
+# a wait compares its elapsed time and deadline in units of 2**TICK_SHIFT ticks
+# (2.56 us), as 32-bit scalars: a deadline of 60 s is 2.3e7 of them
+TICK_SHIFT = 8
 
 
 def deadline_ticks(seconds: float) -> int:
@@ -143,6 +146,17 @@ class Guard:
             )
         )
         return (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
+
+    def scalar_deadline(self):
+        """The deadline >> ``TICK_SHIFT`` in an SGPR: one scalar load, so a check
+        in a wait holds no VGPRs next to the polled words. The host writes the
+        deadline before the launch, so the scalar cache may serve it (a GLC load
+        here slows the launch's other scalar loads)."""
+        w = fx.Vector(bo.buffer_load(rsrc(self.epoch), 0, vec_width=4, is_scalar=True))
+        dl = (fx.Int64(w[GUARD_DEADLINE + 1]) << 32) | (
+            fx.Int64(w[GUARD_DEADLINE]) & fx.Int64(0xFFFFFFFF)
+        )
+        return fx.Int32(dl >> TICK_SHIFT)
 
     def next_site(self) -> int:
         self._sites += 1

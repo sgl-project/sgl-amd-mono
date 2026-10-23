@@ -88,6 +88,14 @@ def test_satisfied_wait_is_clean():
     assert int(box[2]) == 42
 
 
+def test_satisfied_wait_with_the_stop_on_is_clean():
+    # the production setting: the wait's checks stop the launch from inside the loop
+    e, box = _epoch(5.0), torch.zeros(4, dtype=torch.int32, device="cuda")
+    _run(_build(publish=True, stop=True), e, box)
+    assert _words(e) == [0, 0, 0]
+    assert int(box[2]) == 42
+
+
 def test_unsatisfied_wait_returns_at_its_deadline_and_later_waits_at_once():
     e, box = _epoch(0.3), torch.zeros(4, dtype=torch.int32, device="cuda")
     took = _run(_build(publish=False), e, box)
