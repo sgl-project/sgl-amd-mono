@@ -157,7 +157,14 @@ class TestMonokernelFault(CustomTestCase):
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
         ):
             process = _launch(
-                extra_env={"SGLANG_AMD_MONO_FAULT_INJECT": "1:1:20"},
+                extra_env={
+                    "SGLANG_AMD_MONO_FAULT_INJECT": "1:1:20",
+                    # the crash dumps (each rank's VRAM, py-spy of each scheduler with
+                    # no timeout, a 60 s wait) can outlast the wait for the stop below
+                    "HSA_DISABLE_COREDUMP_ON_EXCEPTION": "1",
+                    "SGLANG_PYSPY_DUMP_BEFORE_CRASH": "0",
+                    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "0",
+                },
                 extra_args=["--watchdog-timeout", "20"],
                 log=(out, err),
             )
