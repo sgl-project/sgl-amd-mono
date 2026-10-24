@@ -57,3 +57,9 @@ def test_the_load_hook_keeps_this_ranks_shard():
         down.view(torch.int32), full["down"][:, rank * shard : (rank + 1) * shard]
     )
     assert len(copies) == 2, "the hook kept a tensor that is not a shared expert's"
+
+
+def test_both_models_serve_the_shared_specs_steps():
+    """SGLang routes M3 and M3.1 by the shared spec's device limits, so a change to
+    either model's widths or TP sizes must change the other's too."""
+    assert m3.SPEC.devices == m31.SPEC.devices == family.SPEC.devices

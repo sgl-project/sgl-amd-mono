@@ -82,7 +82,7 @@ def _build(model, hf_config, ctx):
     return _model(hf_config).SPEC.build(model, hf_config, ctx)
 
 
-assert m3.SPEC.devices == m31.SPEC.devices, "both models' kernels serve the same steps"
+# SGLang routes both models by these limits; test_minimax_m31_spec checks they agree
 SPEC = MonoSpec(
     name="minimax_m3_family_hip",
     devices=m3.SPEC.devices,
