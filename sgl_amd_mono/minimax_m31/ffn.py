@@ -28,10 +28,12 @@ from enum import Enum
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
+from sgl_amd_mono.common.plan import kernel_sources
 from sgl_amd_mono.minimax_m31.vcommon.ops import (
     CM_SYS,
     ballot,
@@ -56,7 +58,6 @@ from sgl_amd_mono.minimax_m31.vcommon.plan import (
     key_tuple,
     pair_layout,
 )
-from sgl_amd_mono.common.plan import kernel_sources
 from sgl_amd_mono.minimax_m31.vcommon.sync import Space, preg, sreg
 
 from . import a16w8
