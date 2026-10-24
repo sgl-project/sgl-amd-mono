@@ -317,7 +317,7 @@ def build(model, hf_config, ctx):
     from sglang.srt.distributed import get_tp_group
 
     from sgl_amd_mono.minimax_m31.runner import FfnRunner
-    from sgl_amd_mono.minimax_m31.vcommon.peer_memory import PeerBuffer
+    from sgl_amd_mono.common.peer import PeerBuffer
 
     group = get_tp_group()
     rank, device = (

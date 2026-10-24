@@ -31,7 +31,7 @@ class _IpcHandle(ctypes.Structure):
 
 
 @functools.cache
-def _hip():
+def hip_runtime():
     """The HIP runtime this process loaded (torch's), not a second copy."""
     path = None
     with open("/proc/self/maps") as maps:
@@ -66,7 +66,7 @@ def _hip():
 
 def _check(err: int, what: str) -> None:
     if err:
-        msg = _hip().hipGetErrorString(err)
+        msg = hip_runtime().hipGetErrorString(err)
         raise RuntimeError(f"{what}: {msg.decode() if msg else err}")
 
 
@@ -74,17 +74,17 @@ def _alloc_uncached(nbytes: int) -> int:
     size = -(-nbytes // _GRANULE) * _GRANULE
     ptr = ctypes.c_void_p()
     _check(
-        _hip().hipExtMallocWithFlags(ctypes.byref(ptr), size, _DEVICE_MALLOC_UNCACHED),
+        hip_runtime().hipExtMallocWithFlags(ctypes.byref(ptr), size, _DEVICE_MALLOC_UNCACHED),
         "hipExtMallocWithFlags",
     )
-    _check(_hip().hipMemset(ptr, 0, size), "hipMemset")
+    _check(hip_runtime().hipMemset(ptr, 0, size), "hipMemset")
     return int(ptr.value)
 
 
 def _handle(ptr: int) -> bytes:
     h = _IpcHandle()
     _check(
-        _hip().hipIpcGetMemHandle(ctypes.byref(h), ctypes.c_void_p(ptr)),
+        hip_runtime().hipIpcGetMemHandle(ctypes.byref(h), ctypes.c_void_p(ptr)),
         "hipIpcGetMemHandle",
     )
     return bytes(ctypes.string_at(ctypes.byref(h), _IPC_HANDLE_BYTES))
@@ -95,7 +95,7 @@ def _open(handle: bytes) -> int:
     ctypes.memmove(ctypes.byref(h), handle, _IPC_HANDLE_BYTES)
     out = ctypes.c_void_p()
     _check(
-        _hip().hipIpcOpenMemHandle(
+        hip_runtime().hipIpcOpenMemHandle(
             ctypes.byref(out), h, _IPC_MEM_LAZY_ENABLE_PEER_ACCESS
         ),
         "hipIpcOpenMemHandle",
@@ -156,8 +156,8 @@ class PeerBuffer:
         """Unmap the peers and free the local buffer (idempotent)."""
         opened, self._opened = self._opened, []
         for base in opened:
-            _hip().hipIpcCloseMemHandle(ctypes.c_void_p(base))
+            hip_runtime().hipIpcCloseMemHandle(ctypes.c_void_p(base))
         if self.local:
             self.bytes = None
-            _hip().hipFree(ctypes.c_void_p(self.local))
+            hip_runtime().hipFree(ctypes.c_void_p(self.local))
             self.local = 0

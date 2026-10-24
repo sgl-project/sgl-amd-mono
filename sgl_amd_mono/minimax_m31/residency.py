@@ -8,6 +8,8 @@ import functools
 
 import regex as re
 
+from sgl_amd_mono.common.peer import hip_runtime
+
 
 def code_object(ir_text: str) -> bytes:
     """The linked ELF of a FlyDSL artifact's ``gpu.binary`` (MLIR escapes
@@ -31,19 +33,9 @@ def code_object(ir_text: str) -> bytes:
     return bytes(out)
 
 
-def _hip_library() -> str:
-    """The HIP runtime this process already loaded (ROCm wheels ship only the
-    versioned soname, outside the loader path), else the plain soname."""
-    with open("/proc/self/maps") as maps:
-        for line in maps:
-            if "libamdhip64.so" in line:
-                return line.split()[-1]
-    return "libamdhip64.so"
-
-
 @functools.cache
 def _hip():
-    hip = ctypes.CDLL(_hip_library())
+    hip = hip_runtime()
     ptr, out = ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)
     hip.hipModuleLoadData.argtypes = [out, ctypes.c_char_p]
     hip.hipModuleGetFunction.argtypes = [out, ptr, ctypes.c_char_p]

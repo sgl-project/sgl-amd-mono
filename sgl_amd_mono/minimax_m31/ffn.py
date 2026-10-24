@@ -34,7 +34,7 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from sgl_amd_mono.common.plan import kernel_sources
-from sgl_amd_mono.minimax_m31.vcommon.ops import (
+from sgl_amd_mono.common.ops import (
     CM_SYS,
     ballot,
     bf2_f32,
@@ -44,13 +44,12 @@ from sgl_amd_mono.minimax_m31.vcommon.ops import (
     hw_exp2,
     hw_rcp,
     lanes_below,
-    memrealtime,
+    clock,
     peer_bases,
     popcount,
     rsrc,
-    traced,
 )
-from sgl_amd_mono.minimax_m31.vcommon.plan import (
+from sgl_amd_mono.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
@@ -58,7 +57,7 @@ from sgl_amd_mono.minimax_m31.vcommon.plan import (
     key_tuple,
     pair_layout,
 )
-from sgl_amd_mono.minimax_m31.vcommon.sync import Space, preg, sreg
+from sgl_amd_mono.common.sync import Space, preg, sreg
 
 from . import a16w8
 from .a16w4 import scale_f32, scale_loads, step_mfma, weight_loads
@@ -227,7 +226,7 @@ def put_word(c, addr, i, word):
     c["mb"].put_words(addr, i, [word])
 
 
-@traced
+@flyc.jit
 def flag_after_stores(c, addr, i, who):
     """Pair i := 1 (thread ``who``), released after the CTA's earlier stores."""
     cta_sync(drain=True)
@@ -266,7 +265,7 @@ def bf16_bits_f32(bits):
     return ((bits & 0xFFFF) << 16).bitcast(fx.Float32)
 
 
-@traced
+@flyc.jit
 def block_sum(c, v, slot):
     """``v`` summed over the CTA: each wave's butterfly, then waves in order
     (LDS ``red`` words ``slot * WAVES ..``). Every thread gets the sum."""
@@ -282,7 +281,7 @@ def block_sum(c, v, slot):
 
 
 # ---------------------------------------------------------------- seam
-@traced
+@flyc.jit
 def stage_push(c, task):
     """Triples 16 task ..: this rank's partial as triple pairs to every rank's
     ATTN."""
@@ -295,7 +294,7 @@ def stage_push(c, task):
             c["mb"].put_triple(c["peer"][p], attn_pair(c, c["rank"], t, tr), bits)
 
 
-@traced
+@flyc.jit
 def stage_reduce(c, task):
     """Triples 16 task ..: the ranks' values summed in rank order (the
     all-reduce's bf16), + residual in f32 -> residual out, the f32 sum (SRES)
@@ -328,7 +327,7 @@ def stage_reduce(c, task):
         c["mb"].publish(c["ssq"], t * SEAM_TASKS + task, sq)
 
 
-@traced
+@flyc.jit
 def stage_norm(c, t):
     """Token t's Gemma RMSNorm of SRES -> XN, then XRDY."""
     tid, a = c["tid"], c["args"]
@@ -358,7 +357,7 @@ def stage_norm(c, t):
     flag_after_stores(c, c["xrdy"], t, tid == 0)
 
 
-@traced
+@flyc.jit
 def await_x(c, tokens_n):
     """XRDY of the first ``tokens_n`` tokens (thread t polls token t)."""
     tid = c["tid"]
@@ -385,7 +384,7 @@ def mfma_f32(a, b, acc):
     )
 
 
-@traced
+@flyc.jit
 def stage_router(c, task):
     """Experts 16 tile .. over K part ``part`` (384 columns, 48 a wave) for
     every token: FP32 weight x f32(X) on f32 MFMAs, the waves summed in order
@@ -444,7 +443,7 @@ def _sigmoid(x):
     return hw_rcp(fx.Float32(1.0) + hw_exp2(x * fx.Float32(-LOG2E)))
 
 
-@traced
+@flyc.jit
 def stage_route(c, t):
     """Token t: a thread sums 4 of an expert's 16 logit parts, wave 0 the 4
     sums in order (two experts a lane); top-4 of sigmoid + bias (ties to the
@@ -522,7 +521,7 @@ def tab_st(c, v, i):
     fx.ptr_store(fx.Int32(v), c["tab"] + i)
 
 
-@traced
+@flyc.jit
 def load_table(c):
     """Every valid token's picks -> the slots in LDS: slot 0 the shared expert
     over the valid rows, slots 1 .. n_u the picked experts ascending; a slot's
@@ -585,7 +584,7 @@ def load_table(c):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def shared_slot(c):
     """Slot 0: the shared expert over the valid rows (columns ascending; an
     unused column reads row 0)."""
@@ -654,7 +653,7 @@ def x_operands(c, base, row, k_dwords, st0, steps):
     ]
 
 
-@traced
+@flyc.jit
 def stage_up(c, u, j, weights=None, shared=False):
     """Slot u's tile pair j: gate rows 16 j .., up rows 768 + 16 j .. of its
     expert over this wave's K steps; waves summed in order; SwiGLU-OAI ->
@@ -712,7 +711,7 @@ def up_weights(c, rgs, st0, shared=False):
     return wvs, svs
 
 
-@traced
+@flyc.jit
 def down_slot(c, u, tasks, shared=False):
     """Slot u's down GEMV over every task's 16 rows -> LDS ``CONTRIB``."""
     lane, wave, a = c["lane"], c["wave"], c["args"]
@@ -750,7 +749,7 @@ def down_slot(c, u, tasks, shared=False):
                 )
 
 
-@traced
+@flyc.jit
 def stage_down(c, tasks):
     """Rows 16 task .. of every task in ``tasks``: a slot a wave, round robin,
     its MID columns loaded once for every task; a column's result ->
@@ -797,7 +796,7 @@ def stage_down(c, tasks):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_final(c, task):
     s, tid, a = c["S"], c["tid"], c["args"]
     if tid < s * COLS // 2:
@@ -817,17 +816,17 @@ def stage_final(c, task):
 
 
 # ---------------------------------------------------------------- the launch
-@traced
+@flyc.jit
 def stamp(c, k):
     # compile-time gate outside, traced condition inside
     if const_expr(c["timeline"]):  # noqa: SIM102
         if c["tid"] == 0:
             bo.buffer_store(
-                memrealtime(), rsrc(c["tl"].value), fx.block_idx.x * TL_POINTS + k
+                clock(), rsrc(c["tl"].value), fx.block_idx.x * TL_POINTS + k
             )
 
 
-@traced
+@flyc.jit
 def run_ffn(c, bid):
     s = c["S"]
     stamp(c, 0)
@@ -1038,13 +1037,13 @@ def build_ffn(key: FfnBuild):
     return launch
 
 
-@traced
+@flyc.jit
 def refuse_wrap(c, ep):
     if (fx.block_idx.x == 0) & (c["tid"] == 0) & (ep >= EPOCH_LIMIT):
         c["mb"].fail(SITE_WRAP)
 
 
-@traced
+@flyc.jit
 def finish(c, key, epoch, tag, handshake, inject, peers):
     """Every CTA marks the launch done after its work; CTA 0 waits for the
     marks, then moves the epoch on. The step's last launch (``handshake``)
@@ -1062,20 +1061,20 @@ def finish(c, key, epoch, tag, handshake, inject, peers):
         trade_faults(c, tag, peers)
 
 
-@traced
+@flyc.jit
 def injected_fault(c, inject):
     """Fault injection (qualification): rank ``inject[0] - 1`` fails after
     ``inject[1]`` ticks at the end of the step's last launch."""
     target = load32(inject, 0, "agent")
     if target == c["rank"] + 1:
         ticks = fx.Int64(load32(inject, 1, "agent"))
-        t0 = memrealtime()
-        while memrealtime() - t0 < ticks:
+        t0 = clock()
+        while clock() - t0 < ticks:
             rocdl.s_sleep(8)
         c["mb"].fail(SITE_INJECT)
 
 
-@traced
+@flyc.jit
 def trade_faults(c, tag, peers):
     mb = c["mb"]
     failed = fx.Int32((error_word(mb.err_base) != 0).select(1, 0))
@@ -1089,7 +1088,7 @@ def trade_faults(c, tag, peers):
             Mailbox(tag, mb.err_base, [mb.err_base], p, mb.epoch).fail(SITE_PEER)
 
 
-@traced
+@flyc.jit
 def epoch_end(c, epoch, tag):
     """CTA 0, once every CTA marked this launch: the epoch moves on. A mark
     missing past the wait bound sets the error word instead; the epoch stays."""
@@ -1099,13 +1098,13 @@ def epoch_end(c, epoch, tag):
             fx.ptr_store(fx.Int32(0).bitcast(fx.Float32), red)
         gpu.barrier()
         if tid < BLOCKS:
-            t0 = memrealtime()
+            t0 = clock()
             mark = load32(epoch, EPOCH_MARKS + tid, "agent")
             late = fx.Int64(0)
             while (mark != tag) & (late < c["mb"].ticks):
                 rocdl.s_sleep(1)
                 mark = load32(epoch, EPOCH_MARKS + tid, "agent")
-                late = memrealtime() - t0
+                late = clock() - t0
             if mark != tag:
                 fx.ptr_store(fx.Int32(1).bitcast(fx.Float32), red)
             sync_acquire("agent")

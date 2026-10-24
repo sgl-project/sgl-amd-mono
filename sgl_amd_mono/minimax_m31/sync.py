@@ -36,14 +36,15 @@ A poll gives up after ``ticks`` of the 100 MHz clock or once any rank has set
 the error word; a timeout sets ``[1, rank, epoch, site]`` on every rank.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from sgl_amd_mono.minimax_m31.vcommon.ops import memrealtime, traced
-from sgl_amd_mono.minimax_m31.vcommon.sync import Space
+from sgl_amd_mono.common.ops import clock
+from sgl_amd_mono.common.sync import Space
 
 WAIT_TICKS = 1_000_000_000  # 10 s
 ERROR_WORDS = 4
@@ -167,7 +168,7 @@ def acquire_fence(scope):
     fx.memory_fence(syncscope=scope, ordering=fx.AtomicOrdering.Acquire)
 
 
-@traced
+@flyc.jit
 def wave_sync(count, target):
     """Every lane of the wave: what each lane did before (its acquires)
     happens before what any lane does after. Each lane releases, adds one to
@@ -208,9 +209,9 @@ def pack(word, tag):
     return (fx.Int64(tag) << 32) | fx.Int64(fx.Uint32(fx.Int32(word)))
 
 
-@traced
+@flyc.jit
 def _spin(load_all, pending, err_base, ticks):
-    t0 = memrealtime()
+    t0 = clock()
     v = load_all()
     err = error_word(err_base)
     late = fx.Int64(0)
@@ -218,11 +219,11 @@ def _spin(load_all, pending, err_base, ticks):
         rocdl.s_sleep(1)
         v = load_all()
         err = error_word(err_base)
-        late = memrealtime() - t0
+        late = clock() - t0
     return v, pending(v) & (err == 0)
 
 
-@traced
+@flyc.jit
 def _fail_if(timed_out, fail, site):
     if timed_out:
         fail(site)
