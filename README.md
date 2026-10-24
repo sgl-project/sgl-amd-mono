@@ -17,11 +17,13 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | 41 of the 42 MoE layers, all but the last (one launch each), in decode steps of up to 8 rows (4 at TP2) |
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
+| Kimi-K3 | MI350X, MI355X (gfx950) | 8 | Every MoE layer in decode and DSpark verify steps of up to 8 rows |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 
 ### Design
 
 - **One or two launches per layer.** DeepSeek-V4.1-Flash runs two. K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits. GLM-5.3-Flash and GLM-5.3 run each covered layer as one launch. MiniMax-M3 runs one too: K1 (the input norm, the fused qkv and index projection, the q / k norms, RoPE, the KV and index-key writes and the index scores) runs in front of the block selection, the sparse attention, o_proj, the router, the MoE and both all-reduces, in one launch.
+- **The layer's tail on Kimi-K3.** The model runs the attention and stops at its tensor-parallel output; the launch runs the output projection, the attention all-reduce, the FFN mixing, the MoE and the MoE all-reduce. Which attention a layer runs does not matter, so the linear-attention and the full-attention layers are covered alike.
 - **Graph-safe routing.** Each step is routed by its CUDA graph key alone, so every rank makes the same decision and a captured graph replays the decision made at capture.
 - **Fail-stop synchronization.** Every wait on another workgroup or GPU has a deadline. A failed wait stops the launch on every rank, so no token from a failed step is returned.
 - **In-place weights.** The kernels read the weights SGLang loaded. The few weights that need another layout or precision (MiniMax-M3's attention projections run in FP8) are copied once at startup, and each copy is logged.
@@ -94,6 +96,18 @@ SGLANG_USE_AITER=1 SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1 python -m sglang.launch_s
   --monokernel-backend amd
 ```
 
+Kimi-K3 runs at TP8, where the win is on small decode and DSpark verify steps:
+
+```bash
+SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 python -m sglang.launch_server \
+  --model-path moonshotai/Kimi-K3 --trust-remote-code \
+  --tp 8 \
+  --attention-backend aiter \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 7 \
+  --monokernel-backend amd
+```
+
 If the model, GPU or configuration is not supported, the server refuses to start and lists every reason.
 
 ## Repository Structure
@@ -115,6 +129,9 @@ sgl-amd-mono/
 │   │   ├── spec.py      # spec and forward
 │   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
 │   │   └── gfx950/      # kernels and launch runner
+│   ├── kimi_k3/
+│   │   ├── spec.py      # spec and forward
+│   │   └── gfx950/      # kernels and launch runner
 │   ├── minimax_m3/
 │   │   ├── spec.py      # spec and forward
 │   │   ├── weights.py   # the layer views the kernels read
@@ -135,7 +152,9 @@ pytest test/kernels test/e2e -k "not glm53 and not minimax_m3"  # 4 x MI350X or 
 pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k minimax_m3                      # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
+pytest test/kernels test/e2e -k kimi_k3                         # 8 x MI350X or MI355X, KIMI_K3_MODEL_PATH and KIMI_K3_DSPARK_MODEL_PATH set
 ```
+
 
 Kernel-only time of the GLM-5.3-Flash launches (no model needed): `torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8`.
 

@@ -19,6 +19,9 @@ SPECS = {
     "DeepseekV4ForCausalLMDSpark": "sgl_amd_mono.deepseek_v41.draft:SPEC",
     "Glm5NextForConditionalGeneration": "sgl_amd_mono.glm53_flash.spec:SPEC",
     "GlmMoeDsaForCausalLM": "sgl_amd_mono.glm53.spec:SPEC",
+    # Kimi-K3's checkpoint names the VLM wrapper, so that is the forward the
+    # runtime switches; a text-only deployment loads the same wrapper.
+    "KimiK3ForConditionalGeneration": "sgl_amd_mono.kimi_k3.spec:SPEC",
     "MiniMaxM3SparseForCausalLM": "sgl_amd_mono.minimax_m3.spec:SPEC",
     "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax_m3.spec:SPEC",
 }
