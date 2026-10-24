@@ -59,6 +59,7 @@ from sgl_amd_mono.minimax_m31.vcommon.plan import (
 from sgl_amd_mono.common.plan import kernel_sources
 from sgl_amd_mono.minimax_m31.vcommon.sync import Space, preg, sreg
 
+from . import a16w8
 from .a16w4 import scale_f32, scale_loads, step_mfma, weight_loads
 from .sync import (
     ERROR_WORDS,
@@ -653,10 +654,11 @@ def x_operands(c, base, row, k_dwords, st0, steps):
 
 
 @traced
-def stage_up(c, u, j, weights=None):
+def stage_up(c, u, j, weights=None, shared=False):
     """Slot u's tile pair j: gate rows 16 j .., up rows 768 + 16 j .. of its
     expert over this wave's K steps; waves summed in order; SwiGLU-OAI ->
-    bf16 ``MID[u][column][16 j ..]``, then UPF."""
+    bf16 ``MID[u][column][16 j ..]``, then UPF. ``shared``: the MXFP8 shared
+    expert's ``weights``."""
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     e = tab_ld(c, T_SLOT_E + u)
     cnt = slot_count(c, u)
@@ -670,7 +672,12 @@ def stage_up(c, u, j, weights=None):
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
     for i in range_constexpr(UP_WAVE_STEPS):
         for h in range_constexpr(2):
-            accs[h] = step_mfma(accs[h], wvs[h][i], scale_f32(svs[h], rgs[h], i), xs[i])
+            if const_expr(shared):
+                accs[h] = a16w8.step_mfma(accs[h], wvs[h][i], svs[h][i], xs[i])
+            else:
+                accs[h] = step_mfma(
+                    accs[h], wvs[h][i], scale_f32(svs[h], rgs[h], i), xs[i]
+                )
     for h in range_constexpr(2):
         fx.ptr_store(accs[h], red + ((wave * 2 + h) * 64 + lane) * 4)
     gpu.barrier()
@@ -689,11 +696,57 @@ def stage_up(c, u, j, weights=None):
     flag_after_stores(c, c["upf"], u * UP_TILES + j, tid == 0)
 
 
-def up_weights(c, rgs, st0):
+def up_weights(c, rgs, st0, shared=False):
     a = c["args"]
+    if const_expr(shared):
+        wvs = [
+            a16w8.weight_loads(a["w13s"], rg, HIDDEN, st0, UP_WAVE_STEPS) for rg in rgs
+        ]
+        svs = [
+            a16w8.scale_loads(a["s13s"], rg, HIDDEN, st0, UP_WAVE_STEPS) for rg in rgs
+        ]
+        return wvs, svs
     wvs = [weight_loads(a["w13"], rg, HIDDEN, st0, UP_WAVE_STEPS) for rg in rgs]
     svs = [scale_loads(a["s13"], rg, HIDDEN, st0, UP_WAVE_STEPS) for rg in rgs]
     return wvs, svs
+
+
+@traced
+def down_slot(c, u, tasks, shared=False):
+    """Slot u's down GEMV over every task's 16 rows -> LDS ``CONTRIB``."""
+    lane, wave, a = c["lane"], c["wave"], c["args"]
+    if const_expr(shared):
+        rgs = list(tasks)
+        wvs = [a16w8.weight_loads(a["w2s"], rg, INTER, 0, K2_STEPS) for rg in rgs]
+        svs = [a16w8.scale_loads(a["s2s"], rg, INTER, 0, K2_STEPS) for rg in rgs]
+    else:
+        e = tab_ld(c, T_SLOT_E + u)
+        rgs = [e * DOWN_TASKS + task for task in tasks]
+        wvs = [weight_loads(a["w2"], rg, INTER, 0, K2_STEPS) for rg in rgs]
+        svs = [scale_loads(a["s2"], rg, INTER, 0, K2_STEPS) for rg in rgs]
+    cnt = slot_count(c, u)
+    c["mb"].poll(
+        [(c["upf"], u * UP_TILES + fx.min(lane, UP_TILES - 1), 1)], site=SITE_DOWN
+    )
+    c["mb"].acquire(Space.SCRATCH)
+    # a lane's MID loads span tiles other lanes polled
+    wave_sync(c["tab"] + (T_WAVE + wave), 64 * ((u - wave) // WAVES + 1))
+    col = slot_col(c, cnt)
+    xs = x_operands(c, c["mid"].value, u * 16 + col, INTER // 2, 0, K2_STEPS)
+    pick = tab_ld(c, T_SLOT_PICK + u * 16 + col)
+    for ti in range_constexpr(len(tasks)):
+        acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        for i in range_constexpr(K2_STEPS):
+            if const_expr(shared):
+                acc = a16w8.step_mfma(acc, wvs[ti][i], svs[ti][i], xs[i])
+            else:
+                acc = step_mfma(acc, wvs[ti][i], scale_f32(svs[ti], rgs[ti], i), xs[i])
+        if lane % 16 < cnt:
+            for q in range_constexpr(4):
+                fx.ptr_store(
+                    acc[q],
+                    c["contrib"] + ((ti * 80 + pick) * 16 + 4 * (lane // 16) + q),
+                )
 
 
 @traced
@@ -703,34 +756,15 @@ def stage_down(c, tasks):
     LDS ``CONTRIB[task][pick]``, then each token's routed picks (top-k order) x
     their weights + the shared expert -> bf16 pairs pushed to every rank's FFN
     region."""
-    s, tid, lane, wave, a = c["S"], c["tid"], c["lane"], c["wave"], c["args"]
+    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     nt = len(tasks)
     nu = n_slots(c)
     for u in range(wave, nu, WAVES):
-        e = tab_ld(c, T_SLOT_E + u)
-        rgs = [e * DOWN_TASKS + task for task in tasks]
-        wvs = [weight_loads(a["w2"], rg, INTER, 0, K2_STEPS) for rg in rgs]
-        svs = [scale_loads(a["s2"], rg, INTER, 0, K2_STEPS) for rg in rgs]
-        cnt = slot_count(c, u)
-        c["mb"].poll(
-            [(c["upf"], u * UP_TILES + fx.min(lane, UP_TILES - 1), 1)], site=SITE_DOWN
-        )
-        c["mb"].acquire(Space.SCRATCH)
-        # a lane's MID loads span tiles other lanes polled
-        wave_sync(c["tab"] + (T_WAVE + wave), 64 * ((u - wave) // WAVES + 1))
-        col = slot_col(c, cnt)
-        xs = x_operands(c, c["mid"].value, u * 16 + col, INTER // 2, 0, K2_STEPS)
-        pick = tab_ld(c, T_SLOT_PICK + u * 16 + col)
-        for ti in range_constexpr(nt):
-            acc = fx.Vector.filled(4, 0.0, fx.Float32)
-            for i in range_constexpr(K2_STEPS):
-                acc = step_mfma(acc, wvs[ti][i], scale_f32(svs[ti], rgs[ti], i), xs[i])
-            if lane % 16 < cnt:
-                for q in range_constexpr(4):
-                    fx.ptr_store(
-                        acc[q],
-                        c["contrib"] + ((ti * 80 + pick) * 16 + 4 * (lane // 16) + q),
-                    )
+        # slot 0 is the shared expert's (``shared_slot``), its weights MXFP8
+        if u == 0:
+            down_slot(c, u, tasks, shared=True)
+        else:
+            down_slot(c, u, tasks)
     gpu.barrier()
     if tid < nt * s * 8:
         ti = tid // (s * 8)
@@ -816,11 +850,10 @@ def run_ffn(c, bid):
     stamp(c, 5)
     sh = first_task(bid, SHARED0)
     if sh < UP_TILES:
-        rgs = [SHARED * (2 * UP_TILES) + sh, SHARED * (2 * UP_TILES) + UP_TILES + sh]
-        weights = up_weights(c, rgs, c["wave"] * UP_WAVE_STEPS)
+        weights = up_weights(c, [sh, UP_TILES + sh], c["wave"] * UP_WAVE_STEPS, True)
         await_x(c, s)
         shared_slot(c)
-        stage_up(c, 0, sh, weights)
+        stage_up(c, 0, sh, weights, shared=True)
     stamp(c, 6)
     load_table(c)
     stamp(c, 7)
@@ -878,6 +911,10 @@ def build_ffn(key: FfnBuild):
         s13: Int64,
         w2: Int64,
         s2: Int64,
+        w13s: Int64,
+        s13s: Int64,
+        w2s: Int64,
+        s2s: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -927,6 +964,10 @@ def build_ffn(key: FfnBuild):
                     "s13": s13,
                     "w2": w2,
                     "s2": s2,
+                    "w13s": w13s,
+                    "s13s": s13s,
+                    "w2s": w2s,
+                    "s2s": s2s,
                 },
             }
             for region, (off, _) in layout.items():
@@ -951,6 +992,10 @@ def build_ffn(key: FfnBuild):
         s13: Int64,
         w2: Int64,
         s2: Int64,
+        w13s: Int64,
+        s13s: Int64,
+        w2s: Int64,
+        s2s: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -975,6 +1020,10 @@ def build_ffn(key: FfnBuild):
             s13,
             w2,
             s2,
+            w13s,
+            s13s,
+            w2s,
+            s2s,
             scratch,
             sym,
             peers,
