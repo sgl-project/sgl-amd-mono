@@ -28,6 +28,7 @@ from enum import Enum
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
@@ -101,6 +102,9 @@ ROUTER_TASKS = EXPERTS // 16 * ROUTER_PARTS
 
 UP_TILES = INTER // 16  # 48 gate/up tile pairs an expert
 DOWN_TASKS = HIDDEN // 16  # 384
+XN_LDS_TOKENS = 8  # steps of up to this many rows keep XN in LDS (16 would not fit)
+XN_ROW = HIDDEN // 2 + 4  # dwords of a token's XN in LDS, 16 bytes off the banks
+XMID_ROW = INTER // 2 + 4  # dwords of a pick's MID in LDS, likewise
 K1_STEPS = HIDDEN // 128
 K2_STEPS = INTER // 128
 UP_WAVE_STEPS = K1_STEPS // WAVES
@@ -141,6 +145,18 @@ class FfnBuild:
 
 def slots(s: int) -> int:
     return 1 + TOPK * s
+
+
+def picks(s: int) -> int:
+    """MID columns at most: a token's routed picks (t * 4 + k), then its shared one."""
+    return (TOPK + 1) * s
+
+
+def pool_words(s: int) -> int:
+    """The LDS pool: XN for the up stage (up to ``XN_LDS_TOKENS`` tokens), then
+    every pick's MID for the down stage."""
+    xn = s * XN_ROW if s <= XN_LDS_TOKENS else 0
+    return max(xn, picks(s) * XMID_ROW)
 
 
 def peer_half_bytes(tp: int) -> int:
@@ -369,12 +385,44 @@ def xn_words(c, t, col, rstd, n):
 
 @flyc.jit
 def await_x(c, tokens_n):
-    """XRDY of the first ``tokens_n`` tokens (thread t polls token t)."""
+    """XRDY of the first ``tokens_n`` tokens (thread t polls token t); up to
+    ``XN_LDS_TOKENS`` tokens, then their XN -> LDS (``xn_operands``)."""
     tid = c["tid"]
     if tid < tokens_n:
         c["mb"].poll([(c["xrdy"], tid, 1)])
         c["mb"].acquire(Space.SCRATCH)
     cta_sync()
+    if const_expr(c["xn_lds"] is not None):
+        row = HIDDEN // 8
+        chunks = tokens_n * row
+        n = -(-chunks // THREADS)
+        for b in range_constexpr(0, n, 6):
+            words, ats = [], []
+            for i in range_constexpr(b, min(b + 6, n)):
+                v = fx.min(tid + THREADS * i, chunks - 1)
+                t, q = v // row, v % row
+                words.append(load_dev(c["xn"].value, t * (HIDDEN // 2) + q * 4, 4))
+                ats.append(t * XN_ROW + q * 4)
+            for i in range_constexpr(len(words)):
+                fx.ptr_store(words[i], c["xn_lds"] + ats[i])
+        gpu.barrier()
+
+
+def xn_operands(c, tok, st0):
+    """The lane's B operands of up steps st0 .. (``x_operands`` of XN), from
+    LDS when XN is there: a unit's global X loads would take most of the
+    CTA's vector memory issue."""
+    if const_expr(c["xn_lds"] is None):
+        return x_operands(c, c["xn"].value, tok, HIDDEN // 2, st0, UP_WAVE_STEPS)
+    v4 = fx.Vector.make_type(4, fx.Int32)
+    at = tok * XN_ROW + (c["lane"] // 16) * 16
+    return [
+        [
+            fx.ptr_load(c["xn_lds"] + (at + (st0 + i) * 64 + d * 4), result_type=v4)
+            for d in range(4)
+        ]
+        for i in range(UP_WAVE_STEPS)
+    ]
 
 
 # ---------------------------------------------------------------- router
@@ -675,7 +723,7 @@ def stage_up(c, u, j, weights=None, shared=False):
         weights = up_weights(c, rgs, st0)
     wvs, svs = weights
     tok = tab_ld(c, T_SLOT_TOK + u * 16 + slot_col(c, cnt))
-    xs = x_operands(c, c["xn"].value, tok, HIDDEN // 2, st0, UP_WAVE_STEPS)
+    xs = xn_operands(c, tok, st0)
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
     for i in range_constexpr(UP_WAVE_STEPS):
         for h in range_constexpr(2):
@@ -734,24 +782,64 @@ def down_slot(c, u, tasks, shared=False):
     cnt = slot_count(c, u)
     c["mb"].poll([(c["upf"], u * UP_TILES + fx.min(lane, UP_TILES - 1), 1)])
     c["mb"].acquire(Space.SCRATCH)
+    k = (u - wave) // WAVES
     # a lane's MID loads span tiles other lanes polled
-    wave_sync(c["tab"] + (T_WAVE + wave), 64 * ((u - wave) // WAVES + 1))
+    wave_sync(c["tab"] + (T_WAVE + wave), 64 * (2 * k + 1))
+    stage_slot_mid(c, u, cnt)
+    # and its B reads span chunks other lanes stored
+    wave_sync(c["tab"] + (T_WAVE + wave), 64 * (2 * k + 2))
     col = slot_col(c, cnt)
-    xs = x_operands(c, c["mid"].value, u * 16 + col, INTER // 2, 0, K2_STEPS)
     pick = tab_ld(c, T_SLOT_PICK + u * 16 + col)
-    for ti in range_constexpr(len(tasks)):
-        acc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for i in range_constexpr(K2_STEPS):
+    v4 = fx.Vector.make_type(4, fx.Int32)
+    at = fx.max(fx.min(pick, picks(c["S"]) - 1), 0) * XMID_ROW + (lane // 16) * 16
+    accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in tasks]
+    for i in range_constexpr(K2_STEPS):
+        # a step's B at a time, each task's MFMA chain in its order
+        xs = [
+            fx.ptr_load(c["xmid"] + (at + i * 64 + d * 4), result_type=v4)
+            for d in range(4)
+        ]
+        for ti in range_constexpr(len(tasks)):
             if const_expr(shared):
-                acc = a16w8.step_mfma(acc, wvs[ti][i], svs[ti][i], xs[i])
+                accs[ti] = a16w8.step_mfma(accs[ti], wvs[ti][i], svs[ti][i], xs)
             else:
-                acc = step_mfma(acc, wvs[ti][i], scale_f32(svs[ti], rgs[ti], i), xs[i])
+                sc = scale_f32(svs[ti], rgs[ti], i)
+                accs[ti] = step_mfma(accs[ti], wvs[ti][i], sc, xs)
+    for ti in range_constexpr(len(tasks)):
+        acc = accs[ti]
         if lane % 16 < cnt:
             for q in range_constexpr(4):
                 fx.ptr_store(
                     acc[q],
                     c["contrib"] + ((ti * 80 + pick) * 16 + 4 * (lane // 16) + q),
                 )
+
+
+@flyc.jit
+def stage_slot_mid(c, u, cnt):
+    """Slot u's ``cnt`` MID columns -> LDS ``XMID[pick]``, a 16-byte chunk a
+    lane a load, every load out before a store: each lane loading its own B
+    would repeat the last column's ``16 - cnt`` times."""
+    s, lane = c["S"], c["lane"]
+    row = INTER // 8
+    n = cnt * row
+    iters = -(-s * row // 64)
+    # six loads out at a time: the slot's down weights hold most registers
+    for b in range_constexpr(0, iters, 6):
+        words = []
+        for i in range_constexpr(b, min(b + 6, iters)):
+            w = fx.Vector(_llvm.mlir_undef(T.vec(4, T.i32)))
+            if i * 64 < n:
+                v = fx.min(lane + 64 * i, n - 1)
+                at = (u * 16 + v // row) * (INTER // 2) + v % row * 4
+                w = load_dev(c["mid"].value, at, 4)
+            words.append(w)
+        for i in range_constexpr(b, min(b + 6, iters)):
+            if i * 64 < n:
+                v = fx.min(lane + 64 * i, n - 1)
+                pick = tab_ld(c, T_SLOT_PICK + u * 16 + v // row)
+                at = pick * XMID_ROW + v % row * 4
+                fx.ptr_store(words[i - b], c["xmid"] + at)
 
 
 @flyc.jit
@@ -860,8 +948,9 @@ def run_ffn(c, bid):
         stage_up(c, 0, sh, weights, shared=True)
     stamp(c, 6)
     load_table(c)
-    # the router no longer orders XN before the table
-    await_x(c, s)
+    # the router no longer orders XN before the table; a shared CTA has it in LDS
+    if sh >= UP_TILES:
+        await_x(c, s)
     stamp(c, 7)
     total = (n_slots(c) - 1) * UP_TILES
     for unit in range(first_task(bid, ROUTED0), total, BLOCKS):
@@ -902,6 +991,9 @@ def build_ffn(key: FfnBuild):
         red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
         tab: fx.Array[fx.Int32, T_WORDS, 16]
         contrib: fx.Array[fx.Float32, 2 * 80 * 16, 16]
+        # XN while the up stage reads it (``XN_LDS_TOKENS``), then the down
+        # stage's MID columns (``stage_slot_mid``)
+        pool: fx.Array[fx.Int32, pool_words(s), 16]
 
     @flyc.kernel(name=kernel_name(key), known_block_size=[THREADS, 1, 1])
     def kffn(
@@ -964,6 +1056,8 @@ def build_ffn(key: FfnBuild):
                     "red": lds.red.ptr,
                     "tab": lds.tab.ptr,
                     "contrib": lds.contrib.ptr,
+                    "xn_lds": lds.pool.ptr if s <= XN_LDS_TOKENS else None,
+                    "xmid": lds.pool.ptr,
                     "own": preg(sym + par, 0, "peer"),
                     "half_words": half // 8,
                     "peer": [preg(b + par, 0, "peer") for b in raw],
