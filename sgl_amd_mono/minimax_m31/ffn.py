@@ -38,9 +38,9 @@ from sgl_amd_mono.common.epoch import EPOCH_MARKS, epoch_end
 from sgl_amd_mono.common.ops import (
     CM_SYS,
     ballot,
+    bf2_f32,
     bf16_pair,
     bf16_round,
-    bf2_f32,
     butterfly,
     clock,
     hw_exp2,
@@ -720,9 +720,7 @@ def down_slot(c, u, tasks, shared=False):
         wvs = [weight_loads(a["w2"], rg, INTER, 0, K2_STEPS) for rg in rgs]
         svs = [scale_loads(a["s2"], rg, INTER, 0, K2_STEPS) for rg in rgs]
     cnt = slot_count(c, u)
-    c["mb"].poll(
-        [(c["upf"], u * UP_TILES + fx.min(lane, UP_TILES - 1), 1)]
-    )
+    c["mb"].poll([(c["upf"], u * UP_TILES + fx.min(lane, UP_TILES - 1), 1)])
     c["mb"].acquire(Space.SCRATCH)
     # a lane's MID loads span tiles other lanes polled
     wave_sync(c["tab"] + (T_WAVE + wave), 64 * ((u - wave) // WAVES + 1))

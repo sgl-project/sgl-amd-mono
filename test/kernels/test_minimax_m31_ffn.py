@@ -278,4 +278,3 @@ def test_a_tag_cycle_ends_with_its_receive_half_cleared(weights):
             p = ep & 1
             assert not runner.peer_bufs[0][p * half : (p + 1) * half].any(), ep
     assert runner.epoch[0].item() == last + 4
-
