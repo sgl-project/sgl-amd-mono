@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3.5-397B-A17B block-FP8 on gfx950, TP4.
 
-Decode steps of 1 to 8 rows run two new launches. A GDN layer's K1 is the input
-norm, the block-FP8 projections, the conv and the gated delta. K2 is the output
-projection, the tensor-parallel all-reduce, the post-norm and the block-FP8 MoE.
-A full-attention layer writes the KV cache with SGLang's aiter attention, with
-``o_proj`` replaced by identity, and then runs the same K2. Wider steps, and
-anything this spec does not declare, keep the standard forward.
+Decode steps of 1 to 8 rows open with two guarded peer barriers, then run each
+layer as K1 and K2. A GDN layer's K1 is the previous layer's MoE all-reduce,
+fused with the residual add, the input norm and the FP8 quant of its output,
+then the block-FP8 projections, the conv and the gated delta, whose gated norm
+also quantizes the core. K2 is the output projection, its all-reduce fused with
+the post-norm, and the block-FP8 MoE. A full-attention layer takes the same
+fused input into its block-FP8 ``qkv_proj``, runs SGLang's q/k norm, rope and
+aiter attention, which writes the KV cache, and then the same K2 with the output
+gate and its FP8 quant ahead of ``o_proj``. Wider steps, and anything this spec
+does not declare, keep the standard forward.
 """
 
 from __future__ import annotations
@@ -123,7 +127,11 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
             "needs 60 layers, linear attention except every 4th layer "
             f"(full attention), got {kinds[:8]}"
         )
-    rope = getattr(text, "rope_parameters", None) or getattr(text, "rope_scaling", None) or {}
+    rope = (
+        getattr(text, "rope_parameters", None)
+        or getattr(text, "rope_scaling", None)
+        or {}
+    )
     section = list(rope.get("mrope_section") or [])
     if section != [11, 11, 10] or rope.get("partial_rotary_factor") != 0.25:
         reasons.append(
@@ -135,7 +143,11 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     quant = _quant(hf_config)
     method = quant.get("quant_method")
     block = list(quant.get("weight_block_size") or [])
-    if method != "fp8" or quant.get("activation_scheme") != "dynamic" or block != [BLOCK, BLOCK]:
+    if (
+        method != "fp8"
+        or quant.get("activation_scheme") != "dynamic"
+        or block != [BLOCK, BLOCK]
+    ):
         reasons.append(
             "needs dynamic block-FP8 weights with weight_block_size [128, 128], "
             f"got quant_method {method!r}, activation_scheme "
@@ -153,13 +165,20 @@ def _shape(tensor):
 def _dense_block(module, n, k, what) -> list[str]:
     weight = getattr(module, "weight", None)
     scale = getattr(module, "weight_scale_inv", None)
-    if weight is None or getattr(weight, "dtype", None) != _FP8 or _shape(weight) != (n, k):
+    if (
+        weight is None
+        or getattr(weight, "dtype", None) != _FP8
+        or _shape(weight) != (n, k)
+    ):
         return [f"{what} weight is not block-FP8 [{n}, {k}]"]
-    if scale is None or getattr(scale, "dtype", None) != torch.float32 or _shape(scale) != (
-        n // BLOCK,
-        k // BLOCK,
+    if (
+        scale is None
+        or getattr(scale, "dtype", None) != torch.float32
+        or _shape(scale) != (n // BLOCK, k // BLOCK)
     ):
         return [f"{what} scale is not a fp32 {BLOCK}x{BLOCK} block scale"]
+    if getattr(module, "bias", None) is not None:
+        return [f"{what} has a bias, the block-FP8 GEMV adds none"]
     return []
 
 
@@ -184,7 +203,11 @@ def _expert_block(weight, scale, what, *, k_last: int) -> list[str]:
     ):
         return [f"{what} weight is not block-FP8 [E, N, {k_last}]"]
     want = (shape[0], shape[1] // BLOCK, shape[2] // BLOCK)
-    if scale is None or getattr(scale, "dtype", None) != torch.float32 or _shape(scale) != want:
+    if (
+        scale is None
+        or getattr(scale, "dtype", None) != torch.float32
+        or _shape(scale) != want
+    ):
         return [f"{what} scale is not a fp32 {BLOCK}x{BLOCK} block scale {want}"]
     return []
 
@@ -196,13 +219,29 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     if len(layers) != LAYERS:
         return [f"needs {LAYERS} decoder layers, got {len(layers)}"]
     reasons = []
+    # The fused norms take the weight as Gemma's 1 + w
+    norms = [
+        (f"layer {i} {name}", getattr(layer, name, None))
+        for i, layer in enumerate(layers)
+        for name in ("input_layernorm", "post_attention_layernorm")
+    ]
+    norms.append(("the final norm", getattr(inner, "norm", None)))
+    reasons += [
+        f"{what} is {type(norm).__name__}, not a Gemma RMSNorm"
+        for what, norm in norms
+        if type(norm).__name__ != "GemmaRMSNorm"
+    ]
     for i, layer in enumerate(layers):
         mlp = getattr(layer, "mlp", None)
         if mlp is None or not getattr(mlp, "enable_shared_expert_fusion", False):
-            reasons.append(f"layer {i}: the shared expert is not fused into the block-FP8 MoE")
+            reasons.append(
+                f"layer {i}: the shared expert is not fused into the block-FP8 MoE"
+            )
             continue
         if getattr(mlp, "reduce_results", True):
-            reasons.append(f"layer {i}: the MoE all-reduce is inside the block, K2 owns it")
+            reasons.append(
+                f"layer {i}: the MoE all-reduce is inside the block, K2 owns it"
+            )
         experts = getattr(mlp, "experts", None)
         reasons += _expert_block(
             getattr(experts, "w13_weight", None),
@@ -225,21 +264,35 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             or getattr(w2_scale, "dtype", None) != torch.float32
             or _shape(w2_scale) != (w2_shape[0], HIDDEN // BLOCK, w2_shape[2] // BLOCK)
         ):
-            reasons.append(f"layer {i} w2 scale is not a fp32 {BLOCK}x{BLOCK} block scale")
-        reasons += _floating(getattr(mlp, "gate", None), (EXPERTS, HIDDEN), f"layer {i} router")
+            reasons.append(
+                f"layer {i} w2 scale is not a fp32 {BLOCK}x{BLOCK} block scale"
+            )
+        reasons += _floating(
+            getattr(mlp, "gate", None), (EXPERTS, HIDDEN), f"layer {i} router"
+        )
         if hasattr(layer, "linear_attn"):
             if i % 4 == 3:
-                reasons.append(f"layer {i}: a full-attention layer is registered as GDN")
+                reasons.append(
+                    f"layer {i}: a full-attention layer is registered as GDN"
+                )
             attn = layer.linear_attn
-            reasons += _dense_block(attn.in_proj_qkvz, QKVZ_N, HIDDEN, f"layer {i} in_proj_qkvz")
-            reasons += _floating(attn.in_proj_ba, (BA_N, HIDDEN), f"layer {i} in_proj_ba")
+            reasons += _dense_block(
+                attn.in_proj_qkvz, QKVZ_N, HIDDEN, f"layer {i} in_proj_qkvz"
+            )
+            reasons += _floating(
+                attn.in_proj_ba, (BA_N, HIDDEN), f"layer {i} in_proj_ba"
+            )
             conv = _shape(getattr(getattr(attn, "conv1d", None), "weight", None))
             if conv not in ((CONV_DIM, 1, 4), (CONV_DIM, 4)):
-                reasons.append(f"layer {i} conv1d weight is {conv}, TP4 wants {(CONV_DIM, 1, 4)}")
+                reasons.append(
+                    f"layer {i} conv1d weight is {conv}, TP4 wants {(CONV_DIM, 1, 4)}"
+                )
             reasons += _dense_block(attn.out_proj, HIDDEN, O_K, f"layer {i} out_proj")
         elif hasattr(layer, "o_proj"):
             if i % 4 != 3:
-                reasons.append(f"layer {i}: a GDN layer is registered as full attention")
+                reasons.append(
+                    f"layer {i}: a GDN layer is registered as full attention"
+                )
             qkv = getattr(layer, "qkv_proj", None)
             qkv_weight = getattr(qkv, "weight", None)
             qkv_n = _shape(qkv_weight)[:1]
@@ -271,7 +324,12 @@ class _Built:
         pp_proxy_tensors=None,
     ):
         """``Qwen3_5MoeForConditionalGeneration.forward`` for a routed decode step."""
-        from sgl_amd_mono.qwen35_a17b_fp8.gfx950.forward import run_attn, run_k1, run_k2
+        from sgl_amd_mono.qwen35_a17b_fp8.gfx950.forward import (
+            final_norm,
+            run_attn,
+            run_k1,
+            run_k2,
+        )
 
         lm = self.model
         contains = getattr(forward_batch, "contains_image_inputs", None)
@@ -288,6 +346,8 @@ class _Built:
             positions = forward_batch.mrope_positions
         inner = lm.model
         self.runtime.advance()
+        self.runtime.enter(0)
+        self.runtime.enter(1)
         hidden = inner.embed_tokens(input_ids)
         rows = plan.key.rows
         if hidden.shape[0] != rows:
@@ -301,21 +361,23 @@ class _Built:
             layer = inner.layers[i]
             if hasattr(layer, "linear_attn"):
                 core, residual = run_k1(
-                    self.runtime, layer, hidden, residual, forward_batch, rows, self.check
+                    layer, hidden, residual, forward_batch, rows, self.check
                 )
                 proj = layer.linear_attn.out_proj
             else:
-                core, residual = run_attn(layer, hidden, residual, positions, forward_batch)
+                core, residual = run_attn(
+                    layer, hidden, residual, positions, forward_batch
+                )
                 proj = layer.o_proj
             hidden, residual = run_k2(
-                self.runtime, layer, core, residual, forward_batch, rows, proj, self.check
+                layer, core, residual, forward_batch, rows, proj, self.check
             )
         if residual is None:
             hidden = inner.norm(hidden)
+            if isinstance(hidden, tuple):
+                hidden = hidden[0]
         else:
-            hidden = inner.norm(hidden, residual)
-        if isinstance(hidden, tuple):
-            hidden = hidden[0]
+            hidden = final_norm(hidden, residual, inner.norm)
         return lm.logits_processor(input_ids, hidden, lm.lm_head, forward_batch, None)
 
 
@@ -329,7 +391,9 @@ def _build(model, hf_config, ctx):
         raise ValueError(f"Qwen3.5 block-FP8 monokernel is gfx950 only, got {ctx.isa}")
     parallel = get_parallel()
     if int(parallel.tp_size) != TP:
-        raise ValueError(f"Qwen3.5 block-FP8 monokernel is TP{TP}, got TP{parallel.tp_size}")
+        raise ValueError(
+            f"Qwen3.5 block-FP8 monokernel is TP{TP}, got TP{parallel.tp_size}"
+        )
     device = model.model.embed_tokens.weight.device
     runtime = PhaseRuntime(
         int(parallel.tp_rank), parallel.tp_group.cpu_group, device, ctx.deadline_s
@@ -339,7 +403,9 @@ def _build(model, hf_config, ctx):
 
 SPEC = MonoSpec(
     name="qwen35_a17b_fp8_tp4",
-    devices={"gfx950": DeviceLimits(widths=ROWS, tp_sizes=(TP,), resident_blocks=BLOCKS)},
+    devices={
+        "gfx950": DeviceLimits(widths=ROWS, tp_sizes=(TP,), resident_blocks=BLOCKS)
+    },
     features=frozenset(),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),

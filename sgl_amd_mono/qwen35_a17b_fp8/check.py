@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Eager per-layer comparison against the standard path.
 
-Enabled by ``SGLANG_AMD_MONO_CHECK=1``. Each K1/K2 launch logs
+Enabled by ``SGLANG_AMD_MONO_CHECK=1``. Each layer's K1 and K2 log
 ``monokernel check layer <i> (<k1|k2>, <rows> rows):`` and, when a spec bound
 is missed, ``monokernel check violation:``.
 """

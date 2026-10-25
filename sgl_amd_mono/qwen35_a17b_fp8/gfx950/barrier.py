@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One guarded peer barrier per K1 or K2 launch.
+"""The two guarded peer barriers that open each decode step.
 
-Each phase publishes its own tag, then polls that tag on every rank. K1 and K2
-use different pair slots, so a rank that finishes a phase cannot overwrite the
-tag the slower ranks are still polling. A fault at site 1 stalls inside the
-poll, after this phase's tag is published and before any output store; the
-other ranks then block in the next phase until the deadline flags them and
-each rank stops with a store to address 0x0.
+Each phase publishes its own tag, then polls that tag on every rank. Phases 0
+and 1 use different pair slots and run once each per step, in that order, so a
+rank that finishes a phase cannot overwrite the tag the slower ranks are still
+polling. A slot must not be written twice without the other phase in between:
+the second write would need no peer to have read the first. A fault at site 1
+stalls inside the phase 0 poll, after its tag is published and before the step
+runs any layer; the other ranks then block in phase 1 until the deadline flags
+them and each rank stops with a store to address 0x0.
 """
 
 from __future__ import annotations
@@ -22,11 +24,14 @@ from flydsl.expr.typing import Int64, T
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.ops import CM_DEV, load_ptr64, rsrc
-from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources, key_tuple
+from sgl_amd_mono.common.plan import THREADS, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, preg, publish
 from sgl_amd_mono.qwen35_a17b_fp8.gfx950.layout import PHASE_BYTES, PHASE_FLAGS, TP
 
 SOURCES = kernel_sources(__name__)
+# The barrier does no work past the handshake, so one CTA is enough. Every extra
+# CTA only adds threads that poll the same uncached peer tags and slow the wait.
+GRID = int(os.environ.get("SGLANG_AMD_MONO_BARRIER_GRID", 1))
 
 
 def _ensure_cache() -> None:
@@ -55,7 +60,7 @@ def compile_only(launch) -> None:
 
 
 def build_barrier(kind: int, rank: int, fault):
-    """A launch for this phase (``kind`` 0 = K1, 1 = K2) on this rank."""
+    """A launch for the step's phase ``kind`` (0 first, 1 second) on this rank."""
     fault_site = -1 if fault is None else int(fault[0])
     fault_after = 0 if fault is None else int(fault[1])
     # scalars only: FlyDSL drops a tuple closed over by the launch from its cache key
@@ -65,12 +70,15 @@ def build_barrier(kind: int, rank: int, fault):
             "rank": rank,
             "fault_site": -1 if fault is None else int(fault[0]),
             "fault_after": 0 if fault is None else int(fault[1]),
+            "grid": GRID,
         },
         SOURCES,
     )
     _ensure_cache()
 
-    @flyc.kernel(name=f"qwen35_fp8_phase_{kind}_r{rank}", known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(
+        name=f"qwen35_fp8_phase_{kind}_r{rank}", known_block_size=[THREADS, 1, 1]
+    )
     def phase_kernel(peers: Int64, epoch: Int64, sym: Int64):
         _ = keyed
         with guard.scope(
@@ -92,7 +100,7 @@ def build_barrier(kind: int, rank: int, fault):
                     rsrc(epoch), 0, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV
                 )
             )
-            # K1 (kind 0) owns pair `rank`; K2 owns pair `rank + TP`. Tags are
+            # Phase 0 owns pair `rank`; phase 1 owns pair `rank + TP`. Tags are
             # 2*epoch and 2*epoch+1. Publish before the poll so the first step
             # needs no seed, and so one rank cannot replace a tag others still
             # need: the next writer of a slot has already seen every peer finish
@@ -121,7 +129,7 @@ def build_barrier(kind: int, rank: int, fault):
         stream: fx.Stream = fx.Stream(None),
     ):
         phase_kernel(peers, epoch, sym).launch(
-            grid=(BLOCKS,), block=(THREADS,), stream=stream
+            grid=(GRID,), block=(THREADS,), stream=stream
         )
 
     return launch

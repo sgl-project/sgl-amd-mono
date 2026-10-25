@@ -1,184 +1,401 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Decode conv and gated delta for one Qwen3.5 GDN layer.
+"""Decode projection, conv and gated delta for one Qwen3.5 GDN layer, in two kernels.
 
+The first kernel is the block-FP8 ``in_proj_qkvz`` (``gemv.wg_dot``): each
+workgroup's 16 columns are rounded to the activation dtype, as the linear
+rounds them, then a conv channel's column goes through the conv and z is
+stored for the second kernel, the gated delta. A plain weight takes the
+block-FP8 linear and a separate conv kernel.
 The conv window matches causal_conv1d_update (kernel width 4): state columns
 are oldest to newest, ``acc = c0*w0 + c1*w1 + c2*w2 + x*w3 + bias``, then
 SiLU, then the window shifts so the newest column is ``x``. The recurrence
 matches the packed decode rule: per-head L2 norm of q and k, ``q *= K**-0.5``,
 ``g = -exp(A_log) * softplus(a + dt_bias)``, beta rounded through the
-projection dtype, then ``h *= exp(g); v -= h k; v *= beta; h += v k``.
-Pad rows (cache index < 0) write nothing.
+projection dtype, then ``h *= exp(g); v -= h k; v *= beta; h += v k``. The
+core is rounded to the activation dtype before the gated RMSNorm
+``rmsnorm(o) * w * silu(z)``. ``b`` and ``a`` are the bf16 ``in_proj_ba``
+projection, rounded to bf16 the way the linear rounds them.
+One V head is one 1x128 quant group of ``out_proj``'s input, so the delta kernel
+also writes the FP8 core and its column-major scale (see ``norm.py``).
+Pad rows (cache index < 0) write no state and return zeros.
 """
 
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sgl_amd_mono.qwen35_a17b_fp8.gfx950.gemv import (
+    WG_BN,
+    WG_ROWS,
+    WG_SPLIT,
+    WG_WARPS,
+    block_fp8_gemv_q,
+    wg_dot,
+    wg_fits,
+)
 from sgl_amd_mono.qwen35_a17b_fp8.gfx950.layout import (
     BA_N,
+    BLOCK,
+    CONV_DIM,
     CONV_KERNEL,
+    FP8_MAX,
     GDN_HEAD,
     GDN_K_HEADS,
     GDN_V_HEADS,
+    HIDDEN,
     QKVZ_N,
     SOFTPLUS_THRESHOLD,
 )
+from sgl_amd_mono.qwen35_a17b_fp8.gfx950.norm import quant_buffers
+
+CONV_BLOCK = 1024
 
 
 @triton.jit
-def _scatter_rows(
-    dst,
-    src,
-    idx,
-    valid,
-    n_cols,
-    stride_dst,
-    stride_src,
+def _proj_conv_kernel(
+    x_ptr,
+    stride_x,
+    xs_ptr,
+    stride_xs_m,
+    stride_xs_k,
+    w_ptr,
+    ws_ptr,
+    stride_ws_n,
+    stride_ws_k,
+    state_ptr,
+    stride_slot,
+    stride_dim,
+    stride_win,
+    tap_ptr,
+    bias_ptr,
+    idx_ptr,
+    mixed_ptr,
+    stride_mixed,
+    z_ptr,
+    stride_z,
+    M,
+    C: tl.constexpr,
+    K: tl.constexpr,
+    S: tl.constexpr,
+    GROUP: tl.constexpr,
+    BN: tl.constexpr,
+    ROWS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    m = tl.arange(0, ROWS)
+    cols = pid * BN + tl.arange(0, BN)
+    rows_ok = m < M
+    is_conv = pid * BN < C
+    # The window and taps load ahead of the product, which hides their latency
+    slot = tl.load(idx_ptr + m, mask=rows_ok & is_conv, other=-1).to(tl.int64)
+    live = (slot >= 0)[:, None]
+    cell = (
+        state_ptr
+        + tl.maximum(slot, 0)[:, None] * stride_slot
+        + cols[None, :] * stride_dim
+    )
+    s0 = tl.load(cell, mask=live, other=0.0)
+    s1 = tl.load(cell + stride_win, mask=live, other=0.0)
+    s2 = tl.load(cell + 2 * stride_win, mask=live, other=0.0)
+    taps = cols < C
+    w0 = tl.load(tap_ptr + cols * 4, mask=taps, other=0.0).to(tl.float32)
+    w1 = tl.load(tap_ptr + cols * 4 + 1, mask=taps, other=0.0).to(tl.float32)
+    w2 = tl.load(tap_ptr + cols * 4 + 2, mask=taps, other=0.0).to(tl.float32)
+    w3 = tl.load(tap_ptr + cols * 4 + 3, mask=taps, other=0.0).to(tl.float32)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + cols, mask=taps, other=0.0).to(tl.float32)
+    x = wg_dot(
+        x_ptr,
+        stride_x,
+        xs_ptr,
+        stride_xs_m,
+        stride_xs_k,
+        w_ptr,
+        ws_ptr,
+        stride_ws_n,
+        stride_ws_k,
+        pid,
+        M,
+        K=K,
+        S=S,
+        GROUP=GROUP,
+        BN=BN,
+        ROWS=ROWS,
+    ).to(mixed_ptr.dtype.element_ty)
+    if is_conv:
+        acc = s0.to(tl.float32) * w0[None, :] + s1.to(tl.float32) * w1[None, :]
+        acc = acc + s2.to(tl.float32) * w2[None, :] + x.to(tl.float32) * w3[None, :]
+        if HAS_BIAS:
+            acc = acc + bias[None, :]
+        y = acc / (1.0 + tl.exp(-acc))
+        out = mixed_ptr + m[:, None] * stride_mixed + cols[None, :]
+        tl.store(out, y.to(mixed_ptr.dtype.element_ty), mask=rows_ok[:, None])
+        tl.store(cell, s1, mask=live)
+        tl.store(cell + stride_win, s2, mask=live)
+        tl.store(cell + 2 * stride_win, x.to(state_ptr.dtype.element_ty), mask=live)
+    else:
+        tl.store(
+            z_ptr + m[:, None] * stride_z + cols[None, :], x, mask=rows_ok[:, None]
+        )
+
+
+@triton.jit
+def _conv_kernel(
+    x_ptr,
+    stride_x,
+    state_ptr,
+    stride_slot,
+    stride_dim,
+    stride_win,
+    w_ptr,
+    bias_ptr,
+    idx_ptr,
+    out_ptr,
+    stride_out,
+    C,
+    HAS_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
-    if tl.load(valid + row) == 0:
-        return
-    slot = tl.load(idx + row).to(tl.int64)
-    offs = tl.arange(0, BLOCK)
-    col = 0
-    while col < n_cols:
-        o = col + offs
-        mask = o < n_cols
-        v = tl.load(src + row * stride_src + o, mask=mask, other=0)
-        tl.store(dst + slot * stride_dst + o, v, mask=mask)
-        col += BLOCK
-
-
-def _zeros_if_pad(gathered: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    """A pad row (cache index < 0) reads zeros, not whatever lives in slot 0."""
-    mask = valid.view(-1, *([1] * (gathered.ndim - 1))).to(dtype=torch.bool)
-    return torch.where(mask, gathered, torch.zeros_like(gathered))
-
-
-def _scatter(table: torch.Tensor, rows: torch.Tensor, idx: torch.Tensor, valid: torch.Tensor):
-    flat_src = rows.reshape(rows.shape[0], -1).contiguous()
-    flat_dst = table.view(table.shape[0], -1)
-    n_cols = flat_src.shape[1]
-    _scatter_rows[(flat_src.shape[0],)](
-        flat_dst,
-        flat_src,
-        idx,
-        valid,
-        n_cols,
-        flat_dst.stride(0),
-        flat_src.stride(0),
-        BLOCK=1024,
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < C
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0)
+    w0 = tl.load(w_ptr + cols * 4, mask=mask, other=0.0).to(tl.float32)
+    w1 = tl.load(w_ptr + cols * 4 + 1, mask=mask, other=0.0).to(tl.float32)
+    w2 = tl.load(w_ptr + cols * 4 + 2, mask=mask, other=0.0).to(tl.float32)
+    w3 = tl.load(w_ptr + cols * 4 + 3, mask=mask, other=0.0).to(tl.float32)
+    slot = tl.load(idx_ptr + row).to(tl.int64)
+    live = slot >= 0
+    cell = state_ptr + tl.maximum(slot, 0) * stride_slot + cols * stride_dim
+    s0 = tl.load(cell, mask=mask & live, other=0.0)
+    s1 = tl.load(cell + stride_win, mask=mask & live, other=0.0)
+    s2 = tl.load(cell + 2 * stride_win, mask=mask & live, other=0.0)
+    acc = s0.to(tl.float32) * w0 + s1.to(tl.float32) * w1
+    acc = acc + s2.to(tl.float32) * w2 + x.to(tl.float32) * w3
+    if HAS_BIAS:
+        acc = acc + tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y = acc / (1.0 + tl.exp(-acc))
+    tl.store(
+        out_ptr + row * stride_out + cols, y.to(out_ptr.dtype.element_ty), mask=mask
     )
+    keep = mask & live
+    tl.store(cell, s1, mask=keep)
+    tl.store(cell + stride_win, s2, mask=keep)
+    tl.store(cell + 2 * stride_win, x.to(state_ptr.dtype.element_ty), mask=keep)
 
 
-def _split_qkvzba(qkvz: torch.Tensor, ba: torch.Tensor):
-    hk, hv, d = GDN_K_HEADS, GDN_V_HEADS, GDN_HEAD
-    q_dim = hk * d
-    v_dim = hv * d
-    if qkvz.shape[-1] != QKVZ_N or ba.shape[-1] != BA_N:
-        raise RuntimeError(
-            f"GDN projections are {tuple(qkvz.shape)} and {tuple(ba.shape)}, "
-            f"TP4 wants [*, {QKVZ_N}] and [*, {BA_N}]"
-        )
-    q, k, v, z = qkvz.split([q_dim, q_dim, v_dim, v_dim], dim=-1)
-    b, a = ba.split([hv, hv], dim=-1)
-    s = qkvz.shape[0]
-    return (
-        q.view(s, hk, d),
-        k.view(s, hk, d),
-        v.view(s, hv, d),
-        z.view(s, hv, d),
-        b,
-        a,
+@triton.jit
+def _delta_kernel(
+    conv_ptr,
+    stride_conv,
+    qkvz_ptr,
+    stride_qkvz,
+    hidden_ptr,
+    stride_hidden,
+    ba_w_ptr,
+    stride_ba_w,
+    state_ptr,
+    stride_s_slot,
+    stride_s_head,
+    stride_s_v,
+    stride_s_k,
+    idx_ptr,
+    a_log_ptr,
+    dt_bias_ptr,
+    norm_w_ptr,
+    out_ptr,
+    stride_out,
+    q_ptr,
+    stride_q,
+    q_scale_ptr,
+    rows,
+    scale,
+    eps,
+    fp8_max,
+    inv_fp8_max,
+    HK: tl.constexpr,
+    HV: tl.constexpr,
+    D: tl.constexpr,
+    K_IN: tl.constexpr,
+    THRESHOLD: tl.constexpr,
+):
+    row = tl.program_id(0)
+    hv = tl.program_id(1)
+    kh = hv // (HV // HK)
+    offs = tl.arange(0, D)
+    slot = tl.load(idx_ptr + row).to(tl.int64)
+    live = slot >= 0
+    cell = (
+        state_ptr
+        + tl.maximum(slot, 0) * stride_s_slot
+        + hv * stride_s_head
+        + offs[:, None] * stride_s_v
+        + offs[None, :] * stride_s_k
     )
+    h = tl.load(cell, mask=live, other=0.0).to(tl.float32)
+    base = conv_ptr + row * stride_conv
+    q = tl.load(base + kh * D + offs).to(tl.float32)
+    k = tl.load(base + HK * D + kh * D + offs).to(tl.float32)
+    v = tl.load(base + 2 * HK * D + hv * D + offs).to(tl.float32)
+    z = tl.load(qkvz_ptr + row * stride_qkvz + 2 * HK * D + HV * D + hv * D + offs)
+    z = z.to(tl.float32)
+    # b and a: rows hv and HV + hv of the bf16 in_proj_ba weight
+    cols = tl.arange(0, K_IN)
+    x_in = tl.load(hidden_ptr + row * stride_hidden + cols).to(tl.float32)
+    w_b = tl.load(ba_w_ptr + hv * stride_ba_w + cols).to(tl.float32)
+    w_a = tl.load(ba_w_ptr + (HV + hv) * stride_ba_w + cols).to(tl.float32)
+    dt_bias = tl.load(dt_bias_ptr + hv).to(tl.float32)
+    a_log = tl.load(a_log_ptr + hv).to(tl.float32)
+    norm_w = tl.load(norm_w_ptr + offs).to(tl.float32)
+
+    b = tl.sum(x_in * w_b, axis=0).to(tl.bfloat16).to(tl.float32)
+    a = tl.sum(x_in * w_a, axis=0).to(tl.bfloat16).to(tl.float32)
+    q = q / tl.sqrt(tl.sum(q * q, axis=0) + 1e-6)
+    k = k / tl.sqrt(tl.sum(k * k, axis=0) + 1e-6)
+    q = q * scale
+    x = a + dt_bias
+    e = tl.exp(tl.minimum(x, THRESHOLD))
+    u = 1.0 + e
+    softplus = tl.where(x <= THRESHOLD, tl.log(u) - ((u - 1.0) - e) / u, x)
+    g = -tl.exp(a_log) * softplus
+    beta = tl.sigmoid(b).to(tl.bfloat16).to(tl.float32)
+
+    h = h * tl.exp(g)
+    v = (v - tl.sum(h * k[None, :], axis=1)) * beta
+    h = h + v[:, None] * k[None, :]
+    o = tl.sum(h * q[None, :], axis=1)
+    tl.store(cell, h.to(state_ptr.dtype.element_ty), mask=live)
+
+    o = o.to(out_ptr.dtype.element_ty).to(tl.float32)
+    rstd = tl.rsqrt(tl.sum(o * o, axis=0) / D + eps)
+    y = o * rstd * norm_w * (z * tl.sigmoid(z))
+    y = tl.where(live, y, 0.0).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + row * stride_out + hv * D + offs, y)
+    yf = y.to(tl.float32)
+    group_scale = tl.maximum(tl.max(tl.abs(yf), axis=0), 1e-10) * inv_fp8_max
+    yq = tl.clamp(yf * (1.0 / group_scale), -fp8_max, fp8_max)
+    tl.store(q_ptr + row * stride_q + hv * D + offs, yq.to(q_ptr.dtype.element_ty))
+    tl.store(q_scale_ptr + hv * rows + row, group_scale)
 
 
-def _conv_update(x, conv, idx, valid, weight, bias):
-    """One decode token. ``conv`` is ``[slots, dim, 3]`` or ``[slots, 3, dim]``."""
-    safe = idx.clamp(min=0)
-    window_last = conv.shape[-1] == CONV_KERNEL - 1
-    gathered = _zeros_if_pad(conv.index_select(0, safe), valid)
-    if window_last:
-        state = gathered
-    else:
-        state = gathered.transpose(1, 2).contiguous()
-    w = weight.view(weight.shape[0], CONV_KERNEL)
-    acc = state[..., 0].float() * w[:, 0] + state[..., 1].float() * w[:, 1]
-    acc = acc + state[..., 2].float() * w[:, 2] + x.float() * w[:, 3]
-    if bias is not None:
-        acc = acc + bias.float()
-    y = (acc / (1.0 + torch.exp(-acc))).to(dtype=x.dtype)
-    new = torch.stack(
-        [state[..., 1], state[..., 2], x.to(dtype=state.dtype)], dim=-1
-    ).contiguous()
-    if not window_last:
-        new = new.transpose(1, 2).contiguous()
-    _scatter(conv, new, idx, valid)
-    return y
+def _conv_strides(conv: torch.Tensor):
+    """``conv`` is ``[slots, dim, 3]`` or ``[slots, 3, dim]``."""
+    if conv.shape[-1] == CONV_KERNEL - 1:
+        return conv.stride(0), conv.stride(1), conv.stride(2)
+    return conv.stride(0), conv.stride(2), conv.stride(1)
 
 
-def _gated_delta(q, k, v, a, b, state, idx, valid, a_log, dt_bias):
-    s, hk, d = q.shape
-    hv = v.shape[1]
-    rep = hv // hk
-    qf = q.float()
-    kf = k.float()
-    qf = qf / torch.sqrt((qf * qf).sum(-1, keepdim=True) + 1e-6)
-    kf = kf / torch.sqrt((kf * kf).sum(-1, keepdim=True) + 1e-6)
-    qf = qf * (d**-0.5)
-    qf = qf.repeat_interleave(rep, dim=1)
-    kf = kf.repeat_interleave(rep, dim=1)
-    a_log = a_log.reshape(-1)
-    dt_bias = dt_bias.reshape(-1)
-    x = a.float() + dt_bias.float()
-    softplus = torch.where(
-        x <= SOFTPLUS_THRESHOLD, torch.log1p(torch.exp(x.clamp(max=SOFTPLUS_THRESHOLD))), x
-    )
-    g = -torch.exp(a_log.float()) * softplus
-    beta = torch.sigmoid(b.float()).to(dtype=b.dtype).float()
-    safe = idx.clamp(min=0)
-    h = _zeros_if_pad(state.index_select(0, safe), valid).float()
-    vf = v.float()
-    h = h * torch.exp(g)[:, :, None, None]
-    vf = vf - (h * kf[:, :, None, :]).sum(-1)
-    vf = vf * beta[:, :, None]
-    h = h + vf[:, :, :, None] * kf[:, :, None, :]
-    out = (h * qf[:, :, None, :]).sum(-1)
-    _scatter(state, h.to(dtype=state.dtype), idx, valid)
-    out = torch.where(valid.view(-1, 1, 1).bool(), out, torch.zeros_like(out))
-    return out.to(dtype=v.dtype)
+def gdn_core(mod, hidden, hidden_q, conv, ssm, idx, rows: int):
+    """The local core ``[rows, V]`` and its FP8 ``(q, scale)``.
 
-
-def gdn_core(mod, hidden, conv, ssm, idx, rows: int) -> torch.Tensor:
-    """Input RMSNorm is the caller's. Returns the local core, ``[rows, V]``."""
-    from sgl_amd_mono.qwen35_a17b_fp8.gfx950.gemv import block_fp8_gemv
-
+    ``hidden`` is the input RMSNorm's bf16 output and ``hidden_q`` its FP8 pair.
+    """
     x = hidden[:rows]
-    qkvz = block_fp8_gemv(x, mod.in_proj_qkvz.weight, mod.in_proj_qkvz.weight_scale_inv)
-    ba = F.linear(x, mod.in_proj_ba.weight, getattr(mod.in_proj_ba, "bias", None))
-    q, k, v, z, b, a = _split_qkvzba(qkvz, ba)
-    mixed = torch.cat([q.reshape(rows, -1), k.reshape(rows, -1), v.reshape(rows, -1)], -1)
-    cache_idx = idx[:rows].to(torch.long)
-    valid = (cache_idx >= 0).to(torch.int32)
-    mixed = _conv_update(
-        mixed, conv, cache_idx, valid, mod.conv1d.weight, mod.conv1d.bias
+    w, w_scale = mod.in_proj_qkvz.weight, mod.in_proj_qkvz.weight_scale_inv
+    ba_w = mod.in_proj_ba.weight
+    if getattr(mod.in_proj_ba, "bias", None) is not None:
+        raise RuntimeError("in_proj_ba has a bias; the fused GDN decode reads none")
+    if w.shape[0] != QKVZ_N or ba_w.shape != (BA_N, HIDDEN) or x.shape[-1] != HIDDEN:
+        raise RuntimeError(
+            f"GDN projections are {tuple(w.shape)} and {tuple(ba_w.shape)}, "
+            f"TP4 wants [{QKVZ_N}, {HIDDEN}] and [{BA_N}, {HIDDEN}]"
+        )
+    cache_idx = idx[:rows]
+    weight = mod.conv1d.weight.reshape(CONV_DIM, CONV_KERNEL)
+    bias = mod.conv1d.bias
+    mixed = torch.empty(rows, CONV_DIM, dtype=x.dtype, device=x.device)
+    slot_stride, dim_stride, win_stride = _conv_strides(conv)
+    if wg_fits(rows, HIDDEN, w) and CONV_DIM % WG_BN == 0:
+        # Only z's columns are written: the conv columns go straight to ``mixed``
+        qkvz = torch.empty(rows, QKVZ_N, dtype=x.dtype, device=x.device)
+        q, q_scale = hidden_q
+        _proj_conv_kernel[(QKVZ_N // WG_BN,)](
+            q,
+            q.stride(0),
+            q_scale,
+            q_scale.stride(0),
+            q_scale.stride(1),
+            w,
+            w_scale,
+            w_scale.stride(0),
+            w_scale.stride(1),
+            conv,
+            slot_stride,
+            dim_stride,
+            win_stride,
+            weight,
+            weight if bias is None else bias,
+            cache_idx,
+            mixed,
+            mixed.stride(0),
+            qkvz,
+            qkvz.stride(0),
+            rows,
+            C=CONV_DIM,
+            K=HIDDEN,
+            S=WG_SPLIT,
+            GROUP=BLOCK,
+            BN=WG_BN,
+            ROWS=WG_ROWS,
+            HAS_BIAS=bias is not None,
+            num_warps=WG_WARPS,
+        )
+    else:
+        qkvz = block_fp8_gemv_q(x, hidden_q, w, w_scale)
+        _conv_kernel[(rows, triton.cdiv(CONV_DIM, CONV_BLOCK))](
+            qkvz,
+            qkvz.stride(0),
+            conv,
+            slot_stride,
+            dim_stride,
+            win_stride,
+            weight,
+            weight if bias is None else bias,
+            cache_idx,
+            mixed,
+            mixed.stride(0),
+            CONV_DIM,
+            HAS_BIAS=bias is not None,
+            BLOCK=CONV_BLOCK,
+        )
+    out = torch.empty(rows, GDN_V_HEADS * GDN_HEAD, dtype=x.dtype, device=x.device)
+    out_q, out_scale = quant_buffers(rows, GDN_V_HEADS * GDN_HEAD, x.device)
+    _delta_kernel[(rows, GDN_V_HEADS)](
+        mixed,
+        mixed.stride(0),
+        qkvz,
+        qkvz.stride(0),
+        x,
+        x.stride(0),
+        ba_w,
+        ba_w.stride(0),
+        ssm,
+        ssm.stride(0),
+        ssm.stride(1),
+        ssm.stride(2),
+        ssm.stride(3),
+        cache_idx,
+        mod.A_log.reshape(-1),
+        mod.dt_bias.reshape(-1),
+        mod.norm.weight,
+        out,
+        out.stride(0),
+        out_q,
+        out_q.stride(0),
+        out_scale,
+        rows,
+        GDN_HEAD**-0.5,
+        mod.norm.eps,
+        FP8_MAX,
+        1.0 / FP8_MAX,
+        HK=GDN_K_HEADS,
+        HV=GDN_V_HEADS,
+        D=GDN_HEAD,
+        K_IN=HIDDEN,
+        THRESHOLD=SOFTPLUS_THRESHOLD,
+        num_warps=8,
     )
-    q_dim = GDN_K_HEADS * GDN_HEAD
-    v_dim = GDN_V_HEADS * GDN_HEAD
-    q, k, v = mixed.split([q_dim, q_dim, v_dim], dim=-1)
-    q = q.view(rows, GDN_K_HEADS, GDN_HEAD)
-    k = k.view(rows, GDN_K_HEADS, GDN_HEAD)
-    v = v.view(rows, GDN_V_HEADS, GDN_HEAD)
-    core = _gated_delta(
-        q, k, v, a, b, ssm, cache_idx, valid, mod.A_log, mod.dt_bias
-    )
-    flat = core.reshape(-1, GDN_HEAD)
-    zflat = z.reshape(-1, GDN_HEAD)
-    gated = mod.norm(flat, zflat)
-    if isinstance(gated, tuple):
-        gated = gated[0]
-    return gated.reshape(rows, -1).contiguous()
+    return out, (out_q, out_scale)

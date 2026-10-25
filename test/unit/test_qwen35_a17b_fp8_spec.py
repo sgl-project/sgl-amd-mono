@@ -1,5 +1,6 @@
 """Qwen3.5-397B-A17B block-FP8 TP4 spec on CPU: registration, the gfx950/TP4
-limits, and the refusals for MXFP4, per-channel FP8 and a non-TP4 shape."""
+limits, and the refusals for MXFP4, per-channel FP8, a non-TP4 shape, a plain
+RMSNorm and a projection with a bias."""
 
 from types import SimpleNamespace
 
@@ -55,9 +56,7 @@ class _Tensor:
 def _fp8(shape):
     return SimpleNamespace(
         weight=_Tensor(shape, torch.float8_e4m3fn),
-        weight_scale_inv=_Tensor(
-            tuple(s // 128 for s in shape[-2:]), torch.float32
-        ),
+        weight_scale_inv=_Tensor(tuple(s // 128 for s in shape[-2:]), torch.float32),
     )
 
 
@@ -83,6 +82,18 @@ def _mlp():
     )
 
 
+class GemmaRMSNorm:
+    """Stands in for SGLang's, which the spec knows by name."""
+
+
+class RMSNorm:
+    pass
+
+
+def _norms():
+    return dict(input_layernorm=GemmaRMSNorm(), post_attention_layernorm=GemmaRMSNorm())
+
+
 def _layer(i):
     if i % 4 == 3:
         qkv_n = 4608
@@ -90,6 +101,7 @@ def _layer(i):
             mlp=_mlp(),
             qkv_proj=_fp8((qkv_n, 4096)),
             o_proj=_fp8((4096, 2048)),
+            **_norms(),
         )
     return SimpleNamespace(
         mlp=_mlp(),
@@ -99,11 +111,16 @@ def _layer(i):
             conv1d=_bf16((3072, 1, 4)),
             out_proj=_fp8((4096, 2048)),
         ),
+        **_norms(),
     )
 
 
 def _model():
-    return SimpleNamespace(model=SimpleNamespace(layers=[_layer(i) for i in range(LAYERS)]))
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[_layer(i) for i in range(LAYERS)], norm=GemmaRMSNorm()
+        )
+    )
 
 
 def test_the_plugin_registers_tp4_block_fp8_on_gfx950():
@@ -127,7 +144,9 @@ def test_config_accepts_block_fp8_and_refuses_mxfp4():
     joined = " | ".join(fp8.SPEC.config_disable_reasons(_cfg(), quark))
     assert "block-FP8" in joined, joined
     channel = _hf(weight_block_size=[1, 4096])
-    assert any("block-FP8" in r for r in fp8.SPEC.config_disable_reasons(_cfg(), channel))
+    assert any(
+        "block-FP8" in r for r in fp8.SPEC.config_disable_reasons(_cfg(), channel)
+    )
     mx = _hf(quant_method="mxfp4")
     assert any("block-FP8" in r for r in fp8.SPEC.config_disable_reasons(_cfg(), mx))
 
@@ -142,3 +161,19 @@ def test_model_accepts_tp4_block_scales_and_refuses_per_channel():
     )
     reasons = fp8.SPEC.model_disable_reasons(model, _hf(), {})
     assert reasons and "layer 3 o_proj" in reasons[0], reasons
+
+
+def test_model_refuses_a_plain_rmsnorm():
+    model = _model()
+    model.model.layers[5].post_attention_layernorm = RMSNorm()
+    reasons = fp8.SPEC.model_disable_reasons(model, _hf(), {})
+    assert reasons == [
+        "layer 5 post_attention_layernorm is RMSNorm, not a Gemma RMSNorm"
+    ], reasons
+
+
+def test_model_refuses_a_projection_with_a_bias():
+    model = _model()
+    model.model.layers[3].qkv_proj.bias = _Tensor((4608,), torch.bfloat16)
+    reasons = fp8.SPEC.model_disable_reasons(model, _hf(), {})
+    assert reasons == ["layer 3 qkv has a bias, the block-FP8 GEMV adds none"], reasons

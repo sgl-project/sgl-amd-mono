@@ -50,7 +50,10 @@ def _refuse_if_devices_are_busy(devices: str) -> None:
                 environ = raw.read().split(b"\x00")
         except OSError:
             continue
-        if "sglang.launch_server" not in command and "sglang/launch_server" not in command:
+        if (
+            "sglang.launch_server" not in command
+            and "sglang/launch_server" not in command
+        ):
             continue
         for item in environ:
             if not item.startswith(b"CUDA_VISIBLE_DEVICES="):
@@ -210,9 +213,7 @@ class TestMonokernelFault(CustomTestCase):
                 faults = re.findall(r"faulting addr: (0x[0-9a-fA-F]+)", log)
                 faults += [
                     "0x0" if addr == "nil" else addr
-                    for addr in re.findall(
-                        r"on address \((nil|0x[0-9a-fA-F]+)\)", log
-                    )
+                    for addr in re.findall(r"on address \((nil|0x[0-9a-fA-F]+)\)", log)
                 ]
                 self.assertTrue(faults, log[-2000:])
                 self.assertTrue(all(addr == "0x0" for addr in faults), faults)
