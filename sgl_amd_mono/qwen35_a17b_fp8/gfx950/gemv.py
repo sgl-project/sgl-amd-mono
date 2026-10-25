@@ -217,14 +217,15 @@ def _allow_block_fp8_linear() -> None:
 
     That import runs before the helper can decline the shape, so every block-FP8
     linear dies with it. Publishing the names lets the import finish; disabling
-    the helper then takes the same block-scale GEMM the larger shapes use.
+    the helper then takes the same block-scale GEMM the larger shapes use. A
+    module that still defines them is left alone, helper included.
     """
     import importlib
 
     moe = importlib.import_module("sglang.kernels.ops.moe.smallm_moe_gfx950")
-    os.environ.setdefault("SGLANG_ROCM_SMALLM_FP8_BS", "0")
     if hasattr(moe, "_check"):
         return
+    os.environ.setdefault("SGLANG_ROCM_SMALLM_FP8_BS", "0")
 
     class _Kernel:
         def __init__(self, *_args, **_kwargs):
