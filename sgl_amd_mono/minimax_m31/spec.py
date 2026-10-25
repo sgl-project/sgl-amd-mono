@@ -271,7 +271,6 @@ class _Built:
                 else None,  # fmt: skip
             )
         slots = forward_batch.out_cache_loc
-        last = self.sparse[-1]
         for lid in self.sparse:
             layer = m.layers[lid]
             call = {}
@@ -294,7 +293,6 @@ class _Built:
                 stream.residual.contiguous(),
                 self.weights[lid],
                 slots,
-                final=lid == last,
             )
             # the next layer's input norm applies the residual add
             stream.write(residual)
@@ -326,6 +324,7 @@ def build(model, hf_config, ctx):
     )
     peer = PeerBuffer(ffn.peer_bytes(TP), group.cpu_group, rank, TP, device)
     runner = FfnRunner(TP, rank, peer.local, peer.addresses, device, tuple(ctx.widths))
+    runner.set_deadline(ctx.deadline_s)
     sparse = _sparse_ids(model)
     weights = {}
     for i in sparse:

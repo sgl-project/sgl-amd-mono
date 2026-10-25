@@ -17,6 +17,7 @@ if (
 ):
     pytest.skip("gfx950 only", allow_module_level=True)
 
+from sgl_amd_mono.common import guard  # noqa: E402
 from sgl_amd_mono.minimax_m31 import a16w8, ffn  # noqa: E402
 from sgl_amd_mono.minimax_m31.runner import FfnRunner  # noqa: E402
 
@@ -162,8 +163,8 @@ def _run(weights, s, seed=1):
     slots = torch.arange(s, dtype=torch.int64, device="cuda")
     out, res_out = runner(part, residual, weights, slots)
     torch.cuda.synchronize()
-    err = runner.peer_bufs[0][: 4 * ffn.ERROR_WORDS].view(torch.int32).tolist()
-    assert err[0] == 0, err
+    err = runner.epoch[list(guard.ERROR_WORDS)].tolist()
+    assert not any(err), err
     x = runner.region(s, "xn")[: s * H * 2].view(torch.bfloat16).view(s, H)
     parts = _pairs(runner.region(s, "logit"), s * ffn.EXPERTS * ffn.ROUTER_PARTS)
     parts = parts.view(torch.float32).view(s, ffn.EXPERTS, ffn.ROUTER_PARTS)
@@ -208,3 +209,73 @@ def test_ffn_stages_match_native(weights, s):
     want = want + _native_shared(r.x, weights.shared)
     cos, rel = _metrics(r.out, want)
     assert cos > 0.9999 and rel < 1e-2, (cos, rel)
+
+
+_STALLED_LAUNCH = """
+import torch
+import test_minimax_m31_ffn as t
+from sgl_amd_mono.minimax_m31 import ffn
+from sgl_amd_mono.minimax_m31.runner import FfnRunner
+
+w = t.weights._get_wrapped_function()()
+dev = torch.device("cuda")
+buf = torch.zeros(ffn.peer_bytes(1), dtype=torch.uint8, device=dev)
+peers = torch.tensor([buf.data_ptr()], dtype=torch.int64, device=dev)
+runner = FfnRunner(1, 0, buf.data_ptr(), peers, dev, (1,), drop_mark=5)
+runner.set_deadline(0.2)
+runner.warm(w)
+part = torch.randn(1, ffn.HIDDEN, device=dev).bfloat16()
+runner(part, part.clone(), w, torch.zeros(1, dtype=torch.int64, device=dev))
+torch.cuda.synchronize()
+print("LAUNCH_RETURNED", flush=True)
+"""
+
+
+def test_a_timed_out_wait_stops_the_launch():
+    """A CTA that never marks the epoch barrier must stop the launch at the deadline
+    (the guard's store to the null page), not let the step return."""
+    import os
+    import subprocess
+    import sys
+
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([os.path.dirname(__file__), *sys.path]),
+        # the stop faults the GPU on purpose: no core dump of its VRAM
+        "HSA_DISABLE_COREDUMP_ON_EXCEPTION": "1",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", _STALLED_LAUNCH],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    log = proc.stdout + proc.stderr
+    assert "LAUNCH_RETURNED" not in log and proc.returncode != 0, log[-2000:]
+
+
+def test_a_tag_cycle_ends_with_its_receive_half_cleared(weights):
+    """Across the 16-bit triple tags' wrap every launch matches one at epoch 0, and
+    the last launch of each parity's cycle leaves that parity's receive half zero
+    (a stale pair there could otherwise carry the next cycle's tags)."""
+    s = 16
+    g = torch.Generator(device="cuda").manual_seed(3)
+    part = torch.randn(s, H, device="cuda", generator=g).bfloat16()
+    residual = torch.randn(s, H, device="cuda", generator=g).mul(4).bfloat16()
+    slots = torch.arange(s, dtype=torch.int64, device="cuda")
+    want, want_res = _runner(weights, s)(part, residual, weights, slots)
+
+    runner = _runner(weights, s)
+    half = ffn.peer_half_bytes(1)
+    last = 2 * (ffn.TAG16_CYCLE - 1)  # parity 0's last launch of the first cycle
+    runner.epoch[0] = last
+    for ep in range(last, last + 4):
+        out, res_out = runner(part, residual, weights, slots)
+        torch.cuda.synchronize()
+        assert torch.equal(out, want) and torch.equal(res_out, want_res), ep
+        if ep < last + 2:  # a cycle's end: the parity's half was cleared
+            p = ep & 1
+            assert not runner.peer_bufs[0][p * half : (p + 1) * half].any(), ep
+    assert runner.epoch[0].item() == last + 4
+

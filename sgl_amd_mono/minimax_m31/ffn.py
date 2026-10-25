@@ -33,6 +33,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
+from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.plan import kernel_sources
 from sgl_amd_mono.common.ops import (
     CM_SYS,
@@ -57,20 +58,19 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
     pair_layout,
 )
+from sgl_amd_mono.common.epoch import EPOCH_MARKS, epoch_end
 from sgl_amd_mono.common.sync import Space, preg, sreg
 
 from . import a16w8
 from .a16w4 import scale_f32, scale_loads, step_mfma, weight_loads
 from .sync import (
-    ERROR_WORDS,
-    WAIT_TICKS,
     Mailbox,
     cta_sync,
-    error_word,
     load32,
     load_dev,
     store16,
     store32,
+    store64,
     store_dev,
     sync_acquire,
     sync_release,
@@ -113,16 +113,9 @@ ROUTER0 = NORM0 + MAX_TOKENS
 SHARED0 = (ROUTER0 + ROUTER_TASKS) % BLOCKS
 ROUTED0 = SHARED0 + UP_TILES
 
-ERROR_BYTES = 256  # the error line, ahead of the two parity halves
-HANDSHAKE_BYTES = 64  # the step-end handshake's pairs in the error line, one a rank
-
-# sites of a timed-out wait (the error word's fourth field)
-SITE_REDUCE, SITE_NORM, SITE_ROUTER, SITE_ROUTE = 1, 2, 3, 4
-SITE_TABLE, SITE_UP, SITE_DOWN, SITE_FINAL, SITE_EPOCH = 5, 6, 7, 8, 9
-SITE_WRAP, SITE_HANDSHAKE, SITE_INJECT, SITE_PEER = 10, 11, 12, 13
-# launches before a triple pair's 16-bit tag (one a launch of its parity)
-# could repeat a stale pair: fail-stop instead
-EPOCH_LIMIT = (1 << 17) - (1 << 12)
+# a triple pair's 16-bit tags over its parity's launches: 1 .. TAG16_CYCLE, never
+# the 0 a cleared half holds
+TAG16_CYCLE = (1 << 16) - 1
 
 
 class Experts(Enum):
@@ -142,7 +135,9 @@ class FfnBuild:
     timeline: bool = False
     # fault injection: this CTA never marks the epoch barrier
     drop_mark: int = -1
-    wait_ticks: int = WAIT_TICKS
+    # SGLANG_AMD_MONO_FAULT_INJECT (``guard.fault_injection``): the wait that stalls
+    fault_site: int = 0
+    fault_after: int = 0
 
 
 def slots(s: int) -> int:
@@ -155,8 +150,13 @@ def peer_half_bytes(tp: int) -> int:
     return tp * MAX_TOKENS * (TRIPLES + HIDDEN // 2) * 8
 
 
+def flags_offset(tp: int) -> int:
+    """The guard's peer flags, past the two parity halves."""
+    return 2 * peer_half_bytes(tp)
+
+
 def peer_bytes(tp: int) -> int:
-    return ERROR_BYTES + 2 * peer_half_bytes(tp)
+    return flags_offset(tp) + guard.FLAG_BYTES
 
 
 def scratch_layout(s: int) -> dict[str, tuple[int, int]]:
@@ -187,7 +187,6 @@ def scratch_bytes(s: int) -> int:
     return max(o + n for o, n in scratch_layout(s).values())
 
 
-EPOCH_MARKS = 4
 TL_STAGES = (
     "push",
     "reduce",
@@ -306,7 +305,6 @@ def stage_reduce(c, task):
         tr = task * TASK_TRIPLES + tid % TASK_TRIPLES
         got = c["mb"].poll(
             [(c["own"], attn_pair(c, src, t, tr), 1) for src in range(c["tp"])],
-            site=SITE_REDUCE,
             triples=True,
         )
         res = triple_bits(a["res_in"], t, tr)
@@ -333,7 +331,7 @@ def stage_norm(c, t):
     tid, a = c["tid"], c["args"]
     part = fx.Float32(0.0)
     if tid < SEAM_TASKS:
-        got = c["mb"].poll([(c["ssq"], t * SEAM_TASKS + tid, 1)], site=SITE_NORM)
+        got = c["mb"].poll([(c["ssq"], t * SEAM_TASKS + tid, 1)])
         part = got[0][0].bitcast(fx.Float32)
         c["mb"].acquire(Space.SCRATCH)
     cta_sync()
@@ -362,7 +360,7 @@ def await_x(c, tokens_n):
     """XRDY of the first ``tokens_n`` tokens (thread t polls token t)."""
     tid = c["tid"]
     if tid < tokens_n:
-        c["mb"].poll([(c["xrdy"], tid, 1)], site=SITE_ROUTER)
+        c["mb"].poll([(c["xrdy"], tid, 1)])
         c["mb"].acquire(Space.SCRATCH)
     cta_sync()
 
@@ -457,7 +455,6 @@ def stage_route(c, t):
             (c["logit"], (t * EXPERTS + e) * ROUTER_PARTS + q * quarter + p, 2)
             for p in range(0, quarter, 2)
         ],
-        site=SITE_ROUTE,
     )
     c["mb"].acquire(Space.SCRATCH)
     part = fx.Float32(0.0)
@@ -536,7 +533,6 @@ def load_table(c):
                 (c["route"], t * 2 * TOPK + tid % TOPK, 1),
                 (c["route"], t * 2 * TOPK + TOPK + tid % TOPK, 1),
             ],
-            site=SITE_TABLE,
         )
         c["mb"].acquire(Space.SCRATCH)
         tab_st(c, got[0][0], T_PICK_E + tid)
@@ -726,7 +722,7 @@ def down_slot(c, u, tasks, shared=False):
         svs = [scale_loads(a["s2"], rg, INTER, 0, K2_STEPS) for rg in rgs]
     cnt = slot_count(c, u)
     c["mb"].poll(
-        [(c["upf"], u * UP_TILES + fx.min(lane, UP_TILES - 1), 1)], site=SITE_DOWN
+        [(c["upf"], u * UP_TILES + fx.min(lane, UP_TILES - 1), 1)]
     )
     c["mb"].acquire(Space.SCRATCH)
     # a lane's MID loads span tiles other lanes polled
@@ -804,7 +800,6 @@ def stage_final(c, task):
         cp = task * (COLS // 2) + tid % (COLS // 2)
         got = c["mb"].poll(
             [(c["own"], ffn_pair(c, src, t, cp), 1) for src in range(c["tp"])],
-            site=SITE_FINAL,
         )
         lo, hi = bf2_f32(got[0][0])
         for src in range_constexpr(1, c["tp"]):
@@ -879,8 +874,8 @@ def kernel_name(key: FfnBuild) -> str:
         name += "_tl"
     if key.drop_mark >= 0:
         name += f"_drop{key.drop_mark}"
-    if key.wait_ticks != WAIT_TICKS:
-        name += f"_w{key.wait_ticks}"
+    if key.fault_site:
+        name += f"_fault{key.fault_site}_{key.fault_after}"
     return name
 
 
@@ -920,63 +915,72 @@ def build_ffn(key: FfnBuild):
         peers: Int64,
         rank: Int32,
         epoch: Int64,
-        handshake: Int32,
-        inject: Int64,
         mode: Int32,
     ):
         _ = keyed
-        if mode != 0:
-            bid = fx.block_idx.x
-            tid = fx.thread_idx.x
-            lds = fx.SharedAllocator().allocate(Lds).peek()
-            ep = load32(epoch, 0, "agent")
-            tag = ep + 1
-            raw = peer_bases(peers, tp)
-            par = fx.Int64(ep & 1) * fx.Int64(half) + fx.Int64(ERROR_BYTES)
-            # a seam half's launches are those of one parity
-            tag16 = ((ep >> 1) + 1) & 0xFFFF
-            mb = Mailbox(tag, sym, raw, rank, ep, key.wait_ticks, tag16)
-            c = {
-                "S": s,
-                "tp": tp,
-                "experts": key.experts,
-                "timeline": key.timeline,
-                "tid": tid,
-                "lane": tid % 64,
-                "wave": tid // 64,
-                "rank": rank,
-                "mb": mb,
-                "red": lds.red.ptr,
-                "tab": lds.tab.ptr,
-                "contrib": lds.contrib.ptr,
-                "own": preg(sym + par, 0, "peer"),
-                "peer": [preg(b + par, 0, "peer") for b in raw],
-                "args": {
-                    "part": part,
-                    "res_in": res_in,
-                    "res_out": res_out,
-                    "out": out,
-                    "slots": slots,
-                    "norm_w": norm_w,
-                    "router_w": router_w,
-                    "bias": bias,
-                    "w13": w13,
-                    "s13": s13,
-                    "w2": w2,
-                    "s2": s2,
-                    "w13s": w13s,
-                    "s13s": s13s,
-                    "w2s": w2s,
-                    "s2s": s2s,
-                },
-            }
-            for region, (off, _) in layout.items():
-                c[region] = sreg(scratch, off, region)
-            c["vmask"] = valid_mask(c)
-            refuse_wrap(c, ep)
-            run_ffn(c, bid)
-            finish(c, key, epoch, tag, handshake, inject, raw)
-            stamp(c, 11)
+        with guard.scope(
+            guard.Guard(
+                epoch,
+                own=sym,
+                peers=peers,
+                rank=rank,
+                npes=tp,
+                flags_offset=flags_offset(tp),
+                fault_site=key.fault_site or None,
+                fault_after=key.fault_after,
+            )
+        ):
+            if mode != 0:
+                bid = fx.block_idx.x
+                tid = fx.thread_idx.x
+                lds = fx.SharedAllocator().allocate(Lds).peek()
+                ep = load32(epoch, 0, "agent")
+                tag = ep + 1
+                raw = peer_bases(peers, tp)
+                par = fx.Int64(ep & 1) * fx.Int64(half)
+                # a seam half's launches are those of one parity
+                mb = Mailbox(tag, tag16_of(ep))
+                c = {
+                    "S": s,
+                    "tp": tp,
+                    "experts": key.experts,
+                    "timeline": key.timeline,
+                    "tid": tid,
+                    "lane": tid % 64,
+                    "wave": tid // 64,
+                    "rank": rank,
+                    "mb": mb,
+                    "red": lds.red.ptr,
+                    "tab": lds.tab.ptr,
+                    "contrib": lds.contrib.ptr,
+                    "own": preg(sym + par, 0, "peer"),
+                    "half_words": half // 8,
+                    "peer": [preg(b + par, 0, "peer") for b in raw],
+                    "args": {
+                        "part": part,
+                        "res_in": res_in,
+                        "res_out": res_out,
+                        "out": out,
+                        "slots": slots,
+                        "norm_w": norm_w,
+                        "router_w": router_w,
+                        "bias": bias,
+                        "w13": w13,
+                        "s13": s13,
+                        "w2": w2,
+                        "s2": s2,
+                        "w13s": w13s,
+                        "s13s": s13s,
+                        "w2s": w2s,
+                        "s2s": s2s,
+                    },
+                }
+                for region, (off, _) in layout.items():
+                    c[region] = sreg(scratch, off, region)
+                c["vmask"] = valid_mask(c)
+                run_ffn(c, bid)
+                finish(c, key, epoch, ep, tag)
+                stamp(c, 11)
 
     @flyc.jit
     def launch(
@@ -1001,8 +1005,6 @@ def build_ffn(key: FfnBuild):
         peers: Int64,
         rank: Int32,
         epoch: Int64,
-        handshake: Int32,
-        inject: Int64,
         mode: Int32,
         stream: fx.Stream = _STREAM,
     ):
@@ -1029,98 +1031,45 @@ def build_ffn(key: FfnBuild):
             peers,
             rank,
             epoch,
-            handshake,
-            inject,
             mode,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch
 
 
-@flyc.jit
-def refuse_wrap(c, ep):
-    if (fx.block_idx.x == 0) & (c["tid"] == 0) & (ep >= EPOCH_LIMIT):
-        c["mb"].fail(SITE_WRAP)
+def tag16_of(ep):
+    """Launch ``ep``'s triple-pair tag: its parity's launches count 1 .. TAG16_CYCLE."""
+    return (ep >> 1) % TAG16_CYCLE + 1
 
 
 @flyc.jit
-def finish(c, key, epoch, tag, handshake, inject, peers):
-    """Every CTA marks the launch done after its work; CTA 0 waits for the
-    marks, then moves the epoch on. The step's last launch (``handshake``)
-    then trades every rank's failure flag over the peers: a fault anywhere in
-    the step is in every rank's error word before this launch ends."""
+def finish(c, key, epoch, ep, tag):
+    """Every CTA marks the launch done after its work; CTA 0 waits for the marks
+    and moves the epoch on (``common.epoch``), then ends a tag cycle."""
     tid, bid = c["tid"], fx.block_idx.x
-    if (handshake != 0) & (bid == 0) & (tid == 0):
-        injected_fault(c, inject)
     cta_sync(drain=True)
     if (tid == 0) & (bid != key.drop_mark):
         sync_release("agent")
         store32(epoch, EPOCH_MARKS + bid, tag, "agent")
-    epoch_end(c, epoch, tag)
-    if (handshake != 0) & (bid == 0) & (tid == 0):
-        trade_faults(c, tag, peers)
+    epoch_end({"bid": bid, "tid": tid}, epoch, ep)
+    clear_cycle(c, ep)
 
 
 @flyc.jit
-def injected_fault(c, inject):
-    """Fault injection (qualification): rank ``inject[0] - 1`` fails after
-    ``inject[1]`` ticks at the end of the step's last launch."""
-    target = load32(inject, 0, "agent")
-    if target == c["rank"] + 1:
-        ticks = fx.Int64(load32(inject, 1, "agent"))
-        t0 = clock()
-        while clock() - t0 < ticks:
-            rocdl.s_sleep(8)
-        c["mb"].fail(SITE_INJECT)
-
-
-@flyc.jit
-def trade_faults(c, tag, peers):
-    mb = c["mb"]
-    failed = fx.Int32((error_word(mb.err_base) != 0).select(1, 0))
-    hs = [preg(b, HANDSHAKE_BYTES, "handshake") for b in peers]
-    own = preg(mb.err_base, HANDSHAKE_BYTES, "handshake")
-    mb.put_release_all(hs, c["rank"], failed)
-    got = mb.poll([(own, p, 1) for p in range(c["tp"])], site=SITE_HANDSHAKE)
-    mb.acquire_system()
-    for p in range_constexpr(c["tp"]):
-        if (got[p][0] != 0) & (error_word(mb.err_base) == 0):
-            Mailbox(tag, mb.err_base, [mb.err_base], p, mb.epoch).fail(SITE_PEER)
-
-
-@flyc.jit
-def epoch_end(c, epoch, tag):
-    """CTA 0, once every CTA marked this launch: the epoch moves on. A mark
-    missing past the wait bound sets the error word instead; the epoch stays."""
-    tid, red = c["tid"], c["red"]
-    if fx.block_idx.x == 0:
-        if tid == 0:
-            fx.ptr_store(fx.Int32(0).bitcast(fx.Float32), red)
-        gpu.barrier()
-        if tid < BLOCKS:
-            t0 = clock()
-            mark = load32(epoch, EPOCH_MARKS + tid, "agent")
-            late = fx.Int64(0)
-            while (mark != tag) & (late < c["mb"].ticks):
-                rocdl.s_sleep(1)
-                mark = load32(epoch, EPOCH_MARKS + tid, "agent")
-                late = clock() - t0
-            if mark != tag:
-                fx.ptr_store(fx.Int32(1).bitcast(fx.Float32), red)
-            sync_acquire("agent")
-        cta_sync()
-        if tid == 0:
-            if fx.ptr_load(red).bitcast(fx.Int32) == 0:
-                store32(epoch, 0, tag, "agent")
-            else:
-                c["mb"].fail(SITE_EPOCH)
+def clear_cycle(c, ep):
+    """CTA 0, past the epoch barrier of its parity's last launch of a tag cycle:
+    zero this rank's receive half, so no stale pair there carries the next cycle's
+    tags. Every read of it is done, and no peer writes it again before this rank's
+    next launch has pushed its data."""
+    if (fx.block_idx.x == 0) & (tag16_of(ep) == TAG16_CYCLE):
+        for i in range(c["tid"], c["half_words"], THREADS):
+            store64(c["own"].value, i, fx.Int64(0), None)
 
 
 __all__ = [
     "BLOCKS",
     "CM_SYS",
     "EPOCH_WORDS",
-    "ERROR_WORDS",
     "Experts",
     "FfnBuild",
     "MAX_TOKENS",

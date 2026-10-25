@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Bounded tagged hand-offs and the sticky error word.
+"""Tagged hand-offs of one launch, its waits bounded by the plugin's guard.
 
 The contract, in the LLVM "AMDGPU Memory Model" (llvm/docs/AMDGPUMemoryModel.md,
 AMM) and AMDGPUUsage "Execution Barriers":
@@ -10,7 +10,9 @@ AMM) and AMDGPUUsage "Execution Barriers":
   for the peer heap). An atomic access is never split, so a load that sees a
   pair's tag sees that store's value. A triple pair (``put_triple``, the
   attention seam) is the same atomic with three bf16 in bits 0 .. 47 under a
-  16-bit tag, unique between epoch resets (the kernel's EPOCH_LIMIT).
+  16-bit tag that cycles 1 .. 65535 over its parity's launches; the launch that
+  ends a cycle clears its receive half (``ffn.clear_cycle``), so a stale pair
+  never carries a current tag.
 - Data a pair announces is stored *store-available* and loaded *load-visible*
   at agent scope (AMM: agent atomics of 16 to 64 bits, ``llvm.amdgcn.av.load.
   b128``; ``store_dev`` / ``load_dev``).
@@ -29,11 +31,10 @@ The av operations are lowered with the agent-scope cache bits (``sc1``) and
 the av-none fences to waits only, so no L2 write-back or invalidate is
 emitted. The GFX942 workgroup release waits ``lgkmcnt(0)`` only outside
 tgsplit mode, so a publishing CTA also has every wave wait for its own stores
-before the barrier (``cta_sync(drain=True)``). The step-end fault handshake
-uses plain system release / acquire once a step.
+before the barrier (``cta_sync(drain=True)``).
 
-A poll gives up after ``ticks`` of the 100 MHz clock or once any rank has set
-the error word; a timeout sets ``[1, rank, epoch, site]`` on every rank.
+A poll waits as every plugin wait does (``common.sync._spin`` under the launch's
+``guard.scope``): past SGLang's deadline, or once any rank failed, the launch stops.
 """
 
 import flydsl.compiler as flyc
@@ -43,11 +44,8 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from sgl_amd_mono.common.ops import clock
-from sgl_amd_mono.common.sync import Space
+from sgl_amd_mono.common.sync import Space, _spin
 
-WAIT_TICKS = 1_000_000_000  # 10 s
-ERROR_WORDS = 4
 POLL_MAX = 12
 
 _SCOPE = {Space.SCRATCH: "agent", Space.PEER: None}
@@ -201,48 +199,17 @@ def cta_sync(drain=False):
     gpu.barrier()
 
 
-def error_word(base):
-    return load32(base, 0, None)
-
-
 def pack(word, tag):
     return (fx.Int64(tag) << 32) | fx.Int64(fx.Uint32(fx.Int32(word)))
-
-
-@flyc.jit
-def _spin(load_all, pending, err_base, ticks):
-    t0 = clock()
-    v = load_all()
-    err = error_word(err_base)
-    late = fx.Int64(0)
-    while pending(v) & (err == 0) & (late < ticks):
-        rocdl.s_sleep(1)
-        v = load_all()
-        err = error_word(err_base)
-        late = clock() - t0
-    return v, pending(v) & (err == 0)
-
-
-@flyc.jit
-def _fail_if(timed_out, fail, site):
-    if timed_out:
-        fail(site)
 
 
 class Mailbox:
     """Tagged pairs of one launch (``tag``), every address an ``Addr``."""
 
-    def __init__(
-        self, tag, err_base, peer_bases, rank, epoch, ticks=WAIT_TICKS, tag16=None
-    ):
+    def __init__(self, tag, tag16=None):
         self.tag = tag
         # a triple pair's 16-bit tag (``put_triple``), if the launch has one
         self.tag16 = tag16
-        self.err_base = err_base
-        self.peer_bases = peer_bases
-        self.rank = rank
-        self.epoch = epoch
-        self.ticks = ticks
 
     def put(self, a, i, v):
         """Pair i of ``a`` := (v, tag), monotonic: a value no other data hangs on."""
@@ -273,21 +240,12 @@ class Mailbox:
     def acquire_system(self):
         acquire_fence(None)
 
-    def fail(self, site):
-        lo = (fx.Int64(fx.Int32(self.rank)) << 32) | fx.Int64(1)
-        hi = (fx.Int64(fx.Int32(site)) << 32) | fx.Int64(
-            fx.Uint32(fx.Int32(self.epoch))
-        )
-        for base in self.peer_bases:
-            store64(base, 1, hi, None)
-            store64(base, 0, lo, None)
-
     def put_triple(self, a, i, bits48):
         """Pair i of ``a`` := (48 value bits | tag16 << 48), monotonic."""
         word = (bits48 & ((1 << 48) - 1)) | (fx.Int64(self.tag16) << 48)
         store64(a.value, i, word, _SCOPE[a.space])
 
-    def poll(self, specs, batch=POLL_MAX, site=0, triples=False):
+    def poll(self, specs, batch=POLL_MAX, triples=False):
         """Pairs ``specs`` = [(Addr, pair index, npairs in {1, 2})], all of one
         space, re-loaded together until every tag is this launch's. Returns the
         value words; ``triples``: of triple pairs (``put_triple``), both
@@ -295,8 +253,8 @@ class Mailbox:
         if const_expr(len(specs) == 0):
             return []
         if const_expr(len(specs) > batch):
-            return self.poll(specs[:batch], batch, site, triples) + self.poll(
-                specs[batch:], batch, site, triples
+            return self.poll(specs[:batch], batch, triples) + self.poll(
+                specs[batch:], batch, triples
             )
         spaces = {a.space for a, _, _ in specs}
         assert len(spaces) == 1, f"one poll batch spans {spaces}"
@@ -322,8 +280,7 @@ class Mailbox:
                 bad = bad | (high_tag(v[e]) != tag)
             return bad
 
-        v, timed_out = _spin(load_all, pending, self.err_base, self.ticks)
-        _fail_if(timed_out, self.fail, site)
+        v = _spin(load_all, pending)
         outs, e = [], 0
         for _, _, n in specs:
             if const_expr(triples):

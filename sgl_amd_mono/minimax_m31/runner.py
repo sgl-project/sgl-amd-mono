@@ -11,6 +11,8 @@ from typing import Any
 
 import torch
 
+from sgl_amd_mono.common import guard
+
 from .ffn import (
     BLOCKS,
     EPOCH_WORDS,
@@ -25,6 +27,9 @@ from .ffn import (
     scratch_layout,
 )
 from .residency import active_workgroups_per_cu
+
+# every wait's deadline until the spec sets SGLang's (BuildContext.deadline_s)
+DEFAULT_DEADLINE_S = 60.0
 
 
 def _writable_flydsl_cache() -> None:
@@ -60,6 +65,9 @@ class FfnRunner:
         _writable_flydsl_cache()
         self.tp, self.rank, self.sym, self.peers = tp, rank, sym, peers
         self.widths = widths
+        fault = guard.fault_injection(rank)
+        if fault is not None:
+            build = {"fault_site": fault[0], "fault_after": fault[1], **build}
         self.keys = {
             s: FfnBuild(tokens=s, tp=tp, experts=experts, timeline=timeline, **build)
             for s in widths
@@ -67,8 +75,7 @@ class FfnRunner:
         if epoch is None:
             epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=device)
         self.epoch = epoch
-        # fault injection (qualification): [rank + 1, delay ticks], 0 = off
-        self.inject = torch.zeros(2, dtype=torch.int32, device=device)
+        self.set_deadline(DEFAULT_DEADLINE_S)
         self.scratch = {
             s: torch.zeros(scratch_bytes(s), dtype=torch.uint8, device=device)
             for s in widths
@@ -78,7 +85,14 @@ class FfnRunner:
         # every width's driver-reported resident CTAs per CU
         self.residency: dict[int, int] = {}
 
-    def _args(self, s, part, res_in, res_out, out, slots, w, mode, final=False):
+    def set_deadline(self, seconds: float) -> None:
+        """Every wait's deadline, as the guard block's clock ticks."""
+        ticks = guard.deadline_ticks(seconds)
+        lo = ticks & 0xFFFFFFFF
+        self.epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
+        self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
+
+    def _args(self, s, part, res_in, res_out, out, slots, w, mode):
         return (
             part.data_ptr(),
             res_in.data_ptr(),
@@ -101,8 +115,6 @@ class FfnRunner:
             self.peers.data_ptr(),
             self.rank,
             self.epoch.data_ptr(),
-            int(final),
-            self.inject.data_ptr(),
             mode,
             torch.cuda.current_stream(),
         )
@@ -133,14 +145,12 @@ class FfnRunner:
         residual: torch.Tensor,
         weights,
         slots: torch.Tensor,
-        final: bool = False,
     ):
         """``part``: this rank's unreduced o_proj output; ``slots``: the step's
         int64 slot mapping. A row with a negative slot (padding) still runs the
         seam (its residual output is unspecified) but joins no expert and its
         MoE output is zero. Returns the reduced MoE output and the residual after
-        attention. ``final``: the step's last launch, which ends in the TP
-        fault handshake."""
+        attention."""
         s = part.shape[0]
         assert part.is_contiguous() and residual.is_contiguous()
         assert (
@@ -148,15 +158,9 @@ class FfnRunner:
         )
         out = torch.empty_like(part)
         res_out = torch.empty_like(residual)
-        args = self._args(s, part, residual, res_out, out, slots, weights, 1, final)
+        args = self._args(s, part, residual, res_out, out, slots, weights, 1)
         self._compiled[s](*args)
         return out, res_out
-
-    def reset(self) -> None:
-        """Every width's scratch and the epoch cleared (no launch in flight)."""
-        for buf in self.scratch.values():
-            buf.zero_()
-        self.epoch.zero_()
 
     def region(self, s: int, name: str) -> torch.Tensor:
         off, nbytes = scratch_layout(s)[name]
