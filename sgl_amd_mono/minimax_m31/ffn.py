@@ -163,6 +163,7 @@ def scratch_layout(s: int) -> dict[str, tuple[int, int]]:
         [
             ("ssq", s * SEAM_TASKS),
             ("xrdy", s),
+            ("rstd", s),
             ("logit", s * EXPERTS * ROUTER_PARTS),
             ("route", s * 2 * TOPK),
             ("upf", slots(s) * UP_TILES),
@@ -327,7 +328,7 @@ def stage_reduce(c, task):
 @flyc.jit
 def stage_norm(c, t):
     """Token t's Gemma RMSNorm of SRES -> XN, then XRDY."""
-    tid, a = c["tid"], c["args"]
+    tid = c["tid"]
     part = fx.Float32(0.0)
     if tid < SEAM_TASKS:
         got = c["mb"].poll([(c["ssq"], t * SEAM_TASKS + tid, 1)])
@@ -336,22 +337,34 @@ def stage_norm(c, t):
     cta_sync()
     var = block_sum(c, part, 0) / fx.Float32(HIDDEN)
     rstd = fx.Float32(1.0) / fx.Float32(fmath.sqrt(var + fx.Float32(EPS)))
+    # released after the SSQ acquires: the router reads SRES on it, not on XRDY
+    if tid == 0:
+        c["mb"].publish(c["rstd"], t, rstd)
     per = HIDDEN // THREADS  # 12
     for q in range_constexpr(per // 2):
         col = (q * THREADS + tid) * 2
-        sv = load_dev(c["sres"].value, t * HIDDEN + col, 2)
-        ww = fx.Int32(
-            bo.buffer_load(rsrc(a["norm_w"]), col // 2, vec_width=1, dtype=T.i32)
-        )
-        wl, wh = bf2_f32(ww)
-        ol = fx.Int32(sv[0]).bitcast(fx.Float32) * rstd * (fx.Float32(1.0) + wl)
-        oh = fx.Int32(sv[1]).bitcast(fx.Float32) * rstd * (fx.Float32(1.0) + wh)
         store_dev(
-            c["xn"].value,
-            t * (HIDDEN // 2) + col // 2,
-            [bf16_pair(ol, oh).bitcast(fx.Int32)],
+            c["xn"].value, t * (HIDDEN // 2) + col // 2, xn_words(c, t, col, rstd, 2)
         )
     flag_after_stores(c, c["xrdy"], t, tid == 0)
+
+
+def xn_words(c, t, col, rstd, n):
+    """XN[t][col .. col + n) from SRES: bf16 pairs of the Gemma RMSNorm, one word
+    a pair."""
+    sv = load_dev(c["sres"].value, t * HIDDEN + col, n)
+    words = []
+    for h in range_constexpr(n // 2):
+        ww = fx.Int32(
+            bo.buffer_load(
+                rsrc(c["args"]["norm_w"]), col // 2 + h, vec_width=1, dtype=T.i32
+            )
+        )
+        wl, wh = bf2_f32(ww)
+        ol = fx.Int32(sv[2 * h]).bitcast(fx.Float32) * rstd * (fx.Float32(1.0) + wl)
+        oh = fx.Int32(sv[2 * h + 1]).bitcast(fx.Float32) * rstd * (fx.Float32(1.0) + wh)
+        words.append(bf16_pair(ol, oh).bitcast(fx.Int32))
+    return words
 
 
 @flyc.jit
@@ -407,12 +420,12 @@ def stage_router(c, task):
         )
         for ch in range(chunks)
     ]
-    await_x(c, s)
     tok = fx.min(lane % 16, s - 1)
-    xv = [
-        load_dev(c["xn"].value, (tok * HIDDEN + k0 + 16 * ch) // 2, 2)
-        for ch in range(chunks)
-    ]
+    # the norm's scale, published before XN: the router normalizes its own columns
+    got = c["mb"].poll([(c["rstd"], tok, 1)])
+    c["mb"].acquire(Space.SCRATCH)
+    rstd = got[0][0].bitcast(fx.Float32)
+    xv = [xn_words(c, tok, k0 + 16 * ch, rstd, 4) for ch in range(chunks)]
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for ch in range_constexpr(chunks):
         for h in range_constexpr(2):
@@ -428,7 +441,6 @@ def stage_router(c, task):
         tot = fx.Float32(0.0)
         for w in range_constexpr(WAVES):
             tot = tot + fx.ptr_load(red + (w * 64 * 4 + at))
-        # released: a routed up CTA reads XN through logit -> route -> table
         c["mb"].publish(
             c["logit"], (t * EXPERTS + tile * 16 + r) * ROUTER_PARTS + part, tot
         )
@@ -848,6 +860,8 @@ def run_ffn(c, bid):
         stage_up(c, 0, sh, weights, shared=True)
     stamp(c, 6)
     load_table(c)
+    # the router no longer orders XN before the table
+    await_x(c, s)
     stamp(c, 7)
     total = (n_slots(c) - 1) * UP_TILES
     for unit in range(first_task(bid, ROUTED0), total, BLOCKS):
