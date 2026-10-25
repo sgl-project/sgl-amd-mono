@@ -21,13 +21,15 @@ A routed decode step (1 to 16 rows) runs ``_Built.forward`` in place of
     logits        model.logits_processor; output.hidden_states = the streams
 
 The GDN states are SGLang's, updated in place at the step's mamba cache indices; a
-pad row (index <= 0) writes none.
+pad row (index <= 0) writes none. ``SGLANG_AMD_MONO_CHECK=1`` (eager) also runs
+SGLang's layer next to each launch (``check``).
 """
 
 from __future__ import annotations
 
 import inspect
 import logging
+import os
 
 import torch
 
@@ -189,6 +191,42 @@ SGLANG_READS = {
         "get_req_to_token_pool",
     ),
 }
+
+# Each launch against SGLang's own layer on the same input (``check``). The
+# launches quantize the GDN projections' inputs to MXFP4 where SGLang runs bf16,
+# so a layer's own contribution (delta, update) is held to a quantization-sized
+# bound; a wrong layout or stride lands near 0.
+BOUNDS = {
+    "front.mix.cosine": 0.999,
+    "gdn.streams.cosine": 0.999,
+    "gdn.delta.cosine": 0.9,
+    "gdn.core.cosine": 0.9,
+    "gdn.conv.cosine": 0.98,
+    "gdn.state.cosine": 0.999,
+    "gdn.update.cosine": 0.9,
+    "qsa.streams.cosine": 0.999,
+    "qsa.delta.cosine": 0.9,
+    # SGLang's radix track-save copies the states
+    "gdn.track.max_abs": 0.0,
+}
+
+# ``SGLANG_AMD_MONO_CHECK_REF=mxfp4``: the reference's GDN projections run the
+# kernels' MXFP4 arithmetic, so the MoE-free metrics are held to rounding-order
+# bounds; streams and delta carry the two MoE implementations' difference and are
+# logged only.
+CHECK_MXFP4_BOUNDS = {
+    "front.mix.cosine": 0.999,
+    "gdn.core.cosine": 0.9995,
+    "gdn.conv.cosine": 0.9995,
+    "gdn.state.cosine": 0.9999,
+    "gdn.update.cosine": 0.999,
+    "gdn.track.max_abs": 0.0,
+}
+
+
+def check_bounds(ref: str) -> dict[str, float]:
+    """The check's bounds for its reference (``check.REFS``)."""
+    return CHECK_MXFP4_BOUNDS if ref == "mxfp4" else dict(BOUNDS)
 
 
 def _text(config):
@@ -524,6 +562,11 @@ class _Built:
         }
         self._states: dict[int, tuple] = {}
         self.first_seen: set = set()
+        self.check = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
+        if self.check:
+            from sgl_amd_mono.qwen38_flash_next.decode.check import reference_mode
+
+            self.check_ref = reference_mode()
 
     def _gdn_state(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Layer i's GDN states in SGLang's pool, checked once a binding."""
@@ -582,6 +625,11 @@ class _Built:
                 plan.key.forward_mode,
                 rows,
             )
+        check = None
+        if self.check and not torch.cuda.is_current_stream_capturing():
+            from sgl_amd_mono.qwen38_flash_next.decode import check as check_mod
+
+            check = check_mod.StepCheck(positions, forward_batch, rows, self.check_ref)
         pos = forward_batch.mrope_positions if model.is_mrope_enabled else positions
         la.begin_step()
         lm.last_hc_hidden_states = None
@@ -608,20 +656,33 @@ class _Built:
                 state = state + layer.ple(state, forward_batch, ple_batch)
                 msq = None
             gdn = None if w.gdn is None else self._gdn_state(w.idx)
+            if check is not None:
+                check.before(layer, w, pos, state, slots, gdn)
             x, inj = la.hc_front(w.idx, w.attn_hc, state, msq, la.attn_scratch)
+            if check is not None:
+                check.front(w, layer.attn_hyper_connection, state, x)
             if gdn is not None:
                 core, gate = la.gdn(w.idx, w.gdn, x, gdn[0], gdn[1], slots), None
                 # SGLang's own call (its GDN backend's decode), with its int64 slots
                 lab._track_mamba_state_decode(
                     forward_batch, gdn[0], gdn[1], md.mamba_cache_indices, w.idx
                 )
+                if check is not None:
+                    check.core(core)
             else:
                 core, gate = qsa_core(layer, x, pos, forward_batch)
             mid, msq = la.oproj(w, core, gate, state, inj)
             x, inj = la.hc_front(w.idx, w.mlp_hc, mid, msq, la.mlp_scratch)
+            if check is not None:
+                check.front(w, layer.mlp_hyper_connection, mid, x)
             state, msq = la.moe(w.idx, w.moe, x, mid, inj)
+            if check is not None:
+                check.after(w, state)
         if ple_batch is not None:
             _commit_ple_batch(batch=ple_batch, forward_batch=forward_batch)
+        if check is not None:
+            check.track(self._states, forward_batch, md)
+            check.finish()
         hidden = lm.hyper_connection_mixer.mix(state)[0]
         lm.last_hc_hidden_states = state
         if get_embedding:
@@ -673,12 +734,13 @@ def build(model, hf_config, ctx) -> _Built:
     built = _Built(model, layers, la, widths, tp)
     logger.info(
         "Qwen3.8-Flash-Next monokernel: %d launches compiled for widths %s; experts "
-        "padded to %d, w2 read to %d; HC eps %s, GDN norm eps %s",
+        "padded to %d, w2 read to %d; HC eps %s, GDN norm eps %s; check mode %s",
         len(keys),
         list(widths),
         rip,
         KL.Layout(tp).RIP,
         hc_eps,
         gdn_eps,
+        built.check,
     )
     return built

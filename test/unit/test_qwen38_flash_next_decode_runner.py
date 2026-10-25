@@ -141,6 +141,7 @@ def build(monkeypatch):
         runner, "compile_build", lambda build, key, stream: compiled.append(key)
     )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+    monkeypatch.delenv("SGLANG_AMD_MONO_CHECK", raising=False)
     model = fake_model(rip=512)
     model.model.layers[5].mlp_hyper_connection.hc_norm.variance_epsilon = 1e-5
     # SGLang's floor: half a --watchdog-timeout of 10 s; 20 rows: a TP1 path width

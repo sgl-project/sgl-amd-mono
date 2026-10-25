@@ -1,7 +1,7 @@
 """The Qwen3.8-Flash-Next TP2 decode forward on CPU: a routed step's launch sequence
 on a recording launcher, SGLang's PLE and QSA calls in SGLang's order, the radix
-track-save after the GDN launches, and the model's own forward at a width the spec
-routes for the TP1 path."""
+track-save after the GDN launches, the check mode's per-layer calls, and the model's
+own forward at a width the spec routes for the TP1 path."""
 
 from types import SimpleNamespace as NS
 
@@ -14,6 +14,7 @@ try:
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels import spec as registry
 
+from sgl_amd_mono.qwen38_flash_next.decode import check
 from sgl_amd_mono.qwen38_flash_next.decode import spec as D
 from sgl_amd_mono.qwen38_flash_next.decode.gfx950.weights import Layer
 
@@ -109,6 +110,7 @@ def sglang(monkeypatch):
     monkeypatch.setattr(
         forward_context, "get_attn_backend", lambda: NS(linear_attn_backend=lab)
     )
+    monkeypatch.delenv("SGLANG_AMD_MONO_CHECK", raising=False)
     return NS(log=log, lab=lab, md=md, forward_context=forward_context)
 
 
@@ -274,3 +276,65 @@ def test_a_gdn_pool_the_kernels_cannot_update_raises(sglang, monkeypatch):
     )
     with pytest.raises(RuntimeError, match="layer 0: recurrent state"):
         built._gdn_state(0)
+
+
+def test_check_mode_checks_each_layer_against_sglang_s(sglang, monkeypatch):
+    calls = []
+
+    class Step:
+        def __init__(self, positions, forward_batch, rows, ref):
+            calls.append(("step", rows, ref))
+
+        def before(self, layer, w, positions, state, slots, gdn):
+            calls.append(("before", w.idx, gdn is not None))
+
+        def front(self, w, hc, state, x):
+            calls.append(("front", w.idx, hc))
+
+        def core(self, core):
+            calls.append(("core", tuple(core.shape)))
+
+        def after(self, w, state):
+            calls.append(("after", w.idx))
+
+        def track(self, states, forward_batch, md):
+            calls.append(("track", sorted(states), forward_batch is fb))
+
+        def finish(self):
+            calls.append(("finish",))
+
+    monkeypatch.setattr(check, "StepCheck", Step)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setenv("SGLANG_AMD_MONO_CHECK", "1")
+    monkeypatch.setenv(check.REF_ENV, "mxfp4")
+    model, layers = _model(sglang.log)
+    for i, m in enumerate(model.model.layers):
+        m.attn_hyper_connection, m.mlp_hyper_connection = f"attn-{i}", f"mlp-{i}"
+    built = D._Built(model, layers, _Launcher(), widths=(2,), tp=2)
+    fb = NS(mrope_positions=torch.arange(3 * ROWS).reshape(3, ROWS))
+    _step(built, fb)
+
+    def layer(i, gdn):
+        core = [("core", (ROWS, H))] if gdn else []
+        return [
+            ("before", i, gdn),
+            ("front", i, f"attn-{i}"),
+            *core,
+            ("front", i, f"mlp-{i}"),
+            ("after", i),
+        ]
+
+    assert calls == [
+        ("step", ROWS, "mxfp4"),
+        *[c for i in range(4) for c in layer(i, i != 3)],
+        ("track", [0, 1, 2], True),
+        ("finish",),
+    ]
+    # no check while a graph captures
+    calls.clear()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    _step(built, fb)
+    assert calls == []
+    monkeypatch.setenv(check.REF_ENV, "fp8")
+    with pytest.raises(ValueError, match="SGLANG_AMD_MONO_CHECK_REF"):
+        D._Built(model, layers, _Launcher(), widths=(2,), tp=2)
