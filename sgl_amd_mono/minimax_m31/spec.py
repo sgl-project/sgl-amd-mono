@@ -10,12 +10,15 @@ layer's input norm applies. SGLang's final norm and logits processor close the s
 
 The launch reads SGLang's post-load MXFP4 routed experts in place, and the shared
 expert in the checkpoint's own MXFP8: the load hook keeps this rank's shard, and the
-build lays it out for the launch (``a16w8``).
+build lays it out for the launch (``a16w8``). ``SGLANG_AMD_MONO_CHECK=1`` runs SGLang's
+layer on a copy of every sparse layer's input in eager steps and logs both outputs'
+differences on the live rows; the bounds in ``NUMERICS`` come from these runs.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 import torch
@@ -76,7 +79,15 @@ SGLANG_READS = {
         "final_norm(capture)",
         "final_norm(finalize_norm)",
     ),
-    "srt/layers/layer_boundary/residual/stream.py": ("write", "record", "residual"),
+    "srt/layers/layer_boundary/residual/stream.py": (
+        "ResidualStream",
+        "write",
+        "record",
+        "residual",
+        "snapshot",
+        "from_handoff",
+        "export",
+    ),
     "srt/layers/layer_boundary/residual/add_norm.py": ("PLAIN_ADD",),
     "srt/layers/aux_hidden_states.py": ("AuxHiddenStateList", "capture"),
     "srt/models/minimax_m3_vl.py": (
@@ -237,6 +248,7 @@ class _Built:
         self.lm, self.model = lm, lm.model
         self.runner, self.peer, self.weights = runner, peer, weights
         self.first, self.sparse = sparse[0], sparse
+        self.check = os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1"
 
     def forward(self, plan, input_ids, positions, forward_batch, *args, **kwargs):
         lm = self.lm
@@ -271,8 +283,11 @@ class _Built:
                 else None,  # fmt: skip
             )
         slots = forward_batch.out_cache_loc
+        stream = stream_of(forward_batch)
+        check = self.check and not torch.cuda.is_current_stream_capturing()
         for lid in self.sparse:
             layer = m.layers[lid]
+            ref = self._reference(layer, positions, forward_batch, hidden) if check else None  # fmt: skip
             call = {}
             if getattr(layer, "_norm_quant", None) is not None:
                 call["quant_format"] = layer._norm_quant.attn_quant_format(rows)
@@ -287,13 +302,16 @@ class _Built:
             part = layer.self_attn(
                 positions=positions, hidden_states=x, forward_batch=forward_batch
             )
-            stream = stream_of(forward_batch)
             out, residual = self.runner(
                 part.contiguous(),
                 stream.residual.contiguous(),
                 self.weights[lid],
                 slots,
             )
+            if ref is not None:
+                from sgl_amd_mono.minimax.check import log_check
+
+                log_check(layer, lid, slots[:rows] > 0, (out, residual), ref, ffn.TOPK)
             # the next layer's input norm applies the residual add
             stream.write(residual)
             hidden = stream.record(out, PLAIN_ADD)
@@ -307,6 +325,25 @@ class _Built:
             skip_empty=True,
         )
         return hidden, (aux if len(aux) else None)
+
+    def _reference(self, layer, positions, forward_batch, hidden):
+        """Check mode: SGLang's layer on a copy of the residual entering it, on a
+        stream of its own; returns (MLP output, residual after attention) as the launch
+        does. It writes the same KV slots, which the launch's layer writes again."""
+        from sglang.srt.layers.layer_boundary.residual.batch import stream_of
+        from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+
+        entering = stream_of(forward_batch).snapshot(hidden)
+        hidden, stream = ResidualStream.from_handoff(entering, None, None)
+        original = forward_batch.residual_stream
+        forward_batch.residual_stream = stream
+        try:
+            out = layer(
+                positions=positions, forward_batch=forward_batch, hidden_states=hidden
+            )
+            return stream.export(out)
+        finally:
+            forward_batch.residual_stream = original
 
 
 def build(model, hf_config, ctx):
@@ -357,14 +394,16 @@ def build(model, hf_config, ctx):
     return _Built(model, runner, peer, weights, sparse)
 
 
-# TODO: add the check mode (SGLANG_AMD_MONO_CHECK); until then MiniMax-M3's bounds
+# check mode, 2 runs of 16 GSM8K prompts (49,476 and 44,004 launches); worst case:
+# residual, every row: rel 0.042, cosine 0.99831
+# MLP output, rows routed alike (94%): rel 0.28, cosine 0.66
 NUMERICS = Numerics(
     NumericsKind.TOLERANCE,
     {
-        "layer.residual.rel": 0.1,
+        "layer.residual.rel": 0.08,
         "layer.residual.cosine": 0.995,
         "layer.mlp_out.rel": 0.5,
-        "layer.mlp_out.cosine": 0.4,
+        "layer.mlp_out.cosine": 0.5,
     },
 )
 
