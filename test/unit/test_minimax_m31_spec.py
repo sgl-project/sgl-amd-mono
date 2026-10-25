@@ -63,3 +63,37 @@ def test_both_models_serve_the_shared_specs_steps():
     """SGLang routes M3 and M3.1 by the shared spec's device limits, so a change to
     either model's widths or TP sizes must change the other's too."""
     assert m3.SPEC.devices == m31.SPEC.devices == family.SPEC.devices
+
+
+def test_the_shared_spec_rechecks_every_requirement():
+    """The shared spec re-checks each model's Requirements as SGLang's guard does,
+    except dtypes, which SGLang checks on the shared spec alone; a field SGLang adds
+    would go unchecked for both models."""
+    from sglang.srt.monokernels.spec import Requirements
+
+    rechecked = {"attention_backends", "server_args", "hf_config", "env"}
+    assert set(Requirements.__struct_fields__) == rechecked | {"dtypes"}
+    assert m3.SPEC.requires.dtypes == m31.SPEC.requires.dtypes
+    assert family.SPEC.requires.dtypes == m3.SPEC.requires.dtypes
+
+
+def test_what_the_shared_spec_takes_from_one_model_agrees():
+    """SGLang reads the fields the shared spec does not hand to the checkpoint's own
+    spec from the shared spec alone, so both models must agree on them."""
+    from sglang.srt.monokernels.spec import MonoSpec
+
+    dispatched = {
+        "features",
+        "requires",
+        "model_disable_reasons",
+        "build",
+        "config_disable_reasons",
+        "load_tensor",
+    }
+    shared = {"devices", "api_version", "tokens_per_request", "unread_metadata"}
+    # only the kind: each model's check mode reads its own bounds
+    assert set(MonoSpec.__struct_fields__) == dispatched | shared | {"name", "numerics"}
+    for field in shared:
+        assert getattr(m3.SPEC, field) == getattr(m31.SPEC, field), field
+        assert getattr(family.SPEC, field) == getattr(m3.SPEC, field), field
+    assert m3.SPEC.numerics.kind == m31.SPEC.numerics.kind == family.SPEC.numerics.kind
