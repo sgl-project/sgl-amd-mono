@@ -82,6 +82,41 @@ def poison_new_index_scales(pages: torch.Tensor, slots: torch.Tensor) -> None:
     scales[slots // PAGE_TOKENS, slots % PAGE_TOKENS] = POISON_SCALE
 
 
+def launch_scores(runtime, rows: int) -> torch.Tensor:
+    """The launch's index scores as f32 bits, int32 [rows, index_max_seq]: the value
+    words of the (value, tag) pairs in the runtime's scratch."""
+    n = runtime.key.index_max_seq
+    at = runtime.sc["index_scores"]
+    pairs = runtime.scratch[at : at + rows * n * 8].view(torch.int32)
+    return pairs.view(rows, n, 2)[..., 0]
+
+
+def _radix_keys(bits: torch.Tensor) -> torch.Tensor:
+    """The kernel's order of f32 score bits (``radix_key``): larger keys rank first."""
+    b = bits.to(torch.int64)
+    return torch.where(b >= 0, b + (1 << 31), ~b & 0xFFFFFFFF)
+
+
+def _exact_topk_outputs(step, scores: torch.Tensor, S: int) -> dict:
+    """Per row past TOPK keys, how many keys of the exact top-k of the launch's own
+    scores (score descending, then position) its selection (``step.topk``) misses."""
+    from sgl_amd_mono.glm53.gfx950.runner import TOPK
+
+    bounds = step.indptr[: S + 1].tolist()
+    picked = step.topk.tolist()
+    missed = 0
+    for s in range(S):
+        n = int(step.positions[s]) + 1
+        if n <= TOPK:
+            continue
+        keys = _radix_keys(scores[s, :n])
+        pos = torch.sort(keys, descending=True, stable=True).indices[:TOPK]
+        pages = step.page_table[int(step.req_ids[s]), pos // PAGE_TOKENS].long()
+        want = set((pages * PAGE_TOKENS + pos % PAGE_TOKENS).tolist())
+        missed = max(missed, len(want - set(picked[bounds[s] : bounds[s + 1]])))
+    return {"topk_exact": {"max_abs": float(missed)}}
+
+
 def _topk_outputs(ref_topk: torch.Tensor, step, slots: torch.Tensor, S: int) -> dict:
     """Per row, SGLang's selected KV slots against the kernel's (``step.topk`` at
     the row's ``indptr``): the largest share of SGLang's a row misses, and the most
@@ -188,7 +223,15 @@ def reference(L, positions, h_in, forward_batch, S: int, prev_topk) -> dict:
 
 
 def compare(
-    L, ref: dict, streams: torch.Tensor, positions, forward_batch, S: int, *, step
+    L,
+    ref: dict,
+    streams: torch.Tensor,
+    positions,
+    forward_batch,
+    S: int,
+    *,
+    step,
+    scores: torch.Tensor | None,
 ) -> None:
     from sglang.srt.runtime_context import get_parallel
 
@@ -199,6 +242,8 @@ def compare(
     outputs = _outputs("streams", streams, ref["streams"])
     for name, (t, idx) in _regions(L, forward_batch, S).items():
         outputs.update(_outputs(name, t[idx], ref[name]))
+    if scores is not None:
+        outputs.update(_exact_topk_outputs(step, scores, S))
     # SGLang's layer returns no top-k when no later layer reuses it
     if L.w.index is not None and ref["topk"] is not None:
         slots = forward_batch.out_cache_loc[:S]

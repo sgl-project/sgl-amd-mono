@@ -157,6 +157,8 @@ NUMERICS = Numerics(
         "layer.index.cosine": 0.999,
         # an indexer layer selects every key of a row's own draft chain SGLang selects
         "layer.topk_own.max_abs": 0.0,
+        # and exactly the top-k of its own scores (score descending, then position)
+        "layer.topk_exact.max_abs": 0.0,
     },
 )
 
@@ -399,7 +401,12 @@ class _Built:
                 plan.state["ref_topk"] = ref["topk"]
         out = L.ops[W].launch(h, L.caches, self.cos, self.sin, step)
         if checking:
-            check.compare(L, ref, out[:S], positions, forward_batch, S, step=step)
+            scores = None
+            if L.w.index is not None:
+                scores = check.launch_scores(L.ops[W].rt, S)
+            check.compare(
+                L, ref, out[:S], positions, forward_batch, S, step=step, scores=scores
+            )
         if L.i != self.last:
             return out
         for (w, _), rt in self.runtimes.items():

@@ -19,8 +19,8 @@ SPECS = {
     "DeepseekV4ForCausalLMDSpark": "sgl_amd_mono.deepseek_v41.draft:SPEC",
     "Glm5NextForConditionalGeneration": "sgl_amd_mono.glm53_flash.spec:SPEC",
     "GlmMoeDsaForCausalLM": "sgl_amd_mono.glm53.spec:SPEC",
-    "MiniMaxM3SparseForCausalLM": "sgl_amd_mono.minimax_m3.spec:SPEC",
-    "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax_m3.spec:SPEC",
+    "MiniMaxM3SparseForCausalLM": "sgl_amd_mono.minimax.spec:SPEC",
+    "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax.spec:SPEC",
     "Qwen3_5MoeForConditionalGeneration": "sgl_amd_mono.qwen35_a17b_fp8.spec:SPEC",
 }
 
