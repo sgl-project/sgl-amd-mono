@@ -1,5 +1,6 @@
 """A Qwen3.8-Flash-Next model as the TP2 decode unit tests read it: namespaces
-holding meta tensors in the per-rank shapes SGLang loads at TP2."""
+holding meta tensors in the per-rank shapes SGLang loads at TP2, and the text config
+and server args the spec checks."""
 
 from types import SimpleNamespace as NS
 
@@ -96,4 +97,47 @@ def fake_model(rip: int = 512):
     layers[1].ple = NS()
     return NS(
         model=NS(layers=layers, hyper_connection_mixer=_hc()), is_mrope_enabled=True
+    )
+
+
+# Qwen3.8-Flash-Next's text config fields the TP2 path checks
+TEXT_CONFIG = {
+    "hidden_size": 2560,
+    "hc_count": 4,
+    "hc_lowrank": 320,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "num_attention_heads": 24,
+    "head_dim": 256,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+    "moe_intermediate_size": 640,
+    "shared_expert_intermediate_size": 640,
+    "hidden_act": "silu",
+    "norm_topk_prob": True,
+}
+
+
+def hf_config(quant="quark", **text):
+    return NS(
+        architectures=["Qwen4ExpForConditionalGeneration"],
+        text_config=NS(**{**TEXT_CONFIG, **text}),
+        quantization_config={"quant_method": quant},
+    )
+
+
+def server_args(**overrides):
+    """A TP2 decode server's arguments the spec reads."""
+    return NS(
+        **{
+            "tp_size": 2,
+            "speculative_algorithm": None,
+            "mamba_ssm_dtype": None,
+            "linear_attn_backend": "triton",
+            "linear_attn_decode_backend": None,
+            **overrides,
+        }
     )

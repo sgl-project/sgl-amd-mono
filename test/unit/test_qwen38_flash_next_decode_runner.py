@@ -1,20 +1,25 @@
-"""The Qwen3.8-Flash-Next TP2 decode launches' build keys and the per-rank launch
-state on CPU (FlyDSL and AITER's FlyDSL helpers importable; nothing compiled but
-the o_proj launch ``test_the_guard_s_stop_and_fault_injection_are_compiled_in``
-builds)."""
+"""The Qwen3.8-Flash-Next TP2 decode launches' build keys, the per-rank launch state
+and the spec's build at TP2 on CPU (FlyDSL and AITER's FlyDSL helpers importable;
+nothing compiled but the o_proj launch
+``test_the_guard_s_stop_and_fault_injection_are_compiled_in`` builds)."""
 
 import os
 import subprocess
 import sys
+from types import SimpleNamespace as NS
 
 import pytest
 import torch
+from qwen38_flash_next_decode_fakes import fake_model, meta
 
 pytest.importorskip("flydsl")
 pytest.importorskip("aiter.ops.flydsl.kernels")
 
 from sgl_amd_mono.common import guard
+from sgl_amd_mono.qwen38_flash_next import spec as S
+from sgl_amd_mono.qwen38_flash_next.decode import spec as D
 from sgl_amd_mono.qwen38_flash_next.decode.gfx950 import blocks, front, runner
+from sgl_amd_mono.qwen38_flash_next.decode.gfx950 import weights as W
 
 
 def test_build_keys_per_width():
@@ -101,6 +106,74 @@ def test_launcher_fault_injection_is_this_rank_s(monkeypatch):
     cpu = torch.device("cpu")
     assert runner.Launcher((1,), 1, 2, "g", cpu, 512, 60.0, _Peers).fault == (3, 7)
     assert runner.Launcher((1,), 0, 2, "g", cpu, 512, 60.0, _Peers).fault == (0, 0)
+
+
+@pytest.fixture
+def build(monkeypatch):
+    """The spec's build on rank 1 of 2 in one process: no group to agree over, a
+    recording launcher and compiler, meta weights."""
+    import sglang.srt.runtime_context as runtime_context
+
+    monkeypatch.setattr(
+        runtime_context,
+        "get_parallel",
+        lambda: NS(tp_size=2, tp_rank=1, tp_group=NS(cpu_group=None)),
+    )
+    real = W.build_layers
+
+    def meta_quantize(w):
+        n, k = w.shape
+        return meta(n, k // 2, dtype=torch.uint8), meta(n, k // 32, dtype=torch.uint8)
+
+    monkeypatch.setattr(
+        W, "build_layers", lambda model, copies: real(model, copies, meta_quantize)
+    )
+    made, compiled = [], []
+
+    class Launcher:
+        def __init__(self, *args):
+            made.append(args)
+            self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32)
+            self.fault = (3, 7)
+
+    monkeypatch.setattr(runner, "Launcher", Launcher)
+    monkeypatch.setattr(
+        runner, "compile_build", lambda build, key, stream: compiled.append(key)
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+    model = fake_model(rip=512)
+    model.model.layers[5].mlp_hyper_connection.hc_norm.variance_epsilon = 1e-5
+    # SGLang's floor: half a --watchdog-timeout of 10 s; 20 rows: a TP1 path width
+    ctx = NS(widths=(1, 2, 20), copies={}, deadline_s=5.0)
+    return NS(model=model, ctx=ctx, made=made, compiled=compiled)
+
+
+def test_the_build_compiles_every_launch_from_this_rank_s_share(build):
+    built = S.SPEC.build(build.model, None, build.ctx)
+    assert isinstance(built, D._Built) and len(built.layers) == 48
+    # the waits' deadline is SGLang's; the TP1 path's width is not built
+    assert build.made == [((1, 2), 1, 2, None, torch.device("meta"), 512, 5.0)]
+    # with the launcher's fault injection
+    keys = runner.build_keys(
+        (1, 2), 2, 512, hc_eps=(1e-6, 1e-5), gdn_eps=(1e-6,), fault=(3, 7)
+    )
+    # rank 1 of 2 starts halfway through the list, then wraps
+    assert len(keys) == 16
+    assert build.compiled == [k for _, k in keys[8:] + keys[:8]]
+    assert len(build.ctx.copies) == 96 + 144 + 36
+    assert set(built.st_idx) == {1, 2}
+
+
+def test_a_compile_failure_raises(build, monkeypatch):
+    def fail(build, key, stream):
+        raise ValueError("LDS over the limit")
+
+    monkeypatch.setattr(runner, "compile_build", fail)
+    with pytest.raises(
+        RuntimeError, match="compiling the kernels failed on this rank"
+    ) as e:
+        S.SPEC.build(build.model, None, build.ctx)
+    assert isinstance(e.value.__cause__, ValueError)
 
 
 PROBE = """
