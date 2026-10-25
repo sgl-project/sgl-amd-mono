@@ -50,6 +50,7 @@ from sgl_amd_mono.common.ops import (
     peer_bases,
     popcount,
     rsrc,
+    uniform,
 )
 from sgl_amd_mono.common.plan import (
     BLOCKS,
@@ -709,21 +710,25 @@ def x_operands(c, base, row, k_dwords, st0, steps):
 
 
 @flyc.jit
-def stage_up(c, u, j, weights=None, shared=False):
+def stage_up(c, u, j, weights, shared=False, nxt=None):
     """Slot u's tile pair j: gate rows 16 j .., up rows 768 + 16 j .. of its
     expert over this wave's K steps; waves summed in order; SwiGLU-OAI ->
-    bf16 ``MID[u][column][16 j ..]``, then UPF. ``shared``: the MXFP8 shared
-    expert's ``weights``."""
+    bf16 ``MID[u][column][16 j ..]``, then UPF. ``weights``: the pair's
+    ``up_weights`` (``shared``: the MXFP8 shared expert's). ``nxt``: the
+    routed unit after it; returns that unit's ``unit_weights``, issued past
+    this pair's X reads (loads return in order: from global memory, the GEMV
+    still waits on X only)."""
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     e = tab_ld(c, T_SLOT_E + u)
     cnt = slot_count(c, u)
     st0 = wave * UP_WAVE_STEPS
     rgs = [e * (2 * UP_TILES) + j, e * (2 * UP_TILES) + UP_TILES + j]
-    if const_expr(weights is None):
-        weights = up_weights(c, rgs, st0)
     wvs, svs = weights
     tok = tab_ld(c, T_SLOT_TOK + u * 16 + slot_col(c, cnt))
     xs = xn_operands(c, tok, st0)
+    ahead = None
+    if const_expr(nxt is not None):
+        ahead = unit_weights(c, nxt)
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
     for i in range_constexpr(UP_WAVE_STEPS):
         for h in range_constexpr(2):
@@ -749,9 +754,24 @@ def stage_up(c, u, j, weights=None, shared=False):
             v = _swiglu(g, up).to(fx.BFloat16)
             store16(c["mid"].value, (u * 16 + col) * INTER + j * 16 + r, v, "agent")
     flag_after_stores(c, c["upf"], u * UP_TILES + j, tid == 0)
+    return ahead
 
 
-def up_weights(c, rgs, st0, shared=False):
+def unit_weights(c, unit):
+    """Routed up unit ``unit``'s weights for this wave (``up_weights``); past
+    the last unit, zero-sized reads."""
+    total = (n_slots(c) - 1) * UP_TILES
+    live = unit < total
+    unit = fx.min(unit, total - 1)
+    u, j = 1 + unit // UP_TILES, unit % UP_TILES
+    e = tab_ld(c, T_SLOT_E + u)
+    rgs = [e * (2 * UP_TILES) + j, e * (2 * UP_TILES) + UP_TILES + j]
+    # a descriptor's size must be uniform: the unit is the CTA's
+    nbytes = fx.Int64(uniform(live.select(fx.Int32(-1), fx.Int32(0))))
+    return up_weights(c, rgs, c["wave"] * UP_WAVE_STEPS, nbytes=nbytes)
+
+
+def up_weights(c, rgs, st0, shared=False, nbytes=None):
     a = c["args"]
     if const_expr(shared):
         wvs = [
@@ -761,8 +781,14 @@ def up_weights(c, rgs, st0, shared=False):
             a16w8.scale_loads(a["s13s"], rg, HIDDEN, st0, UP_WAVE_STEPS) for rg in rgs
         ]
         return wvs, svs
-    wvs = [weight_loads(a["w13"], rg, HIDDEN, st0, UP_WAVE_STEPS) for rg in rgs]
-    svs = [scale_loads(a["s13"], rg, HIDDEN, st0, UP_WAVE_STEPS) for rg in rgs]
+    wvs = [
+        weight_loads(a["w13"], rg, HIDDEN, st0, UP_WAVE_STEPS, nbytes=nbytes)
+        for rg in rgs
+    ]
+    svs = [
+        scale_loads(a["s13"], rg, HIDDEN, st0, UP_WAVE_STEPS, nbytes=nbytes)
+        for rg in rgs
+    ]
     return wvs, svs
 
 
@@ -948,13 +974,17 @@ def run_ffn(c, bid):
         stage_up(c, 0, sh, weights, shared=True)
     stamp(c, 6)
     load_table(c)
+    total = (n_slots(c) - 1) * UP_TILES
+    first = first_task(bid, ROUTED0)
+    weights = unit_weights(c, first)
     # the router no longer orders XN before the table; a shared CTA has it in LDS
     if sh >= UP_TILES:
         await_x(c, s)
     stamp(c, 7)
-    total = (n_slots(c) - 1) * UP_TILES
-    for unit in range(first_task(bid, ROUTED0), total, BLOCKS):
-        stage_up(c, 1 + unit // UP_TILES, unit % UP_TILES)
+    for unit in range(first, total, BLOCKS):
+        weights = stage_up(
+            c, 1 + unit // UP_TILES, unit % UP_TILES, weights, nxt=unit + BLOCKS
+        )
     stamp(c, 8)
     if bid < DOWN_TASKS - BLOCKS:
         stage_down(c, [bid, bid + BLOCKS])
