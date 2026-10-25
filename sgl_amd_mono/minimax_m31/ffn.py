@@ -34,18 +34,18 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.common.plan import kernel_sources
+from sgl_amd_mono.common.epoch import EPOCH_MARKS, epoch_end
 from sgl_amd_mono.common.ops import (
     CM_SYS,
     ballot,
-    bf2_f32,
     bf16_pair,
     bf16_round,
+    bf2_f32,
     butterfly,
+    clock,
     hw_exp2,
     hw_rcp,
     lanes_below,
-    clock,
     peer_bases,
     popcount,
     rsrc,
@@ -55,10 +55,10 @@ from sgl_amd_mono.common.plan import (
     THREADS,
     WAVES,
     first_task,
+    kernel_sources,
     key_tuple,
     pair_layout,
 )
-from sgl_amd_mono.common.epoch import EPOCH_MARKS, epoch_end
 from sgl_amd_mono.common.sync import Space, preg, sreg
 
 from . import a16w8
@@ -72,7 +72,6 @@ from .sync import (
     store32,
     store64,
     store_dev,
-    sync_acquire,
     sync_release,
     wave_sync,
 )

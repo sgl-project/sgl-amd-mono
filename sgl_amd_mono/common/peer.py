@@ -74,7 +74,9 @@ def _alloc_uncached(nbytes: int) -> int:
     size = -(-nbytes // _GRANULE) * _GRANULE
     ptr = ctypes.c_void_p()
     _check(
-        hip_runtime().hipExtMallocWithFlags(ctypes.byref(ptr), size, _DEVICE_MALLOC_UNCACHED),
+        hip_runtime().hipExtMallocWithFlags(
+            ctypes.byref(ptr), size, _DEVICE_MALLOC_UNCACHED
+        ),
         "hipExtMallocWithFlags",
     )
     _check(hip_runtime().hipMemset(ptr, 0, size), "hipMemset")
