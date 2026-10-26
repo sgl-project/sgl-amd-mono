@@ -5,8 +5,9 @@ SGLang's runtime switches the model's forward at attach: a routed decode or DSpa
 verify step runs ``_Built.forward``, which takes and returns what the model's forward
 does. The embedding, the dense layers and each sparse layer's input norm and attention
 run SGLang's modules; the rest of every sparse layer is one launch (``ffn.py``), from
-the unreduced o_proj partial to the reduced MoE output, whose residual add the next
-layer's input norm applies. SGLang's final norm and logits processor close the step.
+the attention output (o_proj on SGLang's rowwise-FP8 copy of its weight) to the
+reduced MoE output, whose residual add the next layer's input norm applies. SGLang's
+final norm and logits processor close the step.
 
 The launch reads SGLang's post-load MXFP4 routed experts in place, and the shared
 expert in the checkpoint's own MXFP8: the load hook keeps this rank's shard, and the
@@ -20,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from contextlib import contextmanager
 
 import torch
 from sglang.srt.monokernels.spec import (
@@ -61,6 +63,8 @@ SGLANG_READS = {
         "e_score_correction_bias",
         "post_attention_layernorm",
         "layer_id",
+        "o_proj",
+        "disable_index_value",
         "embed_tokens",
         "norm",
         "layers",
@@ -90,6 +94,7 @@ SGLANG_READS = {
     ),
     "srt/layers/layer_boundary/residual/add_norm.py": ("PLAIN_ADD",),
     "srt/layers/aux_hidden_states.py": ("AuxHiddenStateList", "capture"),
+    "srt/layers/quantization/fp8.py": ("_ptpc_weight", "_ptpc_scale"),
     "srt/models/minimax_m3_vl.py": (
         "logits_processor",
         "lm_head",
@@ -211,6 +216,21 @@ def model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         if layer.mlp.e_score_correction_bias is None:
             reasons.append(f"layer {i}: no routing bias")
             break
+        if not getattr(layer.self_attn, "disable_index_value", False):
+            reasons.append(f"layer {i}: index values add to o_proj's output")
+            break
+        wo, wos = _o_proj_rowwise(layer)
+        if (
+            wo is None
+            or wo.dtype != torch.float8_e4m3fn
+            or tuple(wo.shape) != (ffn.HIDDEN, ffn.ATTN_K)
+            or wos is None
+            or tuple(wos.shape) != (ffn.HIDDEN, 1)
+        ):
+            reasons.append(
+                f"layer {i}: o_proj has no rowwise-FP8 copy (MXFP8 on aiter)"
+            )
+            break
         missing = [
             (proj, kind)
             for proj in ("gate", "up", "down")
@@ -221,6 +241,23 @@ def model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             reasons.append(f"layer {i}: no checkpoint shared expert {missing}")
             break
     return reasons
+
+
+def _o_proj_rowwise(layer):
+    """The rowwise-FP8 o_proj SGLang keeps for decode-sized steps on gfx950: the
+    (16, 16)-shuffled weight and its per-row scale."""
+    w = layer.self_attn.o_proj.weight
+    return getattr(w, "_ptpc_weight", None), getattr(w, "_ptpc_scale", None)
+
+
+@contextmanager
+def _o_proj_input(o_proj):
+    """``o_proj`` returns its input while the attention runs: the launch applies it."""
+    o_proj.forward = lambda x: (x, None)
+    try:
+        yield
+    finally:
+        del o_proj.forward
 
 
 def _shared_mxfp8(copies: dict, i: int):
@@ -299,11 +336,12 @@ class _Built:
                 else None,  # fmt: skip
                 **call,
             )
-            part = layer.self_attn(
-                positions=positions, hidden_states=x, forward_batch=forward_batch
-            )
+            with _o_proj_input(layer.self_attn.o_proj):
+                attn = layer.self_attn(
+                    positions=positions, hidden_states=x, forward_batch=forward_batch
+                )
             out, residual = self.runner(
-                part.contiguous(),
+                attn.contiguous(),
                 stream.residual.contiguous(),
                 self.weights[lid],
                 slots,
@@ -368,6 +406,7 @@ def build(model, hf_config, ctx):
         layer = model.model.layers[i]
         moe, experts = layer.mlp, layer.mlp.experts
         w13s, s13s, w2s, s2s = _shared_mxfp8(ctx.copies, i)
+        wo, wos = _o_proj_rowwise(layer)
         weights[i] = SimpleNamespace(
             post_norm=layer.post_attention_layernorm.weight.data,
             router=moe.gate.weight.data.float().contiguous(),
@@ -380,6 +419,8 @@ def build(model, hf_config, ctx):
             s13s=s13s,
             w2s=w2s,
             s2s=s2s,
+            wo=wo,
+            wos=wos.contiguous(),
         )
     # every width compiles alike; its residency is checked against the grid
     runner.warm(

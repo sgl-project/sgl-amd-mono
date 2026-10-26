@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MiniMax-M3 FFN launch: one persistent kernel from the unreduced ``o_proj``
-partial to the reduced MoE output (``MiniMaxM3DecoderLayer.forward`` after its
-attention).
+"""MiniMax-M3 FFN launch: one persistent kernel from the attention output to the
+reduced MoE output (``MiniMaxM3DecoderLayer.forward`` after its attention, o_proj
+included).
 
 ``BLOCKS`` x ``THREADS``, S rows, one launch per sparse layer and rank:
 
-    push    (192 x 32 columns): the partial's bf16 pairs to every rank
+    push    (128 x 48 columns): o_proj as SGLang runs it (per-token FP8 rows x
+            its rowwise-FP8 weight), the partial's bf16 triples to every rank
     reduce  (192): the ranks' pairs in rank order, f32 -> bf16; + residual
             in f32 -> residual out (bf16), the f32 sum, its sum of squares
     norm    (S): Gemma RMSNorm of the f32 sum -> X (bf16)
@@ -37,6 +38,7 @@ from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import EPOCH_MARKS, epoch_end
 from sgl_amd_mono.common.ops import (
+    CM_NT,
     CM_SYS,
     ballot,
     bf2_f32,
@@ -44,6 +46,7 @@ from sgl_amd_mono.common.ops import (
     bf16_round,
     butterfly,
     clock,
+    fp8_pack4,
     hw_exp2,
     hw_rcp,
     lanes_below,
@@ -96,6 +99,14 @@ FINAL_TASKS = HIDDEN // COLS  # 192
 # the attention seam's pairs carry three bf16 under a 16-bit tag
 TRIPLES = HIDDEN // 3  # 2048 a row
 TASK_TRIPLES = 16  # triples of a push / reduce task (CTAs 0 .. 127)
+ATTN_K = 2048  # a TP4 rank's o_proj input: 16 heads of 128
+OP_TILES = 3 * TASK_TRIPLES // 16  # o_proj's 16-row tiles of a push task
+INV_FP8_MAX = 1.0 / 448.0  # AITER's per-token FP8 scale: amax / 448 as one f32 multiply
+# the push stage's LDS pool words: row amax, the task's partial, the waves' MFMA tiles
+OP_AMAX = 0
+OP_PART = OP_AMAX + MAX_TOKENS
+OP_RED = OP_PART + MAX_TOKENS * 3 * TASK_TRIPLES
+OP_WORDS = OP_RED + WAVES * OP_TILES * 256
 SEAM_TASKS = TRIPLES // TASK_TRIPLES  # 128 (a token's SSQ parts)
 ROUTER_PARTS = 16
 ROUTER_K = HIDDEN // ROUTER_PARTS
@@ -144,6 +155,13 @@ class FfnBuild:
     fault_after: int = 0
 
 
+def oproj_split(s: int) -> tuple[int, int]:
+    """Waves and 64-wide K steps a wave of SGLang's o_proj GEMM on ``s`` rows
+    (``smallm_fp8_gemm`` at (N, K) = (HIDDEN, ATTN_K)), so that the partial is its
+    own to the bit."""
+    return (8, 4) if s <= 8 else (4, 8)
+
+
 def slots(s: int) -> int:
     return 1 + TOPK * s
 
@@ -154,10 +172,10 @@ def picks(s: int) -> int:
 
 
 def pool_words(s: int) -> int:
-    """The LDS pool: XN for the up stage (up to ``XN_LDS_TOKENS`` tokens), then
-    every pick's MID for the down stage."""
+    """The LDS pool: the push stage's o_proj, XN for the up stage (up to
+    ``XN_LDS_TOKENS`` tokens), then every pick's MID for the down stage."""
     xn = s * XN_ROW if s <= XN_LDS_TOKENS else 0
-    return max(xn, picks(s) * XMID_ROW)
+    return max(OP_WORDS, xn, picks(s) * XMID_ROW)
 
 
 def peer_half_bytes(tp: int) -> int:
@@ -299,15 +317,151 @@ def block_sum(c, v, slot):
 # ---------------------------------------------------------------- seam
 @flyc.jit
 def stage_push(c, task):
-    """Triples 16 task ..: this rank's partial as triple pairs to every rank's
-    ATTN."""
+    """Triples 16 task ..: this rank's o_proj partial (``oproj``) as triple pairs
+    to every rank's ATTN."""
     s, tid = c["S"], c["tid"]
+    oproj(c, task)
     if tid < s * TASK_TRIPLES:
         t = tid // TASK_TRIPLES
-        tr = task * TASK_TRIPLES + tid % TASK_TRIPLES
-        bits = triple_bits(c["args"]["part"], t, tr)
+        q = tid % TASK_TRIPLES
+        tr = task * TASK_TRIPLES + q
+        at = c["fpool"] + (OP_PART + t * 3 * TASK_TRIPLES + 3 * q)
+        bits = fx.Int64(0)
+        for k in range_constexpr(3):
+            hi = fx.Int64((fx.ptr_load(at + k).bitcast(fx.Int32) >> 16) & 0xFFFF)
+            bits = bits | (hi << (16 * k))
         for p in range_constexpr(c["tp"]):
             c["mb"].put_triple(c["peer"][p], attn_pair(c, c["rank"], t, tr), bits)
+
+
+@flyc.jit
+def oproj(c, task):
+    """The rank's o_proj partial of every row at the task's 48 columns -> LDS
+    ``OP_PART`` (bf16 values as f32), as SGLang computes it from the attention
+    rows: AITER's per-token FP8 quant (scale amax / 448, its v_rcp_f32 inverse,
+    clamped, RNE) and ``smallm_fp8_gemm`` on the rowwise-FP8 weight, with its waves,
+    K steps, accumulator chains and wave order (``oproj_split``)."""
+    s, tid, lane, wave, a = c["S"], c["tid"], c["lane"], c["wave"], c["args"]
+    k = ATTN_K
+    vw, steps = oproj_split(s)
+    chains = 2  # smallm's accumulator chains: step pair p on chain p % 2
+    row, kc = lane % 16, (lane // 16) * 16
+    k0 = wave * steps * 64
+    nb = task * OP_TILES
+    pool, fpool = c["pool"], c["fpool"]
+    # waves past the GEMM's run on zero-sized buffers: their tiles are never summed
+    live = fx.Int64(uniform((wave < vw).select(fx.Int32(-1), fx.Int32(0))))
+    rx = rsrc(a["attn"], fx.Int64(s * k * 2) & live)
+    rw = rsrc(a["wo"], live)
+
+    # the lane's 16 weight bytes of each tile and step (AITER's (16, 16) shuffle:
+    # row l % 16, K bytes 16 (l / 16) .. of each 64-wide step), then its 16 bf16 of
+    # row ``row`` at the same K (rows past s read 0)
+    wvs = [
+        [
+            fx.Vector(
+                bo.buffer_load(
+                    rw,
+                    ((nb + tt) * 16 * k + k0 * 16 + lane * 16 + i * 1024) // 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_NT,
+                )
+            )
+            for i in range(steps)
+        ]
+        for tt in range(OP_TILES)
+    ]
+    xvs = [
+        [
+            fx.Vector(
+                bo.buffer_load(
+                    rx,
+                    (row * k + k0 + i * 64 + kc) // 2 + 4 * h,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+            )
+            for h in range(2)
+        ]
+        for i in range(steps)
+    ]
+    if tid < 16:
+        fx.ptr_store(fx.Int32(0), pool + (OP_AMAX + tid))
+    gpu.barrier()
+    # every row's amax over K, as a nonnegative f32's bits
+    mx = fx.Int32(0)
+    for i in range_constexpr(steps):
+        for h in range_constexpr(2):
+            for d in range_constexpr(4):
+                word = fx.Int32(xvs[i][h][d])
+                mx = fx.max(mx, (word << 16) & 0x7FFF0000)
+                mx = fx.max(mx, word & 0x7FFF0000)
+    mx = butterfly(mx, (16, 32), fx.max)
+    if lane < 16:
+        fx.llvm.atomic_max(pool + (OP_AMAX + row), mx, syncscope="workgroup")
+    gpu.barrier()
+    scale = fx.ptr_load(pool + (OP_AMAX + row)).bitcast(fx.Float32) * fx.Float32(
+        INV_FP8_MAX
+    )
+    inv = hw_rcp(scale)
+    accs = [
+        [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(chains)]
+        for _ in range(OP_TILES)
+    ]
+    xq = []
+    for i in range_constexpr(steps):
+        vals = []
+        for h in range_constexpr(2):
+            for d in range_constexpr(4):
+                word = fx.Int32(xvs[i][h][d])
+                for half in range_constexpr(2):
+                    bits = (word << 16) if half == 0 else (word & -65536)
+                    v = bits.bitcast(fx.Float32) * inv
+                    vals.append(
+                        fx.min(fx.max(v, fx.Float32(-448.0)), fx.Float32(448.0))
+                    )
+        xq.append([fp8_pack4(*vals[4 * j : 4 * j + 4]) for j in range(4)])
+    # a 16x16x128 MFMA takes two steps
+    for p in range_constexpr(steps // 2):
+        x8 = fx.Vector.from_elements(xq[2 * p] + xq[2 * p + 1], fx.Int32)
+        for tt in range_constexpr(OP_TILES):
+            w8 = fx.Vector.from_elements(
+                [wvs[tt][2 * p + i][e] for i in range(2) for e in range(4)], fx.Int32
+            )
+            accs[tt][p % chains] = fx.Vector(
+                rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    T.vec(4, T.f32),
+                    [x8, w8, accs[tt][p % chains], 0, 0, 0, 127, 0, 127],
+                )
+            )
+    for tt in range_constexpr(OP_TILES):
+        acc = accs[tt][0]
+        for ch in range_constexpr(1, chains):
+            acc = acc + accs[tt][ch]
+        for r in range_constexpr(4):
+            fx.ptr_store(
+                acc[r], fpool + (OP_RED + (wave * OP_TILES + tt) * 256 + r * 64 + lane)
+            )
+    gpu.barrier()
+    # MFMA C: element tt 256 + r 64 + l is row 4 (l / 16) + r, column 16 tt + l % 16
+    for e0 in range_constexpr(0, OP_TILES * 256, THREADS):
+        e = tid + e0
+        m = (e % 64) // 16 * 4 + e % 256 // 64
+        n = e // 256 * 16 + e % 16
+        if (e < OP_TILES * 256) & (m < s):
+            v = fx.Float32(0.0)
+            for w in range_constexpr(vw):
+                v = v + fx.ptr_load(fpool + (OP_RED + w * OP_TILES * 256 + e))
+            amax = fx.ptr_load(pool + (OP_AMAX + m)).bitcast(fx.Float32)
+            ws = fx.Float32(
+                bo.buffer_load(rsrc(a["wos"]), nb * 16 + n, vec_width=1, dtype=T.f32)
+            )
+            sc = (amax * fx.Float32(INV_FP8_MAX)) * ws
+            fx.ptr_store(
+                bf16_round(v * sc), fpool + (OP_PART + m * 3 * TASK_TRIPLES + n)
+            )
+    gpu.barrier()
 
 
 @flyc.jit
@@ -1027,7 +1181,7 @@ def build_ffn(key: FfnBuild):
 
     @flyc.kernel(name=kernel_name(key), known_block_size=[THREADS, 1, 1])
     def kffn(
-        part: Int64,
+        attn: Int64,
         res_in: Int64,
         res_out: Int64,
         out: Int64,
@@ -1043,6 +1197,8 @@ def build_ffn(key: FfnBuild):
         s13s: Int64,
         w2s: Int64,
         s2s: Int64,
+        wo: Int64,
+        wos: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -1088,11 +1244,13 @@ def build_ffn(key: FfnBuild):
                     "contrib": lds.contrib.ptr,
                     "xn_lds": lds.pool.ptr if s <= XN_LDS_TOKENS else None,
                     "xmid": lds.pool.ptr,
+                    "pool": lds.pool.ptr,
+                    "fpool": fx.recast_iter(fx.Float32, lds.pool.ptr),
                     "own": preg(sym + par, 0, "peer"),
                     "half_words": half // 8,
                     "peer": [preg(b + par, 0, "peer") for b in raw],
                     "args": {
-                        "part": part,
+                        "attn": attn,
                         "res_in": res_in,
                         "res_out": res_out,
                         "out": out,
@@ -1108,6 +1266,8 @@ def build_ffn(key: FfnBuild):
                         "s13s": s13s,
                         "w2s": w2s,
                         "s2s": s2s,
+                        "wo": wo,
+                        "wos": wos,
                     },
                 }
                 for region, (off, _) in layout.items():
@@ -1119,7 +1279,7 @@ def build_ffn(key: FfnBuild):
 
     @flyc.jit
     def launch(
-        part: Int64,
+        attn: Int64,
         res_in: Int64,
         res_out: Int64,
         out: Int64,
@@ -1135,6 +1295,8 @@ def build_ffn(key: FfnBuild):
         s13s: Int64,
         w2s: Int64,
         s2s: Int64,
+        wo: Int64,
+        wos: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -1145,7 +1307,7 @@ def build_ffn(key: FfnBuild):
     ):
         _ = keyed
         kffn(
-            part,
+            attn,
             res_in,
             res_out,
             out,
@@ -1161,6 +1323,8 @@ def build_ffn(key: FfnBuild):
             s13s,
             w2s,
             s2s,
+            wo,
+            wos,
             scratch,
             sym,
             peers,
