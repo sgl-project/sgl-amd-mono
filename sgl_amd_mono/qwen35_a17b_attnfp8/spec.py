@@ -13,9 +13,10 @@ A decode step runs each decoder layer as at most two launches:
 
 A full-attention layer runs SGLang's attention up to o_proj's input, then K2. A
 target-verify step (speculative decoding) runs K2 only: K1 keeps no state per
-draft token for the rollback, so a GDN layer runs SGLang's GDN up to out_proj's
-input there. SGLang's embedding, final norm and logits processor run around the
-layers.
+draft token for the rollback, so a GDN layer runs a fused Gemma norm and
+per-token FP8 quant, SGLang's in_proj GEMM, and the draft-chain conv, delta
+and gated norm up to out_proj's input. SGLang's embedding, final norm and
+logits processor run around the layers.
 
 The kernels read SGLang's weights in place at each launch (SGLang repacks
 in_proj_qkvz after the build). The kernels also have the fused shared expert
@@ -438,6 +439,12 @@ class _Built:
             layer = m.layers[i]
             if _is_gdn(layer) and not verify:
                 core, res_attn = self._k1(i, layer, h, residual, idx, s, fb)
+            elif _is_gdn(layer):
+                from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950.verify_gdn import (
+                    verify_layer,
+                )
+
+                core, res_attn = verify_layer(layer, h, residual, forward_batch)
             else:
                 if residual is None:
                     res_attn, x = h, layer.input_layernorm(h)
