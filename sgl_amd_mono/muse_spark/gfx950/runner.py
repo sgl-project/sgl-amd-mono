@@ -506,10 +506,12 @@ class MuseMonoRunner:
         layer's attention input)."""
         L = self.views[i]
         if not (self.use_kernels and L.kind == "mxfp4" and rows % q_len == 0):
-            return self.modules[i](
+            out = self.modules[i](
                 positions, stream, forward_batch, attn_input=attn_input,
                 ffn_boundary=self.boundaries[i], pre_norm_dtype=pre_norm_dtype,
             )  # fmt: skip
+            # newer SGLang layers also return an FP8 copy of the next attention input
+            return out[0], out[1]
         if self.pool is None:
             raise RuntimeError("Muse Spark monokernels: launch before bind")
         if not (stream.dtype == torch.float32 and stream.is_contiguous() and tuple(stream.shape) == (rows, HIDDEN)):

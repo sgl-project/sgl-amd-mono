@@ -22,10 +22,11 @@ import os
 
 import torch
 
-# SGLANG_AMD_MONO_MUSE_QUANT_BF16=0: the bf16-expert layers (0 and 61 of the Quark
-# checkpoint) stay on SGLang's modules instead of running the kernels on an online
-# MXFP4 quantization of their experts (aiter's rule, see mxfp4_quant.py)
-QUANT_BF16 = os.environ.get("SGLANG_AMD_MONO_MUSE_QUANT_BF16", "1") == "1"
+# SGLANG_AMD_MONO_MUSE_QUANT_BF16=1: the bf16-expert layers (0 and 61 of the Quark
+# checkpoint, as of the NVFP4 one) run the kernels on an online MXFP4 quantization of
+# their experts (aiter's rule, see mxfp4_quant.py) instead of SGLang's modules. Off:
+# the checkpoints keep these layers bf16 on purpose; on was ~5% faster at C1.
+QUANT_BF16 = os.environ.get("SGLANG_AMD_MONO_MUSE_QUANT_BF16", "0") == "1"
 # SGLANG_AMD_MONO_MUSE_FP8_DENSE=0: the pooler and unpooler stay bf16 (else the kernels
 # stream FP8 E4M3 copies with a scale a row, 36 % of a layer's bytes halved; see fp8_quant.py)
 # off: per-row E4M3 pooler / unpooler copies were -0.2 ms a C1 step but cut AIME26 pass@1 0.958 -> 0.908 (native

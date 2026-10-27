@@ -334,11 +334,12 @@ def test_the_views_read_in_place_and_log_the_copies():
     layer.mlp.router_pooler_packed_weight = packed
     v2 = LayerViews.build(layer, 3, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), {})
     assert v2.gate_hi.data_ptr() == packed[MOE_HIDDEN].data_ptr()
-    # bf16 experts: quantized online into Quark-layout copies (the layer then takes the
-    # kernels), or left to the modules with the switch off
+    # bf16 experts: quantized online into Quark-layout copies with the switch on (the layer
+    # then takes the kernels), else left to the modules (the default)
     bf16 = _layer(experts=_bf16_experts())
     copies = {}
-    q = LayerViews.build(bf16, 0, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), copies)
+    with mock.patch.object(muse_weights, "QUANT_BF16", True):
+        q = LayerViews.build(bf16, 0, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), copies)
     assert q.quantized and q.kind == "mxfp4"
     assert tuple(q.w13.shape) == (LOCAL_EXPERTS, 2 * INTER, MOE_HIDDEN // 2) and q.w13.dtype == torch.uint8
     assert tuple(q.s2.shape) == (LOCAL_EXPERTS, MOE_HIDDEN, INTER // 32) and q.s2.dtype == torch.uint8
