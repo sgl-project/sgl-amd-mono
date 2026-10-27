@@ -159,10 +159,10 @@ class Guard:
         return (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
 
     def scalar_deadline(self):
-        """The deadline >> ``TICK_SHIFT`` in an SGPR: one scalar load, so a check
-        in a wait holds no VGPRs next to the polled words. The host writes the
-        deadline before the launch, so the scalar cache may serve it (a GLC load
-        here slows the launch's other scalar loads)."""
+        """The deadline >> ``TICK_SHIFT`` in an SGPR, so a wait's check needs no VGPRs.
+
+        The host writes it before the launch, so the scalar cache may serve it; a GLC
+        load slows the launch's other scalar loads."""
         w = fx.Vector(bo.buffer_load(rsrc(self.epoch), 0, vec_width=4, is_scalar=True))
         dl = (fx.Int64(w[GUARD_DEADLINE + 1]) << 32) | (
             fx.Int64(w[GUARD_DEADLINE]) & fx.Int64(0xFFFFFFFF)

@@ -48,14 +48,8 @@ def _spin(load_all, pending):
     deadline_of, stopped, fail, note_peer = g.deadline, g.stopped, g.fail, g.note_peer
     v = load_all()
     if const_expr(g.stop and g.fault_site != site):
-        # A failed wait stops the launch from inside the check, so the loop is the
-        # unguarded one plus a wave-uniform poll count: no second exit, no state
-        # next to the polled words, which then reload in place (a loop that
-        # carries a stop value copies them every poll: spills at large batches).
-        # The check is all scalar (the deadline by a scalar load, the time in
-        # 32-bit units), so it needs no VGPRs at the batch's peak either. Without
-        # peers it reads no error words: a wait on this GPU that failed stopped
-        # the whole launch already.
+        # a failed check stops the launch inside the loop, so the loop carries no stop
+        # value: one copies the polled words every poll and spills at large batches
         scalar_deadline, has_peers = g.scalar_deadline, g.has_peers
         t0 = fx.Int64(0)
         polls = fx.Int32(0)
@@ -68,6 +62,7 @@ def _spin(load_all, pending):
                 t0 = (polls == CHECK_POLLS).select(now, t0)
                 if fx.Int32((now - t0) >> guard.TICK_SHIFT) > scalar_deadline():
                     fail(site)
+                # a failed wait on this GPU has stopped the launch already
                 if const_expr(has_peers):
                     if stopped():
                         note_peer()
