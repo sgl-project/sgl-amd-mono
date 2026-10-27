@@ -23,6 +23,10 @@ SPECS = {
     "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax.spec:SPEC",
 }
 
+SPECS["Qwen3_5MoeForConditionalGeneration"] = (
+    "sgl_amd_mono.qwen35_a17b_attnfp8.spec:SPEC"
+)
+
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": ("register",)
