@@ -3,11 +3,15 @@
 # python/sglang/srt/layers/qwen3_8_dense_mono.py
 """Which Qwen3.8-27B layers the dense launches take as SGLang loaded them, and
 their weights as the launches read them: SGLang's parameters in place, except
-the MXFP4 weights, copied once into the (16, 16)-shuffled order
-(``dense_ffn.shuffle_w``; the caller records them in ``copies``)."""
+the MXFP4 weights, which the launches read in the (16, 16)-shuffled order
+(``dense_ffn.shuffle_w``) with plain e8m0 scales. A weight on SGLang's Triton
+GEMM is copied once into that order; one on its ASM GEMM is in that order
+already and is read in place, with its scales copied out of the ASM tile order
+(``mxfp4_operands``; the caller records the copies in ``copies``)."""
 
 from __future__ import annotations
 
+import functools
 from typing import Optional
 
 import torch
@@ -22,6 +26,8 @@ SGLANG_READS = {
     "srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py": (
         "QuarkW4A4MXFP4",
         "dequantized_bf16",
+        "use_aiter_asm_fp4_gemm",
+        "_swizzle_asm_fp4_scale",
     ),
     "srt/layers/linear.py": ("quant_method",),
     "srt/layers/quantization/quark/*.py": ("scheme",),
@@ -67,9 +73,46 @@ def o_proj(layer):
     return layer.linear_attn.out_proj if is_gdn(layer) else layer.o_proj
 
 
-def mxfp4_reason(proj, n: int, k: int) -> Optional[str]:
-    """Why ``proj`` is not a plain MXFP4 [n, k] linear on the Triton
-    ``gemm_afp4wfp4`` path (the kernels' reference), else None."""
+def asm_layout(proj) -> bool:
+    """Whether SGLang runs ``proj`` on AITER's ASM FP4 GEMM (``--fp4-gemm-backend
+    aiter``, or ``auto`` on gfx95 for the shapes AITER tunes). SGLang has then
+    replaced the weight with AITER's ``shuffle_weight(layout=(16, 16))`` of it,
+    the order ``dense_ffn.shuffle_w`` makes, and the scales with their ASM tile
+    order (``_swizzle_asm_fp4_scale``), and marked neither ``is_shuffled``."""
+    return bool(getattr(proj, "use_aiter_asm_fp4_gemm", False))
+
+
+def unswizzle_scales(ws: torch.Tensor) -> torch.Tensor:
+    """Plain e8m0 [N, K / 32] scales from the ASM tile order: the inverse of
+    SGLang's ``_swizzle_asm_fp4_scale``, whose tiles are 32 rows by 8 groups."""
+    n, groups = ws.shape
+    return (
+        ws.view(n // 32, groups // 8, 4, 16, 2, 2, 1)
+        .permute(0, 5, 3, 1, 4, 2, 6)
+        .contiguous()
+        .view(n, groups)
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _unswizzles(n: int, groups: int) -> bool:
+    """Whether ``unswizzle_scales`` inverts SGLang's ``_swizzle_asm_fp4_scale`` on
+    [n, groups] scales; both only permute, so an index tensor shows it."""
+    if n % 32 or groups % 8:
+        return False
+    from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+        _swizzle_asm_fp4_scale,
+    )
+
+    idx = torch.arange(n * groups, dtype=torch.int32).view(n, groups)
+    return torch.equal(_swizzle_asm_fp4_scale(unswizzle_scales(idx)), idx)
+
+
+def mxfp4_reason(proj, n: int, k: int, *, bitwise: bool = False) -> Optional[str]:
+    """Why ``proj`` is not an MXFP4 [n, k] linear the kernels read, row-major on
+    the Triton ``gemm_afp4wfp4`` path (the kernels' reference) or in the ASM
+    GEMM's layout (``asm_layout``), else None. The kernels match the Triton path
+    bit for bit, not the ASM one; ``bitwise`` refuses the ASM layout."""
     from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
     from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
         QuarkW4A4MXFP4,
@@ -83,21 +126,45 @@ def mxfp4_reason(proj, n: int, k: int) -> Optional[str]:
     if getattr(proj, "dequantized_bf16", False):
         return "MXFP4 weights dequantized to bf16 (AITER_FORCE_A8W4)"
     w, ws = proj.weight, proj.weight_scale
-    # The kernels shuffle their own copy; a weight another path already
-    # preshuffled would be shuffled twice.
-    for marker in ("is_shuffled", "aiter_bpreshuffled"):
-        if getattr(w, marker, False) or getattr(ws, marker, False):
-            return f"weights already preshuffled ({marker})"
+    asm = asm_layout(proj)
+    if asm and bitwise:
+        return (
+            "on the ASM FP4 GEMM, which the kernels do not match bit for bit "
+            "(--fp4-gemm-backend triton)"
+        )
+    if not asm:
+        # The kernels shuffle their own copy of a row-major weight; one another
+        # path already preshuffled would be shuffled twice.
+        for marker in ("is_shuffled", "aiter_bpreshuffled"):
+            if getattr(w, marker, False) or getattr(ws, marker, False):
+                return f"weights already preshuffled ({marker})"
     if w.dtype != torch.uint8 or w.shape != (n, k // 2):
         return f"weight {tuple(w.shape)} {w.dtype}, want MXFP4 {n} x {k}"
     if ws is None or ws.shape != (n, k // 32) or not ws.is_contiguous():
-        return "weight scales not plain e8m0 [N, K / 32]"
+        return "weight scales not e8m0 [N, K / 32]"
+    if asm and not w.is_contiguous():
+        return "ASM-layout weight not contiguous"
+    if asm and not _unswizzles(n, k // 32):
+        return "ASM-layout scales not in the tile order unswizzle_scales inverts"
     return None
 
 
-def ffn_reason(layer, *, tp: int) -> Optional[str]:
+def mxfp4_operands(proj, name: str, idx: int, copies: dict):
+    """``proj``'s weight in the (16, 16)-shuffled order and its plain e8m0 scales:
+    an ASM-layout weight in place with its scales unswizzled, any other weight
+    copied shuffled with its scales in place. The copies go in ``copies``."""
+    if asm_layout(proj):
+        ws = unswizzle_scales(proj.weight_scale.data)
+        copies[f"unswizzled {name} scales", idx] = ws
+        return proj.weight.data, ws
+    w = D.shuffle_w(proj.weight.data.contiguous())
+    copies[f"shuffled {name}", idx] = w
+    return w, proj.weight_scale
+
+
+def ffn_reason(layer, *, tp: int, bitwise: bool = False) -> Optional[str]:
     """Why K2 cannot run this layer's FFN share at TP ``tp`` (with o_proj folded
-    in at TP1), else None."""
+    in at TP1), else None; ``bitwise`` as in ``mxfp4_reason``."""
     inter = D.FGeo(tp).inter
     projs = [
         ("gate_up_proj", layer.mlp.gate_up_proj, 2 * inter, D.HIDDEN),
@@ -106,15 +173,15 @@ def ffn_reason(layer, *, tp: int) -> Optional[str]:
     if tp == 1:
         projs.append(("o_proj", o_proj(layer), D.HIDDEN, D.CORE))
     for name, proj, n, k in projs:
-        why = mxfp4_reason(proj, n, k)
+        why = mxfp4_reason(proj, n, k, bitwise=bitwise)
         if why is not None:
             return f"{name}: {why}"
     return None
 
 
-def gdn_reason(layer, *, tp: int) -> Optional[str]:
+def gdn_reason(layer, *, tp: int, bitwise: bool = False) -> Optional[str]:
     """Why K1 cannot run this GDN layer's share at TP ``tp`` (with out_proj
-    folded in at TP2), else None."""
+    folded in at TP2), else None; ``bitwise`` as in ``mxfp4_reason``."""
     a = layer.linear_attn
     geo = K.Geo(tp)
     if a.attn_tp_size != tp:
@@ -126,7 +193,7 @@ def gdn_reason(layer, *, tp: int) -> Optional[str]:
     if tp == 2:
         projs.append(("out_proj", a.out_proj, K.HIDDEN, geo.val))
     for name, proj, n, k in projs:
-        why = mxfp4_reason(proj, n, k)
+        why = mxfp4_reason(proj, n, k, bitwise=bitwise)
         if why is not None:
             return f"{name}: {why}"
     conv = a.conv1d.weight
@@ -174,23 +241,19 @@ def gdn_state(cache) -> DenseGdnState:
 
 
 def ffn_weights(layer, idx: int, *, tp: int, copies: dict) -> DenseFfnWeights:
-    """Layer ``idx``'s K2 operands; copies the shuffled gate_up, down and (TP1)
-    o_proj / out_proj."""
+    """Layer ``idx``'s K2 operands: gate_up, down and (TP1) o_proj / out_proj as
+    ``mxfp4_operands`` gives them."""
     mlp = layer.mlp
-    w13 = D.shuffle_w(mlp.gate_up_proj.weight.data)
-    w2 = D.shuffle_w(mlp.down_proj.weight.data)
-    copies["shuffled gate_up", idx] = w13
-    copies["shuffled down", idx] = w2
+    w13, w13s = mxfp4_operands(mlp.gate_up_proj, "gate_up", idx, copies)
+    w2, w2s = mxfp4_operands(mlp.down_proj, "down", idx, copies)
     w_o = w_os = None
     if tp == 1:
-        o = o_proj(layer)
-        w_o, w_os = D.shuffle_w(o.weight.data), o.weight_scale
-        copies["shuffled o_proj", idx] = w_o
+        w_o, w_os = mxfp4_operands(o_proj(layer), "o_proj", idx, copies)
     return DenseFfnWeights(
         w13=w13,
-        w13s=mlp.gate_up_proj.weight_scale,
+        w13s=w13s,
         w2=w2,
-        w2s=mlp.down_proj.weight_scale,
+        w2s=w2s,
         ln_w=layer.post_attention_layernorm.weight,
         w_o=w_o,
         w_os=w_os,
@@ -198,22 +261,19 @@ def ffn_weights(layer, idx: int, *, tp: int, copies: dict) -> DenseFfnWeights:
 
 
 def gdn_weights(layer, idx: int, *, tp: int, copies: dict) -> DenseGdnWeights:
-    """GDN layer ``idx``'s K1 operands; copies the shuffled in_proj_qkvz,
-    in_proj_ba and (TP2) out_proj."""
+    """GDN layer ``idx``'s K1 operands: in_proj_qkvz, in_proj_ba and (TP2)
+    out_proj as ``mxfp4_operands`` gives them."""
     a = layer.linear_attn
-    w_qkvz = D.shuffle_w(a.in_proj_qkvz.weight.data.contiguous())
-    w_ba = D.shuffle_w(a.in_proj_ba.weight.data.contiguous())
-    copies["shuffled in_proj_qkvz", idx] = w_qkvz
-    copies["shuffled in_proj_ba", idx] = w_ba
+    w_qkvz, w_qkvzs = mxfp4_operands(a.in_proj_qkvz, "in_proj_qkvz", idx, copies)
+    w_ba, w_bas = mxfp4_operands(a.in_proj_ba, "in_proj_ba", idx, copies)
     w_o = w_os = None
     if tp == 2:
-        w_o, w_os = D.shuffle_w(a.out_proj.weight.data), a.out_proj.weight_scale
-        copies["shuffled out_proj", idx] = w_o
+        w_o, w_os = mxfp4_operands(a.out_proj, "out_proj", idx, copies)
     return DenseGdnWeights(
         w_qkvz=w_qkvz,
-        w_qkvzs=a.in_proj_qkvz.weight_scale,
+        w_qkvzs=w_qkvzs,
         w_ba=w_ba,
-        w_bas=a.in_proj_ba.weight_scale,
+        w_bas=w_bas,
         conv_w=a.conv1d.weight,
         a_log=a.A_log,
         dt_bias=a.dt_bias,

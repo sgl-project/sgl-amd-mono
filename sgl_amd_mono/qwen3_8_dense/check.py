@@ -5,7 +5,9 @@
 path on the kernel's inputs, on the caches as they were, and checks the kernel's
 outputs and the state rows it writes against it, each against its
 ``spec.NUMERICS`` bound. Every check is logged; a miss is logged as a violation.
-TP1 checks K1 and K2; TP2 checks K1's core and state."""
+TP1 checks K1 and K2; TP2 checks K1's core and state. The bounds hold against
+SGLang's Triton FP4 GEMM (``--fp4-gemm-backend triton``); its ASM one, which
+``auto`` picks on gfx95, rounds differently."""
 
 from __future__ import annotations
 

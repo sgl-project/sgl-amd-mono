@@ -49,7 +49,12 @@ SGLANG_READS = {
         "NumericsKind",
         "Requirements",
     ),
-    "srt/runtime_context.py": ("get_parallel", '"tp_rank"', '"tp_size"'),
+    "srt/runtime_context.py": ("get_exec", "get_parallel", '"tp_rank"', '"tp_size"'),
+    "srt/arg_groups/fields/exec_.py": (
+        '"exec.deterministic"',
+        "enable_deterministic_inference",
+        "rl_on_policy_target",
+    ),
     "srt/configs/mamba_utils.py": ("mamba2_state_dtype",),
     "srt/arg_groups/*.py": ('"enable_linear_replayssm"',),
     "srt/layers/layernorm.py": ("_use_aiter", "_has_rocm_triton_gemma_rms_norm"),
@@ -102,7 +107,9 @@ ROWS = tuple(range(1, 9))
 TP_SIZES = (1, 2)
 # Measured on MI355X (PR #43558): wider steps lose to SGLang's path
 TP_MAX_ROWS = {1: 4, 2: 8}
-# K1 and K2 match SGLang's Triton path bit for bit (exact by construction)
+# K1 and K2 match SGLang's Triton FP4 path bit for bit (exact by construction).
+# Its ASM FP4 GEMM rounds differently, so _model_disable_reasons refuses layers
+# on it under the flags that need BITWISE.
 NUMERICS = Numerics(
     NumericsKind.BITWISE,
     {
@@ -148,11 +155,13 @@ def _model_disable_reasons(model, hf_config, copies) -> list[str]:
         _use_aiter,
     )
     from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
     from .gfx950 import weights as W
 
     tp = get_parallel().tp_size
+    det = get_exec().deterministic
+    bitwise = bool(det.enable_deterministic_inference or det.rl_on_policy_target)
     m = model.model
     if model.capture_aux_hidden_states:
         return ["captures aux hidden states (speculative decoding)"]
@@ -164,9 +173,9 @@ def _model_disable_reasons(model, hf_config, copies) -> list[str]:
     for i, layer in enumerate(m.layers):
         if not isinstance(layer.mlp, Qwen2MoeMLP):
             return [f"layer {i}: MLP {type(layer.mlp).__name__}"]
-        why = W.gdn_reason(layer, tp=tp) if W.is_gdn(layer) else None
+        why = W.gdn_reason(layer, tp=tp, bitwise=bitwise) if W.is_gdn(layer) else None
         if why is None:
-            why = W.ffn_reason(layer, tp=tp)
+            why = W.ffn_reason(layer, tp=tp, bitwise=bitwise)
         if why is not None:
             return [f"layer {i}: {why}"]
     return []
@@ -387,6 +396,12 @@ def _build(model, hf_config, ctx: BuildContext) -> _Built:
         cap,
     )
     check = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
+    if check and any(W.asm_layout(m) for m in model.modules()):
+        logger.warning(
+            "SGLANG_AMD_MONO_CHECK: SGLang's ASM FP4 GEMM rounds differently from "
+            "K1 / K2, so its layers miss the bit-exact bounds; --fp4-gemm-backend "
+            "triton checks the kernels against the path they match"
+        )
     return _Built(model, rt, ffn, gdn, tp=tp, check=check)
 
 
