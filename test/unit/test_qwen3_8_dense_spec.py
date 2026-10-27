@@ -215,6 +215,18 @@ def test_state_reasons(W, tp):
     assert W.state_reason(_cache(3 - tp, W), tp=tp) is not None
 
 
+def _swizzle(scale):
+    # SGLang's _swizzle_asm_fp4_scale (sgl-project/sglang#39598): e8m0 [N, K / 32]
+    # scales in the ASM FP4 GEMM's 32 x 8 tile order
+    rows, cols = scale.shape
+    return (
+        scale.view(rows // 32, 2, 16, cols // 8, 2, 4, 1)
+        .permute(0, 3, 5, 2, 4, 1, 6)
+        .contiguous()
+        .view(rows, cols)
+    )
+
+
 @pytest.fixture
 def quark(monkeypatch):
     """SGLang's Quark linear method and MXFP4 scheme, without their imports."""
@@ -223,12 +235,16 @@ def quark(monkeypatch):
         scheme=type("QuarkW4A4MXFP4", (), {}),
     )
     base = "sglang.srt.layers.quantization.quark"
-    for name, attr, cls in (
-        (f"{base}.quark", "QuarkLinearMethod", classes.method),
-        (f"{base}.schemes.quark_w4a4_mxfp4", "QuarkW4A4MXFP4", classes.scheme),
+    for name, attrs in (
+        (f"{base}.quark", {"QuarkLinearMethod": classes.method}),
+        (
+            f"{base}.schemes.quark_w4a4_mxfp4",
+            {"QuarkW4A4MXFP4": classes.scheme, "_swizzle_asm_fp4_scale": _swizzle},
+        ),
     ):
         module = types.ModuleType(name)
-        setattr(module, attr, cls)
+        for attr, value in attrs.items():
+            setattr(module, attr, value)
         monkeypatch.setitem(sys.modules, name, module)
     return classes
 
@@ -259,6 +275,83 @@ def test_mxfp4_reasons(W, quark):
     assert W.mxfp4_reason(_mxfp4(quark, n, k), n, 2 * k).startswith("weight ")
     scales = torch.empty(k // 32, n, dtype=torch.uint8, device="meta").t()
     assert "scales" in W.mxfp4_reason(_mxfp4(quark, n, k, weight_scale=scales), n, k)
+
+
+def test_mxfp4_reasons_take_the_asm_layout(W, quark, monkeypatch):
+    # SGLang's ASM FP4 GEMM leaves the weight (16, 16)-shuffled and the scales in
+    # 32 x 8 tiles, and marks neither is_shuffled: the kernels read it as it is
+    n, k = 256, 512
+    asm = _mxfp4(quark, n, k, use_aiter_asm_fp4_gemm=True)
+    assert W.asm_layout(asm) and not W.asm_layout(_mxfp4(quark, n, k))
+    assert W.mxfp4_reason(asm, n, k) is None
+    asm.weight.is_shuffled = True
+    assert W.mxfp4_reason(asm, n, k) is None
+    # the kernels match SGLang's Triton FP4 GEMM bit for bit, not its ASM one
+    assert "bit for bit" in W.mxfp4_reason(asm, n, k, bitwise=True)
+    assert W.mxfp4_reason(_mxfp4(quark, n, k), n, k, bitwise=True) is None
+    assert W.mxfp4_reason(asm, n, 2 * k).startswith("weight ")
+    # scales in part tiles, or tiles unswizzle_scales does not invert
+    narrow = _mxfp4(quark, n, 128, use_aiter_asm_fp4_gemm=True)
+    assert "tile order" in W.mxfp4_reason(narrow, n, 128)
+    module = sys.modules[
+        "sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4"
+    ]
+    monkeypatch.setattr(module, "_swizzle_asm_fp4_scale", lambda s: s.clone())
+    W._unswizzles.cache_clear()
+    try:
+        assert "tile order" in W.mxfp4_reason(asm, n, k)
+    finally:
+        W._unswizzles.cache_clear()
+
+
+def test_mxfp4_operands(W, quark):
+    # a row-major weight is copied (16, 16)-shuffled, its scales read as they are;
+    # an ASM-layout weight is read as it is, its scales unswizzled
+    n, k = 64, 512
+    gen = torch.Generator().manual_seed(0)
+    w = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, generator=gen)
+    ws = torch.randint(0, 256, (n, k // 32), dtype=torch.uint8, generator=gen)
+    copies = {}
+    got_w, got_ws = W.mxfp4_operands(
+        _mxfp4(quark, n, k, weight=w, weight_scale=ws), "down", 3, copies
+    )
+    assert torch.equal(got_w, W.D.shuffle_w(w)) and got_ws is ws
+    assert list(copies) == [("shuffled down", 3)]
+    asm = _mxfp4(
+        quark,
+        n,
+        k,
+        weight=W.D.shuffle_w(w),
+        weight_scale=_swizzle(ws),
+        use_aiter_asm_fp4_gemm=True,
+    )
+    copies = {}
+    got_w, got_ws = W.mxfp4_operands(asm, "down", 3, copies)
+    assert got_w.data_ptr() == asm.weight.data_ptr() and torch.equal(got_ws, ws)
+    assert list(copies) == [("unswizzled down scales", 3)]
+
+
+def test_the_asm_layout_is_the_one_the_kernels_read(W):
+    # AITER's shuffle_weight(layout=(16, 16)) is dense_ffn.shuffle_w on fp4x2
+    # bytes, and unswizzle_scales inverts the ASM scale order
+    from aiter.ops.shuffle import shuffle_weight
+
+    gen = torch.Generator().manual_seed(0)
+    w = torch.randint(0, 256, (64, 256), dtype=torch.uint8, generator=gen)
+    assert torch.equal(shuffle_weight(w, layout=(16, 16)), W.D.shuffle_w(w))
+    ws = torch.randint(0, 256, (96, 24), dtype=torch.uint8, generator=gen)
+    assert torch.equal(W.unswizzle_scales(_swizzle(ws)), ws)
+
+
+def test_the_asm_scale_order_is_sglangs():
+    try:
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            _swizzle_asm_fp4_scale,
+        )
+    except (ImportError, RuntimeError) as e:  # before sglang#39598; needs a GPU
+        pytest.skip(f"SGLang's _swizzle_asm_fp4_scale: {e}")
+    ws = torch.randint(0, 256, (96, 24), dtype=torch.uint8)
+    assert torch.equal(_swizzle_asm_fp4_scale(ws), _swizzle(ws))
 
 
 def _gdn_layer(W, quark, tp, **attn):
@@ -313,6 +406,18 @@ def test_gdn_and_ffn_reasons(W, quark, tp):
     assert W.gdn_reason(_gdn_layer(W, quark, tp, in_proj_ba=ba), tp=tp) == (
         "in_proj_ba: not Quark MXFP4"
     )
+    # on SGLang's ASM FP4 GEMM, refused where BITWISE is needed
+    qkvz = SimpleNamespace(
+        **vars(layer.linear_attn.in_proj_qkvz), use_aiter_asm_fp4_gemm=True
+    )
+    asm = _gdn_layer(W, quark, tp, in_proj_qkvz=qkvz)
+    asm.mlp.down_proj = SimpleNamespace(
+        **vars(layer.mlp.down_proj), use_aiter_asm_fp4_gemm=True
+    )
+    assert W.gdn_reason(asm, tp=tp) is None
+    assert W.ffn_reason(asm, tp=tp) is None
+    assert W.gdn_reason(asm, tp=tp, bitwise=True).startswith("in_proj_qkvz: on the ASM")
+    assert W.ffn_reason(asm, tp=tp, bitwise=True).startswith("down_proj: on the ASM")
     # K2 folds out_proj in at TP1 only
     out = SimpleNamespace(**{**vars(layer.linear_attn.out_proj), "scheme": None})
     folded = _gdn_layer(W, quark, tp, out_proj=out)

@@ -307,12 +307,18 @@ class TestMonokernelCheck(CustomTestCase):
                 tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
                 tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
             ):
+                # the bit-exact bounds hold against the Triton FP4 GEMM; auto
+                # picks the ASM one on gfx95, which rounds differently
                 process = _launch(
                     tp,
                     mono=True,
                     log=(out, err),
                     extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
-                    extra_args=["--disable-cuda-graph"],
+                    extra_args=[
+                        "--disable-cuda-graph",
+                        "--fp4-gemm-backend",
+                        "triton",
+                    ],
                 )
                 try:
                     for n in (1, cap):

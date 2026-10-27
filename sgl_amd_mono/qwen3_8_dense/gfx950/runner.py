@@ -20,7 +20,8 @@ from . import dense_gdn as K
 
 
 class DenseFfnWeights(msgspec.Struct, frozen=True):
-    """A layer's K2 operands: MXFP4 weights shuffled, scales as loaded."""
+    """A layer's K2 operands: MXFP4 weights (16, 16)-shuffled, e8m0 scales
+    [N, K / 32]."""
 
     w13: torch.Tensor
     w13s: torch.Tensor
@@ -32,7 +33,8 @@ class DenseFfnWeights(msgspec.Struct, frozen=True):
 
 
 class DenseGdnWeights(msgspec.Struct, frozen=True):
-    """A GDN layer's K1 operands: MXFP4 weights shuffled, the rest as loaded."""
+    """A GDN layer's K1 operands: MXFP4 weights (16, 16)-shuffled, e8m0 scales
+    [N, K / 32], the rest as loaded."""
 
     w_qkvz: torch.Tensor
     w_qkvzs: torch.Tensor
