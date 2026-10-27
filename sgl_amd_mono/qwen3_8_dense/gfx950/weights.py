@@ -6,7 +6,8 @@ their weights as the launches read them: SGLang's parameters in place, except
 the MXFP4 weights, which the launches read in the (16, 16)-shuffled order
 (``dense_ffn.shuffle_w``) with plain e8m0 scales. A weight on SGLang's Triton
 GEMM is copied once into that order; one on its ASM GEMM is in that order
-already and is read in place, with its scales copied out of the ASM tile order
+already and is read in place (in_proj_qkvz, which SGLang may repack after the
+build, is copied as it is), with its scales copied out of the ASM tile order
 (``mxfp4_operands``; the caller records the copies in ``copies``)."""
 
 from __future__ import annotations
@@ -149,14 +150,18 @@ def mxfp4_reason(proj, n: int, k: int, *, bitwise: bool = False) -> Optional[str
     return None
 
 
-def mxfp4_operands(proj, name: str, idx: int, copies: dict):
+def mxfp4_operands(proj, name: str, idx: int, copies: dict, *, in_place: bool = True):
     """``proj``'s weight in the (16, 16)-shuffled order and its plain e8m0 scales:
-    an ASM-layout weight in place with its scales unswizzled, any other weight
-    copied shuffled with its scales in place. The copies go in ``copies``."""
+    an ASM-layout weight in place (copied as it is without ``in_place``) with its
+    scales unswizzled, any other weight copied shuffled with its scales in place.
+    The copies go in ``copies``."""
     if asm_layout(proj):
-        ws = unswizzle_scales(proj.weight_scale.data)
+        w, ws = proj.weight.data, unswizzle_scales(proj.weight_scale.data)
         copies[f"unswizzled {name} scales", idx] = ws
-        return proj.weight.data, ws
+        if not in_place:
+            w = w.clone()
+            copies[f"copied {name}", idx] = w
+        return w, ws
     w = D.shuffle_w(proj.weight.data.contiguous())
     copies[f"shuffled {name}", idx] = w
     return w, proj.weight_scale
@@ -264,7 +269,12 @@ def gdn_weights(layer, idx: int, *, tp: int, copies: dict) -> DenseGdnWeights:
     """GDN layer ``idx``'s K1 operands: in_proj_qkvz, in_proj_ba and (TP2)
     out_proj as ``mxfp4_operands`` gives them."""
     a = layer.linear_attn
-    w_qkvz, w_qkvzs = mxfp4_operands(a.in_proj_qkvz, "in_proj_qkvz", idx, copies)
+    # finalize_fused_in_proj may pack in_proj_qkvz with in_proj_ba after the KV
+    # pool is sized, freeing its weight as loaded; read in place, that weight
+    # would stay alive outside the pool's budget
+    w_qkvz, w_qkvzs = mxfp4_operands(
+        a.in_proj_qkvz, "in_proj_qkvz", idx, copies, in_place=False
+    )
     w_ba, w_bas = mxfp4_operands(a.in_proj_ba, "in_proj_ba", idx, copies)
     w_o = w_os = None
     if tp == 2:

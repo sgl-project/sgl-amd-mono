@@ -329,6 +329,12 @@ def test_mxfp4_operands(W, quark):
     got_w, got_ws = W.mxfp4_operands(asm, "down", 3, copies)
     assert got_w.data_ptr() == asm.weight.data_ptr() and torch.equal(got_ws, ws)
     assert list(copies) == [("unswizzled down scales", 3)]
+    # or copied as it is, for a weight SGLang replaces after the build
+    copies = {}
+    got_w, got_ws = W.mxfp4_operands(asm, "down", 3, copies, in_place=False)
+    assert got_w.data_ptr() != asm.weight.data_ptr()
+    assert torch.equal(got_w, asm.weight) and torch.equal(got_ws, ws)
+    assert list(copies) == [("unswizzled down scales", 3), ("copied down", 3)]
 
 
 def test_the_asm_layout_is_the_one_the_kernels_read(W):
