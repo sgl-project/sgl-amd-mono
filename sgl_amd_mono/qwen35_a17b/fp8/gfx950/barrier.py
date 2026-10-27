@@ -26,7 +26,7 @@ from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.ops import CM_DEV, load_ptr64, rsrc
 from sgl_amd_mono.common.plan import THREADS, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, preg, publish
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.layout import PHASE_BYTES, PHASE_FLAGS, TP
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.layout import PHASE_BYTES, PHASE_FLAGS, TP
 
 SOURCES = kernel_sources(__name__)
 # The barrier does no work past the handshake, so one CTA is enough. Every extra
@@ -59,7 +59,7 @@ def compile_only(launch) -> None:
             os.environ[var] = old
 
 
-def build_barrier(kind: int, rank: int, fault):
+def build_barrier(kind: int, rank: int, fault, tp: int = TP):
     """A launch for the step's phase ``kind`` (0 first, 1 second) on this rank."""
     fault_site = -1 if fault is None else int(fault[0])
     fault_after = 0 if fault is None else int(fault[1])
@@ -71,13 +71,14 @@ def build_barrier(kind: int, rank: int, fault):
             "fault_site": -1 if fault is None else int(fault[0]),
             "fault_after": 0 if fault is None else int(fault[1]),
             "grid": GRID,
+            "tp": tp,
         },
         SOURCES,
     )
     _ensure_cache()
 
     @flyc.kernel(
-        name=f"qwen35_fp8_phase_{kind}_r{rank}", known_block_size=[THREADS, 1, 1]
+        name=f"qwen35_fp8_phase_{kind}_r{rank}_tp{tp}", known_block_size=[THREADS, 1, 1]
     )
     def phase_kernel(peers: Int64, epoch: Int64, sym: Int64):
         _ = keyed
@@ -87,7 +88,7 @@ def build_barrier(kind: int, rank: int, fault):
                 own=sym,
                 peers=peers,
                 rank=rank,
-                npes=TP,
+                npes=tp,
                 flags_offset=PHASE_FLAGS,
                 fault_site=None if fault_site < 0 else fault_site,
                 fault_after=fault_after,
@@ -106,7 +107,7 @@ def build_barrier(kind: int, rank: int, fault):
             # need: the next writer of a slot has already seen every peer finish
             # the previous read of it.
             mine = ep * fx.Int32(2) + fx.Int32(kind)
-            slot = rank if kind == 0 else rank + TP
+            slot = rank if kind == 0 else rank + tp
             publish(
                 Mailbox(mine).put,
                 preg(sym, 0, "self"),
@@ -117,7 +118,7 @@ def build_barrier(kind: int, rank: int, fault):
             Mailbox(mine).poll(
                 [
                     (preg(load_ptr64(peers, p), 0, f"r{p}"), slot - rank + p, 1)
-                    for p in range(TP)
+                    for p in range(tp)
                 ]
             )
 
@@ -138,16 +139,19 @@ def build_barrier(kind: int, rank: int, fault):
 class PhaseRuntime:
     """The two phase barriers, the peer buffer they publish into, and the epoch."""
 
-    def __init__(self, rank: int, group, device: torch.device, deadline_s: float):
+    def __init__(
+        self, rank: int, group, device: torch.device, deadline_s: float, tp: int = TP
+    ):
         from sgl_amd_mono.common.peer import PeerBuffer
 
         self.rank = rank
         fault = guard.fault_injection(rank)
+        self.tp = tp
         self.launch = {
-            0: build_barrier(0, rank, fault),
-            1: build_barrier(1, rank, fault),
+            0: build_barrier(0, rank, fault, tp),
+            1: build_barrier(1, rank, fault, tp),
         }
-        self.peer = PeerBuffer(PHASE_BYTES, group, rank, TP, device)
+        self.peer = PeerBuffer(PHASE_BYTES, group, rank, tp, device)
         self.peer.bytes.zero_()
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         self.set_deadline(deadline_s)

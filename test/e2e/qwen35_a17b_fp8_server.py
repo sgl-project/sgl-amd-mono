@@ -1,7 +1,7 @@
-"""Qwen3.5-397B-A17B block-FP8 server for the TP4 monokernel test.
+"""Qwen3.5-397B-A17B block-FP8 server for the monokernel test.
 
-Four MI355X GPUs, aiter attention, decode graphs at batch sizes 1 through 8.
-The model path is the block-FP8 checkpoint, not the MXFP4-AttnFP8 one.
+``QWEN35_FP8_TP`` selects 4 (default) or 8 GPUs. Decode graphs cover batch
+sizes 1 through 8. The model path is the block-FP8 checkpoint.
 """
 
 import os
@@ -13,10 +13,11 @@ ENV = {
     "AITER_BF16_FP8_MOE_BOUND": "0",
     "SAFETENSORS_FAST_GPU": "1",
 }
+TP = os.environ.get("QWEN35_FP8_TP", "4")
 ARGS = [
     "--trust-remote-code",
     "--tp-size",
-    "4",
+    TP,
     "--attention-backend",
     "aiter",
     "--moe-runner-backend",

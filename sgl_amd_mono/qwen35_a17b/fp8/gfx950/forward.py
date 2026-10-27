@@ -22,12 +22,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from sgl_amd_mono.qwen35_a17b_fp8.check import _metrics, log_check
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.gdn import gdn_core
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.gemv import block_fp8_gemv_wg
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.layout import BLOCK
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.moe import route_and_moe
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.norm import add_norm_quant, gate_quant
+from sgl_amd_mono.qwen35_a17b.fp8.check import _metrics, log_check
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.gdn import gdn_core
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.gemv import block_fp8_gemv_wg
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.layout import BLOCK
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.moe import route_and_moe
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.norm import add_norm_quant, gate_quant
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -165,7 +165,7 @@ def _checking(enabled: bool) -> bool:
     return enabled and not torch.cuda.is_current_stream_capturing()
 
 
-def run_k1(layer, hidden, residual, forward_batch, rows: int, check: bool):
+def run_k1(layer, hidden, residual, forward_batch, rows: int, check: bool, layout=None):
     """The GDN core ``(bf16, (fp8, scale))`` and the residual."""
     y, residual, y_q = _norm_quant(hidden, residual, layer.input_layernorm)
     mod = layer.linear_attn
@@ -181,7 +181,7 @@ def run_k1(layer, hidden, residual, forward_batch, rows: int, check: bool):
             ref_ssm = ssm.index_select(0, slots).clone()
             conv.index_copy_(0, slots, saved_conv)
             ssm.index_copy_(0, slots, saved_ssm)
-    core, core_q = gdn_core(mod, y, y_q, conv, ssm, idx, rows)
+    core, core_q = gdn_core(mod, y, y_q, conv, ssm, idx, rows, layout)
     if ref_out is not None:
         proj = block_fp8_gemv_wg(
             core, core_q, mod.out_proj.weight, mod.out_proj.weight_scale_inv

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.5-397B-A17B block-FP8 on gfx950, TP4.
+"""Qwen3.5-397B-A17B block-FP8 on gfx950, TP4 and TP8.
 
 Decode steps of 1 to 8 rows open with two guarded peer barriers, then run each
 layer as K1 and K2. A GDN layer's K1 is the previous layer's MoE all-reduce,
@@ -28,18 +28,14 @@ from sglang.srt.monokernels.spec import (
 )
 
 from sgl_amd_mono.common.plan import BLOCKS
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.layout import (
-    BA_N,
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.layout import (
     BLOCK,
-    CONV_DIM,
     EXPERTS,
     HIDDEN,
     LAYERS,
-    O_K,
-    QKVZ_N,
     ROWS,
-    TP,
 )
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.shapes import BY_O_K, TP_SIZES, for_tp
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -106,6 +102,7 @@ def _quant(config) -> dict:
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
+    _install_block_fp8_linear()
     del cfg
     text = _text(hf_config)
     reasons = [
@@ -188,7 +185,7 @@ def _floating(module, shape, what) -> list[str]:
     if weight is None or dtype not in (torch.bfloat16, torch.float16, torch.float32):
         return [f"{what} is not an unquantized floating weight"]
     if shape is not None and _shape(weight) != shape:
-        return [f"{what} weight is {_shape(weight)}, TP4 wants {shape}"]
+        return [f"{what} weight is {_shape(weight)}, wants {shape}"]
     return []
 
 
@@ -212,12 +209,32 @@ def _expert_block(weight, scale, what, *, k_last: int) -> list[str]:
     return []
 
 
+def _projection_k(layers) -> int | None:
+    for layer in layers:
+        attn = getattr(layer, "linear_attn", None)
+        weight = getattr(getattr(attn, "out_proj", None), "weight", None)
+        shape = _shape(weight)
+        if len(shape) == 2:
+            return shape[1]
+        weight = getattr(getattr(layer, "o_proj", None), "weight", None)
+        shape = _shape(weight)
+        if len(shape) == 2:
+            return shape[1]
+    return None
+
+
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     del hf_config, copies
     inner = getattr(model, "model", None)
     layers = list(getattr(inner, "layers", []) or [])
     if len(layers) != LAYERS:
         return [f"needs {LAYERS} decoder layers, got {len(layers)}"]
+    layout = BY_O_K.get(_projection_k(layers))
+    if layout is None:
+        return [
+            "needs a TP4 shard (projection K 2048) or a TP8 shard "
+            f"(projection K 1024), got K {_projection_k(layers)}"
+        ]
     reasons = []
     # The fused norms take the weight as Gemma's 1 + w
     norms = [
@@ -243,12 +260,17 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
                 f"layer {i}: the MoE all-reduce is inside the block, K2 owns it"
             )
         experts = getattr(mlp, "experts", None)
+        w13 = getattr(experts, "w13_weight", None)
         reasons += _expert_block(
-            getattr(experts, "w13_weight", None),
+            w13,
             getattr(experts, "w13_weight_scale_inv", None),
             f"layer {i} w13",
             k_last=HIDDEN,
         )
+        if _shape(w13)[1:2] != (layout.w13_n,):
+            reasons.append(
+                f"layer {i} w13 N is {_shape(w13)[1:2]}, TP{layout.tp} wants {(layout.w13_n,)}"
+            )
         w2 = getattr(experts, "w2_weight", None)
         w2_scale = getattr(experts, "w2_weight_scale_inv", None)
         w2_shape = _shape(w2)
@@ -256,9 +278,11 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             getattr(w2, "dtype", None) != _FP8
             or len(w2_shape) != 3
             or w2_shape[1] != HIDDEN
-            or w2_shape[2] % BLOCK
+            or w2_shape[2] != layout.intermediate
         ):
-            reasons.append(f"layer {i} w2 weight is not block-FP8 [E, {HIDDEN}, N]")
+            reasons.append(
+                f"layer {i} w2 weight is not block-FP8 [E, {HIDDEN}, {layout.intermediate}]"
+            )
         elif (
             w2_scale is None
             or getattr(w2_scale, "dtype", None) != torch.float32
@@ -277,17 +301,20 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
                 )
             attn = layer.linear_attn
             reasons += _dense_block(
-                attn.in_proj_qkvz, QKVZ_N, HIDDEN, f"layer {i} in_proj_qkvz"
+                attn.in_proj_qkvz, layout.qkvz_n, HIDDEN, f"layer {i} in_proj_qkvz"
             )
             reasons += _floating(
-                attn.in_proj_ba, (BA_N, HIDDEN), f"layer {i} in_proj_ba"
+                attn.in_proj_ba, (layout.ba_n, HIDDEN), f"layer {i} in_proj_ba"
             )
             conv = _shape(getattr(getattr(attn, "conv1d", None), "weight", None))
-            if conv not in ((CONV_DIM, 1, 4), (CONV_DIM, 4)):
+            if conv not in ((layout.conv_dim, 1, 4), (layout.conv_dim, 4)):
                 reasons.append(
-                    f"layer {i} conv1d weight is {conv}, TP4 wants {(CONV_DIM, 1, 4)}"
+                    f"layer {i} conv1d weight is {conv}, "
+                    f"TP{layout.tp} wants {(layout.conv_dim, 1, 4)}"
                 )
-            reasons += _dense_block(attn.out_proj, HIDDEN, O_K, f"layer {i} out_proj")
+            reasons += _dense_block(
+                attn.out_proj, HIDDEN, layout.o_k, f"layer {i} out_proj"
+            )
         elif hasattr(layer, "o_proj"):
             if i % 4 != 3:
                 reasons.append(
@@ -296,11 +323,15 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             qkv = getattr(layer, "qkv_proj", None)
             qkv_weight = getattr(qkv, "weight", None)
             qkv_n = _shape(qkv_weight)[:1]
-            if len(qkv_n) != 1 or qkv_n[0] % BLOCK:
-                reasons.append(f"layer {i} qkv N is not a multiple of {BLOCK}")
+            if len(qkv_n) != 1 or qkv_n[0] != layout.qkv_n:
+                reasons.append(
+                    f"layer {i} qkv N is {qkv_n[:1]}, TP{layout.tp} wants {layout.qkv_n}"
+                )
             else:
                 reasons += _dense_block(qkv, qkv_n[0], HIDDEN, f"layer {i} qkv")
-            reasons += _dense_block(layer.o_proj, HIDDEN, O_K, f"layer {i} o_proj")
+            reasons += _dense_block(
+                layer.o_proj, HIDDEN, layout.o_k, f"layer {i} o_proj"
+            )
         else:
             reasons.append(f"layer {i}: neither a GDN layer nor a full-attention layer")
     return reasons
@@ -309,9 +340,10 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
 class _Built:
     """One rank's barriers and the decode forward."""
 
-    def __init__(self, model, runtime):
+    def __init__(self, model, runtime, layout):
         self.model = model
         self.runtime = runtime
+        self.layout = layout
         self.check = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
 
     def forward(
@@ -324,7 +356,7 @@ class _Built:
         pp_proxy_tensors=None,
     ):
         """``Qwen3_5MoeForConditionalGeneration.forward`` for a routed decode step."""
-        from sgl_amd_mono.qwen35_a17b_fp8.gfx950.forward import (
+        from sgl_amd_mono.qwen35_a17b.fp8.gfx950.forward import (
             final_norm,
             run_attn,
             run_k1,
@@ -361,7 +393,13 @@ class _Built:
             layer = inner.layers[i]
             if hasattr(layer, "linear_attn"):
                 core, residual = run_k1(
-                    layer, hidden, residual, forward_batch, rows, self.check
+                    layer,
+                    hidden,
+                    residual,
+                    forward_batch,
+                    rows,
+                    self.check,
+                    self.layout,
                 )
                 proj = layer.linear_attn.out_proj
             else:
@@ -385,26 +423,33 @@ def _build(model, hf_config, ctx):
     del hf_config
     from sglang.srt.runtime_context import get_parallel
 
-    from sgl_amd_mono.qwen35_a17b_fp8.gfx950.barrier import PhaseRuntime
+    from sgl_amd_mono.qwen35_a17b.fp8.gfx950.barrier import PhaseRuntime
 
     if ctx.isa != "gfx950":
         raise ValueError(f"Qwen3.5 block-FP8 monokernel is gfx950 only, got {ctx.isa}")
     parallel = get_parallel()
-    if int(parallel.tp_size) != TP:
+    tp = int(parallel.tp_size)
+    if tp not in TP_SIZES:
         raise ValueError(
-            f"Qwen3.5 block-FP8 monokernel is TP{TP}, got TP{parallel.tp_size}"
+            f"Qwen3.5 block-FP8 monokernel supports TP{list(TP_SIZES)}, got TP{tp}"
         )
+    _install_block_fp8_linear()
+    layout = for_tp(tp)
     device = model.model.embed_tokens.weight.device
     runtime = PhaseRuntime(
-        int(parallel.tp_rank), parallel.tp_group.cpu_group, device, ctx.deadline_s
+        int(parallel.tp_rank),
+        parallel.tp_group.cpu_group,
+        device,
+        ctx.deadline_s,
+        tp,
     )
-    return _Built(model, runtime)
+    return _Built(model, runtime, layout)
 
 
 SPEC = MonoSpec(
-    name="qwen35_a17b_fp8_tp4",
+    name="qwen35_a17b_fp8",
     devices={
-        "gfx950": DeviceLimits(widths=ROWS, tp_sizes=(TP,), resident_blocks=BLOCKS)
+        "gfx950": DeviceLimits(widths=ROWS, tp_sizes=TP_SIZES, resident_blocks=BLOCKS)
     },
     features=frozenset(),
     requires=Requirements(
@@ -423,9 +468,6 @@ SPEC = MonoSpec(
 def _install_block_fp8_linear() -> None:
     # Prefill uses SGLang's block-FP8 linear, whose gfx950 small-M helper imports
     # symbols that module no longer defines. Install the stand-in before that import.
-    from sgl_amd_mono.qwen35_a17b_fp8.gfx950.gemv import _allow_block_fp8_linear
+    from sgl_amd_mono.qwen35_a17b.fp8.gfx950.gemv import _allow_block_fp8_linear
 
     _allow_block_fp8_linear()
-
-
-_install_block_fp8_linear()

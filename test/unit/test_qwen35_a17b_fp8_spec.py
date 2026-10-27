@@ -1,6 +1,6 @@
-"""Qwen3.5-397B-A17B block-FP8 TP4 spec on CPU: registration, the gfx950/TP4
-limits, and the refusals for MXFP4, per-channel FP8, a non-TP4 shape, a plain
-RMSNorm and a projection with a bias."""
+"""Qwen3.5-397B-A17B block-FP8 spec on CPU: family registration, TP4 and TP8
+shapes, and the refusals for MXFP4, per-channel FP8, a plain RMSNorm and a
+projection with a bias."""
 
 from types import SimpleNamespace
 
@@ -8,8 +8,18 @@ import torch
 from sglang.srt.monokernels import spec as registry
 
 import sgl_amd_mono
-from sgl_amd_mono.qwen35_a17b_fp8 import spec as fp8
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.layout import LAYERS
+from sgl_amd_mono.qwen35_a17b import spec as family
+from sgl_amd_mono.qwen35_a17b.fp8 import spec as fp8
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.layout import (
+    GDN_K_HEADS,
+    GDN_V_HEADS,
+    INTERMEDIATE,
+    O_K,
+    QKVZ_N,
+    TP,
+)
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.shapes import TP4, TP8, for_tp
+from sgl_amd_mono.qwen35_a17b.layout import LAYERS
 
 ARCH = ["Qwen3_5MoeForConditionalGeneration"]
 
@@ -64,20 +74,22 @@ def _bf16(shape):
     return SimpleNamespace(weight=_Tensor(shape, torch.bfloat16))
 
 
-def _experts(e=513):
+def _experts(layout, e=513):
+    w13_n = layout.w13_n
+    intermediate = layout.intermediate
     return SimpleNamespace(
-        w13_weight=_Tensor((e, 512, 4096), torch.float8_e4m3fn),
-        w13_weight_scale_inv=_Tensor((e, 4, 32), torch.float32),
-        w2_weight=_Tensor((e, 4096, 256), torch.float8_e4m3fn),
-        w2_weight_scale_inv=_Tensor((e, 32, 2), torch.float32),
+        w13_weight=_Tensor((e, w13_n, 4096), torch.float8_e4m3fn),
+        w13_weight_scale_inv=_Tensor((e, w13_n // 128, 32), torch.float32),
+        w2_weight=_Tensor((e, 4096, intermediate), torch.float8_e4m3fn),
+        w2_weight_scale_inv=_Tensor((e, 32, intermediate // 128), torch.float32),
     )
 
 
-def _mlp():
+def _mlp(layout):
     return SimpleNamespace(
         enable_shared_expert_fusion=True,
         reduce_results=False,
-        experts=_experts(),
+        experts=_experts(layout),
         gate=_bf16((512, 4096)),
     )
 
@@ -94,43 +106,58 @@ def _norms():
     return dict(input_layernorm=GemmaRMSNorm(), post_attention_layernorm=GemmaRMSNorm())
 
 
-def _layer(i):
+def _layer(i, layout):
     if i % 4 == 3:
-        qkv_n = 4608
         return SimpleNamespace(
-            mlp=_mlp(),
-            qkv_proj=_fp8((qkv_n, 4096)),
-            o_proj=_fp8((4096, 2048)),
+            mlp=_mlp(layout),
+            qkv_proj=_fp8((layout.qkv_n, 4096)),
+            o_proj=_fp8((4096, layout.o_k)),
             **_norms(),
         )
     return SimpleNamespace(
-        mlp=_mlp(),
+        mlp=_mlp(layout),
         linear_attn=SimpleNamespace(
-            in_proj_qkvz=_fp8((5120, 4096)),
-            in_proj_ba=_bf16((32, 4096)),
-            conv1d=_bf16((3072, 1, 4)),
-            out_proj=_fp8((4096, 2048)),
+            in_proj_qkvz=_fp8((layout.qkvz_n, 4096)),
+            in_proj_ba=_bf16((layout.ba_n, 4096)),
+            conv1d=_bf16((layout.conv_dim, 1, 4)),
+            out_proj=_fp8((4096, layout.o_k)),
         ),
         **_norms(),
     )
 
 
-def _model():
+def _model(layout=TP4):
     return SimpleNamespace(
         model=SimpleNamespace(
-            layers=[_layer(i) for i in range(LAYERS)], norm=GemmaRMSNorm()
+            layers=[_layer(i, layout) for i in range(LAYERS)], norm=GemmaRMSNorm()
         )
     )
 
 
-def test_the_plugin_registers_tp4_block_fp8_on_gfx950():
+def test_tp4_specialization_is_the_layout_module():
+    assert (TP4.tp, TP4.gdn_k_heads, TP4.gdn_v_heads) == (TP, GDN_K_HEADS, GDN_V_HEADS)
+    assert (TP4.qkvz_n, TP4.o_k, TP4.intermediate) == (QKVZ_N, O_K, INTERMEDIATE)
+    assert for_tp(4) is not for_tp(8)
+    assert (TP8.gdn_k_heads, TP8.gdn_v_heads, TP8.qkvz_n) == (2, 8, 2560)
+    assert (TP8.ba_n, TP8.conv_dim, TP8.o_k, TP8.intermediate, TP8.w13_n) == (
+        16,
+        1536,
+        1024,
+        128,
+        256,
+    )
+    assert TP8.qkv_n == 2560
+
+
+def test_the_plugin_registers_the_family_on_gfx950():
     sgl_amd_mono.register_specs()
     found, why = registry.find_spec(
         backend=sgl_amd_mono.BACKEND, architectures=ARCH, isa="gfx950"
     )
-    assert found is fp8.SPEC, why
+    assert found is family.SPEC, why
     limits = found.devices["gfx950"]
-    assert limits.tp_sizes == (4,)
+    assert limits.tp_sizes == (4, 8)
+    assert fp8.SPEC.devices["gfx950"].tp_sizes == (4, 8)
     assert limits.widths == tuple(range(1, 9))
     missing, why = registry.find_spec(
         backend=sgl_amd_mono.BACKEND, architectures=ARCH, isa="gfx942"
@@ -149,10 +176,19 @@ def test_config_accepts_block_fp8_and_refuses_mxfp4():
     )
     mx = _hf(quant_method="mxfp4")
     assert any("block-FP8" in r for r in fp8.SPEC.config_disable_reasons(_cfg(), mx))
+    family_mx = " | ".join(family.SPEC.config_disable_reasons(_cfg(), mx))
+    assert "not in this package" in family_mx, family_mx
+    assert family.SPEC.config_disable_reasons(_cfg(), _hf()) == []
 
 
-def test_model_accepts_tp4_block_scales_and_refuses_per_channel():
-    assert fp8.SPEC.model_disable_reasons(_model(), _hf(), {}) == []
+def test_model_accepts_tp4_and_tp8_and_refuses_per_channel():
+    assert fp8.SPEC.model_disable_reasons(_model(TP4), _hf(), {}) == []
+    assert fp8.SPEC.model_disable_reasons(_model(TP8), _hf(), {}) == []
+    assert family.SPEC.model_disable_reasons(_model(TP8), _hf(), {}) == []
+    odd = _model(TP4)
+    odd.model.layers[0].linear_attn.out_proj = _fp8((4096, 4096))
+    refused = fp8.SPEC.model_disable_reasons(odd, _hf(), {})
+    assert refused and "projection K" in refused[0], refused
     model = _model()
     # per-channel AttnFP8: a 1-D scale instead of a 128x128 block scale
     model.model.layers[3].o_proj = SimpleNamespace(

@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import logging
 
-import torch
-import torch.nn.functional as F
+from sgl_amd_mono.qwen35_a17b.check import _metrics
 
 logger = logging.getLogger(__name__)
+
+__all__ = ["_metrics", "log_check"]
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -21,27 +22,10 @@ SGLANG_READS = {
 }
 
 
-def _metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
-    a = a.detach().float().reshape(-1)
-    b = b.detach().float().reshape(-1)
-    if a.numel() == 0 or b.numel() == 0 or a.numel() != b.numel():
-        return {}
-    diff = a - b
-    denom = b.norm().clamp_min(1e-30)
-    cos = F.cosine_similarity(a, b, dim=0)
-    if not torch.isfinite(cos):
-        cos = torch.ones((), device=a.device) if diff.abs().max().item() == 0 else cos
-    return {
-        "cosine": float(cos.item()),
-        "rel": float(diff.norm().item() / denom.item()),
-        "max_abs": float(diff.abs().max().item()),
-    }
-
-
 def log_check(layer: int, kind: str, rows: int, values: dict[str, float]) -> None:
     from sglang.srt.runtime_context import get_parallel
 
-    from sgl_amd_mono.qwen35_a17b_fp8.spec import NUMERICS
+    from sgl_amd_mono.qwen35_a17b.fp8.spec import NUMERICS
 
     if get_parallel().tp_rank != 0:
         return

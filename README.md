@@ -19,7 +19,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | The FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
-| Qwen3.5-397B-A17B-FP8 | MI355X (gfx950) | 4 | Decode steps of up to 8 rows: every layer's norms, FP8 quants and dense projections, and the 45 GDN layers' conv and gated delta (two launches a GDN layer). Attention and the MoE run SGLang's kernels |
+| Qwen3.5-397B-A17B-FP8 | MI355X (gfx950) | 4, 8 | Decode steps of up to 8 rows: every layer's norms, FP8 quants and dense projections, and the 45 GDN layers' conv and gated delta (two launches a GDN layer). Attention and the MoE run SGLang's kernels |
 
 ### Design
 
@@ -155,10 +155,14 @@ sgl-amd-mono/
 │   │   ├── a16w4.py     # routed experts' MXFP4 GEMV steps
 │   │   ├── a16w8.py     # the shared expert's MXFP8 GEMV steps
 │   │   └── runner.py    # launch runner
-│   ├── qwen35_a17b_fp8/
-│   │   ├── spec.py      # spec and forward
-│   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each launch against SGLang's own layer
-│   │   └── gfx950/      # kernels and the step barriers
+│   ├── qwen35_a17b/
+│   │   ├── spec.py      # family spec: block-FP8 now, MXFP4 when that path moves here
+│   │   ├── config.py    # shared checkpoint checks
+│   │   ├── layout.py    # model facts shared by every precision
+│   │   └── fp8/
+│   │       ├── spec.py  # block-FP8 spec and forward, TP4 and TP8
+│   │       ├── check.py # SGLANG_AMD_MONO_CHECK: each launch against SGLang's own layer
+│   │       └── gfx950/  # kernels and the step barriers
 │   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4; spec and kernels land in its PR
 │   └── qwen38_flash_next/   # Qwen3.8-Flash-Next; spec and kernels land in its PR
 └── test/
@@ -176,7 +180,7 @@ pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_M
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k "minimax_m3 and not minimax_m31"  # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
 pytest test/kernels test/e2e -k minimax_m31                     # 4 x MI350X, MINIMAX_M31_FLASH_MODEL_PATH set
-pytest test/e2e -k qwen35_a17b_fp8                              # 4 x MI355X (CUDA_VISIBLE_DEVICES, default 4-7), QWEN35_FP8_MODEL_PATH set
+pytest test/e2e -k qwen35_a17b_fp8                              # MI355X, QWEN35_FP8_MODEL_PATH set; QWEN35_FP8_TP=4 (default) or 8
 ```
 
 Kernel-only time of the GLM-5.3-Flash launches (no model needed): `torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8` (`--kind full` for the whole served step: layer 0 from the tokens, the dense layers, layers 3 to 44 and the tail).

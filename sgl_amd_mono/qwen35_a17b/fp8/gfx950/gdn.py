@@ -26,7 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.gemv import (
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.gemv import (
     WG_BN,
     WG_ROWS,
     WG_SPLIT,
@@ -35,7 +35,7 @@ from sgl_amd_mono.qwen35_a17b_fp8.gfx950.gemv import (
     wg_dot,
     wg_fits,
 )
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.layout import (
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.layout import (
     BA_N,
     BLOCK,
     CONV_DIM,
@@ -48,7 +48,7 @@ from sgl_amd_mono.qwen35_a17b_fp8.gfx950.layout import (
     QKVZ_N,
     SOFTPLUS_THRESHOLD,
 )
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.norm import quant_buffers
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.norm import quant_buffers
 
 CONV_BLOCK = 1024
 
@@ -288,31 +288,46 @@ def _conv_strides(conv: torch.Tensor):
     return conv.stride(0), conv.stride(2), conv.stride(1)
 
 
-def gdn_core(mod, hidden, hidden_q, conv, ssm, idx, rows: int):
+def gdn_core(mod, hidden, hidden_q, conv, ssm, idx, rows: int, layout=None):
     """The local core ``[rows, V]`` and its FP8 ``(q, scale)``.
 
     ``hidden`` is the input RMSNorm's bf16 output and ``hidden_q`` its FP8 pair.
+    ``layout`` is the rank specialization; omitted, the TP4 constants are used.
     """
+    qkvz_n = QKVZ_N if layout is None else layout.qkvz_n
+    ba_n = BA_N if layout is None else layout.ba_n
+    conv_dim = CONV_DIM if layout is None else layout.conv_dim
+    gdn_k_heads = GDN_K_HEADS if layout is None else layout.gdn_k_heads
+    gdn_v_heads = GDN_V_HEADS if layout is None else layout.gdn_v_heads
+    gdn_head = GDN_HEAD if layout is None else layout.gdn_head
+    hidden_size = HIDDEN if layout is None else layout.hidden
+    fp8_max = FP8_MAX if layout is None else layout.fp8_max
+    threshold = SOFTPLUS_THRESHOLD if layout is None else layout.softplus_threshold
+    tp = 4 if layout is None else layout.tp
     x = hidden[:rows]
     w, w_scale = mod.in_proj_qkvz.weight, mod.in_proj_qkvz.weight_scale_inv
     ba_w = mod.in_proj_ba.weight
     if getattr(mod.in_proj_ba, "bias", None) is not None:
         raise RuntimeError("in_proj_ba has a bias; the fused GDN decode reads none")
-    if w.shape[0] != QKVZ_N or ba_w.shape != (BA_N, HIDDEN) or x.shape[-1] != HIDDEN:
+    if (
+        w.shape[0] != qkvz_n
+        or ba_w.shape != (ba_n, hidden_size)
+        or x.shape[-1] != hidden_size
+    ):
         raise RuntimeError(
             f"GDN projections are {tuple(w.shape)} and {tuple(ba_w.shape)}, "
-            f"TP4 wants [{QKVZ_N}, {HIDDEN}] and [{BA_N}, {HIDDEN}]"
+            f"TP{tp} wants [{qkvz_n}, {hidden_size}] and [{ba_n}, {hidden_size}]"
         )
     cache_idx = idx[:rows]
-    weight = mod.conv1d.weight.reshape(CONV_DIM, CONV_KERNEL)
+    weight = mod.conv1d.weight.reshape(conv_dim, CONV_KERNEL)
     bias = mod.conv1d.bias
-    mixed = torch.empty(rows, CONV_DIM, dtype=x.dtype, device=x.device)
+    mixed = torch.empty(rows, conv_dim, dtype=x.dtype, device=x.device)
     slot_stride, dim_stride, win_stride = _conv_strides(conv)
-    if wg_fits(rows, HIDDEN, w) and CONV_DIM % WG_BN == 0:
+    if wg_fits(rows, hidden_size, w) and conv_dim % WG_BN == 0:
         # Only z's columns are written: the conv columns go straight to ``mixed``
-        qkvz = torch.empty(rows, QKVZ_N, dtype=x.dtype, device=x.device)
+        qkvz = torch.empty(rows, qkvz_n, dtype=x.dtype, device=x.device)
         q, q_scale = hidden_q
-        _proj_conv_kernel[(QKVZ_N // WG_BN,)](
+        _proj_conv_kernel[(qkvz_n // WG_BN,)](
             q,
             q.stride(0),
             q_scale,
@@ -334,8 +349,8 @@ def gdn_core(mod, hidden, hidden_q, conv, ssm, idx, rows: int):
             qkvz,
             qkvz.stride(0),
             rows,
-            C=CONV_DIM,
-            K=HIDDEN,
+            C=conv_dim,
+            K=hidden_size,
             S=WG_SPLIT,
             GROUP=BLOCK,
             BN=WG_BN,
@@ -345,7 +360,7 @@ def gdn_core(mod, hidden, hidden_q, conv, ssm, idx, rows: int):
         )
     else:
         qkvz = block_fp8_gemv_q(x, hidden_q, w, w_scale)
-        _conv_kernel[(rows, triton.cdiv(CONV_DIM, CONV_BLOCK))](
+        _conv_kernel[(rows, triton.cdiv(conv_dim, CONV_BLOCK))](
             qkvz,
             qkvz.stride(0),
             conv,
@@ -357,13 +372,13 @@ def gdn_core(mod, hidden, hidden_q, conv, ssm, idx, rows: int):
             cache_idx,
             mixed,
             mixed.stride(0),
-            CONV_DIM,
+            conv_dim,
             HAS_BIAS=bias is not None,
             BLOCK=CONV_BLOCK,
         )
-    out = torch.empty(rows, GDN_V_HEADS * GDN_HEAD, dtype=x.dtype, device=x.device)
-    out_q, out_scale = quant_buffers(rows, GDN_V_HEADS * GDN_HEAD, x.device)
-    _delta_kernel[(rows, GDN_V_HEADS)](
+    out = torch.empty(rows, gdn_v_heads * gdn_head, dtype=x.dtype, device=x.device)
+    out_q, out_scale = quant_buffers(rows, gdn_v_heads * gdn_head, x.device)
+    _delta_kernel[(rows, gdn_v_heads)](
         mixed,
         mixed.stride(0),
         qkvz,
@@ -387,15 +402,15 @@ def gdn_core(mod, hidden, hidden_q, conv, ssm, idx, rows: int):
         out_q.stride(0),
         out_scale,
         rows,
-        GDN_HEAD**-0.5,
+        gdn_head**-0.5,
         mod.norm.eps,
-        FP8_MAX,
-        1.0 / FP8_MAX,
-        HK=GDN_K_HEADS,
-        HV=GDN_V_HEADS,
-        D=GDN_HEAD,
-        K_IN=HIDDEN,
-        THRESHOLD=SOFTPLUS_THRESHOLD,
+        fp8_max,
+        1.0 / fp8_max,
+        HK=gdn_k_heads,
+        HV=gdn_v_heads,
+        D=gdn_head,
+        K_IN=hidden_size,
+        THRESHOLD=threshold,
         num_warps=8,
     )
     return out, (out_q, out_scale)

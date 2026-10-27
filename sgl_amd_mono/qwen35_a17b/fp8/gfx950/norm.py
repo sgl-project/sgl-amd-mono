@@ -20,7 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sgl_amd_mono.qwen35_a17b_fp8.gfx950.layout import BLOCK, FP8_MAX, HIDDEN
+from sgl_amd_mono.qwen35_a17b.fp8.gfx950.layout import BLOCK, FP8_MAX, HIDDEN
 
 
 @triton.jit
