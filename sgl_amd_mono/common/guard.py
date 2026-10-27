@@ -119,9 +119,13 @@ class Guard:
         fault_after=0,
         stop=True,
     ):
+        assert (own is None) == (peers is None), (
+            "own and peers come together: a rank reads the flags its peers write"
+        )
         self.epoch = epoch
         self.own = own
         self.peers = peers
+        self.has_peers = peers is not None
         self.rank = rank
         self.npes = npes
         self.flags_offset = flags_offset
@@ -178,7 +182,7 @@ class Guard:
 
     def flags(self):
         """This rank's flags as its peers wrote them (system scope); 0 when clean."""
-        if self.own is None:
+        if not self.has_peers:
             return fx.Int32(0)
         acc = fx.Int32(0)
         # a buffer load carries at most 4 dwords: TP 8 reads its flags in two
@@ -210,7 +214,7 @@ class Guard:
         bo.buffer_store(
             fx.Int32(site + 1), rsrc(self.epoch), ERR_DEADLINE, cache_modifier=CM_DEV
         )
-        if self.peers is not None:
+        if self.has_peers:
             for p in range_constexpr(self.npes):
                 bo.buffer_store(
                     fx.Int32(1),

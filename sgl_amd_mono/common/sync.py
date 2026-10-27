@@ -56,7 +56,7 @@ def _spin(load_all, pending):
         # 32-bit units), so it needs no VGPRs at the batch's peak either. Without
         # peers it reads no error words: a wait on this GPU that failed stopped
         # the whole launch already.
-        scalar_deadline, peers = g.scalar_deadline, g.own is not None
+        scalar_deadline, has_peers = g.scalar_deadline, g.has_peers
         t0 = fx.Int64(0)
         polls = fx.Int32(0)
         while pending(v):
@@ -68,7 +68,7 @@ def _spin(load_all, pending):
                 t0 = (polls == CHECK_POLLS).select(now, t0)
                 if fx.Int32((now - t0) >> guard.TICK_SHIFT) > scalar_deadline():
                     fail(site)
-                if const_expr(peers):
+                if const_expr(has_peers):
                     if stopped():
                         note_peer()
         return v
