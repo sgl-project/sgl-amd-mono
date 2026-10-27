@@ -18,7 +18,9 @@ per-token FP8 quant, SGLang's in_proj GEMM, and the draft-chain conv, delta
 and gated norm up to out_proj's input. SGLang's embedding, final norm and
 logits processor run around the layers.
 
-The kernels read SGLang's weights in place at each launch (SGLang repacks
+The family spec ``sgl_amd_mono.qwen35_a17b.spec`` selects this package when the
+checkpoint is Quark MXFP4. It stays TP4. The kernels read SGLang's weights in
+place at each launch (SGLang repacks
 in_proj_qkvz after the build). The kernels also have the fused shared expert
 (K2 ``fse``) and MXFP4 GDN projections (K1 ``qq``, K2 ``oq``). Until SGLang
 serves them (sglang#41899, sglang#43839), the spec refuses them at startup.
@@ -44,8 +46,8 @@ from sglang.srt.monokernels.spec import (
     Requirements,
 )
 
-from sgl_amd_mono.qwen35_a17b_attnfp8 import HF_CONFIG
-from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950 import layout as L
+from sgl_amd_mono.qwen35_a17b.mxfp4 import HF_CONFIG
+from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950 import layout as L
 
 logger = logging.getLogger(__name__)
 
@@ -440,7 +442,7 @@ class _Built:
             if _is_gdn(layer) and not verify:
                 core, res_attn = self._k1(i, layer, h, residual, idx, s, fb)
             elif _is_gdn(layer):
-                from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950.verify_gdn import (
+                from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950.verify_gdn import (
                     verify_layer,
                 )
 
@@ -499,8 +501,8 @@ class _Built:
 
     def _k1(self, i, layer, h, residual, idx, s, check_batch=None):
         """``check_batch``: the forward batch in check mode, else None."""
-        from sgl_amd_mono.qwen35_a17b_attnfp8 import check
-        from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950 import gdn
+        from sgl_amd_mono.qwen35_a17b.mxfp4 import check
+        from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950 import gdn
 
         a = layer.linear_attn
         conv, temporal = self._state(a)
@@ -538,8 +540,8 @@ class _Built:
         return core, res_out
 
     def _k2(self, i, layer, core, residual, s, check_batch=None):
-        from sgl_amd_mono.qwen35_a17b_attnfp8 import check
-        from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950 import layer as k2
+        from sgl_amd_mono.qwen35_a17b.mxfp4 import check
+        from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950 import layer as k2
 
         mlp = layer.mlp
         o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
@@ -620,8 +622,8 @@ def _build(model, hf_config, ctx) -> _Built:
 
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
-    from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950 import gdn
-    from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950 import layer as k2
+    from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950 import gdn
+    from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950 import layer as k2
 
     _writable_flydsl_cache()
     p = get_parallel()

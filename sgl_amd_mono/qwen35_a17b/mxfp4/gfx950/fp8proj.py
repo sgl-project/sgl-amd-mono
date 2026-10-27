@@ -24,7 +24,7 @@ from flydsl.expr.typing import T
 from sgl_amd_mono.common.mx import UNIT_SCALE, mfma_scaled
 from sgl_amd_mono.common.ops import bf_hi, bf_lo, fp8_pack4, rsrc
 from sgl_amd_mono.common.plan import THREADS, WAVES
-from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950._k3 import LDS_PAD
+from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950._k3 import LDS_PAD
 
 FP8_MAX = 448.0
 

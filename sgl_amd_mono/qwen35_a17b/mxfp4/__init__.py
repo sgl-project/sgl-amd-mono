@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2 monokernels.
+"""Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2 monokernels (TP4).
 
 Projections are Quark per-channel FP8. Routed experts and the fused shared
-expert are MXFP4. The spec is ``spec.py``; the gfx950 kernels are ``gfx950``.
+expert are MXFP4. The family spec selects this package; ``spec.py`` is the
+precision spec and ``gfx950`` holds the kernels.
 """
 
 HF_CONFIG = {

@@ -74,22 +74,22 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, sreg
-from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950 import _k3 as gemv
-from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950 import layout as L
-from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950._k3 import KernelAbi, wave_sum
-from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950.fp8proj import (
+from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950 import _k3 as gemv
+from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950 import layout as L
+from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950._k3 import KernelAbi, wave_sum
+from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950.fp8proj import (
     fp8_loads,
     fp8_mfmas,
     ld_f32,
     quant_pc,
     x8_row,
 )
-from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950.layer import (
+from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950.layer import (
     fp4_gemv,
     fp4_gemv_loads,
     quant_x,
 )
-from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950.layout import need
+from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950.layout import need
 
 SOURCES = kernel_sources(__name__)
 

@@ -20,7 +20,18 @@ import torch
 import triton
 import triton.language as tl
 
-from sgl_amd_mono.qwen35_a17b_attnfp8.gfx950 import layout as L
+from sgl_amd_mono.qwen35_a17b.mxfp4.gfx950 import layout as L
+
+# The SGLang names this module reads (test/unit/test_contract.py pins them)
+SGLANG_READS = {
+    "srt/layers/attention/linear/utils.py": (
+        "select_verify_intermediate_state_indices",
+    ),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "kernels/ops/quantization/fp8_kernel.py": ("fp8_dtype",),
+    "srt/layers/quantization/fp8_utils.py": ("apply_fp8_linear",),
+}
+
 
 _LOGGED = False
 
@@ -429,6 +440,6 @@ def _chain(mod, qkvz, ba, forward_batch, rows, tokens) -> torch.Tensor:
 
 
 def _identity_out_proj(mod):
-    from sgl_amd_mono.qwen35_a17b_attnfp8.spec import _proj_input
+    from sgl_amd_mono.qwen35_a17b.mxfp4.spec import _proj_input
 
     return _proj_input(mod, "out_proj")

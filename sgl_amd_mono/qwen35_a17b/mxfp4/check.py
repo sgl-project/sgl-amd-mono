@@ -56,7 +56,7 @@ def _live(idx: torch.Tensor) -> torch.Tensor:
 
 def k1_reference(layer, h, residual, conv, temporal, idx, forward_batch) -> dict:
     """SGLang's input norm and GDN on K1's input; the state rows are restored."""
-    from sgl_amd_mono.qwen35_a17b_attnfp8.spec import _proj_input
+    from sgl_amd_mono.qwen35_a17b.mxfp4.spec import _proj_input
 
     rows = _live(idx)
     saved = conv[rows].clone(), temporal[rows].clone()
@@ -106,7 +106,7 @@ def k2_reference(layer, o_proj, core, residual, forward_batch) -> dict:
 def compare(kind: str, layer_id: int, rows: int, ref: dict, got: dict) -> None:
     from sglang.srt.runtime_context import get_parallel
 
-    from sgl_amd_mono.qwen35_a17b_attnfp8.spec import NUMERICS
+    from sgl_amd_mono.qwen35_a17b.mxfp4.spec import NUMERICS
 
     if get_parallel().tp_rank != 0:
         return
