@@ -69,7 +69,7 @@ from .plan import (
     WOA_ROWS,
     Dims,
     cdiv,
-    k2_chunk_keys as chunk_keys,
+    k2_chunk_keys,
     tile_rows,
     token_tiles,
 )
@@ -102,6 +102,11 @@ def head_groups(d: Dims, s: int) -> int:
     64-key chunks, twice the units) while the units fit the grid, else one (a
     wave's keys loaded and dequantized once for every head tile)."""
     return 2 if d.head_tiles == 2 and s * cdiv(KEYS, 64) <= BLOCKS else 1
+
+
+def chunk_keys(d: Dims, s: int) -> int:
+    """A split unit's keys; plan.back_scratch sizes K2's scratch with the same value."""
+    return k2_chunk_keys(d, s)
 
 
 def p_row(d: Dims, s: int) -> int:
