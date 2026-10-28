@@ -1274,7 +1274,7 @@ SPEC = MonoSpec(
     devices={
         "gfx950": DeviceLimits(
             widths=tuple(range(1, MAX_ROWS + 1)),
-            tp_sizes=(2, 4),
+            tp_sizes=(2, 4, 8),
             resident_blocks=BLOCKS,
         )
     },

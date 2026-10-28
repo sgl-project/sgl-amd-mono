@@ -45,15 +45,20 @@ class Dims(msgspec.Struct, frozen=True):
     tp: int
 
     def __post_init__(self):
-        assert self.tp in (2, 4), self.tp
+        assert self.tp in (2, 4, 8), self.tp
 
     @property
     def heads(self) -> int:
         return N_HEADS // self.tp
 
     @property
+    def tile_heads(self) -> int:
+        """``heads`` padded to whole head tiles: TP8's 8 heads fill half of one."""
+        return round_up(self.heads, HEAD_TILE)
+
+    @property
     def head_tiles(self) -> int:
-        return self.heads // HEAD_TILE
+        return self.tile_heads // HEAD_TILE
 
     @property
     def groups(self) -> int:

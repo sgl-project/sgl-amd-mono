@@ -124,6 +124,18 @@ def publish(c, region, i):
 
 
 @flyc.jit
+def store_partial(part, words, off):
+    """A lane's 32 B of a head's chunk partial: ``words`` (8 i32) at i32 ``off``."""
+    for hlf in range_constexpr(2):
+        bo.buffer_store(
+            fx.Vector.from_elements(words[4 * hlf : 4 * hlf + 4], fx.Int32),
+            rsrc(part),
+            off + 4 * hlf,
+            cache_modifier=CM_DEV,
+        )
+
+
+@flyc.jit
 def await_flags(c, region, n, index):
     """Thread u < n polls flag ``index(u)``; then the CTA proceeds."""
     tid = c["tid"]
@@ -208,6 +220,7 @@ def stage_split(c, unit):
     k0 = ch * ck
     # q does not depend on the key table: in flight before an index source's wait
     qrow = d.heads * HEAD_DIM // 8
+    qpad = d.tile_heads * HEAD_DIM // 8  # with the head tile's padding rows
     qv = []
     for i in range_constexpr(cdiv(qrow, THREADS)):
         u = fresh(tid) + THREADS * i
@@ -248,6 +261,18 @@ def stage_split(c, unit):
                     + (u // (HEAD_DIM // 8)) * Q_ROW
                     + (u % (HEAD_DIM // 8)) * 4,
                 )
+        if const_expr(qpad > qrow):
+            # the tile's padding heads score zeros; their columns are never stored
+            zero = fx.Vector.filled(4, 0.0, fx.Float32).bitcast(fx.Int32)
+            for i in range_constexpr(cdiv(qpad - qrow, THREADS)):
+                u = fresh(tid) + THREADS * i + qrow
+                if u < qpad:
+                    fx.ptr_store(
+                        zero,
+                        sl["q"]
+                        + (u // (HEAD_DIM // 8)) * Q_ROW
+                        + (u % (HEAD_DIM // 8)) * 4,
+                    )
         # the raw rows to LDS for the PV: every head group loaded the same keys, group 0 stores
         if hgi == 0:
             rawb = sl["raw"] + (kt * 16 + r16) * (REC // 4)
@@ -301,7 +326,7 @@ def stage_split(c, unit):
                 fx.ptr_store(mw, st + ((hgi * nht + ht) * nkt + kt) * HEAD_TILE + r16)
             svs.append(sv)
         gpu.barrier()
-        lst = st + d.heads * nkt
+        lst = st + d.tile_heads * nkt
         for ht in range_constexpr(nht):
             hti = hgi * nht + ht
             m = fx.ptr_load(st + (hti * nkt) * HEAD_TILE + r16)
@@ -432,13 +457,11 @@ def stage_split(c, unit):
                 w2 = v4.to(fx.BFloat16).bitcast(fx.Int32)
                 words += [w2[0], w2[1]]
             off = (((t * nchunk + ch) * d.heads + hh) * HEAD_DIM + dbase + 16 * g) // 2
-            for hlf in range_constexpr(2):
-                bo.buffer_store(
-                    fx.Vector.from_elements(words[4 * hlf : 4 * hlf + 4], fx.Int32),
-                    rsrc(c["part"]),
-                    off + 4 * hlf,
-                    cache_modifier=CM_DEV,
-                )
+            if const_expr(d.tile_heads > d.heads):
+                if r16 < d.heads:
+                    store_partial(c["part"], words, off)
+            else:
+                store_partial(c["part"], words, off)
         publish(c, c["srdy"], (t * nchunk + ch) * FLAG_STRIDE)
         stamp(c, 7)
 
@@ -672,10 +695,10 @@ def back_lds_members(s: int, d: Dims) -> dict:
 
     @fx.struct
     class SplitLds:
-        q: fx.Array[fx.Int32, d.heads * Q_ROW, 16]
+        q: fx.Array[fx.Int32, d.tile_heads * Q_ROW, 16]
         raw: fx.Array[fx.Int32, ck * REC // 4, 16]
-        p: fx.Array[fx.Int32, d.heads * p_row(d, s), 16]
-        st: fx.Array[fx.Float32, 2 * d.heads * (WAVES // head_groups(d, s)), 16]
+        p: fx.Array[fx.Int32, d.tile_heads * p_row(d, s), 16]
+        st: fx.Array[fx.Float32, 2 * d.tile_heads * (WAVES // head_groups(d, s)), 16]
 
     @fx.struct
     class GemvLds:
