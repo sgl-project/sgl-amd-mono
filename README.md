@@ -18,6 +18,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | DeepSeek-V4-Pro | MI355X (gfx950) | 8 | All 61 layers (one launch each) in decode steps of up to 8 rows, and DSpark verify steps of one request (5 to 8 tokens) |
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | All 45 layers (one launch each; layer 0 from the tokens, with the embedding) and the final norm, LM head and logits (one launch), in decode steps of up to 8 rows (4 at TP2) |
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
+| Kimi-K3 | MI350X, MI355X (gfx950) | 8 | Every MoE layer in decode and DSpark verify steps of up to 8 rows |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
 
@@ -97,6 +98,18 @@ SGLANG_USE_AITER=1 SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1 python -m sglang.launch_s
   --monokernel-backend amd
 ```
 
+Kimi-K3 runs at TP8, where the win is on small decode and DSpark verify steps:
+
+```bash
+SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 python -m sglang.launch_server \
+  --model-path moonshotai/Kimi-K3 --trust-remote-code \
+  --tp 8 \
+  --attention-backend aiter \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 7 \
+  --enable-amd-monokernel
+```
+
 MiniMax-M3.1-Flash, with DSpark:
 
 ```bash
@@ -155,6 +168,9 @@ sgl-amd-mono/
 │   │   ├── spec.py      # spec and forward
 │   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
 │   │   └── gfx950/      # kernels and launch runner
+│   ├── kimi_k3/
+│   │   ├── spec.py      # spec and forward
+│   │   └── gfx950/      # kernels and launch runner
 │   ├── minimax/
 │   │   ├── spec.py      # the MiniMax-M3 architecture's spec: selects M3 or M3.1
 │   │   └── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
@@ -186,6 +202,7 @@ pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_M
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k "minimax_m3 and not minimax_m31"  # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
 pytest test/kernels test/e2e -k minimax_m31                     # 4 x MI350X, MINIMAX_M31_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k kimi_k3                         # 8 x MI350X or MI355X, KIMI_K3_MODEL_PATH and KIMI_K3_DSPARK_MODEL_PATH set
 ```
 
 Kernel-only time of the GLM-5.3-Flash launches (no model needed): `torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8` (`--kind full` for the whole served step: layer 0 from the tokens, the dense layers, layers 3 to 44 and the tail).

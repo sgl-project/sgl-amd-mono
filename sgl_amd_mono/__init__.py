@@ -30,6 +30,7 @@ SPECS = {
         "MiniMaxM3SparseForConditionalGeneration",
         None,
     ): "sgl_amd_mono.minimax.spec:SPEC",
+    ("KimiK3ForConditionalGeneration", None): "sgl_amd_mono.kimi_k3.spec:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
