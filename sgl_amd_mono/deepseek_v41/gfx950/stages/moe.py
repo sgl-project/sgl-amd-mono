@@ -572,8 +572,9 @@ def gemv_fp4_pair(c, w, ws, e, n_rows, k, rg0, ks, xl, xsl, scale_cols, col):
     slices = c["rs"].ug_k_slices
     rounds = ug_rounds(k, ks, slices)
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
-    # rounds whose loads are in flight past the one computing
-    ahead = slices // 2
+    # rounds whose loads are in flight past the one computing; TP8's ug tasks outnumber
+    # the CTAs, so the CTAs that run two stream each at what loads they keep in flight
+    ahead = slices if c["d"].tp >= 8 else slices // 2
     ops = [
         fp4_pair_loads(c, w, ws, e, n_rows, k, rg0, scale_cols, *rounds[q])
         for q in range(min(ahead, len(rounds)))
