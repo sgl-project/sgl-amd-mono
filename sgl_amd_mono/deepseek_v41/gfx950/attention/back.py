@@ -59,6 +59,7 @@ from .gemv import (
 )
 from .plan import (
     DATA,
+    FLAG_STRIDE,
     HALF,
     HEAD_DIM,
     HEAD_TILE,
@@ -404,7 +405,7 @@ def stage_split(c, unit):
                     off + 4 * hlf,
                     cache_modifier=CM_DEV,
                 )
-        publish(c, c["srdy"], t * nchunk + ch)
+        publish(c, c["srdy"], (t * nchunk + ch) * FLAG_STRIDE)
         stamp(c, 7)
 
 
@@ -447,7 +448,7 @@ def stage_combine(c, unit):
         await_flags(c, c["krdy"], 1, lambda u: t)
     kv_len = ld_i32(a["klen"], t, CM_DEV if const_expr("krdy" in c) else 0)
     nlive = (kv_len + ck - 1) // ck
-    await_flags(c, c["srdy"], nlive, lambda u: t * nchunk + u)
+    await_flags(c, c["srdy"], nlive, lambda u: (t * nchunk + u) * FLAG_STRIDE)
     m = fx.Float32(NEG)
     ms, ls, vs = [], [], []
     for cc in range_constexpr(nchunk):
@@ -502,7 +503,7 @@ def stage_combine(c, unit):
         t * (d.q_rows // 2) + (h * HEAD_DIM + d0) // 2,
         cache_modifier=CM_DEV,
     )
-    publish(c, c["crdy"], t * hg_n + hg)
+    publish(c, c["crdy"], (t * hg_n + hg) * FLAG_STRIDE)
 
 
 # ---------------------------------------------------------------- wo_a / wo_b
@@ -762,7 +763,7 @@ def run_back(c, key, bid):
             c,
             c["crdy"],
             n_tokens,
-            lambda u: (t0 + u) * (heads // COMB_HEADS) + grp,
+            lambda u: ((t0 + u) * (heads // COMB_HEADS) + grp) * FLAG_STRIDE,
         )
         stamp(c, 9)
         # the group's XO rows a K half at a time, the next half's loads in flight
@@ -784,22 +785,24 @@ def run_back(c, key, bid):
                 if woa_unit // woa_tasks == ti:
                     woa_tile(ti, tiles[ti][1])
             stamp(c, 10)
-            publish(c, c["ardy"], woa_unit)
+            publish(c, c["ardy"], woa_unit * FLAG_STRIDE)
         else:
             # every token tile in turn, the first waiting on every row's flags
             for ti in range_constexpr(nt):
                 woa_tile(ti, s if ti == 0 else 0)
             stamp(c, 10)
-            publish(c, c["ardy"], woa_t)
+            publish(c, c["ardy"], woa_t * FLAG_STRIDE)
     stamp(c, 3)
     if const_expr(not early_wob):
         wops = wob_weights()
     stamp(c, 11)
     if const_expr(woa_spread):
         # this tile's wo_a units
-        await_flags(c, c["ardy"], woa_tasks, lambda u: wob_tile * woa_tasks + u)
+        await_flags(
+            c, c["ardy"], woa_tasks, lambda u: (wob_tile * woa_tasks + u) * FLAG_STRIDE
+        )
     else:
-        await_flags(c, c["ardy"], woa_tasks, lambda u: u)
+        await_flags(c, c["ardy"], woa_tasks, lambda u: u * FLAG_STRIDE)
     stamp(c, 12)
     x8b = (
         c["x8b"],

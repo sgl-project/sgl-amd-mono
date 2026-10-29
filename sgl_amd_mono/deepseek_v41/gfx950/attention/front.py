@@ -23,7 +23,7 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.plan import first_task
 from sgl_amd_mono.common.stamps import stamp
-from sgl_amd_mono.common.sync import preg
+from sgl_amd_mono.common.sync import FLAG_STRIDE, preg
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
@@ -339,7 +339,7 @@ def stage_qkv(c, t):
                         )
         gpu.barrier()
     else:
-        publish(c, c["qrdy"], t)
+        publish(c, c["qrdy"], t * FLAG_STRIDE)
 
 
 def record_scales(red):
@@ -692,7 +692,7 @@ def run_front(
             stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
             index_tile(ti, t0, n)
     else:
-        await_flags(c, c["qrdy"], s, lambda u: u)
+        await_flags(c, c["qrdy"], s, lambda u: u * FLAG_STRIDE)
         stamp(c, 38)
         qx = (c["qx8"], c["qx8s"], QX_WORDS, 0, QX_WORDS, Q_RANK // 32, 0, Q_RANK // 32)
         regs = rows_loads(c, *qx, *tiles[0])
