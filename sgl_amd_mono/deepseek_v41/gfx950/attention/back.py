@@ -165,15 +165,20 @@ def _scale_byte(scw, blk64):
     return (scw[blk64 // 4] >> (blk64 % 4 * 8)) & 0xFF
 
 
-def _fp8_pair_f32(word, scale, hi):
-    v = rocdl.cvt_scalef32_pk_f32_fp8(
-        fx.Vector.make_type(2, fx.Float32),
-        as_ir_value(fx.Int32(word)),
-        as_ir_value(fx.Float32(scale)),
-        hi,
-    )
-    v = fx.Vector(v)
-    return [v[0], v[1]]
+def _fp8_quad_bf16(word, scale):
+    """A dword's four E4M3 times a power-of-two ``scale`` -> four bf16 (exact)."""
+    out = []
+    for hi in (False, True):
+        v = fx.Vector(
+            rocdl.cvt_scalef32_pk_bf16_fp8(
+                T.bf16x2,
+                as_ir_value(fx.Int32(word)),
+                as_ir_value(fx.Float32(scale)),
+                hi,
+            )
+        )
+        out += [v[0], v[1]]
+    return out
 
 
 # ---------------------------------------------------------------- split
@@ -331,59 +336,88 @@ def stage_split(c, unit):
                 ((t * nchunk + ch) * d.heads + tid) * 2,
                 cache_modifier=CM_DEV,
             )
-        # PV: wave w dims 64 w + 4 r16 + dt (an LDS word holds a key's four), lane g keys 4 g + j
+        # PV: wave w dims 64 w + 4 r16 + dt (an LDS word holds a key's four), lane g keys 4 g + j.
+        # Every tile's LDS reads go out before the first MFMA and the rope wave branches once:
+        # a read, convert, MFMA chain a tile is LDS-latency bound.
         is_rope = wave == WAVES - 1
         dbase = 64 * wave
         sh = (wave % 4) * 8
-        accs = [
-            [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(4)]
-            for _ in range(d.head_tiles)
-        ]
-        for kt2 in range_constexpr(nkt):
-            rb0 = sl["raw"] + (kt2 * 16 + 4 * g) * (REC // 4)
-            vv = fx.Vector.filled(16, 0.0, fx.Float32)  # [dt][j]
-            if is_rope:
-                rv = []
-                for j in range_constexpr(4):
-                    rw = fx.ptr_load(
-                        rb0 + j * (REC // 4) + (NOPE + 8 * r16) // 4,
-                        result_type=fx.Vector.make_type(2, fx.Int32),
-                    )
-                    rv.append([bf_lo(rw[0]), bf_hi(rw[0]), bf_lo(rw[1]), bf_hi(rw[1])])
-                vv = fx.Vector.from_elements(
-                    [rv[j][dt] for dt in range(4) for j in range(4)], fx.Float32
-                )
-            else:
-                nv = []
-                for j in range_constexpr(4):
-                    rb = rb0 + j * (REC // 4)
-                    w = fx.ptr_load(rb + (dbase + 4 * r16) // 4)
-                    scb = fx.ptr_load(rb + DATA // 4 + wave // 4)
-                    scl = pow2((scb >> sh) & 0xFF)
-                    nv.append(
-                        _fp8_pair_f32(w, scl, False) + _fp8_pair_f32(w, scl, True)
-                    )
-                vv = fx.Vector.from_elements(
-                    [nv[j][dt] for dt in range(4) for j in range(4)], fx.Float32
-                )
-            for ht2 in range_constexpr(d.head_tiles):
-                pb = fx.ptr_load(
+        pbs = [
+            [
+                fx.ptr_load(
                     sl["p"]
                     + (ht2 * HEAD_TILE + r16) * p_row(d, s)
                     + (kt2 * 16 + 4 * g) // 2,
                     result_type=fx.Vector.make_type(2, fx.Int32),
                 ).bitcast(fx.Int16)
-                for dt in range_constexpr(4):
-                    av = (
-                        fx.Vector.from_elements(
-                            [vv[dt * 4 + j] for j in range(4)], fx.Float32
-                        )
-                        .to(fx.BFloat16)
-                        .bitcast(fx.Int16)
+                for kt2 in range(nkt)
+            ]
+            for ht2 in range(d.head_tiles)
+        ]
+        rows = [
+            [sl["raw"] + (kt2 * 16 + 4 * g + j) * (REC // 4) for j in range(4)]
+            for kt2 in range(nkt)
+        ]
+        bz = fx.Vector.filled(4, 0.0, fx.Float32).to(fx.BFloat16)
+        avs = [[bz for _ in range(4)] for _ in range(nkt)]  # [kt2][dt]: keys 4 g + j
+        if is_rope:
+            rws = [
+                [
+                    fx.ptr_load(
+                        rb + (NOPE + 8 * r16) // 4,
+                        result_type=fx.Vector.make_type(2, fx.Int32),
+                    ).bitcast(fx.BFloat16)
+                    for rb in rows[kt2]
+                ]
+                for kt2 in range(nkt)
+            ]
+            avs = [
+                [
+                    fx.Vector.from_elements(
+                        [rws[kt2][j][dt] for j in range(4)], fx.BFloat16
                     )
+                    for dt in range(4)
+                ]
+                for kt2 in range(nkt)
+            ]
+        else:
+            ws = [
+                [fx.ptr_load(rb + (dbase + 4 * r16) // 4) for rb in rows[kt2]]
+                for kt2 in range(nkt)
+            ]
+            scbs = [
+                [fx.ptr_load(rb + DATA // 4 + wave // 4) for rb in rows[kt2]]
+                for kt2 in range(nkt)
+            ]
+            avs = []
+            for kt2 in range_constexpr(nkt):
+                pk = []
+                for j in range_constexpr(4):
+                    scl = pow2((scbs[kt2][j] >> sh) & 0xFF)
+                    pk.append(_fp8_quad_bf16(ws[kt2][j], scl))
+                avs.append(
+                    [
+                        fx.Vector.from_elements(
+                            [pk[j][dt] for j in range(4)], fx.BFloat16
+                        )
+                        for dt in range(4)
+                    ]
+                )
+        accs = [
+            [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(4)]
+            for _ in range(d.head_tiles)
+        ]
+        for kt2 in range_constexpr(nkt):
+            for ht2 in range_constexpr(d.head_tiles):
+                for dt in range_constexpr(4):
                     accs[ht2][dt] = fx.Vector(
                         rocdl.mfma_f32_16x16x16bf16_1k(
-                            T.vec(4, T.f32), [av, pb, accs[ht2][dt]]
+                            T.vec(4, T.f32),
+                            [
+                                avs[kt2][dt].bitcast(fx.Int16),
+                                pbs[ht2][kt2],
+                                accs[ht2][dt],
+                            ],
                         )
                     )
         stamp(c, 6)
