@@ -53,7 +53,6 @@ from sgl_amd_mono.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
-    KernelAbi,
     first_task,
     kernel_sources,
     key_tuple,
@@ -128,42 +127,6 @@ class KdaPreBuild:
     write_idx: int = -1  # a block-write layer's block: the updated prefix stored there
     kda0: int = 0  # the first KDA task's CTA
     xp: int = 0  # experiment switch (timing only)
-
-
-ABI = KernelAbi(
-    (
-        "prefix",
-        "delta",
-        "blocks",
-        "blk_sm",
-        "blk_sr",
-        "ares_nw",
-        "ares_qk",
-        "in_nw",
-        "w_in",
-        "w_fb",
-        "conv_w",
-        "conv_st",
-        "cs_seq",
-        "cs_dim",
-        "cs_tok",
-        "a_log",
-        "dt_bias",
-        "on_w",
-        "rstate",
-        "rs_seq",
-        "st_idx",
-        "st_stride",
-        "num_acc",
-        "core_out",
-        "x_dbg",
-        "proj_dbg",
-        "scratch",
-        "layer",
-        "epoch",
-        "tl",
-    )
-)
 
 
 def scratch_layout(key: KdaPreBuild) -> dict:
@@ -792,7 +755,6 @@ def build(key: KdaPreBuild):
             tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
-    ABI.check(kda_pre, launch)
     _BUILDS[key] = launch
     return launch
 

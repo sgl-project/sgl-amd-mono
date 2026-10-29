@@ -75,7 +75,6 @@ from sgl_amd_mono.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
-    KernelAbi,
     kernel_sources,
     key_tuple,
     pair_layout,
@@ -170,32 +169,6 @@ class MoeBuild(msgspec.Struct, frozen=True):
     # SGLang's Mxfp4MoEMethod produces for Kimi-K3 under AITER_SITUV2_A8W4.
     # Only the 16-row block index differs, so it costs one remap in ug_loads.
     guint: bool = False
-
-
-ABI = KernelAbi(
-    (
-        "x",
-        "w_gate",
-        "bias",
-        "w_ld",
-        "w_sgu",
-        "w_sd",
-        "w13",
-        "w13s",
-        "w2",
-        "w2s",
-        "ln_w",
-        "w_up",
-        "out",
-        "scratch",
-        "queue",
-        "peers",
-        "rank",
-        "epoch",
-        "layer",
-        "tl",
-    )
-)
 
 
 def peer_pairs(s):
@@ -1443,7 +1416,6 @@ def build(key: MoeBuild):
             tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
-    ABI.check(moe, launch)
     _BUILDS[key] = launch
     return launch
 

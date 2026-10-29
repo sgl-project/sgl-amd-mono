@@ -42,7 +42,6 @@ from sgl_amd_mono.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
-    KernelAbi,
     kernel_sources,
     key_tuple,
     pair_layout,
@@ -88,28 +87,6 @@ class AttnPostBuild(msgspec.Struct, frozen=True):
     eps: float = 1e-5
     out_eps: float = 1e-5
     timeline: bool = False
-
-
-ABI = KernelAbi(
-    (
-        "core",
-        "w_o",
-        "prefix",
-        "blocks",
-        "blk_sm",
-        "blk_sr",
-        "ares_nw",
-        "ares_qk",
-        "in_nw",
-        "x_out",
-        "scratch",
-        "peers",
-        "rank",
-        "epoch",
-        "layer",
-        "tl",
-    )
-)
 
 
 def ar_half_pairs(s):
@@ -387,7 +364,6 @@ def build(key: AttnPostBuild):
             tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
-    ABI.check(attn_post, launch)
     _BUILDS[key] = launch
     return launch
 

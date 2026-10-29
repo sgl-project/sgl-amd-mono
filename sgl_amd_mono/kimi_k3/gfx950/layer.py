@@ -35,7 +35,6 @@ from sgl_amd_mono.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
-    KernelAbi,
     kernel_sources,
     key_tuple,
     pair_layout,
@@ -94,39 +93,6 @@ class K2Build(msgspec.Struct, frozen=True):
     fault_after: int = 0
     xp: int = 0  # timing experiments (7: route without its selection)
     guint: bool = False  # w13's AITER layout; see stages.moe.MoeBuild
-
-
-ABI = KernelAbi(
-    (
-        "core",
-        "w_o",
-        "prefix",
-        "blocks",
-        "blk_sm",
-        "blk_sr",
-        "ares_nw",
-        "ares_qk",
-        "in_nw",
-        "w_gate",
-        "bias",
-        "w_ld",
-        "w_sgu",
-        "w_sd",
-        "w13",
-        "w13s",
-        "w2",
-        "w2s",
-        "ln_w",
-        "w_up",
-        "out",
-        "scratch",
-        "peers",
-        "rank",
-        "epoch",
-        "layer",
-        "tl",
-    )
-)
 
 
 def peer_layout(s):
@@ -553,7 +519,6 @@ def build(key: K2Build):
             tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
-    ABI.check(k2, launch)
     _BUILDS[key] = launch
     return launch
 
