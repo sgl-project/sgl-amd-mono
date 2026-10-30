@@ -46,6 +46,8 @@ from .stages.dims import Dims as StageDims
 from .stages.gemv import plus
 from .stages.moe_shape import EXPERTS, SORT_NETS, TOPK, MoeBuild, route_shape
 from .token_par import (
+    chunk_pairs,
+    half_pair,
     own_view,
     peer_layout,
     peer_offsets,
@@ -632,8 +634,9 @@ def push_bf_row(c, bases, off, t, col, ys, live):
         for p in range_constexpr(c["d"].tp):
             if c["rank"] != p:
                 dst = preg(bases[p], off, "gather")
-                c["put_bf"](dst, t * HIDDEN + col, ys[0:4])
-                c["put_bf"](dst, t * HIDDEN + col + 4, ys[4:8])
+                for h in range_constexpr(2):
+                    at = t * HIDDEN + 2 * half_pair(HIDDEN // 2, col // 8, h)
+                    c["put_bf"](dst, at, ys[4 * h : 4 * h + 4])
 
 
 @flyc.jit
@@ -647,7 +650,7 @@ def gather_row(c, src, t, dst):
             bo.buffer_store(
                 fx.Vector.from_elements([w[0], w[1]], fx.Int32),
                 rsrc(dst),
-                t * (HIDDEN // 2) + 2 * q,
+                t * (HIDDEN // 2) + chunk_pairs(HIDDEN // 2, q),
                 cache_modifier=CM_DEV,
             )
 

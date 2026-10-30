@@ -32,7 +32,12 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     tile_rows,
     token_tiles,
 )
-from sgl_amd_mono.deepseek_v41.gfx950.token_par import KG_WORDS, QX_GROUPS
+from sgl_amd_mono.deepseek_v41.gfx950.token_par import (
+    KG_WORDS,
+    QX_GROUPS,
+    chunk_pairs,
+    half_pair,
+)
 
 from . import index_query
 from .device import (
@@ -255,7 +260,7 @@ def stage_qkv(c, t):
                         for h in range_constexpr(2):
                             c["mb"].put_words(
                                 c["qr_dsts"][p],
-                                tg * (Q_RANK // 2) + 4 * tt + 2 * h,
+                                tg * (Q_RANK // 2) + half_pair(Q_RANK // 2, tt, h),
                                 words[2 * h : 2 * h + 2],
                             )
     if mine & (tt * 8 < Q_RANK):
@@ -378,7 +383,8 @@ def qr_from(c, qrg, t):
         q = tid + THREADS * k
         if q < Q_RANK // 2:
             (w,) = c["mb"].poll([(qrg, t * (Q_RANK // 2) + q, 1)])
-            bo.buffer_store(w[0], rsrc(c["args"]["qr_out"]), t * (Q_RANK // 2) + q)
+            pair = chunk_pairs(Q_RANK // 2, q // 2) + q % 2
+            bo.buffer_store(w[0], rsrc(c["args"]["qr_out"]), t * (Q_RANK // 2) + pair)
 
 
 def token_par_context(c, own, t0, rank, bases, sym, pl):
