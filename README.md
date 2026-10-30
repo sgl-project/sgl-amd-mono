@@ -212,6 +212,7 @@ sgl-amd-mono/
 │       └── decode/      # TP2 decode
 │           ├── spec.py  # its refusals, build and forward
 │           ├── check.py # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
+│           │            # (SGLANG_AMD_MONO_CHECK_REF=mxfp4: with the launches' MXFP4 projections)
 │           └── gfx950/  # kernels (from vLLM), launch runner and weight copies
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
