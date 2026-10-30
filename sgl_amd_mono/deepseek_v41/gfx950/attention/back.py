@@ -59,6 +59,7 @@ from .gemv import (
 )
 from .plan import (
     DATA,
+    FLAG_STRIDE,
     HALF,
     HEAD_DIM,
     HEAD_TILE,
@@ -123,6 +124,18 @@ def publish(c, region, i):
 
 
 @flyc.jit
+def store_partial(part, words, off):
+    """A lane's 32 B of a head's chunk partial: ``words`` (8 i32) at i32 ``off``."""
+    for hlf in range_constexpr(2):
+        bo.buffer_store(
+            fx.Vector.from_elements(words[4 * hlf : 4 * hlf + 4], fx.Int32),
+            rsrc(part),
+            off + 4 * hlf,
+            cache_modifier=CM_DEV,
+        )
+
+
+@flyc.jit
 def await_flags(c, region, n, index):
     """Thread u < n polls flag ``index(u)``; then the CTA proceeds."""
     tid = c["tid"]
@@ -164,15 +177,20 @@ def _scale_byte(scw, blk64):
     return (scw[blk64 // 4] >> (blk64 % 4 * 8)) & 0xFF
 
 
-def _fp8_pair_f32(word, scale, hi):
-    v = rocdl.cvt_scalef32_pk_f32_fp8(
-        fx.Vector.make_type(2, fx.Float32),
-        as_ir_value(fx.Int32(word)),
-        as_ir_value(fx.Float32(scale)),
-        hi,
-    )
-    v = fx.Vector(v)
-    return [v[0], v[1]]
+def _fp8_quad_bf16(word, scale):
+    """A dword's four E4M3 times a power-of-two ``scale`` -> four bf16 (exact)."""
+    out = []
+    for hi in (False, True):
+        v = fx.Vector(
+            rocdl.cvt_scalef32_pk_bf16_fp8(
+                T.bf16x2,
+                as_ir_value(fx.Int32(word)),
+                as_ir_value(fx.Float32(scale)),
+                hi,
+            )
+        )
+        out += [v[0], v[1]]
+    return out
 
 
 # ---------------------------------------------------------------- split
@@ -202,6 +220,7 @@ def stage_split(c, unit):
     k0 = ch * ck
     # q does not depend on the key table: in flight before an index source's wait
     qrow = d.heads * HEAD_DIM // 8
+    qpad = d.tile_heads * HEAD_DIM // 8  # with the head tile's padding rows
     qv = []
     for i in range_constexpr(cdiv(qrow, THREADS)):
         u = fresh(tid) + THREADS * i
@@ -242,6 +261,18 @@ def stage_split(c, unit):
                     + (u // (HEAD_DIM // 8)) * Q_ROW
                     + (u % (HEAD_DIM // 8)) * 4,
                 )
+        if const_expr(qpad > qrow):
+            # the tile's padding heads score zeros; their columns are never stored
+            zero = fx.Vector.filled(4, 0.0, fx.Float32).bitcast(fx.Int32)
+            for i in range_constexpr(cdiv(qpad - qrow, THREADS)):
+                u = fresh(tid) + THREADS * i + qrow
+                if u < qpad:
+                    fx.ptr_store(
+                        zero,
+                        sl["q"]
+                        + (u // (HEAD_DIM // 8)) * Q_ROW
+                        + (u % (HEAD_DIM // 8)) * 4,
+                    )
         # the raw rows to LDS for the PV: every head group loaded the same keys, group 0 stores
         if hgi == 0:
             rawb = sl["raw"] + (kt * 16 + r16) * (REC // 4)
@@ -295,7 +326,7 @@ def stage_split(c, unit):
                 fx.ptr_store(mw, st + ((hgi * nht + ht) * nkt + kt) * HEAD_TILE + r16)
             svs.append(sv)
         gpu.barrier()
-        lst = st + d.heads * nkt
+        lst = st + d.tile_heads * nkt
         for ht in range_constexpr(nht):
             hti = hgi * nht + ht
             m = fx.ptr_load(st + (hti * nkt) * HEAD_TILE + r16)
@@ -330,59 +361,88 @@ def stage_split(c, unit):
                 ((t * nchunk + ch) * d.heads + tid) * 2,
                 cache_modifier=CM_DEV,
             )
-        # PV: wave w dims 64 w + 4 r16 + dt (an LDS word holds a key's four), lane g keys 4 g + j
+        # PV: wave w dims 64 w + 4 r16 + dt (an LDS word holds a key's four), lane g keys 4 g + j.
+        # Every tile's LDS reads go out before the first MFMA and the rope wave branches once:
+        # a read, convert, MFMA chain a tile is LDS-latency bound.
         is_rope = wave == WAVES - 1
         dbase = 64 * wave
         sh = (wave % 4) * 8
-        accs = [
-            [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(4)]
-            for _ in range(d.head_tiles)
-        ]
-        for kt2 in range_constexpr(nkt):
-            rb0 = sl["raw"] + (kt2 * 16 + 4 * g) * (REC // 4)
-            vv = fx.Vector.filled(16, 0.0, fx.Float32)  # [dt][j]
-            if is_rope:
-                rv = []
-                for j in range_constexpr(4):
-                    rw = fx.ptr_load(
-                        rb0 + j * (REC // 4) + (NOPE + 8 * r16) // 4,
-                        result_type=fx.Vector.make_type(2, fx.Int32),
-                    )
-                    rv.append([bf_lo(rw[0]), bf_hi(rw[0]), bf_lo(rw[1]), bf_hi(rw[1])])
-                vv = fx.Vector.from_elements(
-                    [rv[j][dt] for dt in range(4) for j in range(4)], fx.Float32
-                )
-            else:
-                nv = []
-                for j in range_constexpr(4):
-                    rb = rb0 + j * (REC // 4)
-                    w = fx.ptr_load(rb + (dbase + 4 * r16) // 4)
-                    scb = fx.ptr_load(rb + DATA // 4 + wave // 4)
-                    scl = pow2((scb >> sh) & 0xFF)
-                    nv.append(
-                        _fp8_pair_f32(w, scl, False) + _fp8_pair_f32(w, scl, True)
-                    )
-                vv = fx.Vector.from_elements(
-                    [nv[j][dt] for dt in range(4) for j in range(4)], fx.Float32
-                )
-            for ht2 in range_constexpr(d.head_tiles):
-                pb = fx.ptr_load(
+        pbs = [
+            [
+                fx.ptr_load(
                     sl["p"]
                     + (ht2 * HEAD_TILE + r16) * p_row(d, s)
                     + (kt2 * 16 + 4 * g) // 2,
                     result_type=fx.Vector.make_type(2, fx.Int32),
                 ).bitcast(fx.Int16)
-                for dt in range_constexpr(4):
-                    av = (
-                        fx.Vector.from_elements(
-                            [vv[dt * 4 + j] for j in range(4)], fx.Float32
-                        )
-                        .to(fx.BFloat16)
-                        .bitcast(fx.Int16)
+                for kt2 in range(nkt)
+            ]
+            for ht2 in range(d.head_tiles)
+        ]
+        rows = [
+            [sl["raw"] + (kt2 * 16 + 4 * g + j) * (REC // 4) for j in range(4)]
+            for kt2 in range(nkt)
+        ]
+        bz = fx.Vector.filled(4, 0.0, fx.Float32).to(fx.BFloat16)
+        avs = [[bz for _ in range(4)] for _ in range(nkt)]  # [kt2][dt]: keys 4 g + j
+        if is_rope:
+            rws = [
+                [
+                    fx.ptr_load(
+                        rb + (NOPE + 8 * r16) // 4,
+                        result_type=fx.Vector.make_type(2, fx.Int32),
+                    ).bitcast(fx.BFloat16)
+                    for rb in rows[kt2]
+                ]
+                for kt2 in range(nkt)
+            ]
+            avs = [
+                [
+                    fx.Vector.from_elements(
+                        [rws[kt2][j][dt] for j in range(4)], fx.BFloat16
                     )
+                    for dt in range(4)
+                ]
+                for kt2 in range(nkt)
+            ]
+        else:
+            ws = [
+                [fx.ptr_load(rb + (dbase + 4 * r16) // 4) for rb in rows[kt2]]
+                for kt2 in range(nkt)
+            ]
+            scbs = [
+                [fx.ptr_load(rb + DATA // 4 + wave // 4) for rb in rows[kt2]]
+                for kt2 in range(nkt)
+            ]
+            avs = []
+            for kt2 in range_constexpr(nkt):
+                pk = []
+                for j in range_constexpr(4):
+                    scl = pow2((scbs[kt2][j] >> sh) & 0xFF)
+                    pk.append(_fp8_quad_bf16(ws[kt2][j], scl))
+                avs.append(
+                    [
+                        fx.Vector.from_elements(
+                            [pk[j][dt] for j in range(4)], fx.BFloat16
+                        )
+                        for dt in range(4)
+                    ]
+                )
+        accs = [
+            [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(4)]
+            for _ in range(d.head_tiles)
+        ]
+        for kt2 in range_constexpr(nkt):
+            for ht2 in range_constexpr(d.head_tiles):
+                for dt in range_constexpr(4):
                     accs[ht2][dt] = fx.Vector(
                         rocdl.mfma_f32_16x16x16bf16_1k(
-                            T.vec(4, T.f32), [av, pb, accs[ht2][dt]]
+                            T.vec(4, T.f32),
+                            [
+                                avs[kt2][dt].bitcast(fx.Int16),
+                                pbs[ht2][kt2],
+                                accs[ht2][dt],
+                            ],
                         )
                     )
         stamp(c, 6)
@@ -397,14 +457,12 @@ def stage_split(c, unit):
                 w2 = v4.to(fx.BFloat16).bitcast(fx.Int32)
                 words += [w2[0], w2[1]]
             off = (((t * nchunk + ch) * d.heads + hh) * HEAD_DIM + dbase + 16 * g) // 2
-            for hlf in range_constexpr(2):
-                bo.buffer_store(
-                    fx.Vector.from_elements(words[4 * hlf : 4 * hlf + 4], fx.Int32),
-                    rsrc(c["part"]),
-                    off + 4 * hlf,
-                    cache_modifier=CM_DEV,
-                )
-        publish(c, c["srdy"], t * nchunk + ch)
+            if const_expr(d.tile_heads > d.heads):
+                if r16 < d.heads:
+                    store_partial(c["part"], words, off)
+            else:
+                store_partial(c["part"], words, off)
+        publish(c, c["srdy"], (t * nchunk + ch) * FLAG_STRIDE)
         stamp(c, 7)
 
 
@@ -447,7 +505,7 @@ def stage_combine(c, unit):
         await_flags(c, c["krdy"], 1, lambda u: t)
     kv_len = ld_i32(a["klen"], t, CM_DEV if const_expr("krdy" in c) else 0)
     nlive = (kv_len + ck - 1) // ck
-    await_flags(c, c["srdy"], nlive, lambda u: t * nchunk + u)
+    await_flags(c, c["srdy"], nlive, lambda u: (t * nchunk + u) * FLAG_STRIDE)
     m = fx.Float32(NEG)
     ms, ls, vs = [], [], []
     for cc in range_constexpr(nchunk):
@@ -502,7 +560,7 @@ def stage_combine(c, unit):
         t * (d.q_rows // 2) + (h * HEAD_DIM + d0) // 2,
         cache_modifier=CM_DEV,
     )
-    publish(c, c["crdy"], t * hg_n + hg)
+    publish(c, c["crdy"], (t * hg_n + hg) * FLAG_STRIDE)
 
 
 # ---------------------------------------------------------------- wo_a / wo_b
@@ -637,10 +695,10 @@ def back_lds_members(s: int, d: Dims) -> dict:
 
     @fx.struct
     class SplitLds:
-        q: fx.Array[fx.Int32, d.heads * Q_ROW, 16]
+        q: fx.Array[fx.Int32, d.tile_heads * Q_ROW, 16]
         raw: fx.Array[fx.Int32, ck * REC // 4, 16]
-        p: fx.Array[fx.Int32, d.heads * p_row(d, s), 16]
-        st: fx.Array[fx.Float32, 2 * d.heads * (WAVES // head_groups(d, s)), 16]
+        p: fx.Array[fx.Int32, d.tile_heads * p_row(d, s), 16]
+        st: fx.Array[fx.Float32, 2 * d.tile_heads * (WAVES // head_groups(d, s)), 16]
 
     @fx.struct
     class GemvLds:
@@ -762,7 +820,7 @@ def run_back(c, key, bid):
             c,
             c["crdy"],
             n_tokens,
-            lambda u: (t0 + u) * (heads // COMB_HEADS) + grp,
+            lambda u: ((t0 + u) * (heads // COMB_HEADS) + grp) * FLAG_STRIDE,
         )
         stamp(c, 9)
         # the group's XO rows a K half at a time, the next half's loads in flight
@@ -784,22 +842,24 @@ def run_back(c, key, bid):
                 if woa_unit // woa_tasks == ti:
                     woa_tile(ti, tiles[ti][1])
             stamp(c, 10)
-            publish(c, c["ardy"], woa_unit)
+            publish(c, c["ardy"], woa_unit * FLAG_STRIDE)
         else:
             # every token tile in turn, the first waiting on every row's flags
             for ti in range_constexpr(nt):
                 woa_tile(ti, s if ti == 0 else 0)
             stamp(c, 10)
-            publish(c, c["ardy"], woa_t)
+            publish(c, c["ardy"], woa_t * FLAG_STRIDE)
     stamp(c, 3)
     if const_expr(not early_wob):
         wops = wob_weights()
     stamp(c, 11)
     if const_expr(woa_spread):
         # this tile's wo_a units
-        await_flags(c, c["ardy"], woa_tasks, lambda u: wob_tile * woa_tasks + u)
+        await_flags(
+            c, c["ardy"], woa_tasks, lambda u: (wob_tile * woa_tasks + u) * FLAG_STRIDE
+        )
     else:
-        await_flags(c, c["ardy"], woa_tasks, lambda u: u)
+        await_flags(c, c["ardy"], woa_tasks, lambda u: u * FLAG_STRIDE)
     stamp(c, 12)
     x8b = (
         c["x8b"],

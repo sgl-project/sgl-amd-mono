@@ -54,6 +54,7 @@ from sgl_amd_mono.common.plan import (
 )
 from sgl_amd_mono.common.stamps import stamp
 from sgl_amd_mono.common.sync import (
+    FLAG_STRIDE,
     preg,
     publish,
     sreg,
@@ -141,7 +142,7 @@ def scratch_layout(key: MoeBuild) -> dict[str, tuple[int, int]]:
         "x8": tokens * X8_WORDS // 2,
         "x8s": tokens * HIDDEN // 32 // 2,
         # a token's four MXFP8 regions written (plain words): ``stage_xq``
-        "x8rdy": tokens,
+        "x8rdy": tokens * FLAG_STRIDE,
         "logit": tokens * experts * ROUTER_PARTS,
         "route": ROUTE_COPIES * tokens * 2 * topk,
         "smid": tokens * d.sh_inter,
@@ -571,8 +572,9 @@ def gemv_fp4_pair(c, w, ws, e, n_rows, k, rg0, ks, xl, xsl, scale_cols, col):
     slices = c["rs"].ug_k_slices
     rounds = ug_rounds(k, ks, slices)
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
-    # rounds whose loads are in flight past the one computing
-    ahead = slices // 2
+    # rounds whose loads are in flight past the one computing; TP8's ug tasks outnumber
+    # the CTAs, so the CTAs that run two stream each at what loads they keep in flight
+    ahead = slices if c["d"].tp >= 8 else slices // 2
     ops = [
         fp4_pair_loads(c, w, ws, e, n_rows, k, rg0, scale_cols, *rounds[q])
         for q in range(min(ahead, len(rounds)))
@@ -872,7 +874,7 @@ def load_x8_rows(c, words_mb, codes_mb, xl, xsl, token_of, live):
     """Wait on each token's X8RDY, then load its MXFP8 row into LDS."""
     tid = c["tid"]
     if tid < TILE:
-        c["poll"]([(c["x8rdy"], token_of(fx.min(tid, live - 1)), 1)])
+        c["poll"]([(c["x8rdy"], token_of(fx.min(tid, live - 1)) * FLAG_STRIDE, 1)])
     gpu.barrier()
     for mb, width, dst in ((words_mb, X8_WORDS, xl), (codes_mb, HIDDEN // 32, xsl)):
         quads = width // 4
@@ -1366,7 +1368,7 @@ def run_moe(c, key, bid, before_ug=None):
     for t in range(first_task(bid, XQ0), s, BLOCKS):
         await_x(c, [t])
         stage_xq(c, t)
-        publish(c["put"], c["x8rdy"], t, 1, tid == 0)
+        publish(c["put"], c["x8rdy"], t * FLAG_STRIDE, 1, tid == 0)
     stamp(c, 19)
     multi = len(token_tiles(s)) > 1
     for task in range(first_task(bid, c["rs"].router0), router_tasks, BLOCKS):

@@ -23,7 +23,7 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.plan import first_task
 from sgl_amd_mono.common.stamps import stamp
-from sgl_amd_mono.common.sync import preg
+from sgl_amd_mono.common.sync import FLAG_STRIDE, preg
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
@@ -339,7 +339,7 @@ def stage_qkv(c, t):
                         )
         gpu.barrier()
     else:
-        publish(c, c["qrdy"], t)
+        publish(c, c["qrdy"], t * FLAG_STRIDE)
 
 
 def record_scales(red):
@@ -456,14 +456,19 @@ def stage_wqb(c, task0, bops, t0, n, rope):
 # ---------------------------------------------------------------- kernel
 
 
+def red_floats(s: int, d: Dims) -> int:
+    """``red``: a wq_b task's accumulators each, or the wqkv chains' partials if more
+    (TP8 has one wq_b task a CTA)."""
+    return max(d.wqb_tasks // BLOCKS * RED, wqkv_order(s)[0] * 64 * 4)
+
+
 def front_lds(s: int, d: Dims):
     """K1's LDS (the attention front's stages)."""
     rows = tile_rows(s)
-    wqb_per_cta = d.wqb_tasks // BLOCKS
 
     @fx.struct
     class FrontLds:
-        red: fx.Array[fx.Float32, wqb_per_cta * RED + 16, 16]
+        red: fx.Array[fx.Float32, red_floats(s, d) + 16, 16]
         qxl: fx.Array[fx.Int32, rows * lds_row(QX_WORDS), 16]
         qxsl: fx.Array[fx.Int32, rows * lds_row(Q_RANK // 32), 16]
         xl: fx.Array[fx.Int32, rows * lds_row(X_WORDS), 16]
@@ -521,7 +526,8 @@ def run_front(
     QKV0 = 0  # on wqkv CTAs
     WQB0 = 0
     waves, halves, order = wqkv_order(s)
-    assert waves * 64 * 4 <= wqb_per_cta * RED  # the chains' partials fit ``red``
+    # the chains' partials fit ``red``
+    assert waves * 64 * 4 <= red_floats(s, Dims(key.tp))
 
     # loads complete in issue order: each CTA issues its latency-critical loads first
     wqb_task = first_task(bid, WQB0)
@@ -692,7 +698,7 @@ def run_front(
             stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
             index_tile(ti, t0, n)
     else:
-        await_flags(c, c["qrdy"], s, lambda u: u)
+        await_flags(c, c["qrdy"], s, lambda u: u * FLAG_STRIDE)
         stamp(c, 38)
         qx = (c["qx8"], c["qx8s"], QX_WORDS, 0, QX_WORDS, Q_RANK // 32, 0, Q_RANK // 32)
         regs = rows_loads(c, *qx, *tiles[0])

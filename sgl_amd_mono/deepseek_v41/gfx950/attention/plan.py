@@ -4,6 +4,8 @@
 
 import msgspec
 
+from sgl_amd_mono.common.sync import FLAG_STRIDE
+
 HIDDEN = 5120
 Q_RANK = 1280
 KV_DIM = 512
@@ -43,15 +45,20 @@ class Dims(msgspec.Struct, frozen=True):
     tp: int
 
     def __post_init__(self):
-        assert self.tp in (2, 4), self.tp
+        assert self.tp in (2, 4, 8), self.tp
 
     @property
     def heads(self) -> int:
         return N_HEADS // self.tp
 
     @property
+    def tile_heads(self) -> int:
+        """``heads`` padded to whole head tiles: TP8's 8 heads fill half of one."""
+        return round_up(self.heads, HEAD_TILE)
+
+    @property
     def head_tiles(self) -> int:
-        return self.heads // HEAD_TILE
+        return self.tile_heads // HEAD_TILE
 
     @property
     def groups(self) -> int:
@@ -123,7 +130,7 @@ def front_scratch(s: int, d: Dims) -> dict:
             ("qkvp", WQKV_KPARTS * s * QKV_ROWS * PAIR),
             ("qx8", s * Q_RANK),  # e4m3 words
             ("qx8s", s * Q_RANK // 32 * 4),  # an i32 code a group
-            ("qrdy", s * PAIR),
+            ("qrdy", s * PAIR * FLAG_STRIDE),
             # an index source's ``index_query``: bf16 IQ, a flag a (token tile, 16-column task)
             ("iq", s * 4096 * 2),
             ("iqrdy", cdiv(s, 16) * 256 * PAIR),
@@ -140,12 +147,13 @@ def back_scratch(s: int, d: Dims, start: int = 0) -> dict:
         [
             ("part", s * nchunk * d.heads * HEAD_DIM * 2),  # bf16 partials
             ("pstat", s * nchunk * d.heads * 8),  # (max, sum) f32
-            ("srdy", s * nchunk * PAIR),
+            ("srdy", s * nchunk * PAIR * FLAG_STRIDE),
             ("xo", s * d.q_rows * 2),  # bf16: wo_a reads it unquantized
-            ("crdy", s * d.heads // 8 * PAIR),
+            ("crdy", s * d.heads // 8 * PAIR * FLAG_STRIDE),
             ("x8b", s * d.o_rows),
             ("x8bs", s * d.o_rows // 32 * 4),
-            ("ardy", d.woa_tasks * cdiv(s, ROWS) * PAIR),  # a flag a wo_a unit
+            # a flag a wo_a unit, a line each (``FLAG_STRIDE``)
+            ("ardy", d.woa_tasks * cdiv(s, ROWS) * PAIR * FLAG_STRIDE),
         ],
         start=start,
     )

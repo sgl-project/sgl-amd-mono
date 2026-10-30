@@ -309,6 +309,8 @@ SGLANG_READS = {
         "compress_ratio",
     ),
     "srt/configs/model_config.py": ("context_len",),
+    # the Engram projection's K shards summed (``_engram_kv``)
+    "srt/distributed/communication_op.py": ("tensor_model_parallel_all_reduce",),
     # a token-parallel step's rows from their owners (``_gather_rows``)
     "srt/distributed/parallel_state.py": (
         "get_tp_group",
@@ -1004,7 +1006,7 @@ class _Built:
                 else:  # Engram.forward on the staged rows
                     from sglang.srt.layers.engram import engram_gate
 
-                    kv, _ = engram.wkv(rows.flatten(-2))
+                    kv = self._engram_kv(engram, rows.flatten(-2))
                     residual = engram_gate(
                         before,
                         kv,
@@ -1038,6 +1040,24 @@ class _Built:
             aux[:] = taps
             pre_hc_head = None
         return (hidden, pre_hc_head), aux
+
+    def _engram_kv(self, engram, x: torch.Tensor) -> torch.Tensor:
+        """``engram.wkv(x)`` as each rank's 1 / tp of K, then summed on the custom
+        all-reduce: the projection is replicated, so every rank would read all 157 MB."""
+        from sglang.srt.distributed import tensor_model_parallel_all_reduce
+
+        shards = self.__dict__.setdefault("_engram_kshards", {})
+        key = id(engram)
+        if key not in shards:
+            no_capture_engram = torch.cuda.is_current_stream_capturing()
+            # the shard's weights are copies: made at the first (eager) call only
+            shards[key] = None if no_capture_engram else _k_shard(engram.wkv)
+        shard = shards[key]
+        if shard is None:
+            return engram.wkv(x)[0]
+        linear, k0, k1 = shard
+        part, _ = linear(x[:, k0:k1].contiguous())
+        return tensor_model_parallel_all_reduce(part)
 
     def _engram_rows(self, hash_ids) -> dict:
         """Every Engram layer's rows of the step by hash layer, staged ahead of the
@@ -1154,6 +1174,51 @@ class _Built:
             moe.forward_normal(x[:m], return_moe_output=True)
 
 
+# a block-FP8 linear's tensors and the K columns an entry of each covers
+_K_BLOCKED = {"weight": 1, "weight_scale_inv": 32, "weight_scale_mx_e8m0": 32}
+
+
+def _k_shard(linear):
+    """(this rank's 1 / tp of a replicated block-FP8 linear's K as a linear of its own,
+    K begin, K end), or None where its layout is not the one known."""
+    import copy
+
+    from sglang.srt.distributed import get_tp_group
+
+    group = get_tp_group()
+    tp, rank = group.world_size, group.rank_in_group
+    w = getattr(linear, "weight", None)
+    present = {k for k, v in vars(linear).items() if isinstance(v, torch.Tensor)}
+    present |= {k for k, _ in linear.named_parameters(recurse=False)}
+    if (
+        tp == 1
+        or w is None
+        or w.dim() != 2
+        or w.shape[1] % (32 * tp)
+        or present != set(_K_BLOCKED)
+        or getattr(linear, "mxfp8_aiter_preshuffled", False)
+        or getattr(linear, "bias", None) is not None
+    ):
+        return None
+    n, k = w.shape
+    for name, cols in _K_BLOCKED.items():
+        if getattr(linear, name).shape != (n // cols, k // cols):
+            return None
+    kk = k // tp
+    k0 = rank * kk
+    shard = copy.copy(linear)
+    shard._parameters = dict(linear._parameters)
+    shard._buffers = dict(linear._buffers)
+    for name, cols in _K_BLOCKED.items():
+        part = getattr(linear, name)[:, k0 // cols : (k0 + kk) // cols].contiguous()
+        if name in linear._parameters:
+            shard._parameters[name] = torch.nn.Parameter(part, requires_grad=False)
+        else:
+            shard.__dict__[name] = part
+    shard.input_size = shard.input_size_per_partition = kk
+    return shard, k0, k0 + kk
+
+
 def _longest_context(hf_config) -> int:
     """The longest context a request can have, SGLang's ``context_len``; a ratio-1
     index source sees that many compressed rows (plus a verify step's draft rows)."""
@@ -1209,7 +1274,7 @@ SPEC = MonoSpec(
     devices={
         "gfx950": DeviceLimits(
             widths=tuple(range(1, MAX_ROWS + 1)),
-            tp_sizes=(2, 4),
+            tp_sizes=(2, 4, 8),
             resident_blocks=BLOCKS,
         )
     },
