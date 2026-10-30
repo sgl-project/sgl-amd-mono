@@ -29,7 +29,21 @@ import logging
 import os
 
 import torch
-from sglang.srt.monokernels.spec import DeviceLimits, Feature, MonoSpec, Requirements
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.muse_spark import DRAFT_TOKENS, TP
@@ -54,7 +68,12 @@ DFLASH_CONFIG = dict(block_size=DRAFT_TOKENS, conv_kernel_size=2, conv_group_siz
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
-    "srt/monokernels/spec.py": ("DeviceLimits", "Feature", "MonoSpec", "Requirements"),
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
+        "DeviceLimits",
+        "Feature",
+        "MonoSpec",
+        "Requirements",
+    ),
     "srt/models/dflash.py": (
         "DFlash2DraftModel",
         "forward(input_ids)",
@@ -527,7 +546,7 @@ SPEC = MonoSpec(
     numerics=target.NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
     tokens_per_request=_tokens_per_request,
 )

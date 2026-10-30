@@ -8,16 +8,15 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from sgl_amd_mono.deepseek_v41.spec import NUMERICS
+from sgl_amd_mono.deepseek_v41.spec import NUMERICS, SPEC
 
 HIDDEN, HC, MIX = 5120, 4, 24
 E, TOPK, SCALE, LIMIT = 384, 6, 1.5, 10.0
-# --draft: the DSpark draft's route (128 experts, top-3, a FP4 group an ug task) at
-# its block widths (5 rows a request)
+# --draft: the DSpark draft's route (one FP4 group an ug task) at its widths, 5 rows a request
 DRAFT_ROUTE = dict(experts=128, topk=3, ug_groups=1)
 DRAFT_WIDTHS = (5, 10, 15, 20, 25, 30, 35, 40)
 INTER, PAD = 2304, 128
-WIDTHS = (1, 2, 4, 8, 12, 16, 24, 32, 40, 48)  # every decode graph width <= 48
+WIDTHS = SPEC.devices["gfx950"].widths
 RMS_EPS, HC_EPS = 1e-20, 1e-6
 MIX_RTOL = NUMERICS.bound("ffn.mix.rel")
 FP4 = [
@@ -85,7 +84,7 @@ def term_ulps(out, ref, big):
 
 # ---------------------------------------------------------------- MX helpers (the launch's rules)
 def code_ceil(v):
-    """Biased exponent of the smallest power of two >= v (v > 0), clamped to [lo, 254]."""
+    """Biased exponent of the smallest power of two >= v (v > 0)."""
     bits = v.float().contiguous().view(torch.int32)
     return ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).int()
 
@@ -210,9 +209,7 @@ def golden_partial(x, w, inter, padded):
     """This rank's MoE partial of bf16 rows ``x``: routed (top-k order, bf16 at every add) + shared."""
     ids, wts = routing(x, w)
     xr, xs = mxfp8_qdq(x, "aiter"), mxfp8_qdq(x, "vllm")
-    per_k = torch.zeros(
-        x.shape[0], TOPK, HIDDEN, device=x.device
-    )  # a row's contributions, top-k order
+    per_k = torch.zeros(x.shape[0], TOPK, HIDDEN, device=x.device)
     for e in ids.unique().tolist():
         rows, ks = (ids == e).nonzero(as_tuple=True)
         h = xr[rows] @ deq_fp4(w["w13_raw"][e], w["s13_raw"][e]).T
@@ -276,15 +273,49 @@ def sglang_ffn_seam(part, res, post, comb, pre, w):
     return res2, normed, co.post, co.comb, co.pre
 
 
+FFN_MARKS = {
+    16: "start", 17: "slices", 18: "norm", 19: "xq", 20: "router", 21: "route",
+    22: "shared", 23: "gates", 24: "ug", 25: "down", 26: "reduce", 27: "end",
+}  # fmt: skip
+
+
+def timeline_report(M, tl) -> str:
+    """Each mark's µs after the first CTA's start, then each stage's µs, across CTAs."""
+    t0 = tl[:, 16].min()
+    marks = list(FFN_MARKS)
+    lines = [f"M={M} timeline, us after the first CTA's start (median CTA / last CTA):"]
+    for k in marks:
+        d = (tl[:, k] - t0).double() / 100.0  # 100 MHz ticks
+        name = FFN_MARKS[k]
+        lines.append(f"  {k} {name:7s} {d.median().item():7.2f} {d.max().item():7.2f}")
+    last = int(tl[:, marks[-1]].argmax())
+    lines.append(
+        f"M={M} stage us (median CTA / max CTA / CTA {last}, which ends last):"
+    )
+    for a, b in zip(marks, marks[1:]):
+        d = (tl[:, b] - tl[:, a]).double() / 100.0
+        lines.append(
+            f"  {FFN_MARKS[b]:7s} {d.median().item():7.2f} {d.max().item():7.2f}"
+            f" {d[last].item():7.2f}"
+        )
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replays", type=int, default=500)
     ap.add_argument("--draft", action="store_true", help="the DSpark draft's route")
+    ap.add_argument(
+        "--timeline", action="store_true", help="print each width's stage timeline"
+    )
+    ap.add_argument("--widths", default="", help="comma-separated widths to run")
     args = ap.parse_args()
     global E, TOPK, WIDTHS
     route = DRAFT_ROUTE if args.draft else {}
     if args.draft:
         E, TOPK, WIDTHS = route["experts"], route["topk"], DRAFT_WIDTHS
+    if args.widths:
+        WIDTHS = tuple(int(w) for w in args.widths.split(","))
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
     dev = torch.device("cuda", rank)
@@ -300,15 +331,23 @@ def main():
     w, inter, padded = make_weights(tp, rank, dev)
     mw = mono_weights(w)
     mw.check(tp, E)
+    if args.timeline:  # the runner builds its launches with stage marks
+        os.environ["SGLANG_AMD_MONO_TIMELINE"] = "1"
     runner = DSV41MonoRunner(tp, rank, cpu, dev, **route)
     fails, steps = [], []
     for M in WIDTHS:
         part, res, post, comb, pre = seam_inputs(M, tp, rank, dev)
         out, res_o, post_o, comb_o, pre_o = runner.ffn(mw, part, res, post, comb, pre)
+        if args.timeline:
+            for _ in range(5):
+                runner.ffn(mw, part, res, post, comb, pre)
+            torch.cuda.synchronize()
+            if rank == 0:
+                print(timeline_report(M, runner.timeline(M).cpu()), flush=True)
         res2, normed_ref, post2, comb2, pre2 = sglang_ffn_seam(
             part, res, post, comb, pre, w
         )
-        off = scratch_layout(M, tp, **route)["normed"][0]
+        off = scratch_layout(M, tp, **runner.route_at(M))["normed"][0]
         normed = (
             runner.scratch(M)[off : off + M * HIDDEN * 2]
             .view(torch.bfloat16)
@@ -326,7 +365,7 @@ def main():
         err, err_sgl = term_ulps(res_o, ref64, big), term_ulps(res2, ref64, big)
         checks = {
             "residual exact": torch.equal(res_o, res2),
-            # the same fp32 math in another order: error in ulps of each element's largest term vs an fp64 hc_post
+            # fp32 math in another order: error in ulps of the largest term against an fp64 hc_post
             "residual err <= SGLang's + 0.5 ulp, <= 0.01% differ": err <= err_sgl + 0.5
             and res_share <= 1e-4,
             "post": torch.allclose(post_o.view(M, HC), post2, rtol=MIX_RTOL, atol=1e-5),

@@ -1,10 +1,20 @@
 """Run the GLM-5.3-Flash layer launch on random weights in SGLang's layouts under
 torchrun (TP 2, 4 or 8): ``torchrun --nproc-per-node 4
-test/kernels/glm53_flash/check_layer.py --kind dsa --rows 4``. Every rank must
+test/kernels/glm53_flash/check_layer.py --kind dsa --rows 4``. Kinds: ``ffn`` (the
+MoE alone), ``kda``, ``dsa``, ``dense`` (KDA and the dense FP8 MLP), ``embed`` (the
+dense layer 0 from the step's tokens) and ``head`` (the tail). Every rank must
 finish with no error word set and the same output (the TP sums run in rank order);
 ``--writes``: the launch changes exactly its valid rows' state or cache rows;
-``--compare-shuffled``: a sparse-attention launch on AITER-shuffled FP8 projections
-equals the row-major one bitwise."""
+``--compare-shuffled``: a sparse-attention or dense launch on AITER-shuffled FP8
+weights equals the row-major one bitwise; ``--check-routing``: the top-8 equals
+SGLang's on keys that tie in bf16; ``--check-keys``: rows past 2048 tokens attend to
+the selected pools and then their tail, as SGLang's kpool top-k selects;
+``--check-dense``: the dense MLP's output against an f32 MLP on the launch's own FFN
+input; ``--check-embed``: the launch from the tokens equals the dense launch on the
+gathered embedding rows, and writes the spec's step tables (``--step-rows``: the
+step's rows, fewer than the width); ``--check-head``: the tail's logits against a
+torch tail and an f32 tail; ``--replays N``: a graph of ``--layers`` launches
+replays the eager step bitwise."""
 
 import argparse
 import os
@@ -14,10 +24,12 @@ import torch
 import torch.distributed as dist
 
 from sgl_amd_mono.glm53_flash.gfx950.config import (
+    DENSE_INTER,
     GLOBAL_INTER,
     HC_MULT,
     HIDDEN,
     N_EXPERTS,
+    VOCAB,
 )
 
 N_MIX = HC_MULT * (2 + HC_MULT)
@@ -299,6 +311,130 @@ def layer_inputs(rows: int, device):
     return x, res, post, comb
 
 
+def dense_weights(rank: int, tp: int, device, shuffled: bool = False):
+    """One dense layer's random FFN weights (every rank builds the same) as this
+    rank's shard: gate | up and down FP8 with 128 x 128 block scales, row-major or in
+    AITER's (16, 16) layout."""
+    from aiter.ops.shuffle import shuffle_weight
+
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashDenseWeights
+
+    g = _gen(4, device)
+    I = DENSE_INTER // tp
+    lo, hi = rank * I, (rank + 1) * I
+
+    def rnd(*shape, scale=1.0):
+        return torch.randn(*shape, generator=g, device=device) * scale
+
+    gate, gs = _fp8_block(rnd(DENSE_INTER, HIDDEN, scale=HIDDEN**-0.5))
+    up, us = _fp8_block(rnd(DENSE_INTER, HIDDEN, scale=HIDDEN**-0.5))
+    down, ds = _fp8_block(rnd(HIDDEN, DENSE_INTER, scale=DENSE_INTER**-0.5))
+    w_ug = torch.cat([gate[lo:hi], up[lo:hi]]).contiguous()
+    s_ug = torch.cat(
+        [gs[lo // 128 : hi // 128], us[lo // 128 : hi // 128]]
+    ).contiguous()
+    w_dn = down[:, lo:hi].contiguous()
+    s_dn = ds[:, lo // 128 : hi // 128].contiguous()
+    if shuffled:
+        w_ug, w_dn = shuffle_weight(w_ug, (16, 16)), shuffle_weight(w_dn, (16, 16))
+    return FlashDenseWeights(
+        w_ug=w_ug,
+        s_ug=s_ug,
+        w_dn=w_dn,
+        s_dn=s_dn,
+        hc_fn=rnd(N_MIX, HC_MULT * HIDDEN, scale=0.01),
+        hc_scale=torch.rand(3, generator=g, device=device) + 0.5,
+        hc_base=rnd(N_MIX, scale=0.1),
+        g_norm=(1 + 0.1 * rnd(HIDDEN)).bfloat16(),
+        shuffled=shuffled,
+    )
+
+
+# vocabulary rows a rank holds in the test's embedding (the launch takes any count)
+EMBED_ROWS = 1024
+
+
+def embedding(rank: int, tp: int, device):
+    """A random vocab-parallel embedding of ``EMBED_ROWS`` rows a rank: this rank's
+    shard, and the whole table."""
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashEmbedding
+
+    g = _gen(6, device)
+    table = torch.randn(tp * EMBED_ROWS, HIDDEN, generator=g, device=device).bfloat16()
+    lo = rank * EMBED_ROWS
+    shard = table[lo : lo + EMBED_ROWS].contiguous()
+    return FlashEmbedding(weight=shard, start=lo, end=lo + EMBED_ROWS), table
+
+
+def step_inputs(n: int, width: int, tp: int, device) -> dict:
+    """A step of ``n`` rows (int64, as SGLang's decode buffers hold them): tokens of
+    every rank's shard, positions, MLA slots (row 1 SGLang's padding slot 0) and
+    request rows; the KDA slot and row tables to write, of the width."""
+    from sgl_amd_mono.glm53_flash.gfx950.layout import ROW_WORDS
+
+    g = _gen(8, device)
+    ids = torch.randint(0, tp * EMBED_ROWS, (n,), generator=g, device=device)
+    pos = torch.randint(0, 4000, (n,), generator=g, device=device)
+    loc = torch.randint(256, 1 << 20, (n,), generator=g, device=device)
+    if n > 1:
+        loc[1] = 0
+    rpi = torch.randint(1, 60, (n,), generator=g, device=device)
+    return {
+        "ids": ids,
+        "positions": pos,
+        "out_cache_loc": loc,
+        "req_pool_indices": rpi,
+        "slots": torch.full((width,), 77, dtype=torch.int32, device=device),
+        "rows": torch.full((width, ROW_WORDS), 77, dtype=torch.int32, device=device),
+    }
+
+
+def spec_tables(step: dict, slots: torch.Tensor, width: int):
+    """The KDA slot and row tables as the spec's own (torch) tables hold them."""
+    from sgl_amd_mono.glm53_flash.gfx950.config import KPOOL
+    from sgl_amd_mono.glm53_flash.gfx950.layout import (
+        ROW_BT,
+        ROW_POOL_SLOT,
+        ROW_POS,
+        ROW_SLOT,
+        ROW_TAIL_SLOT,
+    )
+
+    n = step["ids"].shape[0]
+    kda = torch.zeros(width, dtype=torch.int32, device=slots.device)
+    kda[:n] = slots[:n]
+    rows = step["rows"].clone()
+    rows[:, : ROW_TAIL_SLOT + 1] = -1
+    rows[:, ROW_BT] = 0
+    loc = step["out_cache_loc"]
+    valid = loc != 0
+    none = torch.full_like(loc, -1)
+    rows[:n, ROW_POS] = torch.where(valid, step["positions"], none).int()
+    rows[:n, ROW_SLOT] = torch.where(valid, loc, none).int()
+    rows[:n, ROW_POOL_SLOT] = torch.where(valid, loc // KPOOL, none).int()
+    rows[:n, ROW_TAIL_SLOT] = torch.where(
+        valid, step["req_pool_indices"] * KPOOL, none
+    ).int()
+    rows[:n, ROW_BT] = torch.arange(n, dtype=torch.int32, device=slots.device)
+    return kda, rows
+
+
+def head_weights(rank: int, tp: int, device):
+    """The tail's random final-norm weight and this rank's LM-head rows (every rank
+    builds the same whole head)."""
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashHeadWeights
+
+    g = _gen(9, device)
+    rows = VOCAB // tp
+    w = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=device)
+    for r in range(tp):  # this rank's rows of the same random head, a shard at a time
+        part = (torch.randn(rows, HIDDEN, generator=g, device=device) * 0.02).bfloat16()
+        if r == rank:
+            w.copy_(part)
+    norm = (1 + 0.1 * torch.randn(HIDDEN, generator=g, device=device)).bfloat16()
+    return FlashHeadWeights(g_norm=norm, w_head=w)
+
+
 def shuffled_copy(w):
     """``w`` with its FP8 projections in AITER's (16, 16) layout, as SGLang's gfx950
     block-FP8 linear method shuffles them in place."""
@@ -315,8 +451,22 @@ def shuffled_copy(w):
 
 
 def compare_shuffled(args, rank, tp, group, device) -> bool:
-    """One sparse-attention launch on row-major and on AITER-shuffled FP8 weights:
-    the outputs and every cache write must be bitwise equal."""
+    """One sparse-attention or dense launch on row-major and on AITER-shuffled FP8
+    weights: the outputs and every cache or state write must be bitwise equal."""
+    if args.kind == "dense":
+        results = []
+        for shuffled in (False, True):
+            rt, launches, held, ins = build(
+                args, "dense", rank, tp, group, device, shuffled=shuffled
+            )
+            op, kw = launches[0]
+            out = op.launch(*ins, **kw)
+            torch.cuda.synchronize()
+            results.append([t.clone() for t in (*out, *held)])
+            rt.close()
+        same = all(torch.equal(a, b) for a, b in zip(*results))
+        print(f"rank {rank}: dense shuffled == row-major: {same}", flush=True)
+        return same
     from msgspec.structs import astuple, replace
 
     from sgl_amd_mono.glm53_flash.gfx950.kernel import (
@@ -368,6 +518,564 @@ def compare_shuffled(args, rank, tp, group, device) -> bool:
     return same_out and same_cache and wrote
 
 
+# router weights and biases whose keys tie after bf16 rounding (see tie_router)
+TIE_GROUPS, TIE_MEMBERS = 24, 12
+TIE_DELTA = 2.0**-12
+
+
+def tie_router(ffn, device):
+    """``ffn`` with router weights and biases whose keys tie after bf16 rounding: 24
+    groups of 12 experts at random ids. Group g reads column j_g with weight 1 and has
+    bias b_g (bf16); its odd members add +-TIE_DELTA x column j2_g, and every member's
+    f32 bias is b_g plus less than a quarter bf16 ulp. The logits are exact in f32 (two
+    nonzero products), so the keys tie exactly in bf16 and differ in f32. Returns the
+    weights and the plain router [288, HIDDEN] bf16."""
+    from msgspec.structs import replace
+
+    from sgl_amd_mono.glm53_flash.gfx950.packing import pack_bf16
+
+    g = _gen(11, device)
+    assert TIE_GROUPS * TIE_MEMBERS == N_EXPERTS
+    ids = torch.randperm(N_EXPERTS, generator=g, device=device).view(
+        TIE_GROUPS, TIE_MEMBERS
+    )
+    cols = torch.randperm(HIDDEN, generator=g, device=device)[: 2 * TIE_GROUPS]
+    cols = cols.view(2, TIE_GROUPS)
+    b = ((torch.rand(TIE_GROUPS, generator=g, device=device) - 0.5) * 0.4).bfloat16()
+    b = b.float()
+    ulp = torch.exp2(torch.floor(torch.log2(b.abs())) - 7)
+    w = torch.zeros(N_EXPERTS, HIDDEN, device=device)
+    bias = torch.zeros(N_EXPERTS, device=device)
+    for grp in range(TIE_GROUPS):
+        for m in range(TIE_MEMBERS):
+            e = int(ids[grp, m])
+            w[e, cols[0, grp]] = 1.0
+            if m % 2:
+                w[e, cols[1, grp]] = TIE_DELTA if m % 4 == 1 else -TIE_DELTA
+            eps = (torch.rand((), generator=g, device=device) - 0.5) * 0.5 * ulp[grp]
+            bias[e] = b[grp] + eps
+    w = w.bfloat16()
+    return replace(ffn, w_r=pack_bf16(w), bias=bias), w
+
+
+def ffn_input(rt, rows: int) -> torch.Tensor:
+    """The launch's own RMSNorm'd FFN input rows (bf16), from its scratch."""
+    a = rt.scratch[rt.sc["a"] :].view(torch.int32)[: rows * HIDDEN : 2]
+    return a.contiguous().view(torch.bfloat16).view(rows, HIDDEN)
+
+
+def routed(rt, rows: int) -> torch.Tensor:
+    """The launch's 8 routed experts a row, best first (slot 0 is the shared expert)."""
+    from sgl_amd_mono.glm53_flash.gfx950.config import MOE_SLOTS
+
+    sel = rt.scratch[rt.sc["sel"] :].view(torch.int32)[: 2 * rows * MOE_SLOTS : 2]
+    return sel.view(rows, MOE_SLOTS)[:, 1:].clone()
+
+
+def stock_topk(x, w_r, bias) -> torch.Tensor:
+    """SGLang's top-8 for GLM-5.3-Flash with AITER: bf16 logits and bias into AITER's
+    ``biased_grouped_topk`` (one group, renormalized, scale 2.5), best first."""
+    from aiter import biased_grouped_topk
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import ROUTE_SCALE, TOP_K
+
+    logits = (x.float() @ w_r.float().T).bfloat16()
+    weights = torch.empty(x.shape[0], TOP_K, dtype=torch.float32, device=x.device)
+    ids = torch.empty(x.shape[0], TOP_K, dtype=torch.int32, device=x.device)
+    biased_grouped_topk(logits, bias.bfloat16(), weights, ids, 1, 1, True, ROUTE_SCALE)
+    return ids
+
+
+def key_order(x, w_r, bias, rounded: bool, tie: str) -> torch.Tensor:
+    """Top-8 ids of sigmoid(logits) + bias, best first: logits and bias in bf16
+    (``rounded``) or f32; equal keys in AITER's lane order (``tie="aiter"``) or by
+    lower id (``tie="id"``)."""
+    from sgl_amd_mono.glm53_flash.gfx950.config import TOP_K
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import tie_rank
+
+    logits, b = x.float() @ w_r.float().T, bias.float()
+    if rounded:
+        logits, b = logits.bfloat16().float(), b.bfloat16().float()
+    keys = torch.sigmoid(logits) + b
+    ids = torch.arange(N_EXPERTS, device=x.device)
+    if tie == "aiter":
+        rank = torch.tensor([tie_rank(e) for e in range(N_EXPERTS)], device=x.device)
+    else:
+        rank = ids
+    by_rank = torch.argsort(rank)
+    order = torch.argsort(-keys[:, by_rank], dim=-1, stable=True)
+    return by_rank[order][:, :TOP_K].int()
+
+
+def check_routing(args, rank, tp, group, device) -> bool:
+    """FFN launches on router keys that tie in bf16: the launch's top-8 (order
+    included) equals SGLang's (AITER's ``biased_grouped_topk`` on bf16 logits and bias)
+    on the launch's own FFN input, every draw; and the inputs tell that apart from
+    lower-id ties and from f32 keys (negative controls). The host-side key order is
+    printed as a diagnostic only: it restates the kernel's ``tie_rank``."""
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
+
+    key = FlashBuild(
+        rows=args.rows, tp=tp, launches_per_step=1, inter=GLOBAL_INTER // tp, stop=False
+    )
+    ffn, w_r = tie_router(ffn_weights(rank, tp, device), device)
+    rt = FlashRuntime(key, rank, group, device)
+    rt.set_deadline(args.deadline)
+    op = FlashLayerOp(rt, ffn, 0)
+    ok, by_id, by_f32, rows = True, 0, 0, 0
+    for draw in range(3):
+        g = _gen(20 + draw, device)
+        x = torch.randn(args.rows, HIDDEN, generator=g, device=device).bfloat16()
+        _, res, post, comb = layer_inputs(args.rows, device)
+        op.launch(x / tp, res, post, comb)
+        rt.advance_step()
+        torch.cuda.synchronize()
+        a, got = ffn_input(rt, args.rows), routed(rt, args.rows)
+        same = torch.equal(got, stock_topk(a, w_r, ffn.bias))
+        own = torch.equal(got, key_order(a, w_r, ffn.bias, True, "aiter"))
+        print(
+            f"rank {rank} draw {draw}: top-8 == AITER biased_grouped_topk {same} "
+            f"(diagnostic: == bf16 keys in tie_rank order {own})",
+            flush=True,
+        )
+        ok = ok and same
+        by_id += int((got != key_order(a, w_r, ffn.bias, True, "id")).any(-1).sum())
+        by_f32 += int(
+            (got != key_order(a, w_r, ffn.bias, False, "aiter")).any(-1).sum()
+        )
+        rows += args.rows
+    print(
+        f"rank {rank}: lower-id ties would differ in {by_id}/{rows} rows, f32 keys "
+        f"in {by_f32}/{rows}",
+        flush=True,
+    )
+    rt.close()
+    return ok and by_id > 0 and by_f32 > 0
+
+
+# row lengths for the key check: scored rows with tails of 2, 3 and 1 tokens, and a
+# row of 2051 tokens (2048 + a tail of 3), which attends to every token
+KEY_LENS = (4102, 5003, 7001, 2051)
+
+
+def kv_slot(pt: torch.Tensor, row: int, token: int) -> int:
+    """MLA cache row of ``token`` of request ``row`` through the 64-token page table."""
+    return int(pt[row, token // 64]) * 64 + token % 64
+
+
+def check_keys(args, rank, tp, group, device) -> bool:
+    """Sparse-attention launches on rows past 2048 tokens. A scored row (more than 512
+    complete pools) attends to the selected pools' 2048 tokens and then its tail (up to
+    2051 keys), as SGLang's kpool top-k appends it: its selection holds 512 whole
+    distinct complete pools, then the tail tokens in order. Perturbing the MLA rows of
+    the tokens a 2048-key selection gives up for the tail (its last selected pool's last
+    positions) changes the row's output (negative control: a 2048-key selection never
+    reads them); perturbing an unselected pool changes nothing. A row of 2051 tokens
+    attends to every token: perturbing its first token changes its output."""
+    from msgspec.structs import replace
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import KPOOL, TOPK_POOLS, TOPK_TOKENS
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
+    from sgl_amd_mono.glm53_flash.gfx950.layout import SEL_STRIDE
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
+
+    rows = len(KEY_LENS)
+    key = FlashBuild(
+        rows=rows,
+        tp=tp,
+        launches_per_step=1,
+        inter=GLOBAL_INTER // tp,
+        dsa=True,
+        max_pools=args.max_pools,
+        stop=False,
+    )
+    rt = FlashRuntime(key, rank, group, device)
+    rt.set_deadline(args.deadline)
+    op = FlashLayerOp(
+        rt, ffn_weights(rank, tp, device), 0, dsa=dsa_weights(rank, tp, device)
+    )
+    x, res, post, comb = layer_inputs(rows, device)
+    caches, table, pt = dsa_caches(rows, device, list(KEY_LENS))
+
+    def run(kv):
+        c = replace(
+            caches,
+            kv_cache=kv,
+            idx_cache=caches.idx_cache.clone(),
+            tail_k=caches.tail_k.clone(),
+            tail_g=caches.tail_g.clone(),
+        )
+        out = op.launch(x, res, post, comb, caches=c, rows=table, page_table=pt)
+        rt.advance_step()
+        torch.cuda.synchronize()
+        sel = rt.scratch[rt.sc["tok_sel"] :].view(torch.int32)[: 2 * rows * SEL_STRIDE]
+        return out[1].clone(), sel.view(rows, SEL_STRIDE, 2).clone()
+
+    base, sel = run(caches.kv_cache.clone())
+    # (token, launch tag) pairs; kv_ready holds this launch's tag
+    tags = rt.scratch[rt.sc["kv_ready"] :].view(torch.int32)[1 : 2 * rows : 2].clone()
+    sel, sel_tags = sel[..., 0], sel[..., 1]
+    g = _gen(30, device)
+    ok = True
+    for r, n in enumerate(KEY_LENS):
+        bound, tail = n // KPOOL, n % KPOOL
+        if bound <= TOPK_POOLS:
+            victims, spare = [0], None
+        else:
+            picked = sel[r, :TOPK_TOKENS].long()
+            pools = picked.view(TOPK_POOLS, KPOOL)
+            whole = bool(
+                (pools == pools[:, :1] + torch.arange(KPOOL, device=device)).all()
+            )
+            whole = whole and bool((pools[:, 0] % KPOOL == 0).all())
+            ids = pools[:, 0] // KPOOL
+            distinct = ids.unique().numel() == TOPK_POOLS and int(ids.max()) < bound
+            tail_ok = sel[r, TOPK_TOKENS : TOPK_TOKENS + tail].tolist() == [
+                bound * KPOOL + i for i in range(tail)
+            ]
+            tagged = bool((sel_tags[r, : TOPK_TOKENS + tail] == tags[r]).all())
+            print(
+                f"rank {rank} row {r} ({n} tokens): 512 whole distinct pools "
+                f"{whole and distinct}, tail {tail_ok}, tagged {tagged}",
+                flush=True,
+            )
+            ok = ok and whole and distinct and tail_ok and tagged
+            victims = picked[TOPK_TOKENS - tail : TOPK_TOKENS].tolist()
+            unpicked = sorted(set(range(bound)) - set(ids.tolist()))
+            spare = unpicked[0] * KPOOL
+        kv = caches.kv_cache.clone()
+        for t in victims:
+            kv[kv_slot(pt, r, t)] = (
+                30 * torch.randn(kv.shape[1], generator=g, device=device).bfloat16()
+            )
+        moved = not torch.equal(run(kv)[0][r], base[r])
+        print(
+            f"rank {rank} row {r}: perturbing tokens {victims} changes the row {moved}",
+            flush=True,
+        )
+        ok = ok and moved
+        if spare is not None:
+            kv = caches.kv_cache.clone()
+            for t in range(spare, spare + KPOOL):
+                kv[kv_slot(pt, r, t)] = (
+                    30 * torch.randn(kv.shape[1], generator=g, device=device).bfloat16()
+                )
+            still = torch.equal(run(kv)[0][r], base[r])
+            print(
+                f"rank {rank} row {r}: perturbing unselected pool {spare // KPOOL} "
+                f"leaves the row unchanged {still}",
+                flush=True,
+            )
+            ok = ok and still
+    rt.close()
+    return ok
+
+
+KINDS = ("ffn", "kda", "dsa", "dense", "embed", "head")
+
+
+def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
+    """A runtime of ``kind`` at ``args.rows`` rows, ``layers`` launches a step: each
+    layer's op and its launch arguments (its own state or caches), the tensors those
+    launches write, and the step's input. An ``embed`` step has ``args.step_rows``
+    rows (default: the width)."""
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
+    from sgl_amd_mono.glm53_flash.gfx950.runner import (
+        FlashHeadOp,
+        FlashLayerOp,
+        FlashRuntime,
+    )
+
+    kda, dsa = kind in ("kda", "dense", "embed"), kind == "dsa"
+    dense = kind in ("dense", "embed")
+    key = FlashBuild(
+        rows=args.rows,
+        tp=tp,
+        launches_per_step=layers,
+        inter=GLOBAL_INTER // tp,
+        kda=kda,
+        dsa=dsa,
+        max_pools=args.max_pools if dsa else 0,
+        qkv_shuffled=shuffled and dsa,
+        qb_shuffled=shuffled and dsa,
+        o_shuffled=shuffled and dsa,
+        dense=dense,
+        dense_shuffled=shuffled and dense,
+        tokens=kind == "embed",
+        head=kind == "head",
+        stop=False,
+    )
+    rt = FlashRuntime(key, rank, group, device)
+    rt.set_deadline(args.deadline)
+    x, res, post, comb = layer_inputs(args.rows, device)
+    if kind == "head":
+        w = head_weights(rank, tp, device)
+        ops = [FlashHeadOp(rt, w, n) for n in range(layers)]
+        return rt, [(op, {}) for op in ops], [], (x, res, post, comb)
+    ffn = dense_weights(rank, tp, device, shuffled) if dense else None
+    ffn = ffn or ffn_weights(rank, tp, device)
+    attn = kda_weights(rank, tp, device) if kda else None
+    attn = dsa_weights(rank, tp, device) if dsa else attn
+    emb = embedding(rank, tp, device)[0] if kind == "embed" else None
+    if kind == "ffn":
+        x = x / tp  # the FFN launch takes this rank's unreduced attention share
+    if kind == "embed":
+        x, res = torch.zeros_like(x), torch.zeros_like(res)
+        post, comb = torch.ones_like(post), torch.zeros_like(comb)
+    launches, held = [], []
+    valid = args.rows - args.pad_rows
+    for n in range(layers):
+        op = FlashLayerOp(
+            rt,
+            ffn,
+            n,
+            kda=attn if kda else None,
+            dsa=attn if dsa else None,
+            embedding=emb,
+        )
+        kw = {}
+        if kda:
+            state, idx = kda_state(args.rows, tp, device)
+            idx[valid:] = 0  # not positive: a pad row
+            kw = {"state": state, "state_idx": idx}
+            held += [state.conv_state, state.rec_state]
+        if kind == "embed":
+            step = step_inputs(args.step_rows or args.rows, args.rows, tp, device)
+            kw["step"] = step
+            kw["state_idx"] = idx[: step["ids"].shape[0]].clone()
+            held += [step["slots"], step["rows"]]
+        if dsa:
+            from sgl_amd_mono.glm53_flash.gfx950.layout import ROW_BT
+
+            lens = [int(v) for v in args.lens.split(",")] if args.lens else list(LENS)
+            # the valid rows past the given lengths: SGLang's padding (slot 0)
+            lens = lens[:valid] + [0] * (args.rows - min(valid, len(lens)))
+            caches, table, pt = dsa_caches(args.rows, device, lens)
+            # SGLang's page table has the step's rows; the width's pad rows read row 0
+            pt = pt[:valid].clone()
+            table[valid:, ROW_BT] = 0
+            kw = {"caches": caches, "rows": table, "page_table": pt}
+            held += [caches.kv_cache, caches.idx_cache, caches.tail_k, caches.tail_g]
+        launches.append((op, kw))
+    return rt, launches, held, (x, res, post, comb)
+
+
+def run_step(kind, launches, ins):
+    """One step: the launches in order, each on the previous one's outputs (the FFN
+    and the tail launches each on the step's input)."""
+    h = ins
+    for op, kw in launches:
+        if kind in ("ffn", "head"):
+            h = op.launch(*ins, **kw)
+        else:
+            h = op.launch(*h, **kw)
+    return h if isinstance(h, tuple) else (h,)
+
+
+def check_replays(args, rank, tp, group, device) -> bool:
+    """A step of ``--layers`` launches of one kind on one runtime (each layer its own
+    state or caches, inputs chained), captured in a graph after an eager step: from the
+    same state, each of ``--replays`` replays gives the eager step's outputs and writes
+    bitwise, with no error word set, and every rank the same output. A step of tails
+    runs them back to back (each tail's logits in the other slot of the last)."""
+    from sgl_amd_mono.common import guard
+
+    rt, launches, held, ins = build(
+        args, args.kind, rank, tp, group, device, args.layers
+    )
+    saved = [t.clone() for t in held]
+
+    def restore():
+        for t, v in zip(held, saved):
+            t.copy_(v)
+
+    def step():
+        out = run_step(args.kind, launches, ins)
+        rt.advance_step()
+        return out
+
+    # eager first: the launch loads its code outside the capture
+    want = [t.clone() for t in step()]
+    torch.cuda.synchronize()
+    want_held = [t.clone() for t in held]
+    restore()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = step()
+    ok = True
+    for n in range(args.replays):
+        restore()
+        dist.barrier(group=group)
+        graph.replay()
+        torch.cuda.synchronize()
+        same = all(torch.equal(a, b) for a, b in zip(got, want)) and all(
+            torch.equal(a, b) for a, b in zip(held, want_held)
+        )
+        if not same:
+            print(f"rank {rank} replay {n}: differs from the eager step", flush=True)
+            ok = False
+            break
+    words = rt.epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1].tolist()
+    xs = [None] * tp
+    dist.all_gather_object(xs, got[0].cpu())
+    agree = all(torch.equal(xs[0], t) for t in xs)
+    print(
+        f"rank {rank}: {args.replays} replays of {args.layers} {args.kind} launches "
+        f"equal the eager step {ok}, error words {words}, ranks agree {agree}",
+        flush=True,
+    )
+    rt.close()
+    return ok and not any(words) and agree
+
+
+def _dequant(w, s, shuffled: bool) -> torch.Tensor:
+    """A block-FP8 weight (row-major or AITER (16, 16)-shuffled) in f32."""
+    n, k = w.shape
+    if shuffled:
+        w = w.view(torch.uint8).reshape(n // 16, k // 32, 2, 16, 16)
+        w = w.permute(0, 3, 1, 2, 4).reshape(n, k).view(torch.float8_e4m3fn)
+    return w.float() * s.repeat_interleave(128, 0).repeat_interleave(128, 1)
+
+
+def _rel(a, b) -> float:
+    a, b = a.float(), b.float()
+    return ((a - b).norm() / b.norm()).item()
+
+
+# the spec's dense.x_vs_fp32.rel
+DENSE_X_VS_FP32 = 1.2e-2
+
+
+def check_dense(args, rank, tp, group, device) -> bool:
+    """A dense launch's MLP output against an f32 MLP (dequantized weights, the
+    clamped SwiGLU) on the launch's own FFN input, summed over the ranks: within the
+    spec's ``dense.x_vs_fp32.rel``. With one rank's down scales doubled the launch
+    must fail it (negative control)."""
+    import msgspec
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import SWIGLU_LIMIT
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    results = []
+    for control in (False, True):
+        rt, launches, _, ins = build(args, "dense", rank, tp, group, device)
+        op, kw = launches[0]
+        w = op.w
+        if control and rank == 0:
+            op.w = msgspec.structs.replace(w, s_dn=w.s_dn * 2)
+        out = op.launch(*ins, **kw)
+        torch.cuda.synchronize()
+        a = ffn_input(rt, args.rows).float()
+        gate, up = (a @ _dequant(w.w_ug, w.s_ug, w.shuffled).T).chunk(2, -1)
+        mid = torch.nn.functional.silu(gate.clamp(max=SWIGLU_LIMIT))
+        mid = mid * up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+        x32 = mid @ _dequant(w.w_dn, w.s_dn, w.shuffled).T
+        dist.all_reduce(x32)
+        valid = args.rows - args.pad_rows
+        results.append(_rel(out[0][:valid], x32[:valid]))
+        rt.close()
+    ok = results[0] <= DENSE_X_VS_FP32 < results[1]
+    print(
+        f"rank {rank}: dense x vs f32 MLP rel {results[0]:.3e} (bound "
+        f"{DENSE_X_VS_FP32}); one rank's down scales x2: {results[1]:.3e} (caught "
+        f"{results[1] > DENSE_X_VS_FP32})",
+        flush=True,
+    )
+    return ok
+
+
+def check_embed(args, rank, tp, group, device) -> bool:
+    """The launch from the step's tokens against the dense launch on the gathered
+    embedding rows (x = the row on every rank; post 1, comb 0, residual 0) on the same
+    weights and state: outputs and state writes bitwise equal, the width's rows past
+    the step's pads; and the step tables it writes equal the spec's torch tables."""
+    from msgspec.structs import astuple
+
+    rt, launches, _, ins = build(args, "embed", rank, tp, group, device)
+    op, kw = launches[0]
+    step = kw["step"]
+    n = step["ids"].shape[0]
+    _, table = embedding(rank, tp, device)
+    state0 = [t.clone() for t in astuple(kw["state"])]
+    out = [t.clone() for t in op.launch(*ins, **kw)]
+    torch.cuda.synchronize()
+    kda, rows = spec_tables(step, kw["state_idx"], args.rows)
+    tables = torch.equal(step["slots"], kda) and torch.equal(step["rows"], rows)
+    ref_rt, ref_launches, _, _ = build(args, "dense", rank, tp, group, device)
+    ref_op, ref_kw = ref_launches[0]
+    for t, v in zip(astuple(ref_kw["state"]), state0):
+        t.copy_(v)
+    x = torch.zeros(args.rows, HIDDEN, dtype=torch.bfloat16, device=device)
+    x[:n] = table[step["ids"]]
+    ref = ref_op.launch(x, *ins[1:], state=ref_kw["state"], state_idx=kda)
+    torch.cuda.synchronize()
+    same = all(torch.equal(a, b) for a, b in zip(out, ref))
+    writes = all(
+        torch.equal(a, b)
+        for a, b in zip(astuple(kw["state"]), astuple(ref_kw["state"]))
+    )
+    print(
+        f"rank {rank}: {n} of {args.rows} rows from the tokens == the dense launch on "
+        f"their rows: outputs {same}, state writes {writes}; step tables == the "
+        f"spec's {tables}",
+        flush=True,
+    )
+    rt.close()
+    ref_rt.close()
+    return same and writes and tables
+
+
+def check_head(args, rank, tp, group, device) -> bool:
+    """The tail's logits against a torch tail on the same input (the four streams
+    rounded to bf16 as hc_post rounds them, their mean in bf16, the RMSNorm'd rows in
+    bf16, the LM head, bf16 logits) and an f32 tail; ``--launches`` back-to-back tails give the same
+    logits; with the final norm x 1.01 the logits must move well past the launch's
+    own distance (negative control)."""
+    import msgspec
+
+    from sgl_amd_mono.glm53_flash.gfx950.config import EPS
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    rt, launches, _, ins = build(args, "head", rank, tp, group, device)
+    op, _ = launches[0]
+    x, res, post, comb = ins
+    outs = []
+    for _ in range(args.launches):
+        outs.append(op.launch(*ins).clone())
+        rt.advance_step()
+    torch.cuda.synchronize()
+    repeat = all(torch.equal(outs[0], o) for o in outs)
+    S = x.shape[0]
+    streams = post.reshape(S, -1, 1) * x.float()[:, None] + torch.einsum(
+        "sij,sih->sjh", comb, res.float()
+    )
+
+    def tail(h, bf16):
+        n = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + EPS) * op.w.g_norm.float()
+        shard = (n.bfloat16().float() if bf16 else n) @ op.w.w_head.float().T
+        parts = [torch.empty_like(shard) for _ in range(tp)]
+        dist.all_gather(parts, shard.contiguous())
+        out = torch.cat(parts, -1)
+        return out.bfloat16().float() if bf16 else out
+
+    ref = tail(streams.bfloat16().float().mean(1).bfloat16().float(), True)
+    ref32 = tail(streams.mean(1), False)
+    rel, rel32 = _rel(outs[0], ref), _rel(outs[0], ref32)
+    op.w = msgspec.structs.replace(op.w, g_norm=(op.w.g_norm.float() * 1.01).bfloat16())
+    bad = _rel(op.launch(*ins), ref)
+    torch.cuda.synchronize()
+    caught = bad > 4 * rel
+    print(
+        f"rank {rank}: logits vs torch tail rel {rel:.3e}, vs f32 tail {rel32:.3e}; "
+        f"{args.launches} back-to-back tails equal {repeat}; final norm x1.01: rel "
+        f"{bad:.3e} (caught {caught})",
+        flush=True,
+    )
+    rt.close()
+    return rel < 2e-3 and rel32 < 1e-2 and repeat and caught
+
+
 def _changed_rows(before: torch.Tensor, after: torch.Tensor) -> set:
     d = (before != after).reshape(before.shape[0], -1).any(1)
     return set(d.nonzero().flatten().tolist())
@@ -414,23 +1122,24 @@ def writes_only_its_rows(extra: dict, before: dict) -> bool:
 
 def main() -> int:
     from sgl_amd_mono.common import guard
-    from sgl_amd_mono.glm53_flash.gfx950.kernel import (
-        FlashBuild,
-    )
-    from sgl_amd_mono.glm53_flash.gfx950.runner import (
-        FlashLayerOp,
-        FlashRuntime,
-    )
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kind", choices=("ffn", "kda", "dsa"), default="ffn")
+    ap.add_argument("--kind", choices=KINDS, default="ffn")
     ap.add_argument("--rows", type=int, default=4)
     ap.add_argument("--deadline", type=float, default=10.0)
     ap.add_argument("--launches", type=int, default=3)
     ap.add_argument("--max-pools", type=int, default=MAX_LEN // 4)
     ap.add_argument("--lens", type=str, default="", help="comma-separated row lengths")
     ap.add_argument("--compare-shuffled", action="store_true")
+    ap.add_argument("--check-routing", action="store_true")
+    ap.add_argument("--check-keys", action="store_true")
+    ap.add_argument("--check-dense", action="store_true")
+    ap.add_argument("--check-embed", action="store_true")
+    ap.add_argument("--check-head", action="store_true")
+    ap.add_argument("--replays", type=int, default=0, help="graph replays of a step")
+    ap.add_argument("--layers", type=int, default=1, help="launches a step (--replays)")
     ap.add_argument("--pad-rows", type=int, default=0, help="trailing pad rows")
+    ap.add_argument("--step-rows", type=int, default=0, help="an embed step's rows")
     ap.add_argument(
         "--writes", action="store_true", help="check the rows a launch writes"
     )
@@ -440,57 +1149,27 @@ def main() -> int:
     device = torch.device("cuda", torch.cuda.current_device())
     dist.init_process_group("gloo")
     group = dist.new_group(backend="gloo")
-    if args.compare_shuffled:
-        return 0 if compare_shuffled(args, rank, tp, group, device) else 1
-    kda, dsa = args.kind == "kda", args.kind == "dsa"
-    key = FlashBuild(
-        rows=args.rows,
-        tp=tp,
-        launches_per_step=1,
-        inter=GLOBAL_INTER // tp,
-        kda=kda,
-        dsa=dsa,
-        max_pools=args.max_pools if dsa else 0,
-        stop=False,
-    )
-    rt = FlashRuntime(key, rank, group, device)
-    rt.set_deadline(args.deadline)
-    op = FlashLayerOp(
-        rt,
-        ffn_weights(rank, tp, device),
-        0,
-        kda=kda_weights(rank, tp, device) if kda else None,
-        dsa=dsa_weights(rank, tp, device) if dsa else None,
-    )
-    x, res, post, comb = layer_inputs(args.rows, device)
-    extra = {}
-    if kda:
-        state, idx = kda_state(args.rows, tp, device)
-        idx[args.rows - args.pad_rows :] = 0  # not positive: a pad row
-        extra = {"state": state, "state_idx": idx}
-    elif dsa:
-        from sgl_amd_mono.glm53_flash.gfx950.layout import ROW_BT
-
-        lens = [int(v) for v in args.lens.split(",")] if args.lens else None
-        lens = lens or list(LENS[: args.rows])
-        valid = args.rows - args.pad_rows
-        caches, table, pt = dsa_caches(
-            args.rows, device, lens[:valid] + [0] * args.pad_rows
-        )
-        # SGLang's page table has the step's rows; the width's pad rows read row 0
-        pt = pt[:valid].clone()
-        table[valid:, ROW_BT] = 0
-        extra = {"caches": caches, "rows": table, "page_table": pt}
-    else:
-        x = x / tp  # the FFN launch takes this rank's unreduced attention share
+    for flag, check in (
+        (args.compare_shuffled, compare_shuffled),
+        (args.check_routing, check_routing),
+        (args.check_keys, check_keys),
+        (args.check_dense, check_dense),
+        (args.check_embed, check_embed),
+        (args.check_head, check_head),
+        (args.replays, check_replays),
+    ):
+        if flag:
+            return 0 if check(args, rank, tp, group, device) else 1
+    rt, launches, _, ins = build(args, args.kind, rank, tp, group, device)
+    op, extra = launches[0]
     outs, written = [], True
     for n in range(args.launches):
-        if args.writes and n == 0 and extra:
+        if args.writes and n == 0 and args.kind in ("kda", "dsa", "dense"):
             from msgspec.structs import asdict
 
             held = asdict(extra.get("state") or extra["caches"])
             before = {k: t.clone() for k, t in held.items()}
-        out = op.launch(x, res, post, comb, **extra)
+        out = run_step(args.kind, launches, ins)
         rt.advance_step()
         torch.cuda.synchronize()
         words = rt.epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1].tolist()
@@ -498,7 +1177,7 @@ def main() -> int:
         print(f"rank {rank} launch {n}: error words {words}", flush=True)
         if any(words):
             return 1
-        if args.writes and n == 0 and extra:
+        if args.writes and n == 0 and args.kind in ("kda", "dsa", "dense"):
             written = writes_only_its_rows(extra, before)
             print(f"rank {rank}: writes only its rows {written}", flush=True)
     xs = [torch.zeros_like(outs[-1][0]) for _ in range(tp)]

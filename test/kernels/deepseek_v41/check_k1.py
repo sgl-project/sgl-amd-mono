@@ -1,10 +1,14 @@
-"""Check that K1 stays bitwise equal to SGLang's decode chain for the seam and the SWA KV write on gfx950,
-in each variant: the owed post folded in, a settled residual (after an Engram write), the first
-layer (copy 0 of the broadcast embedding), and an index source's normed input and qr."""
+"""Check K1 bitwise against SGLang's decode chain for the seam and SWA KV write on gfx950.
+
+Variants: the owed post folded in, a settled residual (after an Engram write), the first layer
+(copy 0 of the broadcast embedding) and an index source (normed input, qr, index query); each
+also token parallel where the width allows (the seam's outputs on this rank's rows, the rest
+whole)."""
 
 import argparse
 import math
 import os
+import struct
 
 import torch
 import torch.distributed as dist
@@ -19,26 +23,28 @@ from check_ffn import (
     seam_inputs,
 )
 
-from sgl_amd_mono.deepseek_v41.spec import NUMERICS
+from sgl_amd_mono.deepseek_v41.spec import NUMERICS, SPEC
 
 RECORD, BLOCK, PAGES, POSITIONS = 584, 64, 64, 131072
 Q_RANK, NOPE, HEAD = 1280, 448, 512
-# the spec's bounds; measured: mixes <= 5.4e-7 (TP2 / TP4 synthetic, TP4 server)
+# the spec's bound; measured mixes <= 5.4e-7 (TP2 / TP4 synthetic, TP4 server)
 MIX_TOL = NUMERICS.bound("k1.mix.max_abs")
 # K1 rounds q as SGLang does but sums wq_b in another order: bf16 flips only
 Q_COS, Q_REL = NUMERICS.bound("k1.q.cosine"), NUMERICS.bound("k1.q.rel")
-WIDTHS = "1,2,3,4,5,7,8,12,16,17,24,31,32,33,40,47,48"
-# (name, fold, index, first): the variants, each against its SGLang chain
+WIDTHS = ",".join(str(m) for m in SPEC.devices["gfx950"].widths)
+# (name, fold, index, first), each against its own SGLang chain
 VARIANTS = (
     ("fold", True, False, False),
     ("settled", False, False, False),
     ("first", False, False, True),
     ("index", True, True, False),
 )
-# the widths the variants other than fold run at (fold runs at every width)
+# also run token parallel (``token_par``) where the width allows
+TOKEN_PAR_VARIANTS = ("fold", "settled", "index")
+# fold runs at every width, the other variants only at these
 VARIANT_WIDTHS = (1, 6, 12, 24, 48)
 QR_REL = NUMERICS.bound("k1.qr.rel")
-# SGLang's wqkv_a configs K1 is matched to: the GEMV per M bucket up to 32 rows, the split-K tile above
+# SGLang's wqkv_a configs K1 matches: the GEMV per M bucket up to 32 rows, the split-K tile above
 GEMV = {1: "w16s1r16t16k", 2: "w16s1r16t16k", 4: "w16s1r16t16k", 8: "w8s2r16t16k", 16: "w8s2r16t16k",
         32: "w8s1r16t32k"}  # fmt: skip
 LARGE_M = (64, 64, 256, 4, 5)
@@ -74,7 +80,7 @@ def rope_table(dev):
 
 def check_wqkv_route(M):
     """Return whether SGLang's wqkv_a config at M is the one K1 implements."""
-    from sglang.kernels.ops.quantization import mxfp8_native_amd_gfx95 as mx
+    from sglang.kernels.ops.gemm import mxfp8_native_amd_gfx95 as mx
 
     from sgl_amd_mono.deepseek_v41.gfx950.attention.plan import (
         wqkv_order,
@@ -119,26 +125,63 @@ def query_ref(qkv, a, cos_sin, pos):
     return o
 
 
+K1_MARKS = {
+    32: "start", 33: "slices", 34: "norm", 35: "kt", 36: "wqkv", 37: "qkv",
+    38: "qrdy", 39: "wq_b", 40: "gate",
+}  # fmt: skip
+
+
+def k1_timeline(M, tl) -> str:
+    """Each K1 stage's µs across CTAs (median, max) and on the CTA that ends last."""
+    marks = list(K1_MARKS)
+    last = int(tl[:, marks[-1]].argmax())
+    span = (tl[:, marks[-1]].max() - tl[:, marks[0]].min()).item() / 100.0
+    lines = [f"M={M} K1 {span:.2f} us; stage us (median / max / CTA {last}, last):"]
+    for a, b in zip(marks, marks[1:]):
+        d = (tl[:, b] - tl[:, a]).double() / 100.0  # 100 MHz ticks
+        lines.append(
+            f"  {K1_MARKS[b]:6s} {d.median().item():7.2f} {d.max().item():7.2f}"
+            f" {d[last].item():7.2f}"
+        )
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--widths", default=WIDTHS)
     ap.add_argument("--trials", type=int, default=3)
+    ap.add_argument(
+        "--variants-at",
+        default=",".join(map(str, VARIANT_WIDTHS)),
+        help="the widths the variants other than fold run at",
+    )
+    ap.add_argument(
+        "--timeline", action="store_true", help="print each width's stage timeline"
+    )
+    # K1 reads wqkv and wq_b in aiter's (16, 16) preshuffle; the references keep row-major
+    ap.add_argument("--shuffled", action="store_true")
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
     dev = torch.device("cuda", rank)
     dist.init_process_group("nccl")
     cpu = dist.new_group(backend="gloo")
-    from sglang.kernels.ops.attention.dsv4.elementwise import fused_k_norm_rope_flashmla
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        index_q_rope_pack_weights_flydsl,
+    )
+    from sglang.kernels.ops.attention.dsv4.norm_rope import fused_k_norm_rope_flashmla
+    from sglang.kernels.ops.gemm.mxfp8_aiter_gfx95 import aiter_mxfp8_blockscaled_linear
+    from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
+        mxfp8_native_blockscaled_linear,
+        prepare_mxfp8_native_weight,
+    )
+    from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_boundary_fused_deferred,
         rmsnorm_with_sinkhorn,
     )
-    from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
-        mxfp8_native_blockscaled_linear,
-        prepare_mxfp8_native_weight,
-    )
 
+    from sgl_amd_mono.deepseek_v41.gfx950.attention.index_query import fused as iq_fused
     from sgl_amd_mono.deepseek_v41.gfx950.layer import (
         MonoBuild,
         build_mono_k1,
@@ -147,10 +190,13 @@ def main():
     from sgl_amd_mono.deepseek_v41.gfx950.runner import (
         DSV41MonoRunner,
     )
+    from sgl_amd_mono.deepseek_v41.gfx950.token_par import token_par
 
     w, _, _ = make_weights(tp, rank, dev, seed=0)
     m = mono_weights(w)
     del w
+    if args.timeline:  # the runner builds its launches with stage marks
+        os.environ["SGLANG_AMD_MONO_TIMELINE"] = "1"
     r = DSV41MonoRunner(tp, rank, cpu, dev)
     heads = r.q.shape[1]
     g = torch.Generator(device=dev).manual_seed(11)
@@ -158,15 +204,36 @@ def main():
     m.ffn_norm.copy_(
         (torch.randn(HIDDEN, generator=g, device=dev) * 1.5).exp().to(m.ffn_norm.dtype)
     )
+    if args.shuffled:
+        from aiter.ops.shuffle import shuffle_weight
+
+        kw = {n: shuffle_weight(a[n], (16, 16)) for n in ("wqkv", "wqb")}
+    else:
+        kw = {n: a[n] for n in ("wqkv", "wqb")}
     cos_sin = rope_table(dev)
+    # an indexer, replicated on every rank: wq_b, weights_proj and the head-weight scale 2^-6
+    gi = torch.Generator(device=dev).manual_seed(29)
+    iq_w = (torch.randn(4096, Q_RANK, generator=gi, device=dev) * 64).clamp(-448, 448)
+    iq_w = iq_w.to(torch.float8_e4m3fn)
+    iq_ws = torch.randint(
+        116,
+        124,
+        (4096 // 32, Q_RANK // 32),
+        generator=gi,
+        device=dev,
+        dtype=torch.uint8,
+    )
+    iw_w = (torch.randn(32, HIDDEN, generator=gi, device=dev) * 0.02).bfloat16()
+    kw["iq_w"] = shuffle_weight(iq_w, (16, 16)) if args.shuffled else iq_w
+    iw_scale = 128**-0.5 * 32**-0.5
+    iw_bits = struct.unpack("<i", struct.pack("<f", iw_scale))[0]
     freqs = torch.complex(cos_sin[:, :32], cos_sin[:, 32:])  # SGLang's freqs_cis
     w_sh, w_su = prepare_mxfp8_native_weight(
         a["wqkv"], torch.exp2(a["wqkv_s"].float() - 127), (32, 32)
     )
     stride = math.ceil(BLOCK * RECORD / 576) * 576
-    edges = torch.tensor(
-        [BLOCK - 1, BLOCK, PAGES * BLOCK - 1], device=dev
-    )  # page edges, the last slot
+    # page edges and the last slot
+    edges = torch.tensor([BLOCK - 1, BLOCK, PAGES * BLOCK - 1], device=dev)
 
     def records(buf, s):
         """Return the 584 bytes of slots ``s``: 448 NOPE e4m3, 64 bf16 rope, then 8 scale bytes (7, pad)."""
@@ -184,21 +251,41 @@ def main():
         pos = torch.randint(0, POSITIONS, (M,), generator=g, device=dev)
         pos[: min(M, 2)] = torch.tensor([POSITIONS - 1, 65536], device=dev)[: min(M, 2)]
         perm = torch.randperm(PAGES * BLOCK, generator=g, device=dev)
-        slot = torch.cat([edges, perm[~torch.isin(perm, edges)]])[:M]
+        # int32, as SGLang's HIP backend hands the SWA slots out
+        slot = torch.cat([edges, perm[~torch.isin(perm, edges)]])[:M].int()
         return res, x, post, comb, pre, pos, slot
 
     fails = []
     widths = [int(v) for v in args.widths.split(",")]
+    variants_at = {int(v) for v in args.variants_at.split(",")}
     runs = [
-        (M, v)
+        (M, v, False)
         for M in widths
         for v in VARIANTS
-        if v[0] == "fold" or M in VARIANT_WIDTHS
+        if v[0] == "fold" or M in variants_at
     ]
-    for M, (vname, fold, index, first) in runs:
+    runs += [
+        (M, v, True)
+        for M, v, _ in list(runs)
+        if v[0] in TOKEN_PAR_VARIANTS and token_par(M, tp)
+    ]
+    for M, (vname, fold, index, first), tok_par in runs:
         ok, route = check_wqkv_route(M)
-        k1 = build_mono_k1(MonoBuild(M, tp, fold=fold, index=index))
-        lay = scratch_layout(M, tp)
+        route = r.route_at(M)
+        tl = r.timeline_on
+        iq = index and iq_fused(M, tok_par)
+        k1 = build_mono_k1(
+            MonoBuild(
+                M, tp, fold=fold, index=index, timeline=tl, tok_par=tok_par, iq=iq,
+                shuffled=args.shuffled,
+                **route,
+            )
+        )  # fmt: skip
+        # the seam's rows this rank computes: its own, token parallel
+        n = M // tp if tok_par else M
+        own = slice(rank * n, (rank + 1) * n) if tok_par else slice(0, M)
+        vname += ":tp" if tok_par else ""
+        lay = scratch_layout(M, tp, tl, **route)
         sc = r.scratch(M)
         static = [t.clone() for t in inputs(M)]
         swa = torch.full((PAGES, stride), 255, dtype=torch.uint8, device=dev)
@@ -207,30 +294,43 @@ def main():
             pre = r.first_pre[:M]
         # a settled residual: no post owed, the seam reads only the residual
         xk, postk, combk = (x, post, comb) if fold else (res, res, res)
+        # DSpark's capture of the layer, which K1 writes beside its residual
+        aux = torch.full((M, HIDDEN), float("nan"), dtype=torch.bfloat16, device=dev)
 
         def launch():
-            r.epoch[0] += (
-                1  # the FFN launch moves the epoch; K1 alone must not see the last launch's tags
-            )
+            # the FFN launch moves the epoch; K1 alone must not see the last launch's tags
+            r.epoch[0] += 1
             k1(
                 res.data_ptr(), xk.data_ptr(), postk.data_ptr(), combk.data_ptr(), pre.data_ptr(),
                 m.hc_ffn_fn.data_ptr(), m.hc_ffn_scale.data_ptr(), m.hc_ffn_base.data_ptr(),
                 m.ffn_norm.data_ptr(),
-                r.res_mid.data_ptr(), r.post_a.data_ptr(), r.comb_a.data_ptr(), r.pre_a.data_ptr(),
-                a["wqkv"].data_ptr(), a["wqkv_s"].data_ptr(), a["q_norm"].data_ptr(), a["kv_norm"].data_ptr(),
-                a["wqb"].data_ptr(), a["wqb_s"].data_ptr(), cos_sin.data_ptr(), pos.data_ptr(),
-                slot.data_ptr(), swa.data_ptr(), swa.stride(0), BLOCK, 0, 0, 0, 0, 0, 0, r.q.data_ptr(),
-                r.normed.data_ptr(), r.qr.data_ptr(), sc.data_ptr(),
+                r.res_mid.data_ptr(), aux.data_ptr(), r.post_a.data_ptr(), r.comb_a.data_ptr(),
+                r.pre_a.data_ptr(), kw["wqkv"].data_ptr(), a["wqkv_s"].data_ptr(), a["q_norm"].data_ptr(), a["kv_norm"].data_ptr(),
+                kw["wqb"].data_ptr(), a["wqb_s"].data_ptr(), cos_sin.data_ptr(), pos.data_ptr(),
+                slot.data_ptr(), 1, swa.data_ptr(), swa.stride(0), BLOCK, 0, 0, 0, 0, 0, 0, r.q.data_ptr(),
+                r.normed.data_ptr(), r.qr.data_ptr(), kw["iq_w"].data_ptr(), iq_ws.data_ptr(),
+                iw_w.data_ptr(), iw_bits, cos_sin.shape[0], r.iq.data_ptr(),
+                r.iqs.data_ptr(), r.iw.data_ptr(), sc.data_ptr(),
                 r.peer.local, r.peer.addresses.data_ptr(), r.rank, r.epoch.data_ptr(),
                 stream=torch.cuda.current_stream(),
             )  # fmt: skip
 
         launch()
         torch.cuda.synchronize()
+        if args.timeline and vname in ("fold", "fold:tp"):
+            for _ in range(5):
+                launch()
+            torch.cuda.synchronize()
+            if rank == 0:
+                print(k1_timeline(M, r.timeline(M).cpu()), flush=True)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             launch()
-        diff = dict(res=0, x8=0, x8s=0, nope=0, scale=0, rope=0, replay=0, normed=0)
+        diff = dict(
+            res=0, aux=0, x8=0, x8s=0, nope=0, scale=0, rope=0, replay=0, normed=0
+        )
+        if iq:
+            diff |= dict(iq=0, iqs=0, iw=0)
         mix, q_cos, q_rel, qr_rel = 0.0, 1.0, 0.0, 0.0
         for _ in range(args.trials):
             for t, v in zip(static, inputs(M)):
@@ -239,15 +339,20 @@ def main():
             launch()
             torch.cuda.synchronize()
             o = lay["x8"][0]
-            x8 = sc[o : o + M * HIDDEN].clone()
+            x8 = sc[o : o + n * HIDDEN].clone()
             o = lay["x8s"][0]
             x8s = (
-                sc[o : o + M * HIDDEN // 32 * 4]
+                sc[o : o + n * HIDDEN // 32 * 4]
                 .view(torch.int32)
-                .view(M, HIDDEN // 32)
+                .view(n, HIDDEN // 32)
                 .to(torch.uint8)
             )
             got = records(swa, slot.long())
+            # the mean SGLang's DSpark takes of the layer's input residual
+            want_aux = r.res_mid[:M][own].mean(dim=1)
+            diff["aux"] += int(
+                (aux[own].view(torch.int16) != want_aux.view(torch.int16)).sum()
+            )
             eager = [
                 t[:M].clone() for t in (r.q, r.res_mid, r.post_a, r.comb_a, r.pre_a)
             ] + [got.clone()]
@@ -261,12 +366,13 @@ def main():
                 t[:M] for t in (r.q, r.res_mid, r.post_a, r.comb_a, r.pre_a)
             ] + [records(swa, slot.long())]
             diff["replay"] += sum(
-                int((u.view(torch.uint8) != v.view(torch.uint8)).sum())
-                for u, v in zip(eager, replayed)
+                int((u[rows].view(torch.uint8) != v[rows].view(torch.uint8)).sum())
+                for u, v, rows in zip(
+                    eager, replayed, [slice(0, M)] + [own] * 4 + [slice(0, M)]
+                )
             )
 
-            # SGLang's boundary: no x when nothing is owed, no pre_prev on the first
-            # layer (the collapse is copy 0)
+            # SGLang's boundary: no x when nothing is owed, no pre_prev on the first layer (copy 0)
             ro, y, co = hc_boundary_fused_deferred(
                 x if fold else None,
                 res,
@@ -304,14 +410,15 @@ def main():
             want = records(ref, slot.long())
 
             diff["res"] += int(
-                (eager[1].view(torch.int16) != ro.view(torch.int16)).sum()
+                (eager[1][own].view(torch.int16) != ro[own].view(torch.int16)).sum()
             )
             diff["x8"] += int(
-                (x8 != xq.q[:M].contiguous().view(torch.uint8).flatten()).sum()
+                (x8 != xq.q[:M][own].contiguous().view(torch.uint8).flatten()).sum()
             )
             diff["x8s"] += int(
                 (
-                    x8s != xq.scale[:M].contiguous().view(torch.uint8).reshape(M, -1)
+                    x8s
+                    != xq.scale[:M][own].contiguous().view(torch.uint8).reshape(n, -1)
                 ).sum()
             )
             # byte 583 pads the 7 scales: no reader, and SGLang's store leaves it as it was
@@ -326,7 +433,8 @@ def main():
                 (eager[2], post_r),
                 (eager[3], comb_r),
             ):
-                mix = max(mix, (k1_t.reshape(ref_t.shape) - ref_t).abs().max().item())
+                d = (k1_t.reshape(ref_t.shape) - ref_t)[own]
+                mix = max(mix, d.abs().max().item())
             if index:
                 # an index source's outputs, its compressor and indexer's inputs
                 diff["normed"] += int(
@@ -341,6 +449,25 @@ def main():
                     qr_rel,
                     ((r.qr[:M].float() - qr_ref).norm() / qr_ref.norm()).item(),
                 )
+            if iq:
+                # bit for bit vs SGLang's chain (``spec._index_query``) on K1's qr and normed input
+                ref = index_q_rope_pack_weights_flydsl(
+                    q=aiter_mxfp8_blockscaled_linear(r.qr[:M], iq_w, iq_ws),
+                    freqs_cis=freqs,
+                    positions=pos,
+                    rope_dim=64,
+                    head_weight_partials=rocm_router_gemv_split_k(
+                        x=r.normed[:M], w=iw_w
+                    ),
+                    weight_scale=iw_scale,
+                    num_heads=32,
+                )
+                for name, got_t, want_t in zip(
+                    ("iq", "iqs", "iw"), (r.iq, r.iqs, r.iw), ref
+                ):
+                    diff[name] += int(
+                        (got_t[:M].view(torch.uint8) != want_t.view(torch.uint8)).sum()
+                    )
             qr, qk = (
                 query_ref(qkv, a, cos_sin, pos.long()).flatten(),
                 eager[0].double().flatten(),

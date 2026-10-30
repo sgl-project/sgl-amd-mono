@@ -1,23 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Deadlines, sticky error words and the stop of a failed launch (RFC #43949).
 
-Each wait on another workgroup or rank has a deadline below the server's
-watchdog timeout. On a timeout the wait sets a sticky error word on its GPU,
-writes an error flag to every peer, fences, and stops the launch (a store to
-the null page: a GPU fault at address 0x0), and with it the process. A wait
-that sees a failure (its own GPU's words or a peer's flag) stops too. A launch
-never runs on after a failed wait: its data-dependent addresses would come from
-words that never arrived. A rank finishes a step only when each of its waits got
-that step's data, so its tokens are correct; nothing is checked on the host.
-
-The deadline comes from ``--watchdog-timeout`` (half of it, at most 60 s), and
-one under 5 s is refused, so that a normal delay on one rank is not a failure
-(SGLang's ``sglang.srt.monokernels.guards``). A satisfied wait costs nothing
-more, and so does a pending one that the data reaches within ``CHECK_POLLS``
-polls; a longer one checks the failure flags every ``CHECK_POLLS`` polls and its
-deadline on the 100 MHz ``s_memrealtime`` clock from the first of those checks.
-The guard loads nothing at launch entry: the deadline and the peers' addresses
-are read only on those checks and on a failure.
+Each wait on another workgroup or rank has a deadline below the server's watchdog:
+half of ``--watchdog-timeout``, at most 60 s, and SGLang refuses one under 5 s, so a
+normal delay on one rank is not a failure. On a timeout the wait sets a sticky error
+word, flags every peer, fences and stops the launch (a store to the null page), and
+with it the process; a wait that sees a failure (its GPU's words or a peer's flag)
+stops too. A launch never runs on after a failed wait, since its data-dependent
+addresses would come from words that never arrived, so a finished step's tokens are
+correct with nothing checked on the host. A pending wait checks the flags every
+``CHECK_POLLS`` polls and its deadline on the 100 MHz ``s_memrealtime`` clock from the
+first check; the guard reads the deadline and the peers' addresses only on those
+checks and on a failure.
 
 The guard block lives in the launch's epoch buffer (int32 words):
 
@@ -31,11 +25,8 @@ word  meaning
 5     ``fault``: set by the test fault injection (``SGLANG_AMD_MONO_FAULT_INJECT``)
 ====  ======================================================================
 
-A peer's error flags are ``FLAG_WORDS`` words at ``flags_offset`` of each
-rank's peer buffer: rank r writes word r of every rank's flags, its own too.
-
-The guard is set for the duration of a kernel's trace (``scope``); the waits
-pick it up there, so a kernel only builds its guard once at the top.
+A rank's error flags are ``FLAG_WORDS`` words at ``flags_offset`` of each rank's
+peer buffer: rank r writes word r of every rank's flags, its own too.
 """
 
 import contextlib
@@ -69,16 +60,27 @@ FLAG_WORDS = 8  # one a rank; TP 8 at most
 FLAG_BYTES = 256  # the peer buffer's flags region, padded to a cache line pair
 
 CLOCK_HZ = 100_000_000  # s_memrealtime: the constant 100 MHz reference clock
+# a wait's check compares time in 2**TICK_SHIFT ticks (2.56 us), as 32-bit scalars
+TICK_SHIFT = 8
+# a longer deadline wraps in that check, and a wait fails at its first check
+MAX_DEADLINE_TICKS = (1 << 31 << TICK_SHIFT) - 1
 
 
 def deadline_ticks(seconds: float) -> int:
-    return int(seconds * CLOCK_HZ)
+    ticks = int(seconds * CLOCK_HZ)
+    if ticks > MAX_DEADLINE_TICKS:
+        raise ValueError(
+            f"a {seconds} s wait deadline does not fit the wait's 32-bit check; "
+            f"use at most {MAX_DEADLINE_TICKS // CLOCK_HZ} s"
+        )
+    return ticks
 
 
 def fault_injection(rank: int) -> Optional[tuple[int, int]]:
-    """(site, after): the wait this rank stalls at once ``after`` launches have run,
-    from ``SGLANG_AMD_MONO_FAULT_INJECT`` (``rank:site[:after]``), or None. A test
-    hook: the stalled wait times out."""
+    """This rank's test fault injection from ``SGLANG_AMD_MONO_FAULT_INJECT``
+    (``rank:site[:after]``): (site, after), or None.
+
+    Once ``after`` launches have run, the wait at ``site`` stalls until it times out."""
     spec = os.environ.get("SGLANG_AMD_MONO_FAULT_INJECT", "")
     if not spec:
         return None
@@ -86,18 +88,13 @@ def fault_injection(rank: int) -> Optional[tuple[int, int]]:
     return (int(site or 0), int(after or 0)) if int(r) == rank else None
 
 
-# a diagnostic: the timed-out wait stops at page (site + 1) instead of 0x0, so the
-# runtime's fault message names it; the trace prints each site's caller
-SITE_FAULT = os.environ.get("SGLANG_AMD_MONO_GUARD_SITE_FAULT", "0") == "1"
-_GUARDS = [0]
+def stop_launch():
+    """Stop the launch with a volatile store to the null page.
 
-
-def stop_launch(page=0):
-    """Stop the launch: a volatile store to the null page faults (address 0x0, so a
-    deliberate stop is told apart from a real fault), and the runtime tears the
-    queue down. Unlike ``llvm.trap`` it asks nothing of the kernel's ABI, so a
-    launch that never fails pays nothing for it."""
-    fx.generic_store(global_ptr(page << 12), fx.Int32(1), volatile=True)
+    The fault at address 0x0 tells a deliberate stop apart from a real one, and the
+    runtime tears the queue down. Unlike ``llvm.trap`` it asks nothing of the kernel's
+    ABI, so a launch that never fails pays nothing for it."""
+    fx.generic_store(global_ptr(0), fx.Int32(1), volatile=True)
 
 
 class Guard:
@@ -122,9 +119,13 @@ class Guard:
         fault_after=0,
         stop=True,
     ):
+        assert (own is None) == (peers is None), (
+            "own and peers come together: a rank reads the flags its peers write"
+        )
         self.epoch = epoch
         self.own = own
         self.peers = peers
+        self.has_peers = peers is not None
         self.rank = rank
         self.npes = npes
         self.flags_offset = flags_offset
@@ -132,9 +133,6 @@ class Guard:
         self.fault_after = fault_after
         self.stop = stop
         self._sites = 0
-        if SITE_FAULT:
-            _GUARDS[0] += 1
-            self._gid = _GUARDS[0]
 
     def armed(self):
         """The fault injection's stall is on: ``fault_after`` launches have run."""
@@ -160,13 +158,19 @@ class Guard:
         )
         return (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
 
+    def scalar_deadline(self):
+        """The deadline >> ``TICK_SHIFT`` in an SGPR, so a wait's check needs no VGPRs.
+
+        The host writes it before the launch, so the scalar cache may serve it; a GLC
+        load slows the launch's other scalar loads."""
+        w = fx.Vector(bo.buffer_load(rsrc(self.epoch), 0, vec_width=4, is_scalar=True))
+        dl = (fx.Int64(w[GUARD_DEADLINE + 1]) << 32) | (
+            fx.Int64(w[GUARD_DEADLINE]) & fx.Int64(0xFFFFFFFF)
+        )
+        return fx.Int32(dl >> TICK_SHIFT)
+
     def next_site(self) -> int:
         self._sites += 1
-        if SITE_FAULT:
-            import traceback
-
-            fr = [f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}" for f in traceback.extract_stack()[:-1] if "sgl_amd_mono" in f.filename]
-            print(f"[guard-site] g{self._gid} site {self._sites} (page {self._sites + 1:#x}): {' < '.join(reversed(fr[-4:]))}", flush=True)
         return self._sites
 
     def _word(self, i):
@@ -178,7 +182,7 @@ class Guard:
 
     def flags(self):
         """This rank's flags as its peers wrote them (system scope); 0 when clean."""
-        if self.own is None:
+        if not self.has_peers:
             return fx.Int32(0)
         acc = fx.Int32(0)
         # a buffer load carries at most 4 dwords: TP 8 reads its flags in two
@@ -210,7 +214,7 @@ class Guard:
         bo.buffer_store(
             fx.Int32(site + 1), rsrc(self.epoch), ERR_DEADLINE, cache_modifier=CM_DEV
         )
-        if self.peers is not None:
+        if self.has_peers:
             for p in range_constexpr(self.npes):
                 bo.buffer_store(
                     fx.Int32(1),
@@ -220,7 +224,7 @@ class Guard:
                 )
         rocdl.s_waitcnt(vmcnt=0)
         if const_expr(self.stop):
-            stop_launch(site + 1 if SITE_FAULT else 0)
+            stop_launch()
 
     def note_peer(self):
         """A wait saw a failure elsewhere: stop the launch (the failed rank flagged
@@ -242,7 +246,8 @@ _CURRENT: list[Guard] = []
 
 @contextlib.contextmanager
 def scope(guard: Optional[Guard]):
-    """Make ``guard`` the one the waits traced inside this block take."""
+    """Make ``guard`` the one the waits traced inside this block take, so a kernel
+    builds its guard once at the top."""
     _CURRENT.append(guard)
     try:
         yield guard

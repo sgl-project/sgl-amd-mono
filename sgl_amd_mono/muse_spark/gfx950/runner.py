@@ -69,6 +69,7 @@ SGLANG_READS = {
         "k_scale",
         "v_scale",
     ),
+    "srt/runtime_context.py": ("get_parallel",),
     "srt/mem_cache/swa_memory_pool.py": (
         "SWAKVPool",
         "layers_mapping",

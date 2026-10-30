@@ -1,17 +1,27 @@
-"""The MiniMax-M3 gfx950 monokernel spec on CPU (RFC #43949): its registry entries,
-the configurations it refuses before load, the layer views it refuses after load
-(meta tensors of the real shapes) and the verify widths it serves on the EAGLE3
-recipe. SGLang checks the declared requirements, the same way for every spec."""
+"""The MiniMax-M3 gfx950 monokernel spec on CPU (RFC #43949).
+
+Checks its registry entries, the configurations it refuses before load, the layer views
+it refuses after load (meta tensors of the real shapes) and the verify widths it serves
+on the EAGLE3 recipe. SGLang checks the declared requirements, the same way for every
+spec."""
 
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
-from sglang.srt.monokernels import spec as registry
-from sglang.srt.monokernels.guards import covered_capture_sizes
+
+try:
+    from sglang.kernels.plugin_kernels.amd import spec as registry
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels import spec as registry
+try:
+    from sglang.srt.kernel_plugins.amd.binding import covered_capture_sizes
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.guards import covered_capture_sizes
 
 import sgl_amd_mono
+from sgl_amd_mono.minimax import spec as family
 from sgl_amd_mono.minimax_m3 import spec as m3
 from sgl_amd_mono.minimax_m3.gfx950.config import (
     HEAD_DIM,
@@ -86,7 +96,9 @@ def test_the_plugin_registers_both_architectures():
         found, why = registry.find_spec(
             backend=sgl_amd_mono.BACKEND, architectures=[arch], isa="gfx950"
         )
-        assert found is m3.SPEC, why
+        # the architecture's spec, which MiniMax-M3.1 shares, hands M3 to this one
+        assert found is family.SPEC, why
+    assert family._model(VL) is m3
 
 
 def test_the_recipe_is_accepted():
@@ -135,8 +147,7 @@ def test_each_unsupported_setting_is_one_reason(cfg, text):
 
 
 def test_an_sglang_without_the_shuffle_kv_is_refused_with_a_reason():
-    # before sgl-project/sglang#41708 and #41998 merge, SGLang main lacks their
-    # switches: the spec refuses, naming them, instead of failing on a lookup
+    # without sgl-project/sglang#41998 / #41708's switches: a refusal naming them, not a crash
     from sglang.srt.environ import envs
 
     present = {n: getattr(envs, n, None) for n in m3.PENDING_ENV}
@@ -150,8 +161,7 @@ def test_an_sglang_without_the_shuffle_kv_is_refused_with_a_reason():
 
 
 def test_the_recipe_routes_verify_batches_of_one_to_four():
-    # 4 verify rows a request: the 4-, 8-, 12- and 16-row launches, batch sizes up
-    # to 4 captured besides the configured ones (above them the normal path)
+    # 4 rows a request: batch sizes 1-4 (4 to 16 rows) join the configured ones (8: the normal path)
     assert m3.SPEC.widths("gfx950") == tuple(range(1, 17))
     assert covered_capture_sizes(
         widths=m3.SPEC.widths("gfx950"), tokens_per_request=4, sizes=[1, 2, 4, 8]

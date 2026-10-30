@@ -21,11 +21,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _build(publish: bool, fault_site=None, stop=False):
+def _build(publish: bool, fault_site=None, stop=False, slow=False):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from aiter.ops.flydsl.kernels import buffer_ops as bo
-    from flydsl.expr import const_expr
+    from flydsl.expr import const_expr, rocdl
     from flydsl.expr.typing import Int64
 
     from sgl_amd_mono.common import guard
@@ -33,8 +33,10 @@ def _build(publish: bool, fault_site=None, stop=False):
     from sgl_amd_mono.common.plan import THREADS, kernel_sources
     from sgl_amd_mono.common.sync import Mailbox, sreg
 
-    name = f"mono_guard_test_p{int(publish)}_f{fault_site or 0}_s{int(stop)}"
-    keyed = (publish, fault_site, stop, kernel_sources(guard.__name__))
+    name = (
+        f"mono_guard_test_p{int(publish)}_f{fault_site or 0}_s{int(stop)}_w{int(slow)}"
+    )
+    keyed = (publish, fault_site, stop, slow, kernel_sources(guard.__name__))
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k(epoch: Int64, box: Int64):
@@ -44,6 +46,11 @@ def _build(publish: bool, fault_site=None, stop=False):
             c = {"mb": Mailbox(fx.Int32(7))}
             if const_expr(publish):
                 if (fx.block_idx.x == 1) & (fx.thread_idx.x == 0):
+                    if const_expr(slow):
+                        # 2 ms late: the wait runs its deadline checks first
+                        t0 = guard.clock()
+                        while (guard.clock() - t0) < fx.Int64(guard.CLOCK_HZ // 500):
+                            rocdl.s_sleep(127)
                     c["mb"].put(sreg(box, 0, "x"), 0, fx.Int32(42))
             got = c["mb"].poll([(sreg(box, 0, "x"), 0, 1)])
             if (fx.block_idx.x == 0) & (fx.thread_idx.x == 0):
@@ -84,6 +91,20 @@ def _run(launch, e, box):
 def test_satisfied_wait_is_clean():
     e, box = _epoch(5.0), torch.zeros(4, dtype=torch.int32, device="cuda")
     _run(_build(publish=True), e, box)
+    assert _words(e) == [0, 0, 0]
+    assert int(box[2]) == 42
+
+
+def test_the_longest_deadline_taken_lets_a_slow_wait_finish():
+    """A deadline past the wait's 32-bit check stops a wait at its first check, so
+    the host refuses it; the longest one it takes must still let the wait finish."""
+    from sgl_amd_mono.common import guard
+
+    longest = guard.MAX_DEADLINE_TICKS / guard.CLOCK_HZ
+    with pytest.raises(ValueError):
+        guard.deadline_ticks(longest + 1)
+    e, box = _epoch(longest), torch.zeros(4, dtype=torch.int32, device="cuda")
+    _run(_build(publish=True, stop=True, slow=True), e, box)
     assert _words(e) == [0, 0, 0]
     assert int(box[2]) == 42
 

@@ -1,12 +1,16 @@
-"""The DeepSeek-V4.1 gfx950 monokernel spec on CPU (RFC #43949): the layers its
-forward covers on the DeepSeek-V4.1-Flash layer structure, its registry entry, its
-per-output bounds and its model refusal reasons. SGLang checks its declared
-requirements, the same way for every spec."""
+"""The DeepSeek-V4.1 gfx950 monokernel spec on CPU (RFC #43949).
+
+The layers its forward covers on DeepSeek-V4.1-Flash, its registry entry, its per-output bounds
+and its model refusal reasons; SGLang checks its declared requirements, as for every spec."""
 
 from types import SimpleNamespace
 
 import torch
-from sglang.srt.monokernels import spec as registry
+
+try:
+    from sglang.kernels.plugin_kernels.amd import spec as registry
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels import spec as registry
 
 import sgl_amd_mono
 from sgl_amd_mono.deepseek_v41 import CANDIDATES, HF_CONFIG, draft
@@ -26,8 +30,7 @@ FLASH = SimpleNamespace(
 
 
 def test_the_forward_covers_every_flash_layer():
-    # the first layer, the Engram layers, the index sources (their compressor and
-    # indexer between the launches) and DSpark's target layers (37-39) too
+    # the first layer, the Engram layers, the index sources and DSpark's target layers (37-39) too
     assert dsv41._covered_layers(FLASH) == list(range(40))
 
 
@@ -46,14 +49,16 @@ def test_the_plugin_registers_both_specs():
         ("DeepseekV4ForCausalLMDSpark", draft.SPEC),
     ):
         found, why = registry.find_spec(
-            backend=sgl_amd_mono.BACKEND, architectures=[arch], isa="gfx950"
+            backend=sgl_amd_mono.BACKEND,
+            architectures=[arch],
+            isa="gfx950",
+            model_type="deepseek_v41",
         )
         assert found is spec, why
 
 
 def test_kv_records_are_bit_exact():
-    # the normal path reads the KV the kernels write (a prefill, a batch past the
-    # largest width), so the kernel checks hold K1's KV records to bit-exact
+    # the normal path (a prefill, a batch past the largest width) reads the KV records K1 writes
     for spec in (dsv41.SPEC, draft.SPEC):
         assert spec.numerics.bound("k1.kv.max_abs") == 0.0
 
@@ -91,8 +96,7 @@ def test_model_reasons(monkeypatch):
         for k in ("weight", "scale")
     }
     assert dsv41.SPEC.model_disable_reasons(model, FLASH, seen) == []
-    # an FP8 linear method shuffled layer 5's wo_b in place; layer 1 (window only)
-    # has a compressor; layer 7's shared expert never went through the load hook
+    # wo_b shuffled in place (layer 5), a compressor at ratio 0 (layer 1), no load hook (layer 7)
     layers[5] = _layer(5, wo_b=SimpleNamespace(aiter_bpreshuffled=True))
     layers[1] = _layer(1, compress_ratio=0, compressor=SimpleNamespace())
     seen = {k: v for k, v in seen.items() if k[1] != 7}
@@ -101,12 +105,11 @@ def test_model_reasons(monkeypatch):
     assert reasons[0].startswith("layer 1: a compressor or indexer at compress ratio 0")
     assert reasons[1].startswith("layer 5: an FP8 linear method reordered")
     assert "(layers [7])" in reasons[2]
-    # the forward runs every layer: a model with a layer it has no kernels for
+    # the forward runs every layer, so one without kernels refuses the model
     hashed = SimpleNamespace(**{**vars(FLASH), "num_hash_layers": 2})
     reasons = dsv41.SPEC.model_disable_reasons(model, hashed, seen)
     assert reasons[0].startswith("layers [0, 1]: no kernels"), reasons
-    # K2i's indexers: the candidate blocks its REINDEX layers score, and SGLang's
-    # decode-row query path, which K2i's query runs
+    # K2i's indexers: the candidate blocks REINDEX layers score, SGLang's decode-row query path
     layers[1], layers[5] = _layer(1), _layer(5)
     seen |= {
         ("shared expert fp8", 7, p, k): None
@@ -128,3 +131,22 @@ def test_model_reasons(monkeypatch):
     layers[24] = _layer(24, indexer=no_gemv, freqs_cis=rope)
     reasons = dsv41.SPEC.model_disable_reasons(model, FLASH, seen)
     assert [r.split(":")[0] for r in reasons] == ["layer 20", "layer 24"], reasons
+
+
+def test_pd_runs_on_a_mori_decode_server_only():
+    def reasons(mode, backend="mori"):
+        cfg = SimpleNamespace(
+            disaggregation_mode=mode, disaggregation_transfer_backend=backend
+        )
+        return [
+            r for r in dsv41._config_disable_reasons(cfg, FLASH) if "FlyDSL" not in r
+        ]
+
+    pd = registry.Feature.PD_DISAGGREGATION
+    assert pd in dsv41.SPEC.features and pd in draft.SPEC.features
+    assert reasons("null") == reasons(None) == []
+    assert reasons("decode") == []
+    assert reasons("prefill") == ["PD monokernels support the decode role only"]
+    assert reasons("decode", "mooncake") == [
+        "PD monokernels require the mori transfer backend"
+    ]

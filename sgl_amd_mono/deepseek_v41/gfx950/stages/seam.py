@@ -27,7 +27,6 @@ from sgl_amd_mono.common.ops import (
     hw_exp2,
     hw_rcp,
     hw_rsq,
-    lane_gather,
     rsrc,
     sum_partials,
 )
@@ -55,7 +54,7 @@ POST_MULT = 2.0
 LOG2E = 1.0 / math.log(2.0)
 
 COLS = 32  # hidden columns a slice task
-SLICES = HIDDEN // COLS  # 160
+SLICES = HIDDEN // COLS
 KT = HC * COLS  # projection columns a slice task
 PART = MIX + 1  # a slice's partials a token: the mixes, then the sum of squares
 GATE_BLOCK = 8  # slices a gate thread sums
@@ -84,10 +83,6 @@ def sigmoid(z):
     return fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(z * fx.Float32(-LOG2E)))
 
 
-def lane_f32(v, src):
-    return lane_gather(v.bitcast(fx.Int32), src).bitcast(fx.Float32)
-
-
 def pend_value(c, t, col, cc):
     """Return the owed post's sublayer output at (token t, column col)."""
     if const_expr(c.get("pend_lds") is None):
@@ -98,21 +93,36 @@ def pend_value(c, t, col, cc):
 # ---------------------------------------------------------------- slice
 @flyc.jit
 def slice_input(c, task, idx):
-    """Return thread ``idx``'s pair of the layer input."""
+    """Write thread ``idx``'s pair of the layer input to LIN; with ``aux_on``, also store
+    the pair's mean over the R_new streams, as DSpark captures a target layer."""
     s, rl = c["S"], c["rl"]
     a = c["args"]
+    # read before the dynamic branch: a method call on c inside one carries c
+    aux_on = c.get("aux_on")
     c0 = task * COLS
     if idx < s * COLS // 2:
         t = idx // (COLS // 2)
         cc = 2 * (idx % (COLS // 2))
-        outs = []
+        outs, means = [], []
         for d in range_constexpr(2):
             acc = fx.Float32(0.0)
+            total = fx.Float32(0.0)
             for h in range_constexpr(HC):
                 rb = fx.ptr_load(rl + (t * KT + h * COLS + cc + d))
                 acc = acc + ld_f32(a["pre_in"], t * HC + h) * rb
+                # torch's mean over the streams: summed in order, then times 1/HC
+                total = rb if h == 0 else total + rb
             outs.append(acc)
+            means.append(total * fx.Float32(1.0 / HC))
         c["put_bf"](c["lin"], t * HIDDEN + c0 + cc, outs)
+        if const_expr(aux_on is not None):
+            if aux_on:
+                for k in range_constexpr(2):
+                    bo.buffer_store(
+                        means[k].to(fx.BFloat16),
+                        rsrc(a["aux_out"]),
+                        t * HIDDEN + c0 + cc + k,
+                    )
 
 
 def slice_at(c0, e):
@@ -136,8 +146,7 @@ def slice_row(c, c0, e, got):
     a = c["args"]
     t, o, col = slice_at(c0, e)
     if const_expr(not c.get("fold", True)):
-        # a settled residual, no post owed (the first layer, after an Engram write):
-        # stream o as it arrives, as SGLang's boundary without x
+        # no post owed (first layer, after Engram): stream o as is, as SGLang's x-less boundary
         v = got[0]
     else:
         r, cm, post = got
@@ -245,22 +254,29 @@ def slice_mix(c, task, t0, n):
 
 
 # ---------------------------------------------------------------- gate
-def _row(v, lane, q):
-    """Return element q of a comb row (lanes 8..23 hold comb[r][c] at lane 8 + 4 r + c)."""
-    return lane_f32(v, (lane - 8) // 4 * 4 + 8 + q)
+# comb[r][c] on lane COMB0 + 4 r + c, one DPP row: xor-butterfly sums, (e0 + e1) + (e2 + e3)
+COMB0 = 16
 
 
-def _col(v, lane, q):
-    return lane_f32(v, 8 + 4 * q + (lane - 8) % 4)
+def _row_sum(v):
+    return butterfly(v, (1, 2))
+
+
+def _col_sum(v):
+    return butterfly(v, (4, 8))
+
+
+def _row_max(v):
+    return butterfly(v, (1, 2), fx.max)
 
 
 @flyc.jit
 def stage_gate(c, t):
-    """Token t's 160 slices, in slice order, -> post / comb / next pre."""
+    """Token t's slices, in slice order, -> post / comb / next pre."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     red = c["red"]
     a = c["args"]
-    groups = SLICES // GATE_BLOCK  # 20
+    groups = SLICES // GATE_BLOCK
     if tid < groups * PART:
         g = tid // PART
         j = tid % PART
@@ -276,7 +292,10 @@ def stage_gate(c, t):
         fx.ptr_store(acc, red + (g * PART + j))
     gpu.barrier()
     if wave == 0:
-        j = fx.min(lane, MIX - 1)
+        # lanes 0..7 pre and post, COMB0.. comb (the lanes between repeat 0..7)
+        j = (lane < COMB0).select(
+            lane % (2 * HC), fx.min(lane - (COMB0 - 2 * HC), MIX - 1)
+        )
         mix = fx.ptr_load(red + j)
         sq = fx.ptr_load(red + MIX)
         for g in range_constexpr(1, groups):
@@ -295,26 +314,16 @@ def stage_gate(c, t):
                 post * fx.Float32(POST_MULT), rsrc(a["post_out"]), t * HC + lane - HC
             )
         cv = fma(v, sc[2], base)
-        row = [_row(cv, lane, q) for q in range(4)]
         # Triton's exp: exp2 of (x - max) log2(e)
-        m = fx.max(fx.max(row[0], row[1]), fx.max(row[2], row[3]))
-        cv = hw_exp2((cv - m) * fx.Float32(LOG2E))
+        cv = hw_exp2((cv - _row_max(cv)) * fx.Float32(LOG2E))
         # fast_dividef is x rcp(y); its first "+ eps" contracts into the fma
-        row = [_row(cv, lane, q) for q in range(4)]
-        cv = fma(cv, hw_rcp((row[0] + row[1]) + (row[2] + row[3])), fx.Float32(HC_EPS))
-        col = [_col(cv, lane, q) for q in range(4)]
-        cv = cv * hw_rcp(((col[0] + col[1]) + (col[2] + col[3])) + fx.Float32(HC_EPS))
+        cv = fma(cv, hw_rcp(_row_sum(cv)), fx.Float32(HC_EPS))
+        cv = cv * hw_rcp(_col_sum(cv) + fx.Float32(HC_EPS))
         for _ in range_constexpr(SINKHORN - 1):
-            row = [_row(cv, lane, q) for q in range(4)]
-            cv = cv * hw_rcp(
-                ((row[0] + row[1]) + (row[2] + row[3])) + fx.Float32(HC_EPS)
-            )
-            col = [_col(cv, lane, q) for q in range(4)]
-            cv = cv * hw_rcp(
-                ((col[0] + col[1]) + (col[2] + col[3])) + fx.Float32(HC_EPS)
-            )
-        if (lane >= 2 * HC) & (lane < MIX):
-            bo.buffer_store(cv, rsrc(a["comb_out"]), t * HC * HC + lane - 2 * HC)
+            cv = cv * hw_rcp(_row_sum(cv) + fx.Float32(HC_EPS))
+            cv = cv * hw_rcp(_col_sum(cv) + fx.Float32(HC_EPS))
+        if (lane >= COMB0) & (lane < COMB0 + HC * HC):
+            bo.buffer_store(cv, rsrc(a["comb_out"]), t * HC * HC + lane - COMB0)
     gpu.barrier()
 
 
