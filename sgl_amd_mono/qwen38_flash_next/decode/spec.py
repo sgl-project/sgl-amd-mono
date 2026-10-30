@@ -175,6 +175,7 @@ SGLANG_READS = {
         "MambaAttnBackendBase",
         "linear_attn_backend",
         "forward_metadata",
+        "state_layer_cache",
         "_track_mamba_state_decode",
         "_track_mamba_state_decode(forward_batch)",
         "_track_mamba_state_decode(conv_states)",
@@ -184,12 +185,9 @@ SGLANG_READS = {
     ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
     "srt/layers/logits_processor.py": ("LogitsProcessorOutput", "hidden_states"),
-    "srt/mem_cache/memory_pool.py": ("mamba2_layer_cache", "conv", "temporal"),
+    "srt/mem_cache/memory_pool.py": ("conv", "temporal"),
     "srt/model_executor/forward_batch_info.py": ("mrope_positions",),
-    "srt/model_executor/forward_context.py": (
-        "get_attn_backend",
-        "get_req_to_token_pool",
-    ),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
 }
 
 # Each launch against SGLang's own layer on the same input (``check``). The
@@ -443,12 +441,13 @@ TRACK_SAVE_ARGS = (
 )
 
 
-def track_save_reasons() -> list[str]:
-    """The forward calls the linear-attention backend's decode track-save after
-    each GDN launch (a copy with the radix cache on, a no-op with it off): refused
-    when the running SGLang does not take that call. Checked after load: the
-    backend module imports the model runner, which resolving server args must
-    not."""
+def backend_reasons() -> list[str]:
+    """The forward reads each GDN layer's states through the linear-attention
+    backend (``state_layer_cache``, sgl-project/sglang#46980) and calls its decode
+    track-save after each GDN launch (a copy with the radix cache on, a no-op with
+    it off): refused when the running SGLang's backend lacks either. Checked after
+    load: the backend module imports the model runner, which resolving server args
+    must not."""
     where = (
         "sglang.srt.layers.attention.hybrid_linear_attn_backend.MambaAttnBackendBase"
     )
@@ -457,21 +456,27 @@ def track_save_reasons() -> list[str]:
             MambaAttnBackendBase,
         )
     except ImportError as e:
-        return [f"radix track-save: cannot import {where}: {e}"]
+        return [f"linear-attention backend: cannot import {where}: {e}"]
+    reasons = []
+    if not callable(getattr(MambaAttnBackendBase, "state_layer_cache", None)):
+        reasons.append(
+            f"GDN state read: {where} has no state_layer_cache "
+            "(sgl-project/sglang#46980)"
+        )
     fn = getattr(MambaAttnBackendBase, "_track_mamba_state_decode", None)
     params = tuple(inspect.signature(fn).parameters)[1:] if callable(fn) else None
     if params is None or params[: len(TRACK_SAVE_ARGS)] != TRACK_SAVE_ARGS:
-        return [
+        reasons.append(
             f"radix track-save: {where}._track_mamba_state_decode{params} does not "
             f"take {TRACK_SAVE_ARGS}"
-        ]
-    return []
+        )
+    return reasons
 
 
 def model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     from sglang.srt.runtime_context import get_parallel
 
-    return layout_reasons(model, get_parallel().tp_size) + track_save_reasons()
+    return layout_reasons(model, get_parallel().tp_size) + backend_reasons()
 
 
 def gdn_state_reasons(conv: torch.Tensor, ssm: torch.Tensor, tp: int) -> list[str]:
@@ -568,11 +573,10 @@ class _Built:
 
             self.check_ref = reference_mode()
 
-    def _gdn_state(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Layer i's GDN states in SGLang's pool, checked once a binding."""
-        from sglang.srt.model_executor.forward_context import get_req_to_token_pool
-
-        conv, ssm = gdn_state_view(get_req_to_token_pool().mamba2_layer_cache(i))
+    def _gdn_state(self, i: int, lab) -> tuple[torch.Tensor, torch.Tensor]:
+        """Layer i's GDN states in SGLang's pool, read as SGLang's linear-attention
+        backend ``lab`` reads them; checked once a binding."""
+        conv, ssm = gdn_state_view(lab.state_layer_cache(i))
         bound = self._states.get(i)
         if (
             bound is None
@@ -655,7 +659,7 @@ class _Built:
             if layer.ple is not None:
                 state = state + layer.ple(state, forward_batch, ple_batch)
                 msq = None
-            gdn = None if w.gdn is None else self._gdn_state(w.idx)
+            gdn = None if w.gdn is None else self._gdn_state(w.idx, lab)
             if check is not None:
                 check.before(layer, w, pos, state, slots, gdn)
             x, inj = la.hc_front(w.idx, w.attn_hc, state, msq, la.attn_scratch)

@@ -91,7 +91,12 @@ def sglang(monkeypatch):
         conv=[meta(9, 3, 5120)], temporal=meta(9, 24, 128, 128, dtype=torch.float32)
     )
     md = NS(mamba_cache_indices=torch.tensor([3, 7, 0, 0], dtype=torch.int64))
-    lab = NS(forward_metadata=md, _track_mamba_state_decode=lambda *args: None)
+    pools = dict.fromkeys((0, 1, 2), pool)  # the GDN layers of ``_model``
+    lab = NS(
+        forward_metadata=md,
+        state_layer_cache=pools.__getitem__,
+        _track_mamba_state_decode=lambda *args: None,
+    )
     monkeypatch.setattr(
         qwen4_exp,
         "_prepare_ple_batch",
@@ -103,15 +108,10 @@ def sglang(monkeypatch):
         lambda batch, forward_batch: log.append(("commit", batch)),
     )
     monkeypatch.setattr(
-        forward_context,
-        "get_req_to_token_pool",
-        lambda: NS(mamba2_layer_cache=lambda i: pool),
-    )
-    monkeypatch.setattr(
         forward_context, "get_attn_backend", lambda: NS(linear_attn_backend=lab)
     )
     monkeypatch.delenv("SGLANG_AMD_MONO_CHECK", raising=False)
-    return NS(log=log, lab=lab, md=md, forward_context=forward_context)
+    return NS(log=log, lab=lab, md=md)
 
 
 def _model(log):
@@ -265,17 +265,12 @@ def test_the_radix_track_save_copies_once_after_the_last_gdn_launch(sglang):
     assert ("gdn", 2) in [c[:2] for c in la.calls]
 
 
-def test_a_gdn_pool_the_kernels_cannot_update_raises(sglang, monkeypatch):
+def test_a_gdn_pool_the_kernels_cannot_update_raises(sglang):
     model, layers = _model(sglang.log)
     built = D._Built(model, layers, _Launcher(), widths=(2,), tp=2)
     bf16 = NS(conv=[meta(9, 3, 5120)], temporal=meta(9, 24, 128, 128))
-    monkeypatch.setattr(
-        sglang.forward_context,
-        "get_req_to_token_pool",
-        lambda: NS(mamba2_layer_cache=lambda i: bf16),
-    )
     with pytest.raises(RuntimeError, match="layer 0: recurrent state"):
-        built._gdn_state(0)
+        built._gdn_state(0, NS(state_layer_cache=lambda i: bf16))
 
 
 def test_check_mode_checks_each_layer_against_sglang_s(sglang, monkeypatch):

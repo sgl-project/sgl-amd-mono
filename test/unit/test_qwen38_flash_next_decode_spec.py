@@ -1,7 +1,7 @@
 """The Qwen3.8-Flash-Next gfx950 TP2 decode path on CPU (RFC #43949): what the
 model's spec declares for it, the TP size routing its refusals and build, its config
-and model refusal reasons, the GDN cache views and the radix track-save call it
-needs. SGLang checks the declared requirements and features, the same way for every
+and model refusal reasons, the GDN cache views and the linear-attention backend
+calls it needs. SGLang checks the declared requirements and features, the same way for every
 spec."""
 
 import importlib.util
@@ -200,6 +200,19 @@ def test_model_reasons_need_the_track_save_the_forward_calls(tp2, monkeypatch):
         reasons = S.SPEC.model_disable_reasons(model, hf_config(), {})
         assert len(reasons) == 1, reasons
         assert reasons[0].endswith(f"does not take {D.TRACK_SAVE_ARGS}")
+
+
+def test_model_reasons_need_the_backend_s_gdn_state_read(tp2, monkeypatch):
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        MambaAttnBackendBase,
+    )
+
+    # SGLang before sgl-project/sglang#46980
+    monkeypatch.setattr(MambaAttnBackendBase, "state_layer_cache", None, raising=False)
+    assert S.SPEC.model_disable_reasons(fake_model(), hf_config(), {}) == [
+        "GDN state read: sglang.srt.layers.attention.hybrid_linear_attn_backend."
+        "MambaAttnBackendBase has no state_layer_cache (sgl-project/sglang#46980)"
+    ]
 
 
 @pytest.mark.parametrize("rip", [384, 512])
