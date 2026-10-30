@@ -14,6 +14,7 @@ from qwen38_flash_next_decode_fakes import (
     fake_model,
     hf_config,
     meta,
+    needs_gpu_on_rocm,
     server_args,
 )
 
@@ -191,6 +192,7 @@ def _set_track_save(monkeypatch, fn):
     monkeypatch.setattr(MambaAttnBackendBase, "_track_mamba_state_decode", fn)
 
 
+@needs_gpu_on_rocm
 def test_model_reasons_need_the_track_save_the_forward_calls(tp2, monkeypatch):
     model = fake_model()
     # the installed SGLang's backend takes the call
@@ -202,6 +204,7 @@ def test_model_reasons_need_the_track_save_the_forward_calls(tp2, monkeypatch):
         assert reasons[0].endswith(f"does not take {D.TRACK_SAVE_ARGS}")
 
 
+@needs_gpu_on_rocm
 def test_model_reasons_need_the_backend_s_gdn_state_read(tp2, monkeypatch):
     from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
         MambaAttnBackendBase,
@@ -282,6 +285,7 @@ def test_layout_reasons_layer_mix():
     ]
 
 
+@needs_gpu_on_rocm
 def test_model_reasons_refuse_the_padding_short_of_the_read(tp2):
     assert len(S.SPEC.model_disable_reasons(fake_model(rip=352), hf_config(), {})) == 48
 

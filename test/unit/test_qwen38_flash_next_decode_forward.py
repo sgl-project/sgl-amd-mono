@@ -7,7 +7,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 import torch
-from qwen38_flash_next_decode_fakes import meta
+from qwen38_flash_next_decode_fakes import meta, needs_gpu_on_rocm
 
 try:
     from sglang.kernels.plugin_kernels.amd import spec as registry
@@ -17,6 +17,8 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 from sgl_amd_mono.qwen38_flash_next.decode import check
 from sgl_amd_mono.qwen38_flash_next.decode import spec as D
 from sgl_amd_mono.qwen38_flash_next.decode.gfx950.weights import Layer
+
+pytestmark = needs_gpu_on_rocm
 
 H = 8  # the embedding width the stand-in model uses
 ROWS = 2

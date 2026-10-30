@@ -8,7 +8,7 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 import torch.nn.functional as F
-from qwen38_flash_next_decode_fakes import decode_mxfp4
+from qwen38_flash_next_decode_fakes import decode_mxfp4, needs_gpu_on_rocm
 
 from sgl_amd_mono.qwen38_flash_next.decode import check as C
 from sgl_amd_mono.qwen38_flash_next.decode import spec as D
@@ -198,6 +198,7 @@ def test_gdn_reference_restores_on_error():
     _assert_restored(attn)
 
 
+@needs_gpu_on_rocm
 def test_before_runs_the_gdn_reference_under_the_hooks(monkeypatch):
     """A GDN layer's reference call runs with the MXFP4 hooks and keeps out_proj's
     input; a QSA layer's runs bare; SGLang's modules are back after."""
@@ -229,6 +230,7 @@ def test_before_runs_the_gdn_reference_under_the_hooks(monkeypatch):
     assert step.ref["core"] is None and not torch.equal(seen[1], want)
 
 
+@needs_gpu_on_rocm
 def test_before_restores_the_gdn_rows_the_reference_wrote(monkeypatch):
     """The reference's state rows are kept for the comparison; the pool holds the
     rows as they were before it, for the launch; pad slots (<= 0) are left alone."""

@@ -4,9 +4,18 @@ and server args the spec checks."""
 
 from types import SimpleNamespace as NS
 
+import pytest
 import torch
 
 from sgl_amd_mono.qwen38_flash_next.decode.gfx950.weights import E2M1
+
+# SGLang's ROCm build reads the GPU's properties when some of its modules import
+# (memory_pool.py through ``is_fp8_fnuz``, qwen4_exp.py through
+# ``is_gfx95_supported``); with CPU torch they import without one.
+needs_gpu_on_rocm = pytest.mark.skipif(
+    torch.version.hip is not None and not torch.cuda.is_available(),
+    reason="SGLang's ROCm build needs a visible GPU to import its runtime modules",
+)
 
 
 def meta(*shape, dtype=torch.bfloat16):
