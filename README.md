@@ -20,6 +20,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
+| Qwen3.8-27B (Quark MXFP4) | MI350X, MI355X (gfx950) | 1, 2 | The FFN of every layer and the gated delta net of the linear-attention layers, in decode steps of up to 4 rows at TP1 and 8 at TP2 |
 
 ### Design
 
@@ -169,7 +170,11 @@ sgl-amd-mono/
 │   │   ├── a16w8.py     # the shared expert's MXFP8 GEMV steps
 │   │   └── runner.py    # launch runner
 │   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4; spec and kernels land in its PR
-│   └── qwen38_flash_next/   # Qwen3.8-Flash-Next; spec and kernels land in its PR
+│   ├── qwen38_flash_next/   # Qwen3.8-Flash-Next; spec and kernels land in its PR
+│   └── qwen3_8_dense/
+│       ├── spec.py      # spec and forward
+│       ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
+│       └── gfx950/      # kernels, weights and launch runner
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
     ├── kernels/         # GPU: each launch against SGLang's reference ops
@@ -180,12 +185,13 @@ sgl-amd-mono/
 
 ```bash
 pytest test/unit                                                # CPU only
-pytest test/kernels test/e2e -k "not glm53 and not minimax_m3"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k "not glm53 and not minimax_m3 and not qwen3_8_dense"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
 pytest test/kernels -k "deepseek_v4 and not deepseek_v41"      # one MI355X: every DeepSeek-V4-Pro launch compiles
 pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k "minimax_m3 and not minimax_m31"  # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
 pytest test/kernels test/e2e -k minimax_m31                     # 4 x MI350X, MINIMAX_M31_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k qwen3_8_dense                   # 2 x MI350X or MI355X, QWEN3_8_27B_MODEL_PATH set
 ```
 
 Kernel-only time of the GLM-5.3-Flash launches (no model needed): `torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8` (`--kind full` for the whole served step: layer 0 from the tokens, the dense layers, layers 3 to 44 and the tail).
