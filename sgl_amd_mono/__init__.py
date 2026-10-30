@@ -30,6 +30,8 @@ SPECS = {
         "MiniMaxM3SparseForConditionalGeneration",
         None,
     ): "sgl_amd_mono.minimax.spec:SPEC",
+    ("MuseSparkForConditionalGeneration", None): "sgl_amd_mono.muse_spark.spec:SPEC",
+    ("DFlash2DraftModel", None): "sgl_amd_mono.muse_spark.draft:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
