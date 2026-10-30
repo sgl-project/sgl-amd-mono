@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm at 910ca119ca (vllm-project/vllm#63032, Apache-2.0):
+# vllm/models/qwen4_exp/amd/specialized_decode/mono/hc.py
 """The hyper-connection (HC) phases of the kernels: a ``GatedResidual``'s
 combine, its per-stream norm and mix, as ``ops/hc.py`` computes them, on the
 4-stream state [S, 4 H] every rank holds whole.

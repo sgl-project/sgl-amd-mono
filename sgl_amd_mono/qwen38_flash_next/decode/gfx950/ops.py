@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at a526f0d, MIT License,
+# Adapted from vllm-project/vllm at 910ca119ca (vllm-project/vllm#63032, Apache-2.0):
+# vllm/models/qwen4_exp/amd/specialized_decode/mono/common/ops.py, itself adapted from
+# ROCm/ATOM (https://github.com/ROCm/ATOM) at a526f0d, MIT License,
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/mono/device/ops.py
 """The device primitives these kernels use that ``sgl_amd_mono.common.ops`` does not

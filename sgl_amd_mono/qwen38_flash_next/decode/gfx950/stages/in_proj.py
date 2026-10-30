@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm at 910ca119ca (vllm-project/vllm#63032, Apache-2.0):
+# vllm/models/qwen4_exp/amd/specialized_decode/mono/stages/in_proj.py
 """The GDN block's input projections on the block-input rows in LDS ``xl``:
 in_proj_qkvz through MXFP4 (two 16-row groups a CTA, bid and bid + 256) ->
 bf16 PROJ, in_proj_ba as 3 row groups x 2 K halves on the unquantized rows

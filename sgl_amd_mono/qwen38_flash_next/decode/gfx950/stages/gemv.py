@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm at 910ca119ca (vllm-project/vllm#63032, Apache-2.0):
+# vllm/models/qwen4_exp/amd/specialized_decode/mono/stages/gemv.py
 """bf16 GEMV pieces the kernels share: 16 weight rows a task against up
 to 16 token rows in LDS, one ``mfma_f32_16x16x32_bf16`` per 32 K.
 

@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm at 910ca119ca (vllm-project/vllm#63032, Apache-2.0):
+# vllm/models/qwen4_exp/amd/specialized_decode/runtime/layers.py and runtime/decode.py
 """The launches of one decoder layer, from ``weights.Layer`` operands to the
 kernels' arguments, and the per-rank state every launch reads (``Launcher``).
 

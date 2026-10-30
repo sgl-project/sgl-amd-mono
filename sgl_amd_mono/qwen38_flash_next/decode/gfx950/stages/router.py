@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm at 910ca119ca (vllm-project/vllm#63032, Apache-2.0):
+# vllm/models/qwen4_exp/amd/specialized_decode/mono/stages/router.py
 """The MoE block's router and shared-expert gate on the block-input rows in
 LDS ``xl``: bf16 router logits -> RLOG (16 experts a task), and a token's
 sigmoid(bf16(x . w_sg)) -> SGATE."""

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm at 910ca119ca (vllm-project/vllm#63032, Apache-2.0):
+# vllm/models/qwen4_exp/amd/specialized_decode/mono/stages/moe.py
 """The MoE and o_proj stages: the MXFP4 arithmetic, the online-MXFP4 GEMV and
 o_proj, the route (the top-10 of 512 logits, the union U of the step's picks)
 and the routed experts (ug, INTER through MXFP4, down) with the shared expert

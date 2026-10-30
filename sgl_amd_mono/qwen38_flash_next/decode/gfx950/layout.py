@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm at 910ca119ca (vllm-project/vllm#63032, Apache-2.0):
+# vllm/models/qwen4_exp/amd/specialized_decode/mono/layout.py
 """Qwen3.8-Flash-Next (``qwen4_exp``): the shapes the kernels are built for at
 a TP size. A ``Layout`` is a build key's field, so every shape below is a
 compile-time constant of a kernel.

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm at 910ca119ca (vllm-project/vllm#63032, Apache-2.0):
+# vllm/models/qwen4_exp/amd/specialized_decode/mono/stages/gdn.py
 """The gated delta rule of a GDN (linear-attention) block, on the in_proj
 outputs the block's earlier stages put to PROJ / BAPART (``in_proj``):
 

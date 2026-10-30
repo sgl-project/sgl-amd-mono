@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm at 910ca119ca (vllm-project/vllm#63032, Apache-2.0):
+# vllm/models/qwen4_exp/amd/specialized_decode/mono/blocks.py
 """The decoder layer's blocks, each one persistent launch, ``BLOCKS`` x
 ``THREADS``, S <= ``MAX_TOKENS`` rows:
 
