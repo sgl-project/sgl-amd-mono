@@ -456,20 +456,19 @@ class DSV41MonoRunner:
         k1=(),
         k2=(),
         ffn: bool = False,
-        k2i: bool = False,
+        k2i=(),
         tok_par: bool = False,
     ) -> None:
         """Allocate this width's scratch and compile its launches without running them.
 
         K1 for each (fold, index, iq) in ``k1``, K2 for each (compressed, index) in
-        ``k2``, the FFN launch, and K2i (``enable_k2i`` first)."""
+        ``k2``, the FFN launch, and K2i for each page8 in ``k2i`` (``enable_k2i`` first)."""
         self.scratch(tokens)
         kernels = [self.k1_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k1)]
         kernels += [self.k2_kernel(tokens, *v, tok_par=tok_par) for v in sorted(k2)]
         if ffn:
             kernels.append(self.ffn_kernel(tokens))
-        if k2i:
-            kernels.append(self.k2i.kernel(tokens))
+        kernels += [self.k2i.kernel(tokens, page8) for page8 in sorted(k2i)]
         for launch in kernels:
             compile_only(launch)
 

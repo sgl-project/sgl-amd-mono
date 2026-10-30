@@ -140,6 +140,7 @@ SGLANG_READS = {
         "disaggregation_transfer_backend",
     ),
     "srt/environ.py": (
+        "envs",
         "SGLANG_DSV4_FP4_EXPERTS",
         "SGLANG_DSV4_FP4_DEQUANT",
         "SGLANG_USE_AITER_MOE_GU_ITLV",
@@ -224,6 +225,7 @@ SGLANG_READS = {
         "get_index_k_fp4_payload_buffer",
         "get_index_k_fp4_scale_buffer",
         "low_ratio_index_k_is_split",
+        "low_ratio_index_k_page8",
         "get_index_k_page_size",
     ),
     "srt/model_executor/forward_context.py": (
@@ -564,7 +566,7 @@ class _Layer(msgspec.Struct):
     swa_block: int = 0
     comp: Any = None  # the compressed cache, the same layout
     comp_block: int = 0
-    plane: Any = None  # an indexer's FP4 index plane: (payload, scales)
+    plane: Any = None  # an indexer's FP4 index plane: (payload, scales, page8)
 
 
 def _keep(copies: dict, t: torch.Tensor, *key) -> torch.Tensor:
@@ -923,7 +925,7 @@ def _index_plane(*, L, M: int, meta, raw_idx) -> tuple:
     payload = pool.get_index_k_fp4_payload_buffer(L.i)
     scale = pool.get_index_k_fp4_scale_buffer(L.i)
     check_plane(payload=payload, scale=scale)
-    return payload.view(torch.uint8), scale
+    return payload.view(torch.uint8), scale, pool.low_ratio_index_k_page8(L.i)
 
 
 class _Built:
@@ -1161,6 +1163,7 @@ def _longest_context(hf_config) -> int:
 
 
 def _build(model, hf_config, ctx) -> _Built:
+    from sglang.srt.environ import envs
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.deepseek_v41.gfx950.runner import (
@@ -1185,7 +1188,14 @@ def _build(model, hf_config, ctx) -> _Built:
         shuffled=bool(shuffled_layout(L.module.self_attn for L in layers.values())),
     )
     runner.set_deadline(ctx.deadline_s)
-    k2i = any(L.module.self_attn.indexer is not None for L in layers.values())
+    # the plane layouts K2i reads: SGLang's page8 pool is ratio 1's unless aiter lacks the
+    # row-group kernel (each layer's plane picks its build, ``_index_plane``)
+    page8 = envs.SGLANG_HIP_DSV41_INDEX_K_PAGE8.get()
+    k2i = {
+        page8 and L.ratio == 1
+        for L in layers.values()
+        if L.module.self_attn.indexer is not None
+    }
     if k2i:
         # the indexer's buffers, sized here: before SGLang sizes the KV cache
         runner.enable_k2i(_longest_context(hf_config))
@@ -1240,8 +1250,6 @@ SPEC = MonoSpec(
             "SGLANG_DSV4_KV_LAYOUT": "v4",
             # K1 quantizes the SWA nope payload from f32, as SGLang's fused writer does
             "SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE": False,
-            # the scorer reads the ratio-1 index-K pages in the page-64 byte layout
-            "SGLANG_HIP_DSV41_INDEX_K_PAGE8": False,
             # benchmark routing overrides: K2 routes with the model's own router
             "SGLANG_SIMULATE_UNIFORM_EXPERTS": False,
             "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS": False,

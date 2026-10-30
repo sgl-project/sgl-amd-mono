@@ -92,13 +92,14 @@ class K2iRunner:
         )
         self._kernels: dict = {}
 
-    def kernel(self, rows: int):
+    def kernel(self, rows: int, page8: bool = False):
         from ..runner import no_capture
 
-        if rows not in self._kernels:
-            no_capture(f"K2i width {rows}")
-            self._kernels[rows] = build_k2i(rows)
-        return self._kernels[rows]
+        key = (rows, page8)
+        if key not in self._kernels:
+            no_capture(f"K2i width {rows} (page8 {page8})")
+            self._kernels[key] = build_k2i(rows, page8)
+        return self._kernels[key]
 
     def walk_plan(
         self, *, ratio: int, bounds: torch.Tensor, rows: int, per_req: int
@@ -121,7 +122,7 @@ class K2iRunner:
         per_req: int,
         ratio: int,
         query: tuple,  # [rows, 32, 64] E2M1 pairs, [rows, 1, 4, 16, 4] E8M0, [rows, 32] bf16
-        plane: tuple,  # the layer's index plane (``check_plane``)
+        plane: tuple,  # the layer's index plane (``check_plane``), whether a page8 pool's
         page_table: torch.Tensor,  # int32 [rows, pages] of 64-row pages
         bounds: torch.Tensor,  # int32 [rows]: the columns each row sees
         raw_out: torch.Tensor,  # int32 [rows, 512]: sparse_raw_indices
@@ -235,9 +236,9 @@ class K2iRunner:
         ibound, lstride, reindex,
     ) -> None:  # fmt: skip
         q_fp4, q_scale, weights = query
-        payload, scale = plane
+        payload, scale, page8 = plane
         _run_compiled(
-            self.kernel(rows),
+            self.kernel(rows, page8),
             q_fp4.data_ptr(), q_scale.data_ptr(), weights.data_ptr(), payload.data_ptr(), scale.data_ptr(),
             plan.data_ptr(), itab.data_ptr(), itab_stride, itab_len, ibatch.data_ptr(), ishift,
             ibound.data_ptr(), self.ilog.data_ptr(), lstride, reindex,

@@ -1,9 +1,9 @@
 """K2i, the index sources' FP4 scorer (RFC #43949), against SGLang's indexer ops on one gfx950.
 
-On synthetic FP4 planes in SGLang's layout: the device walk plan against the host plan, the
-logits against SGLang's and fp64, a candidate consumer's selection against SGLang's top-k within
-the same candidate blocks, the two-level pipeline against SGLang's by per-row overlap, and a
-graph replay against eager runs.
+On synthetic FP4 planes in SGLang's layouts (64-row pages, and a page8 pool's aiter pages): the
+device walk plan against the host plan, the logits against SGLang's and fp64, a candidate
+consumer's selection against SGLang's top-k within the same candidate blocks, the two-level
+pipeline against SGLang's by per-row overlap, and a graph replay against eager runs.
 
 Adapted from sgl-project/sglang#43984's test_dsv41_k2a_indexer.py."""
 
@@ -127,7 +127,24 @@ def fp4_case(*, ctxs, seed, per_req=PER_REQ, pages_per_req=None, dev="cuda"):
         device=dev,
     )
     return dict(q=q, qscale=qscale, w=w, payload=payload, kscale=kscale, table=table,
-                bounds=bounds, per_req=per_req)  # fmt: skip
+                bounds=bounds, per_req=per_req, page8=False)  # fmt: skip
+
+
+def as_page8(case):
+    """The case on a page8 pool: its keys in aiter's 8-row pages (``pack_kv_cache``, which
+    SGLang's page8 writer matches), in the same buffer shapes."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup import (
+        pack_kv_cache,
+    )
+
+    payload, kscale = case["payload"], case["kscale"]
+    pages = payload.shape[0]
+    slot = torch.arange(64, device=payload.device)
+    rows = payload.view(pages, 4, 64, 16).transpose(1, 2).reshape(pages * 64, 64)
+    e8m0 = kscale.view(pages, 4, 64)[:, :, (slot % 16) * 4 + slot // 16].transpose(1, 2)
+    kv, ks = pack_kv_cache(rows, e8m0.reshape(pages * 64, 4), page_size=8)
+    return dict(case, payload=kv.reshape(payload.shape), kscale=ks.reshape(kscale.shape),
+                page8=True)  # fmt: skip
 
 
 def _other_query(*, case, seed):
@@ -147,7 +164,9 @@ def _unpack(b):
 
 
 def ref_logits(*, case, t, cols):
-    """fp64 logits of row t at columns ``cols``: sum_h w_h relu(sum_c 2^qe 2^ke q.k)."""
+    """fp64 logits of row t at columns ``cols``: sum_h w_h relu(sum_c 2^qe 2^ke q.k).
+
+    ``case`` is on 64-row pages."""
     page = case["table"][t][cols // 64].long()
     slot = cols % 64
     k = _unpack(case["payload"][page, 0, :, slot, :])  # [n, 4, 32]
@@ -178,7 +197,7 @@ def _inputs(case):
         rows=rows,
         per_req=case["per_req"],
         query=(case["q"], case["qscale"], case["w"]),
-        plane=(case["payload"], case["kscale"]),
+        plane=(case["payload"], case["kscale"], case["page8"]),
         page_table=case["table"],
         bounds=case["bounds"],
     )
@@ -214,21 +233,32 @@ def sglang_logits(case):
         q_fp4=case["q"], q_scale=case["qscale"], k_payload=case["payload"],
         k_scale=case["kscale"], weights=case["w"], page_table=case["table"],
         c4_seq_lens=case["bounds"], weight_scale=1.0, page_table_bucket=64,
-        is_decode=True,
+        is_decode=True, page8=case["page8"],
     )  # fmt: skip
 
 
 def sglang_select(*, case, logits, candidates=None):
     """SGLang's decode selection on ``logits``: the plain paged top-k and the
-    producer's candidate blocks, or a consumer's top-k inside ``candidates``.
+    producer's candidate blocks, or a consumer's top-k inside ``candidates`` (on a
+    page8 pool, from its own scores of the candidate blocks alone).
     -> (raw, page, the candidate blocks)."""
     from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
         select_candidate_blocks_hip,
         topk_transform_paged_hip,
         topk_within_candidate_blocks_hip,
+        topk_within_candidate_blocks_page8,
+        with_candidate_page8_table,
     )
 
     raw, page = _outs(case["q"].shape[0])
+    if candidates is not None and case["page8"]:
+        topk_within_candidate_blocks_page8(
+            q_fp4=case["q"], q_scale=case["qscale"], weights=case["w"],
+            k_payload=case["payload"], k_scale=case["kscale"], candidates=candidates,
+            seq_lens=case["bounds"], page_table=case["table"], page_size=64,
+            page_indices=page, raw_indices=raw,
+        )  # fmt: skip
+        return raw, page, candidates
     if candidates is not None:
         topk_within_candidate_blocks_hip(
             logits=logits, seq_lens=case["bounds"], candidates=candidates,
@@ -239,6 +269,10 @@ def sglang_select(*, case, logits, candidates=None):
         logits=logits, seq_lens=case["bounds"], topk_blocks=ip.TOPK_BLOCKS,
         block_size=ip.BLOCK_ROWS,
     )  # fmt: skip
+    if case["page8"]:
+        published = with_candidate_page8_table(
+            published, seq_lens=case["bounds"], page_table=case["table"], page_size=64
+        )
     topk_transform_paged_hip(
         scores=logits, seq_lens=case["bounds"], page_table=case["table"],
         page_indices=page, page_size=64, raw_indices=raw,
@@ -264,17 +298,24 @@ def _jaccard(*, got, want):
 # ---------------------------------------------------------------- the launch
 
 
+PAGE8 = pytest.mark.parametrize("page8", [False, True], ids=["page64", "page8"])
+
+
+@PAGE8
 @pytest.mark.parametrize(
     "ctxs", [[8192], [300, 8192], [131072], [524288]], ids=["8k", "mix", "128k", "512k"]
 )
-def test_logits(ctxs):
-    """K2i's FULL logits of every scored row stay within ``k2i.logits.rel`` of SGLang's and fp64."""
+def test_logits(ctxs, page8):
+    """K2i's FULL logits of every scored row stay within ``k2i.logits.rel`` of SGLang's and fp64;
+    a page8 plane's are the same keys' on 64-row pages, bit for bit."""
     k2i = _k2i()
-    case = fp4_case(ctxs=ctxs, seed=len(ctxs) + max(ctxs))
+    case64 = fp4_case(ctxs=ctxs, seed=len(ctxs) + max(ctxs))
+    case = as_page8(case64) if page8 else case64
     k2i.walk_plan(
         ratio=1, bounds=case["bounds"], rows=case["q"].shape[0], per_req=PER_REQ
     )
-    got = k2i.score(ratio=1, **_inputs(case))
+    got = k2i.score(ratio=1, **_inputs(case)).clone()
+    same = k2i.score(ratio=1, **_inputs(case64))
     torch.cuda.synchronize()
     want = sglang_logits(case)
     bound = dsv41.NUMERICS.bound("k2i.logits.rel")
@@ -284,6 +325,7 @@ def test_logits(ctxs):
             continue
         a, s = got[t, :b], want[t, :b]
         assert torch.isfinite(a).all(), t
+        assert torch.equal(a, same[t, :b]), t
         err = float((a - s).abs().max() / s.abs().max().clamp_min(1e-30))
         assert err <= bound, (t, err)
         cols = (
@@ -291,17 +333,20 @@ def test_logits(ctxs):
             if b > 8192
             else torch.arange(b, device="cuda", dtype=torch.int32)
         )
-        ref = ref_logits(case=case, t=t, cols=cols)
+        ref = ref_logits(case=case64, t=t, cols=cols)
         err64 = float((a[cols.long()].double() - ref).abs().max() / ref.abs().max())
         assert err64 <= bound, (t, err64)
 
 
+@PAGE8
 @pytest.mark.parametrize("ctxs", [[20000, 9000], [131072]], ids=["20k9k", "128k"])
-def test_reindex_selects_sglangs_rows_within_the_candidates(ctxs):
+def test_reindex_selects_sglangs_rows_within_the_candidates(ctxs, page8):
     """A REINDEX consumer, scoring its candidate columns alone, selects the rows SGLang's top-k
-    within the candidate blocks selects from the same layer's full logits."""
+    within the candidate blocks selects from the same layer's full logits (on a page8 pool, from
+    aiter's scores of those columns)."""
     k2i = _k2i()
     case = fp4_case(ctxs=ctxs, seed=21 + max(ctxs))
+    case = as_page8(case) if page8 else case
     rows = case["q"].shape[0]
     _, _, cands = run_k2i(k2i=k2i, case=case, kind="producer")
     consumer = _other_query(case=case, seed=6)
@@ -315,14 +360,16 @@ def test_reindex_selects_sglangs_rows_within_the_candidates(ctxs):
     assert torch.equal(_sorted_sets(page), _sorted_sets(want_page))
 
 
+@PAGE8
 @pytest.mark.parametrize(
     "ctxs", [[8192, 20000], [131072], [300, 524288]], ids=["8k20k", "128k", "512k"]
 )
-def test_pipeline_against_sglang(ctxs):
+def test_pipeline_against_sglang(ctxs, page8):
     """A two-level step's producer rows, candidate blocks and consumer rows overlap SGLang's
     whole pipeline (on its own logits) per row."""
     k2i = _k2i()
     case = fp4_case(ctxs=ctxs, seed=11 + max(ctxs))
+    case = as_page8(case) if page8 else case
     raw, _, cands = run_k2i(k2i=k2i, case=case, kind="producer")
     want_raw, _, want_cands = sglang_select(case=case, logits=sglang_logits(case))
     consumer = _other_query(case=case, seed=5)
@@ -341,14 +388,18 @@ def test_pipeline_against_sglang(ctxs):
         assert med >= JACCARD_MEDIAN and p1 >= JACCARD_P1, (name, med, p1)
 
 
-def test_graph_replay_selects_as_eager():
-    """A captured step of the three kinds, replayed on other contexts and tables, selects as eager.
+@PAGE8
+def test_graph_replay_selects_as_eager(page8):
+    """A captured step of the three kinds, replayed on other contexts and tables, selects as eager;
+    with page8 its ratio-1 sources (producer, reindex) read a page8 plane, as SGLang's pools do.
 
     Compared as sets: SGLang's top-k leaves a row's order to its atomics; eager runs differ too."""
     k2i = _k2i()
     ppr = _cdiv(40000, 64)
     static = fp4_case(ctxs=[20000, 9000], seed=3, pages_per_req=ppr)
-    static2 = _other_query(case=static, seed=4)
+    # its own plane, the rest shared with ``static``
+    ratio1 = as_page8(static) if page8 else static
+    static2 = _other_query(case=ratio1, seed=4)
     rows = static["q"].shape[0]
     outs = [_outs(rows) for _ in range(3)]
     held = {}
@@ -356,7 +407,7 @@ def test_graph_replay_selects_as_eager():
     def step():
         run_k2i(k2i=k2i, case=static, kind="full", outs=outs[0], ratio=2)
         _, _, held["cands"] = run_k2i(
-            k2i=k2i, case=static, kind="producer", outs=outs[1]
+            k2i=k2i, case=ratio1, kind="producer", outs=outs[1]
         )
         run_k2i(
             k2i=k2i,
@@ -382,6 +433,10 @@ def test_graph_replay_selects_as_eager():
         new = fp4_case(ctxs=ctxs, seed=seed, pages_per_req=ppr)
         for name in ("q", "qscale", "w", "payload", "kscale", "table", "bounds"):
             static[name].copy_(new[name])
+        if page8:
+            new8 = as_page8(new)
+            ratio1["payload"].copy_(new8["payload"])
+            ratio1["kscale"].copy_(new8["kscale"])
         other = _other_query(case=new, seed=seed + 100)
         static2["q"].copy_(other["q"])
         static2["w"].copy_(other["w"])
