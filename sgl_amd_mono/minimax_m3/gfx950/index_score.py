@@ -31,21 +31,17 @@ from sgl_amd_mono.common.ops import (
     rsrc,
     uniform,
 )
+from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES
 from sgl_amd_mono.minimax_m3.gfx950.config import (
-    BLOCKS,
     HEAD_DIM,
     INDEX_CP_FROM_BLOCKS,
-    MAX_INDEX_BLOCKS,
     MAX_TOKENS,
-    ONE_INDEX_HEAD,
     SPARSE_BLOCK,
-    THREADS,
     TOPK_BLOCKS,
-    TP,
-    WAVES,
     IndexHeads,
 )
 from sgl_amd_mono.minimax_m3.gfx950.device import readlane, unlikely
+from sgl_amd_mono.minimax_m3.gfx950.layout import Layout
 
 INDEX_BLOCK_BYTES = SPARSE_BLOCK * HEAD_DIM  # one fp8 index-K block
 KEY_TILES = SPARSE_BLOCK // 16  # MFMA row tiles of a block
@@ -98,7 +94,7 @@ def step_rows(seq_lens, tokens: int, q_len, heads: IndexHeads) -> StepRows:
         req_blks[k] = (fx.Int32(k) % q_len == q_len - 1).select(
             n_blks[k], req_blks[k + 1]
         )
-    past = INDEX_CP_FROM_BLOCKS if heads.count > 1 else THREADS
+    past = INDEX_CP_FROM_BLOCKS if heads.cp else THREADS
     return StepRows(seq, n_blks, [nb > past for nb in req_blks])
 
 
@@ -114,34 +110,55 @@ def _pick(vals, k):
 def emit_index_scores(
     slot, lane, wave, red, mb_put, iscore, q_frag, tokens, q_len, init_blocks,
     local_blocks, scale, index_cache, block_table, seq_lens, bt_width,
-    wait_new_keys, prepare, heads=ONE_INDEX_HEAD, q_frag_head=None,
+    wait_new_keys, prepare, heads: IndexHeads, layout: Layout, q_frag_head=None,
     prepare_heads=None,
 ):  # fmt: skip
-    """This CTA's (``slot``) share of the step's score tasks: pair k * MAX_INDEX_BLOCKS
-    + b of mailbox ``iscore`` <- the score of token k's block b.
+    """This CTA's (``slot``) share of the step's score tasks: up to BLOCKS tasks,
+    task u runs on CTA u, else on wave (u // BLOCKS) % WAVES of CTA u % BLOCKS
+    (``red``: WAVES * 16 floats of LDS). The tokens form requests of ``q_len``
+    consecutive rows sharing a block table; the last one has the longest context
+    and lists the request's scored blocks. ``q_frag(k, s)``: this lane's B operand
+    for token k, k-chunk s (bf16x8 of index q). Pair
+    k * ISCORE_BLOCKS + h * heads.score_blocks + b of mailbox ``iscore`` <- the
+    score of token k's block b for index head h (one head: h is 0 and this is
+    the original flat k * MAX_INDEX_BLOCKS + b).
 
-    Up to BLOCKS tasks, task u runs on CTA u, else on wave (u // BLOCKS) % WAVES of CTA
-    u % BLOCKS (``red``: WAVES * 16 floats of LDS). The tokens form requests of
-    ``q_len`` consecutive rows sharing a block table; the last has the longest context
-    and lists the request's scored blocks. ``q_frag(k, s)``: this lane's B operand for
-    token k, k-chunk s (bf16x8 of index q). ``wait_new_keys()`` (wave-local) waits for
-    the index keys this launch inserts, which a block within MAX_TOKENS keys of a
-    token's end may hold (a speculative verify's earlier rows).
-    ``prepare(first, last)`` (with CTA barriers) runs on a CTA with tasks before any
-    index q is read: K1 makes rows first..last's there. Under indexer context
-    parallelism (``heads.count`` > 1) a long request (``step_rows``) scores only this
-    rank's blocks, b = heads.own (mod TP), for every index q head, a key block read
-    once for all: pair k * MAX_INDEX_BLOCKS + h * (MAX_INDEX_BLOCKS / TP) + b / TP <-
-    token k's block b for head h. ``q_frag_head(k, s, h)`` is head h's B operand
-    (every lane its own h), and ``prepare_heads()`` (with CTA barriers, on every CTA)
-    makes those requests' rows' heads first."""
+    Own mode (``heads.count`` > 1, ``cp`` false -- TP2, where a rank holds one
+    index head per KV head): every request is scored with every one of the
+    rank's heads, a block's key tiles read once for all of them, each head's
+    scores to its own full-size region. The split stage's pass h then selects
+    from head h's region for KV head h.
+
+    ``wait_new_keys()`` (wave-local) waits for the index keys this launch
+    inserts: a block within MAX_TOKENS keys of a token's end may hold an earlier
+    token of its request (speculative decode rows). ``prepare(first, last)``
+    (with CTA barriers) runs on a CTA with tasks before any index q is read: K1
+    makes rows first..last's there.
+
+    Indexer context parallelism (``heads.cp``): a long request
+    (``step_rows``) scores only this rank's blocks, b = heads.own
+    (mod TP) -- every index q head of them, a task's key block read once for all:
+    pair k * ISCORE_BLOCKS + h * (MAX_INDEX_BLOCKS / TP) + b / TP <- the score
+    of token k's block b for head h. Its short requests keep the flat layout. ``q_frag_head(k, s, h)``: head h's B operand
+    (every lane its own h); ``prepare_heads()`` (with CTA barriers, on every CTA)
+    makes those requests' rows' heads first. The other requests score as above."""
     assert local_blocks >= 1, "the block of the current token must be pinned"
+    # this build's TP and the stride of a token's whole score region: both were
+    # module constants of a build compiled for one TP, and are now per build
+    TP = heads.dims.tp  # noqa: N806
+    ISCORE_BLOCKS = layout.iscore_blocks  # noqa: N806
     l16 = lane % 16
     g4 = lane // 16
     rows = step_rows(seq_lens, tokens, q_len, heads)
     seq = rows.seq
-    # one task list of every request's scored blocks, and one of CP requests' own blocks (pre_cp)
-    cp = heads.count > 1
+    # every request's scored blocks in one list, a task per wave across the grid;
+    # context-parallel requests' (this rank's blocks) in a second
+    cp = heads.cp
+    # own mode: the rank's own index heads, each scoring every block for the KV
+    # head it pairs with, so a block is scored OWN_HEADS times and the scores go
+    # to per-head regions. 1 at TP4/TP8 (and under CP, whose multi-head path is
+    # emit_cp_tasks), where every expression below is the original one.
+    OWN_HEADS = 1 if cp else heads.count  # noqa: N806
     first_own = init_blocks + (heads.own - init_blocks) % TP
     pre = [fx.Int32(0)]
     pre_cp = [fx.Int32(0)]
@@ -241,9 +258,23 @@ def emit_index_scores(
                 v = fx.max(v, (key0 + e < col_seq).select(c[e], float("-inf")))
         return butterfly(v, (32, 16), fx.max)
 
-    def put(b, col, v):
+    def put(b, col, v, head=0):
+        """Token ``col``'s score of block b for index head ``head``. Under CP the
+        short requests keep the flat layout (head is 0 there, so the offset is
+        0); in own mode head h takes its own full-size region."""
         if (lane < 16) & (l16 < q_len):
-            mb_put(iscore, col * MAX_INDEX_BLOCKS + b, v * scale)
+            mb_put(
+                iscore,
+                col * ISCORE_BLOCKS + head * heads.score_blocks + b,
+                v * scale,
+            )
+
+    def own_frag(tk, s, h):
+        """B operand of token tk's index q for own-mode head h. With one head
+        this is ``q_frag`` itself -- which reads ``heads.own``, not head 0."""
+        if const_expr(OWN_HEADS == 1):
+            return q_frag(tk, s)
+        return q_frag_head(tk, s, h)
 
     def emit_cp_tasks():
         """The context-parallel requests' tasks, a task a wave: B column f of pass
@@ -271,9 +302,7 @@ def emit_index_scores(
                     if (lane < 16) & (f < n_cols):
                         mb_put(
                             iscore,
-                            col * MAX_INDEX_BLOCKS
-                            + head * (MAX_INDEX_BLOCKS // TP)
-                            + b // TP,
+                            col * ISCORE_BLOCKS + head * heads.score_blocks + b // TP,
                             v * scale,
                         )
 
@@ -289,7 +318,19 @@ def emit_index_scores(
                 i = fx.Int32(i)
                 score_cp(readlane(tk_j, i), readlane(b_j, i), readlane(pages, i))
 
-    # a task a CTA, a key tile a wave; its keys load before prepare(), hiding under the index q's
+    if const_expr(OWN_HEADS > 1):
+        # Own mode scores every request with every one of the rank's heads, so
+        # every head's index q is needed on every CTA. The per-task ``prepare``
+        # makes only ``heads.own``'s rows, and there is nothing to defer: unlike
+        # the one-head path, no request scores without all of them.
+        assert prepare_heads is not None, "own mode needs every head's index q"
+        prepare_heads()
+    # Up to BLOCKS tasks: one a CTA, a key tile a wave, the columns' maxima met in
+    # LDS; the keys go out before prepare() (only the task's request's rows), so
+    # their latency hides under the index q's: the scores are on the step's
+    # critical path. More: a task a wave,
+    # every row's index q first (a wave's task count differs: no barrier inside),
+    # the pages of a wave's next 64 tasks fetched at once, a lane each.
     if total <= BLOCKS:
         for u in range(slot, total, BLOCKS):
             tk, b = task_block(fx.Int32(u))
@@ -297,21 +338,24 @@ def emit_index_scores(
             if new_keys_in(tk, b):
                 wait_new_keys()
             raw = load_raw(page, [wave])
-            prepare(tk - (q_len - 1), tk)
+            if const_expr(OWN_HEADS == 1):
+                prepare(tk - (q_len - 1), tk)
             col, col_seq = cols_of(tk)
-            qb = [q_frag(col, s) for s in range(HEAD_DIM // 32)]
-            v = tiles_max(b, qb, col_seq, [wave], split_tiles(raw, [wave]))
-            if lane < 16:
-                fx.ptr_store(v, red + (wave * 16 + l16))
-            gpu.barrier()
-            if wave == 0:
-                for w in range_constexpr(1, WAVES):
-                    v = fx.max(v, fx.ptr_load(red + (w * 16 + l16)))
-                put(b, col, v)
-            gpu.barrier()
-    # more: a task a wave, after every row's index q (wave task counts differ: no barrier inside)
+            kw = split_tiles(raw, [wave])
+            for h in range_constexpr(OWN_HEADS):
+                qb = [own_frag(col, s, h) for s in range(HEAD_DIM // 32)]
+                v = tiles_max(b, qb, col_seq, [wave], kw)
+                if lane < 16:
+                    fx.ptr_store(v, red + (wave * 16 + l16))
+                gpu.barrier()
+                if wave == 0:
+                    for w in range_constexpr(1, WAVES):
+                        v = fx.max(v, fx.ptr_load(red + (w * 16 + l16)))
+                    put(b, col, v, h)
+                gpu.barrier()
     if total > BLOCKS:
-        prepare(fx.Int32(0), fx.Int32(tokens - 1))
+        if const_expr(OWN_HEADS == 1):
+            prepare(fx.Int32(0), fx.Int32(tokens - 1))
         tiles = range(KEY_TILES)
         seq_lane = _pick(seq, fx.min(lane, tokens - 1))  # lane k: token k's context
 
@@ -322,8 +366,11 @@ def emit_index_scores(
             raw = load_raw(page, tiles)
             col = tk - (q_len - 1) + fx.min(l16, q_len - 1)
             col_seq = lane_gather(seq_lane, col)
-            qb = [q_frag(col, s) for s in range(HEAD_DIM // 32)]
-            put(b, col, tiles_max(b, qb, col_seq, tiles, split_tiles(raw, tiles)))
+            # the block's key tiles are read once and kept for every own head
+            kw = split_tiles(raw, tiles)
+            for h in range_constexpr(OWN_HEADS):
+                qb = [own_frag(col, s, h) for s in range(HEAD_DIM // 32)]
+                put(b, col, tiles_max(b, qb, col_seq, tiles, kw), h)
 
         # lane j decodes task c0 + step j once, read back per task: no select chain between tasks
         step = BLOCKS * WAVES
@@ -338,3 +385,24 @@ def emit_index_scores(
         # cold: a step without context-parallel requests runs none of it
         if unlikely(total_cp > 0):
             emit_cp_tasks()
+
+
+def q_frag_from(iq, heads: IndexHeads):
+    """(``q_frag``, ``q_frag_head``) reading index q from memory: [token][head]
+    [HEAD_DIM] bf16, ``heads.count`` heads a token."""
+
+    def q_frag_head(tk, s, head):
+        lane = fx.thread_idx.x % 64
+        return fx.Vector(
+            bo.buffer_load(
+                rsrc(iq),
+                ((tk * heads.count + head) * HEAD_DIM + 32 * s + 8 * (lane // 16)) // 2,
+                vec_width=4,
+                dtype=T.i32,
+            )
+        ).bitcast(fx.BFloat16)
+
+    def q_frag(tk, s):
+        return q_frag_head(tk, s, heads.own)
+
+    return q_frag, q_frag_head

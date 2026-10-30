@@ -8,7 +8,7 @@ page-16 table), split (the paged decode's 256-key partitions, FP8 QK / PV with i
 scale placement), o (the paged decode's reduce, standalone per-token FP8, o_proj; the
 rank-ordered sum s gives h_mid = bf16(bf16(s) + h) and mailbox ``a`` = s), router
 (gemma RMSNorm in the fused all-reduce's reduction order, bf16 gate GEMV) and moe
-(sigmoid + bias top-4 plus the fused shared expert, MXFP8 x MXFP4 on aiter's shuffled
+(sigmoid + bias top-4 plus the fused shared expert, MXFP4 a16w4 on aiter's shuffled
 layout, swiglu, route-weighted down, rank-ordered sum: ar_out = bf16(sum)). The next
 layer's K1 takes (ar_out, h_mid) exactly as the unfused fused all-reduce + RMSNorm
 takes (partials, residual). From ``WIDE_FROM`` tokens the MoE groups its work by
@@ -18,8 +18,13 @@ on CTA (base + t) % BLOCKS, every CTA walks the stages in order and dependencies
 point to earlier stages, so with every CTA co-resident each spin wait makes progress.
 """
 
+import struct
+from functools import reduce
+from typing import Optional
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.act import swiglu_mul_batch
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
@@ -46,30 +51,25 @@ from sgl_amd_mono.common.ops import (
     wave_max,
     xshfl,
 )
-from sgl_amd_mono.common.plan import kernel_sources, key_tuple
-from sgl_amd_mono.common.sync import preg
+from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple
+from sgl_amd_mono.common.sync import Addr, Mailbox, preg, sreg
 from sgl_amd_mono.minimax_m3.gfx950.config import (
-    BLOCKS,
     HEAD_DIM,
     HIDDEN,
     INDEX_CP_FROM_BLOCKS,
-    INTER,
     MAX_INDEX_BLOCKS,
     MAX_TOKENS,
     MOE_SLOTS,
     N_ROUTED,
-    ONE_INDEX_HEAD,
     PAGE16,
     SHARED_EXPERT,
     SPARSE_BLOCK,
-    THREADS,
     TOP_K,
     TOPK_BLOCKS,
-    TP,
-    WAVES,
+    TOTAL_INDEX_HEADS,
+    Dims,
     IndexHeads,
 )
-from sgl_amd_mono.minimax_m3.gfx950.device import StepMailbox as Mailbox
 from sgl_amd_mono.minimax_m3.gfx950.device import block_max as block_max_of
 from sgl_amd_mono.minimax_m3.gfx950.device import (
     release_stores,
@@ -77,45 +77,34 @@ from sgl_amd_mono.minimax_m3.gfx950.device import (
     unlikely,
     wave_sum,
 )
-from sgl_amd_mono.minimax_m3.gfx950.index_score import index_scale_log2e, step_rows
+from sgl_amd_mono.minimax_m3.gfx950.index_score import (
+    index_scale_log2e,
+    step_rows,
+)
 from sgl_amd_mono.minimax_m3.gfx950.layout import (
     AG_RS_FROM,
+    CAND_CAP,
     DN_ROWS,
-    MID_ROW,
-    MIDSC_ROW,
     N_DN,
     N_O,
     N_ROUTER,
     N_SPLIT,
-    O_K,
-    O_ROW,
     O_ROWS,
     PAGES_PER_BLOCK,
     SCORE_COPIES,
-    SCRATCH,
+    SEL_P8_WORDS,
     SH_ROWS,
-    SH_TASKS,
     SPLIT_KEYS,
-    UG_PER_SLOT,
     UG_ROWS,
     XN8_ROW,
     XSC_ROW,
-    H,
-    pool_words,
-    shared_after_routing,
-    stage_bases,
+    Layout,
     sym_layout,
     ug_ctas_per_token,
-    ug_tasks_of,
-    wide_moe,
 )
 from sgl_amd_mono.minimax_m3.gfx950.pre_attn import (
     K1_ARGS,
-)
-from sgl_amd_mono.minimax_m3.gfx950.pre_attn import N_HEAD_TASKS as K1_HEAD_TASKS
-from sgl_amd_mono.minimax_m3.gfx950.pre_attn import SCRATCH_HDONE as K1_SCRATCH_HDONE
-from sgl_amd_mono.minimax_m3.gfx950.pre_attn import SCRATCH_RDONE as K1_SCRATCH_RDONE
-from sgl_amd_mono.minimax_m3.gfx950.pre_attn import (
+    K1Layout,
     emit_k1,
 )
 from sgl_amd_mono.minimax_m3.gfx950.select import (
@@ -132,31 +121,108 @@ FP8_MAX = 448.0
 NEG = -3.4e38  # the paged decode's masked-score value
 PAGE_BYTES = PAGE16 * HEAD_DIM
 XN_SLICE = HIDDEN // N_ROUTER  # normalized-input elements each router task publishes
-W13_ROWS = 2 * INTER  # gate rows then up rows (GGUU)
-W13_BYTES = W13_ROWS * HIDDEN // 2  # one expert, fp4
-W2_BYTES = HIDDEN * INTER // 2
 W13_SCALE_COLS = HIDDEN // 32
-W2_SCALE_COLS = INTER // 32
-S2_BYTES = (N_ROUTED + 1) * HIDDEN * W2_SCALE_COLS  # e8m0, every expert
-S13_BYTES = (N_ROUTED + 1) * W13_ROWS * W13_SCALE_COLS
+
+
+class MoeWeights(msgspec.Struct, frozen=True):
+    """Extents of one rank's share of the MXFP4 expert tables.
+
+    Split off the module constants for the same reason as :class:`Layout`:
+    every one of these follows INTER, so it cannot be known before the server's
+    TP size is. ``W13_SCALE_COLS`` is HIDDEN-wide and stays a module constant.
+    """
+
+    dims: Dims
+
+    @property
+    def w13_rows(self) -> int:
+        """gate rows then up rows (GGUU)"""
+        return 2 * self.dims.inter
+
+    @property
+    def w13_bytes(self) -> int:
+        """one expert, fp4"""
+        return self.w13_rows * HIDDEN // 2
+
+    @property
+    def w2_bytes(self) -> int:
+        return HIDDEN * self.dims.inter // 2
+
+    # The STORED width of an aiter-shuffled w2 scale, which is not INTER // 32.
+    # e8m0_shuffle lays scales out in groups of 8 columns -- ``group_scale_byte``
+    # strides by ``cols // 8`` -- and pads the column count up to a multiple of 8 so
+    # that division is exact. At TP4 and TP2 the natural count (24, 48) is already a
+    # multiple of 8 and the padding is a no-op, which is why the unpadded value went
+    # unnoticed; at TP8 INTER // 32 is 12 against a tensor that is really 16 wide,
+    # and the unpadded stride would collapse two column groups into one, reading the
+    # wrong scale byte for every k past 256. w13's scale is HIDDEN // 32 = 192 wide
+    # and never pads, so W13_SCALE_COLS stays as it is.
+    @property
+    def w2_scale_cols(self) -> int:
+        return self.dims.padded_scale_cols
+
+    @property
+    def s2_bytes(self) -> int:
+        """e8m0, every expert"""
+        return (N_ROUTED + 1) * HIDDEN * self.w2_scale_cols
+
+    @property
+    def s13_bytes(self) -> int:
+        return (N_ROUTED + 1) * self.w13_rows * W13_SCALE_COLS
+
 
 # None: the caller's current stream, graph capture included
 _CURRENT_STREAM = fx.Stream(None)
 
 
-# blocks at or past the selection floor (ATOM's M3 select stage); more ties count every block
-CAND_CAP = 256
-# ``sel``: one put_key entry (two words) a thread; a long request's candidates reuse it
+def _f32(x: float) -> float:
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+# ``sel`` (LDS words): a short request's blocks, one put_key entry (two words) a
+# thread; a long request's gathered candidates reuse them
 SEL_WORDS = 2 * THREADS
 assert SEL_WORDS >= 2 * N_SPLIT * TOPK_BLOCKS
-# no LDS spare at S = 16: the selection borrows ``p8`` / ``red`` between K1 and the split's P
-SEL_P8_WORDS = 2 * CAND_CAP + 2 + WAVES * TOPK_BLOCKS
+# The candidates, their counter and the lane groups' maxima borrow ``p8``, and a
+# long share's entries ``red``. K4's 16-token build uses all but 4 KB of the
+# 160 KB LDS, so they get no arrays of their own.
+#
+# What makes the borrow safe is that a selection's words are dead before the
+# region's owner writes it: the chosen ids leave ``p8`` in ``blk``, which
+# ``read_blk`` consumes immediately, and a barrier separates that from the pass'
+# P stores. ``red`` is past K1's last use by the time the split stage runs.
+#
+# This used to read "before a split task's P is written", which was true only
+# while a task made one selection. With SPLIT_PASSES > 1 (stage_split) pass 1
+# selects *after* pass 0 has written and read its P -- safe because pass 0's P is
+# consumed by its own PV mfma and put to ``sp_o`` first, with the end-of-pass
+# barrier ordering the two. Do not restore the old wording: it would read as a
+# guarantee the two-pass split does not provide.
+#
+# How wide the shared region has to be is decided in layout (``P8_WORDS``):
+# from TP8 down it is the selection, not the P, that sets the size.
+#
 # blocks a thread keys in its split task's eighth of a context (<= MAX_INDEX_BLOCKS)
 CAND_BATCH = 2
 assert N_SPLIT * THREADS * CAND_BATCH >= MAX_INDEX_BLOCKS
-# indexer CP: split task p scans head p // 2's scores of half p % 2 of this rank's blocks
-assert N_SPLIT == 2 * TP
-# a long request's rows end under a block apart, so a share holds >= TOPK_BLOCKS blocks
+# Indexer context parallelism: a long context's split task p scans index head
+# p // 2's scores of half p % 2 of this rank's blocks -- as many as a TP split task
+# scans -- for the head's rank; a request is long past INDEX_CP_FROM_BLOCKS blocks
+# (``step_rows``; every long request context-parallel: no TP long selection in that
+# build), its rows ending less than a block apart are >= INDEX_CP_FROM_BLOCKS blocks
+# each, and a split task then scans >= TOPK_BLOCKS blocks
+# Two split tasks per index head (the comment above: task p takes head p // 2's
+# scores, half p % 2). The model has TOTAL_INDEX_HEADS of them at every TP, so
+# the invariant is 2 * TOTAL_INDEX_HEADS = 8 = N_SPLIT throughout. The original
+# `2 * TP` only coincided at TP4, where TP happens to equal TOTAL_INDEX_HEADS.
+#
+# This fixes the ASSERT, not the indexing it guards: the context-parallel
+# selection still divides and strides by TP where it means "index heads"
+# (`MAX_INDEX_BLOCKS // TP`, `b // TP`, `own0 + TP * j`, here and in
+# index_score.py), which is wrong at TP != 4. CP is only reached when
+# `heads.cp`, so an own-mode build is unaffected by that -- including TP2's,
+# whose two index heads are its own pair and not context parallelism.
+assert N_SPLIT == 2 * TOTAL_INDEX_HEADS
 assert N_SPLIT * TOPK_BLOCKS <= INDEX_CP_FROM_BLOCKS <= THREADS
 assert MAX_TOKENS <= SPARSE_BLOCK
 
@@ -170,9 +236,11 @@ def build_post_attn_kernel(
     swiglu_limit: float,
     init_blocks: int,
     local_blocks: int,
+    dims: Dims,
+    heads: IndexHeads,
+    flags_offset: int,
     tokens: int = 1,
-    heads: IndexHeads = ONE_INDEX_HEAD,
-    fault_site: int = 0,
+    fault_site: Optional[int] = None,
     fault_after: int = 0,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group.
@@ -184,14 +252,48 @@ def build_post_attn_kernel(
     planes with the layer's fixed K / V scales; the router weight is bf16."""
     keyed = key_tuple(locals(), SOURCES)
     assert 1 <= tokens <= MAX_TOKENS
+    # one rank's shapes, and the three layouts derived from them. Everything
+    # below that a build compiled for one TP read as a module constant is bound
+    # here instead, once per build, under its original name.
+    assert heads.dims == dims, f"index heads built for {heads.dims}, not {dims}"
+    layout = Layout(dims=dims)
+    k1 = K1Layout(dims=dims)
+    moe_w = MoeWeights(dims=dims)
+    TP = dims.tp  # noqa: N806
+    INTER = dims.inter  # noqa: N806
+    H, O_K, O_K_SUB, H_SUB = layout.h, layout.o_k, layout.o_k_sub, layout.h_sub  # noqa: N806
+    SPLIT_PASSES = layout.split_passes  # noqa: N806
+    SPLIT_ROWS_WHOLE = layout.split_rows_whole  # noqa: N806
+    SPLIT_LIVE_G4 = layout.split_live_g4  # noqa: N806
+    SPLIT_SLOTS, SPLIT_SLOTS_WHOLE = layout.split_slots, layout.split_slots_whole  # noqa: N806
+    P8_WORDS = layout.p8_words  # noqa: N806
+    KV_PAGE_BYTES = layout.kv_page_bytes  # noqa: N806
+    ISCORE_BLOCKS = layout.iscore_blocks  # noqa: N806
+    UG_PER_SLOT, SH_TASKS = layout.ug_per_slot, layout.sh_tasks  # noqa: N806
+    MID_ROW, MIDSC_ROW, O_ROW = layout.mid_row, layout.midsc_row, layout.o_row  # noqa: N806
+    MERGE_SLOTS, MERGE_PASSES = layout.merge_slots, layout.merge_passes  # noqa: N806
+    MERGE_ROUNDS_WHOLE = layout.merge_rounds_whole  # noqa: N806
+    MERGE_TAIL_SLOTS = layout.merge_tail_slots  # noqa: N806
+    MID_COPY_ROUNDS = layout.mid_copy_rounds  # noqa: N806
+    MID8_SLOTS, MID8_ROUNDS = layout.mid8_slots, layout.mid8_rounds  # noqa: N806
+    SCRATCH = layout.scratch  # noqa: N806
+    W13_ROWS, W13_BYTES = moe_w.w13_rows, moe_w.w13_bytes  # noqa: N806
+    W2_BYTES, W2_SCALE_COLS = moe_w.w2_bytes, moe_w.w2_scale_cols  # noqa: N806
+    S2_BYTES, S13_BYTES = moe_w.s2_bytes, moe_w.s13_bytes  # noqa: N806
+    # The merge walks its thread map in MERGE_PASSES rounds of THREADS slots. At
+    # TP4 and TP2 those come out whole and every thread carries real work; at TP8
+    # (H = 8) the map is 256 slots and the single round is half empty, so
+    # ``merge_token`` masks its tail -- see MERGE_ROUNDS_WHOLE there. The constant
+    # is imported to drive that masking, not to refuse the build.
+    assert MERGE_SLOTS <= MERGE_PASSES * THREADS
     W = npes
     G = BLOCKS
-    BASE = stage_bases(tokens)
+    BASE = layout.stage_bases(tokens)
     SY = sym_layout(W)
     # K1's outputs are read device-coherent (K1 stores them so)
     CM_K1 = CM_DEV
-    WIDE = wide_moe(tokens)
-    POOL = pool_words(tokens)
+    WIDE = layout.wide_moe(tokens)
+    POOL = layout.pool_words(tokens)
     U_MAX = TOP_K * tokens + 1  # distinct routed experts at most, then the shared
 
     @fx.struct
@@ -199,9 +301,25 @@ def build_post_attn_kernel(
         # bf16 pairs / fp8 quads of every token's xn, o_proj input or mid (wide: PV partials too)
         x: fx.Array[fx.Int32, POOL, 16]
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
-        p8: fx.Array[fx.Int32, H * SPLIT_KEYS // 4, 16]
+        # the split's FP8 P (H heads x SPLIT_KEYS keys), and the selection's
+        # candidates borrowed on top of it. The borrow used to fit under the P
+        # size for free; at TP8 H is 8, so P needs only 512 words while the
+        # selection still needs SEL_P8_WORDS = 642, and the region is sized for
+        # whichever is larger. At TP4 and TP2 P is the larger (1024, 2048 words)
+        # and this is the original size.
+        p8: fx.Array[fx.Int32, P8_WORDS, 16]
         q8: fx.Array[fx.Int32, O_K // 4, 16]
-        opart: fx.Array[fx.Float32, 1 if WIDE else WAVES * O_K, 16]  # PV partials
+        # PV partials, one split pass' heads (O_K_SUB == O_K at TP4). The wide
+        # MoE's up partials reuse this region through ``fpool`` instead.
+        #
+        # Sized by ``narrow_opart_floats``, which takes the max of the attention
+        # term and the narrow MoE down stage's. This was ``WAVES * O_K_SUB`` --
+        # the attention term alone -- which is 8 KB short at TP8 width 4 and is
+        # a candidate cause of the fault that forced ``WIDTH_RANGE[8]`` to floor
+        # at 5. No-op at TP2 and TP4; see the docstring for why that matters.
+        opart: fx.Array[
+            fx.Float32, 1 if WIDE else layout.narrow_opart_floats(tokens), 16
+        ]
         # wide MoE: the step's distinct experts (the shared one last), token masks
         uexp: fx.Array[fx.Int32, U_MAX + 2, 16]
         umask: fx.Array[fx.Int32, U_MAX + 2, 16]
@@ -230,8 +348,19 @@ def build_post_attn_kernel(
         io=heads.own,
     )
 
-    ih_count, ih_own = heads.count, heads.own
-    # all heads' index q after K1's x8 rows in the pool; K4's stages use it only after K1
+    # the JIT cache key holds the kernel's scalar closure values, not objects: the
+    # index heads go in as ints (a shared cache otherwise serves one rank's build
+    # to every rank)
+    ih_count, ih_own, ih_cp = heads.count, heads.own, heads.cp
+    # ``dims`` itself is closed over rather than unpacked: it is one field, and
+    # ``kernel_name`` already pins it through ``tp=npes`` (asserted equal above),
+    # so two builds with different dims cannot share a cache entry.
+    # the per-head stride into ``iscore``. How MANY heads a step selects for is
+    # not this: it is SPLIT_PASSES (one pass per KV head, layout.py), which at
+    # TP2 coincides with the index head count without being the same quantity.
+    SCORE_BLOCKS = heads.score_blocks  # noqa: N806
+    # with every index head: K1's index q of every head (qs) after its x8 rows in
+    # the pool (K1 is done with the pool before K4's stages use it)
     QS_CP = tokens * HIDDEN // 4
     assert heads.count == 1 or (QS_CP + HEAD_DIM // 2 * tokens * heads.count <= POOL)
 
@@ -260,6 +389,7 @@ def build_post_attn_kernel(
         sym: Int64,
         peers: Int64,
         step: Int64,
+        epoch: Int64,
         rank: Int32,
         layer: Int32,
         bt_width: Int32,
@@ -270,16 +400,19 @@ def build_post_attn_kernel(
         res: Int64,
     ):
         _ = keyed
-        # the guard's peer flags sit at the tail of each rank's peer buffer
+        # Every wait of this launch runs under the guard: on a deadline it
+        # sets its sticky error word, flags every peer and stops the launch,
+        # rather than returning stale data a later address is computed from.
+        # K1 is traced inside this body, so its waits are covered too.
         with guard.scope(
             guard.Guard(
-                step,
+                epoch,
                 own=sym,
                 peers=peers,
                 rank=rank,
-                npes=W,
-                flags_offset=SY["_bytes"],
-                fault_site=fault_site or None,
+                npes=npes,
+                flags_offset=flags_offset,
+                fault_site=fault_site,
                 fault_after=fault_after,
             )
         ):
@@ -306,7 +439,9 @@ def build_post_attn_kernel(
             route = lds.route.ptr
             rwt = lds.rwt.ptr
             keys = lds.sel.ptr
-            assert SEL_P8_WORDS <= H * SPLIT_KEYS // 4
+            # the borrow fits because ``p8`` is sized for it (Smem above), not
+            # because the P it shares the region with happens to be larger
+            assert SEL_P8_WORDS <= P8_WORDS
             assert 2 * THREADS * CAND_BATCH <= WAVES * 64 * 4
             long_keys = fx.recast_iter(fx.Int32, red)
             cand = p8
@@ -324,7 +459,20 @@ def build_post_attn_kernel(
             mb_poll = mbox.poll
 
             def mb(name):
+                """Scratch region ``name``'s raw address, for the regions a stage
+                reads back through ``rsrc`` as plain words (their flag is a mailbox
+                pair of its own: ``attnq`` / ``attnq_s``, ``xn8p`` / ``xndone``)."""
                 return scratch + fx.Int64(SCRATCH[name])
+
+            def mba(name):
+                """Scratch region ``name`` as a mailbox address (device scope)."""
+                return sreg(scratch, SCRATCH[name], name)
+
+            def at(a, delta):
+                """Mailbox address ``a`` moved ``delta`` bytes on, same region: a
+                token's (and an index head's) slice of a per-token region, whose
+                offset is traced and so cannot go through ``sreg``."""
+                return Addr(a.region, a.space, a.value + delta)
 
             def sy(base, region):
                 """Region ``region`` of a rank's peer buffer ``base`` (system scope)."""
@@ -339,8 +487,9 @@ def build_post_attn_kernel(
             def scores_copy(c, k=0):
                 """Copy c of token k's router outputs: expert e's (routing key, sigmoid)
                 at pairs 2 e, 2 e + 1."""
-                return mb("scores") + (fx.Int64(c) * MAX_TOKENS + fx.Int64(k)) * (
-                    N_ROUTED * 16
+                return at(
+                    mba("scores"),
+                    (fx.Int64(c) * MAX_TOKENS + fx.Int64(k)) * (N_ROUTED * 16),
                 )
 
             def route_key(v, e):
@@ -431,24 +580,28 @@ def build_post_attn_kernel(
             emit_k1(
                 tid, bid, lane, wave, xs, red, qs_k1, step, layer,
                 eps, index_scale_log2e(sm_scale), tokens, q_len, init_blocks,
-                local_blocks, IndexHeads(ih_count, ih_own),
+                local_blocks, IndexHeads(dims=dims, count=ih_count, own=ih_own, cp=ih_cp),
+                k1, layout,
                 (
                     ar_in, res, h_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin,
                     positions, slot_mapping, k_cache, v_cache, k_scale, v_scale,
-                    index_cache, q, iq_out, block_table, seq_lens, mb("iscore"), scratch1,
+                    index_cache, q, iq_out, block_table, seq_lens, mba("iscore"), scratch1,
                 ),
                 bt_width,
             )  # fmt: skip
             gpu.barrier()
             k1_mbox = Mailbox(tag=step_tag(step, layer))
             k1_poll = k1_mbox.poll
-            hdone_mb = scratch1 + fx.Int64(K1_SCRATCH_HDONE)
-            rdone_mb = scratch1 + fx.Int64(K1_SCRATCH_RDONE)
+            hdone_mb = sreg(scratch1, k1.scratch_hdone, "hdone")
+            rdone_mb = sreg(scratch1, k1.scratch_rdone, "rdone")
 
             # ============================================================ 0. index
             # a graph pad row (seq_len 0, zero table row) is one key of page 0: finite, a real page
             seq_lens_k, n_blks, long_rows = step_rows(
-                seq_lens, tokens, q_len, IndexHeads(ih_count, ih_own)
+                seq_lens,
+                tokens,
+                q_len,
+                IndexHeads(dims=dims, count=ih_count, own=ih_own, cp=ih_cp),
             )
             # all <= TOPK_BLOCKS blocks are kept, any order correct (index_topk._pack_score_key)
             scored = [nb > TOPK_BLOCKS for nb in n_blks]
@@ -561,17 +714,20 @@ def build_post_attn_kernel(
                 )
                 return sel, slot, n_ctx
 
-            def select_blocks(k, t):
-                """blk[0:16] := token k's pages of selection slots 2t, 2t+1, blk[16] :=
-                the sparse context length.
-
-                Exactly as the unfused selector emits them: top TOPK_BLOCKS by (score,
-                block id) descending with the init blocks pinned to 1e30 and the local
-                ones to 1e29, full blocks in that order and the tail block (the one
-                holding the current token) last. For a long request
-                ``stage_select_long`` filled blk: a one-block stand-in is ranked,
-                placing nothing."""
-                iscore = mb("iscore") + fx.Int64(k) * (MAX_INDEX_BLOCKS * 8)
+            def select_blocks(k, t, head=0):
+                """blk[0:16] := the pages of selection slots 2t, 2t+1 and blk[16] := the
+                sparse context length, exactly as the unfused selector emits them: top
+                TOPK_BLOCKS by (score, block id) descending with the init blocks pinned
+                to 1e30 and the local ones to 1e29, full blocks in that order and the
+                tail block (the one holding the current token) last. A block's slot
+                follows from its rank, the count of blocks that beat it. k: token.
+                For a long request ``stage_select_long`` left blk: a one-block
+                stand-in is ranked, placing nothing. ``head``: the index head whose
+                scores rank the blocks -- own mode's pass h selects for KV head h.
+                One head leaves the offset 0, the original flat region."""
+                iscore = at(mba("iscore"), fx.Int64(k) * (ISCORE_BLOCKS * 8))
+                if head:  # a Python constant: head 0 emits no offset at all
+                    iscore = at(iscore, fx.Int64(head * SCORE_BLOCKS * 8))
                 short = ~pick(long_rows, k)
                 n_blk = short.select(pick(n_blks, k), fx.Int32(1))
                 seq_len = pick(seq_lens_k, k)
@@ -592,25 +748,29 @@ def build_post_attn_kernel(
                     fx.ptr_store(n_ctx, blk + 16)
                 gpu.barrier()
 
-            def select_long(k, part):
-                """Split task (k, part)'s selection for a long request -> blk as
-                ``select_blocks`` leaves it.
-
-                The task ranks its share of the blocks (a thread keys CAND_BATCH) and
-                mails the share's TOPK_BLOCKS best; the N_SPLIT shares' candidates,
-                which hold the context's TOPK_BLOCKS best, are then ranked and placed.
-                A share is 1 / N_SPLIT of the blocks, mailed to this rank's sel_long;
-                with every index head (indexer context parallelism) it is head
-                part // 2's scores of half part % 2 of this rank's blocks, mailed to
-                the head's rank's sel_cp, where the shares of its own head come in."""
+            def select_long(k, part, head=0):
+                """Split task (k, part) of a long request's token, before the
+                split stage. Its share of the blocks (a thread keys CAND_BATCH) -> each
+                wave's TOPK_BLOCKS best -> the CTA's, to a candidate mailbox; then the
+                N_SPLIT shares' candidates (the context's TOPK_BLOCKS best are among
+                them) are ranked and placed -> blk as ``select_blocks`` leaves it. The
+                share: an eighth of the blocks, to this rank's sel_long; with every
+                index head (indexer context parallelism) head part // 2's scores of half
+                part % 2 of this rank's blocks, to the head's rank's sel_cp -- the
+                shares its own head's candidates come in."""
                 n_blk = pick(n_blks, k)
-                iscore = mb("iscore") + fx.Int64(k) * (MAX_INDEX_BLOCKS * 8)
-                first = k * (N_SPLIT * TOPK_BLOCKS)  # token k's candidates (pair pairs)
+                iscore = at(mba("iscore"), fx.Int64(k) * (ISCORE_BLOCKS * 8))
+                if head:  # a Python constant: head 0 emits no offset at all
+                    iscore = at(iscore, fx.Int64(head * SCORE_BLOCKS * 8))
+                # token k's candidates (pair pairs), in head ``head``'s range -- the
+                # gather is cross-CTA and the tag does not distinguish the passes
+                first = (head * MAX_TOKENS + k) * (N_SPLIT * TOPK_BLOCKS)
                 if tid == 0:
                     fx.ptr_store(fx.Int32(0), blk + 17)
-                if const_expr(ih_count > 1):
-                    # this rank's first block
-                    own0 = init_blocks + (ih_own - init_blocks) % TP
+                if const_expr(ih_cp):
+                    own0 = (
+                        init_blocks + (ih_own - init_blocks) % TP
+                    )  # this rank's first
                     n_own = (n_blk - own0 + TP - 1) // TP
                     # the last scored one: the local blocks' slots hold no score
                     last = own0 + TP * (
@@ -622,7 +782,7 @@ def build_post_attn_kernel(
                     js = [lo + tid + THREADS * i for i in range(CAND_BATCH)]
                     blocks = [own0 + TP * j for j in js]
                     live = [j < hi for j in js]
-                    src = iscore + fx.Int64(part // 2) * (MAX_INDEX_BLOCKS // TP * 8)
+                    src = at(iscore, fx.Int64(part // 2) * (SCORE_BLOCKS * 8))
                     slots = [fx.min(b, last) // TP for b in blocks]
                     out, out_slot = sy(peer_addr(part // 2), "sel_cp"), 2 * rank
                     out_slot = out_slot + part % 2
@@ -638,7 +798,7 @@ def build_post_attn_kernel(
                         fx.min(fx.max(b, init_blocks), n_blk - 1 - local_blocks)
                         for b in blocks
                     ]
-                    out, out_slot = mb("sel_long"), part
+                    out, out_slot = mba("sel_long"), part
                     got_from = out
                 words = [w[0] for w in mb_poll([(src, sl, 1) for sl in slots])]
                 # the share's entry tid + THREADS i is its block i of this thread's
@@ -692,10 +852,16 @@ def build_post_attn_kernel(
                 gpu.barrier()
 
             def stage_select_long():
-                """``select_long`` for this CTA's split task (at most one) of a long request.
+                """The split tasks of a long request's token select before the
+                split stage (``select_long``), each leaving its blk for its split task
+                (a CTA runs at most one). Out of the split stage and cold: inline
+                there, this code slows the split for every context.
 
-                Cold and out of the split stage: inlined there it slows the split for
-                every context."""
+                Only with one KV head. Several passes each need their own head's
+                blocks and there is one ``blk``, so they select inside the split
+                stage instead -- see ``stage_split``."""
+                if const_expr(SPLIT_PASSES > 1):
+                    return
                 ts = start("split")
                 k = ts // N_SPLIT
                 if unlikely((ts < N_SPLIT * tokens) & pick(long_rows, k)):
@@ -703,43 +869,50 @@ def build_post_attn_kernel(
 
             # a function a stage: flydsl carries a local reassigned in a dynamic if / for as state
             # ============================================================ 1. split
+            # K1 done flags a split task waits on: this token's H q heads, then every
+            # token's KV_TASKS new K / V heads. One wave polls them, a flag a lane,
+            # so a build needs ceil(total / 64) rounds -- 1 at TP4 (16 + 2 * 16 = 48
+            # of 64, the original single round) and 2 at TP2, where H alone is 32 and
+            # the four K / V tasks a token put width 12 at 80.
+            KV_TASKS = 2 * dims.local_kv_heads  # noqa: N806
+            POLLS_PER_LANE = -(-(H + KV_TASKS * tokens) // 64)  # noqa: N806
+
+            def hdone_flag(tok, j):
+                """Flag j of the split task's wait list. Past the list's end the
+                index is clamped onto the last token's, which is already in it."""
+                kv = j - H
+                return (j < H).select(
+                    tok * k1.n_head_tasks + j,
+                    fx.min(kv // KV_TASKS, tokens - 1) * k1.n_head_tasks
+                    + H
+                    + kv % KV_TASKS,
+                )
+
             def stage_split():
                 r_ks, r_vs = rsrc(k_scale), rsrc(v_scale)
                 PPW = SPLIT_KEYS // WAVES // PAGE16  # pages per wave
-                for ts in range(start("split"), N_SPLIT * tokens, G):
-                    ts = fx.Int32(ts)
-                    tok = ts // N_SPLIT
-                    t = ts % N_SPLIT
-                    select_blocks(tok, t)
-                    # every token's K / V too: a speculative step's tokens attend to each other
-                    if wave == 0:
-                        kv = lane - H
-                        k1_poll(
-                            [
-                                (
-                                    hdone_mb,
-                                    (lane < H).select(
-                                        tok * K1_HEAD_TASKS + lane,
-                                        fx.min(kv // 2, tokens - 1) * K1_HEAD_TASKS
-                                        + H
-                                        + kv % 2,
-                                    ),
-                                    1,
-                                )
-                            ]
-                        )
-                    gpu.barrier()
-                    acquire()
-                    # independent loads first; a page past the context reads junk, masked below
+
+                def read_blk():
+                    """The current selection's sparse context length and this wave's
+                    pages of it. Pages past the context read junk masked below."""
                     n_ctx = uniform(fx.ptr_load(blk + 16))
                     pages = [
                         uniform(fx.ptr_load(blk + (wave * PPW + j))) for j in range(PPW)
                     ]
-                    qv = ld_bf16x4(rsrc(q), tok * O_K + tid * 4, CM_K1)
-                    # consecutive pages: a 64-bit base keeps lane offsets 32-bit, any cache size
-                    page_base = fx.Int64(pages[0]) * PAGE_BYTES
-                    r_k, r_v = rsrc(k_cache + page_base), rsrc(v_cache + page_base)
-                    # K, the QK B operand: key l16 of page j
+                    return n_ctx, pages
+
+                def kv_loads(p, pages):
+                    """Pass p's K (QK B operand, key = lane % 16 of page j) and V (PV
+                    B operand: dims 16 jd + lane % 16, keys 8 (lane / 16) .. + 8).
+
+                    The wave's pages are consecutive: a 64-bit base at the first keeps
+                    the lane offsets 32-bit for a cache of any size. Stepping one page
+                    steps over every KV head, and pass p reads KV head p, so the page
+                    stride is KV_PAGE_BYTES and the head offset p * PAGE_BYTES."""
+                    page_base = fx.Int64(pages[0]) * KV_PAGE_BYTES
+                    vpg = (g4 // 2 == 0).select(fx.Int32(0), pages[1] - pages[0])
+                    r_k = rsrc(k_cache + page_base + fx.Int64(p * PAGE_BYTES))
+                    r_v = rsrc(v_cache + page_base + fx.Int64(p * PAGE_BYTES))
                     kw = []
                     for j in range_constexpr(PPW):
                         for s in range_constexpr(HEAD_DIM // 32):
@@ -748,7 +921,7 @@ def build_post_attn_kernel(
                                     bo.buffer_load(
                                         r_k,
                                         (
-                                            (pages[j] - pages[0]) * PAGE_BYTES
+                                            (pages[j] - pages[0]) * KV_PAGE_BYTES
                                             + (2 * s + g4 // 2) * 256
                                             + l16 * 16
                                             + (g4 % 2) * 8
@@ -760,14 +933,12 @@ def build_post_attn_kernel(
                                     )
                                 ).bitcast(fx.Int64)[0]
                             )
-                    # V, the PV B operand: dims 16 jd + l16, keys 8 g4 .. + 8
-                    vpg = (g4 // 2 == 0).select(fx.Int32(0), pages[1] - pages[0])
                     vw = [
                         fx.Vector(
                             bo.buffer_load(
                                 r_v,
                                 (
-                                    vpg * PAGE_BYTES
+                                    vpg * KV_PAGE_BYTES
                                     + (16 * jd + l16) * PAGE16
                                     + (g4 % 2) * 8
                                 )
@@ -779,204 +950,422 @@ def build_post_attn_kernel(
                         ).bitcast(fx.Int64)[0]
                         for jd in range(HEAD_DIM // 16)
                     ]
+                    return kw, vw
+
+                def store_q8(qvs):
+                    # A pass' q is SPLIT_SLOTS words, one a thread -- exactly
+                    # THREADS where a GQA group is 16 heads, half of it at TP8.
+                    # ``q8`` is only O_K // 4 words, so the surplus threads must not
+                    # store: unguarded they would run a whole pass' worth past the
+                    # array into ``opart``.
+                    for p in range_constexpr(SPLIT_PASSES):
+                        qv = qvs[p]
+                        if const_expr(SPLIT_SLOTS_WHOLE):
+                            fx.ptr_store(
+                                fp8_pack4(qv[0], qv[1], qv[2], qv[3]),
+                                q8 + (p * SPLIT_SLOTS + tid),
+                            )
+                        elif tid < SPLIT_SLOTS:
+                            fx.ptr_store(
+                                fp8_pack4(qv[0], qv[1], qv[2], qv[3]),
+                                q8 + (p * SPLIT_SLOTS + tid),
+                            )
+
+                for ts in range(start("split"), N_SPLIT * tokens, G):
+                    ts = fx.Int32(ts)  # token tok's partition t: ts = tok N_SPLIT + t
+                    tok = ts // N_SPLIT
+                    t = ts % N_SPLIT
+                    if const_expr(SPLIT_PASSES == 1):
+                        # one KV head: one selection serves the whole task, so it is
+                        # made here and its K / V go out before the barrier
+                        select_blocks(tok, t)
+                    # this token's q heads and every token's new K / V: a request's
+                    # tokens of one step (speculative decode) attend to each other's
+                    if wave == 0:
+                        k1_poll(
+                            [
+                                (hdone_mb, hdone_flag(tok, lane + 64 * i), 1)
+                                for i in range(POLLS_PER_LANE)
+                            ]
+                        )
+                    gpu.barrier()
+                    acquire()
+                    # Every pass' q heads. The surplus threads of a short map (TP8)
+                    # load a neighbouring token's q and drop it in ``store_q8``.
+                    #
+                    # An earlier comment here claimed the buffer descriptor bounds
+                    # the load past the last token and returns zero. It does not:
+                    # ``rsrc`` takes an optional ``nbytes`` and this call omits it,
+                    # so ``num_records`` is left at its default maximum
+                    # (``common/ops.py:36-37``) and the load is unbounded. At TP8
+                    # width 16 the dead lanes of the last token read to element
+                    # 15 * 1024 + 2047 = 17,407 of a 16,384-element ``q``
+                    # (``packed.py:319-321``) -- 2 KB past the allocation.
+                    #
+                    # What makes it harmless is the ``store_q8`` guard below, which
+                    # drops those lanes before anything is written. The values are
+                    # never used, so numerics are unaffected; a fault would need
+                    # ``q`` to be the last block of its allocator segment.
+                    qvs = [
+                        ld_bf16x4(rsrc(q), tok * O_K + p * O_K_SUB + tid * 4, CM_K1)
+                        for p in range(SPLIT_PASSES)
+                    ]
+                    n_ctx = fx.Int32(0)
+                    kw0, vw0 = [], []
+                    if const_expr(SPLIT_PASSES == 1):
+                        # Every independent load goes out first: this wave's pages and
+                        # q, then K and V, all before the q8 store and the barrier.
+                        n_ctx, pages = read_blk()
+                        kw0, vw0 = kv_loads(0, pages)
                     ks1 = fx.Float32(bo.buffer_load(r_ks, 0, vec_width=1, dtype=T.f32))
                     vs1 = fx.Float32(bo.buffer_load(r_vs, 0, vec_width=1, dtype=T.f32))
                     kss = [ks1] * PPW
                     vss = [vs1] * PPW
-                    fx.ptr_store(fp8_pack4(qv[0], qv[1], qv[2], qv[3]), q8 + tid)
+                    store_q8(qvs)
                     gpu.barrier()
-                    # QK per page j: A = q (heads), B = K (keys); a lane: heads 4 g4 + e, key l16
                     key0 = t * SPLIT_KEYS + wave * (PPW * PAGE16)
-                    valid = [key0 + j * PAGE16 + l16 < n_ctx for j in range(PPW)]
-                    sc = []
-                    for j in range_constexpr(PPW):
-                        c = fx.Vector.filled(4, 0.0, fx.Float32)
-                        for s in range_constexpr(HEAD_DIM // 32):
-                            qw = fx.ptr_load(
-                                q8 + (l16 * 32 + 8 * s + 2 * g4), result_type=v2i
-                            )
-                            c = mfma_fp8(
-                                qw.bitcast(fx.Int64)[0], kw[j * (HEAD_DIM // 32) + s], c
-                            )
-                        qk = sm_scale * kss[j]
-                        sc.append(
-                            [
-                                valid[j].select(qk * c[e], fx.Float32(NEG))
-                                for e in range(4)
-                            ]
+
+                    # The thread map below covers H_SUB heads: a lane holds heads
+                    # 4 g4 + e of the pass, and the partial reduction walks O_K_SUB.
+                    # SPLIT_PASSES is 1 at TP4, where h0 is 0, the selection and the
+                    # loads were made above, and every index is the original
+                    # expression.
+                    #
+                    # The MFMA is SPLIT_ROWS = 16 rows wide whatever H_SUB is. Where
+                    # a GQA group is narrower than that (TP8: 8), rows H_SUB..15 are
+                    # not heads: ``a_row`` clamps their A-operand reads onto the last
+                    # real head so nothing reads out of bounds, and ``live_row``
+                    # drops their C rows at every store. Both are the identity when
+                    # the rows come out whole, so TP4 and TP2 emit the original code.
+                    def a_row(r):
+                        return (
+                            r if const_expr(SPLIT_ROWS_WHOLE) else fx.min(r, H_SUB - 1)
                         )
-                    # partition max per head and max v_scale: in-wave butterfly, then LDS
-                    vloc = fx.max(
-                        valid[0].select(vss[0], fx.Float32(0.0)),
-                        valid[1].select(vss[1], fx.Float32(0.0)),
-                    )
-                    vmax_w = wave_max(vloc)
-                    for e in range_constexpr(4):
-                        mh = butterfly(fx.max(sc[0][e], sc[1][e]), (8, 4, 2, 1), fx.max)
-                        if l16 == 0:
-                            fx.ptr_store(mh, hst + (wave * H + g4 * 4 + e))
-                    if lane == 0:
-                        fx.ptr_store(vmax_w, hst + (3 * WAVES * H + wave))
-                    gpu.barrier()
-                    # read every partial before any p8 store: stores in between serialize the reads
-                    vmax = fx.ptr_load(hst + 3 * WAVES * H)
-                    for w in range_constexpr(1, WAVES):
-                        vmax = fx.max(vmax, fx.ptr_load(hst + (3 * WAVES * H + w)))
-                    mxs = []
-                    for e in range_constexpr(4):
-                        mx = fx.ptr_load(hst + (g4 * 4 + e))
-                        for w in range_constexpr(1, WAVES):
-                            mx = fx.max(mx, fx.ptr_load(hst + (w * H + g4 * 4 + e)))
-                        mxs.append(mx)
-                    fscale = FP8_MAX * hw_rcp(vmax + 1e-8)
-                    pscale = vmax * (1.0 / FP8_MAX)
-                    for e in range_constexpr(4):
-                        head = g4 * 4 + e
-                        mx = mxs[e]
-                        ls = fx.Float32(0.0)
+
+                    def live_row(r, cond):
+                        """``cond`` and-ed with "MFMA row ``r`` is a real q head"."""
+                        if const_expr(SPLIT_ROWS_WHOLE):
+                            return cond
+                        return cond & (r < H_SUB)
+
+                    for p in range_constexpr(SPLIT_PASSES):
+                        h0 = p * H_SUB  # this pass' first head, in the rank's H
+                        if const_expr(SPLIT_PASSES > 1):
+                            # Pass p attends KV head p, and index head p chose that
+                            # head's blocks (own mode): the selection, and so the
+                            # pages and the K / V read through them, are the pass'
+                            # own. They cannot be hoisted the way one KV head's are.
+                            if unlikely(pick(long_rows, tok)):
+                                select_long(tok, t, p)
+                            select_blocks(tok, t, p)
+                            n_ctx, pages = read_blk()
+                            kw, vw = kv_loads(p, pages)
+                        else:
+                            kw, vw = kw0, vw0
+                        valid = [key0 + j * PAGE16 + l16 < n_ctx for j in range(PPW)]
+                        # QK per page j: A = q (heads), B = K (keys); lane holds heads 4 g4 + e, key l16
+                        sc = []
                         for j in range_constexpr(PPW):
-                            pj = hw_exp2((sc[j][e] - mx) * LOG2E)
-                            ls = ls + pj
-                            b8 = (
-                                fp8_pack4(
-                                    (valid[j].select(vss[j], fx.Float32(0.0)) * fscale)
-                                    * pj,
-                                    0.0,
-                                    0.0,
-                                    0.0,
+                            c = fx.Vector.filled(4, 0.0, fx.Float32)
+                            for s in range_constexpr(HEAD_DIM // 32):
+                                qw = fx.Vector(
+                                    fx.ptr_load(
+                                        q8
+                                        + (
+                                            p * SPLIT_SLOTS
+                                            + a_row(l16) * 32
+                                            + 8 * s
+                                            + 2 * g4
+                                        ),
+                                        result_type=v2i,
+                                    )
                                 )
-                                & 0xFF
+                                c = mfma_fp8(
+                                    qw.bitcast(fx.Int64)[0],
+                                    kw[j * (HEAD_DIM // 32) + s],
+                                    c,
+                                )
+                            qk = sm_scale * kss[j]
+                            sc.append(
+                                [
+                                    valid[j].select(qk * c[e], fx.Float32(NEG))
+                                    for e in range(4)
+                                ]
                             )
-                            w8 = b8 | (xshfl(b8, 1) << 8)
-                            w8 = w8 | (xshfl(w8, 2) << 16)
-                            if l16 % 4 == 0:
-                                kloc = wave * (PPW * PAGE16) + j * PAGE16 + l16
-                                fx.ptr_store(
-                                    w8, p8 + (head * (SPLIT_KEYS // 4) + kloc // 4)
-                                )
-                        ls = butterfly(ls, (8, 4, 2, 1))
-                        if l16 == 0:
-                            fx.ptr_store(ls, hst + (WAVES * H + wave * H + head))
-                            fx.ptr_store(mx, hst + (2 * WAVES * H + head))
-                    gpu.barrier()
-                    # PV over this wave's 32 keys: A = P (heads), B = V (dims)
-                    pw = fx.ptr_load(
-                        p8
-                        + (
-                            l16 * (SPLIT_KEYS // 4)
-                            + (wave * (PPW * PAGE16) + 8 * g4) // 4
-                        ),
-                        result_type=v2i,
-                    ).bitcast(fx.Int64)[0]
-                    # keys past the context carry P = 0, but a NaN V byte would still poison
-                    nv = n_ctx - (key0 + 8 * g4)
-                    vmask = (nv >= 8).select(
-                        fx.Int64(-1),
-                        (nv <= 0).select(
-                            fx.Int64(0), (fx.Int64(1) << (fx.Int64(nv) * 8)) - 1
-                        ),
-                    )
-                    for jd in range_constexpr(HEAD_DIM // 16):
-                        cv = mfma_fp8(
-                            pw, vw[jd] & vmask, fx.Vector.filled(4, 0.0, fx.Float32)
+                        # partition max per head and max v_scale: in-wave butterfly, then LDS
+                        vloc = fx.max(
+                            valid[0].select(vss[0], fx.Float32(0.0)),
+                            valid[1].select(vss[1], fx.Float32(0.0)),
                         )
+                        vmax_w = wave_max(vloc)
                         for e in range_constexpr(4):
-                            fx.ptr_store(
-                                cv[e],
-                                opart
-                                + (
-                                    wave * O_K + (g4 * 4 + e) * HEAD_DIM + 16 * jd + l16
-                                ),
+                            mh = butterfly(
+                                fx.max(sc[0][e], sc[1][e]), (8, 4, 2, 1), fx.max
                             )
-                    gpu.barrier()
-                    # sum the waves' partials: acc = prob_scale * PV, then * (1 / exp_sum), bf16
-                    e0 = tid * 4
-                    head = e0 // HEAD_DIM
-                    lsum = fx.ptr_load(hst + (WAVES * H + head))
-                    for w in range_constexpr(1, WAVES):
-                        lsum = lsum + fx.ptr_load(hst + (WAVES * H + w * H + head))
-                    inv_l = 1.0 / (lsum > 0.0).select(lsum, fx.Float32(1.0))
-                    ov = []
-                    for k in range_constexpr(4):
-                        acc = fx.ptr_load(opart + (e0 + k))
+                            # a surplus row's max would land in wave + 1's slots
+                            if live_row(g4 * 4 + e, l16 == 0):
+                                fx.ptr_store(mh, hst + (wave * H + h0 + g4 * 4 + e))
+                        if lane == 0:
+                            # head-independent: every pass recomputes the same value
+                            fx.ptr_store(vmax_w, hst + (3 * WAVES * H + wave))
+                        gpu.barrier()
+                        # every wave partial is read before the first p8 store below: LDS
+                        # stores in between serialize each read behind its own wait
+                        vmax = fx.ptr_load(hst + 3 * WAVES * H)
                         for w in range_constexpr(1, WAVES):
-                            acc = acc + fx.ptr_load(opart + (w * O_K + e0 + k))
-                        ov.append((pscale * acc) * inv_l)
-                    mb_put_bf(mb("sp_o"), ts * O_K + e0, ov)
+                            vmax = fx.max(vmax, fx.ptr_load(hst + (3 * WAVES * H + w)))
+                        mxs = []
+                        for e in range_constexpr(4):
+                            # a surplus row reads the last real head's max rather
+                            # than another wave's slot; its results are dropped below
+                            hr = h0 + a_row(g4 * 4 + e)
+                            mx = fx.ptr_load(hst + hr)
+                            for w in range_constexpr(1, WAVES):
+                                mx = fx.max(mx, fx.ptr_load(hst + (w * H + hr)))
+                            mxs.append(mx)
+                        fscale = FP8_MAX * hw_rcp(vmax + 1e-8)
+                        pscale = vmax * (1.0 / FP8_MAX)
+                        for e in range_constexpr(4):
+                            row = g4 * 4 + e
+                            head = h0 + row
+                            mx = mxs[e]
+                            ls = fx.Float32(0.0)
+                            for j in range_constexpr(PPW):
+                                pj = hw_exp2((sc[j][e] - mx) * LOG2E)
+                                ls = ls + pj
+                                b8 = (
+                                    fp8_pack4(
+                                        (
+                                            valid[j].select(vss[j], fx.Float32(0.0))
+                                            * fscale
+                                        )
+                                        * pj,
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                    )
+                                    & 0xFF
+                                )
+                                w8 = b8 | (xshfl(b8, 1) << 8)
+                                w8 = w8 | (xshfl(w8, 2) << 16)
+                                # a surplus row's P would run past p8's head
+                                # dimension, over the selection's borrowed words
+                                if live_row(row, l16 % 4 == 0):
+                                    kloc = wave * (PPW * PAGE16) + j * PAGE16 + l16
+                                    fx.ptr_store(
+                                        w8, p8 + (head * (SPLIT_KEYS // 4) + kloc // 4)
+                                    )
+                            ls = butterfly(ls, (8, 4, 2, 1))
+                            if live_row(row, l16 == 0):
+                                fx.ptr_store(ls, hst + (WAVES * H + wave * H + head))
+                                fx.ptr_store(mx, hst + (2 * WAVES * H + head))
+                        gpu.barrier()
+                        # PV over this wave's 32 keys: A = P (heads), B = V (dims)
+                        pw = fx.Vector(
+                            fx.ptr_load(
+                                p8
+                                + (
+                                    (h0 + a_row(l16)) * (SPLIT_KEYS // 4)
+                                    + (wave * (PPW * PAGE16) + 8 * g4) // 4
+                                ),
+                                result_type=v2i,
+                            )
+                        ).bitcast(fx.Int64)[0]
+                        # keys past the context carry P = 0, but a NaN V byte would still poison
+                        nv = n_ctx - (key0 + 8 * g4)
+                        vmask = (nv >= 8).select(
+                            fx.Int64(-1),
+                            (nv <= 0).select(
+                                fx.Int64(0), (fx.Int64(1) << (fx.Int64(nv) * 8)) - 1
+                            ),
+                        )
+                        for jd in range_constexpr(HEAD_DIM // 16):
+                            cv = mfma_fp8(
+                                pw, vw[jd] & vmask, fx.Vector.filled(4, 0.0, fx.Float32)
+                            )
+
+                            def store_pv(cv=cv, jd=jd):
+                                for e in range_constexpr(4):
+                                    fx.ptr_store(
+                                        cv[e],
+                                        opart
+                                        + (
+                                            wave * O_K_SUB
+                                            + (g4 * 4 + e) * HEAD_DIM
+                                            + 16 * jd
+                                            + l16
+                                        ),
+                                    )
+
+                            # A surplus row's partials would land in wave + 1's.
+                            # The guard is on the lane group alone (H_SUB is a
+                            # multiple of 4), and is absent entirely when every row
+                            # is a real head.
+                            if const_expr(SPLIT_ROWS_WHOLE):
+                                store_pv()
+                            elif g4 < SPLIT_LIVE_G4:
+                                store_pv()
+                        gpu.barrier()
+
+                        # sum the waves' partials: acc = prob_scale * PV, then * (1 / exp_sum), bf16
+                        def reduce_pass(p=p, h0=h0, pscale=pscale):
+                            e0 = tid * 4
+                            head = h0 + e0 // HEAD_DIM
+                            lsum = fx.ptr_load(hst + (WAVES * H + head))
+                            for w in range_constexpr(1, WAVES):
+                                lsum = lsum + fx.ptr_load(
+                                    hst + (WAVES * H + w * H + head)
+                                )
+                            inv_l = 1.0 / (lsum > 0.0).select(lsum, fx.Float32(1.0))
+                            ov = []
+                            for k in range_constexpr(4):
+                                acc = fx.ptr_load(opart + (e0 + k))
+                                for w in range_constexpr(1, WAVES):
+                                    acc = acc + fx.ptr_load(
+                                        opart + (w * O_K_SUB + e0 + k)
+                                    )
+                                ov.append((pscale * acc) * inv_l)
+                            mb_put_bf(mba("sp_o"), ts * O_K + p * O_K_SUB + e0, ov)
+
+                        # This map walks the pass' O_K_SUB dims four to a thread --
+                        # SPLIT_SLOTS of them, exactly THREADS at TP4 and TP2 and
+                        # half a CTA at TP8. The surplus threads would read past
+                        # ``opart``'s pass region, index ``hst`` past H, and publish
+                        # a whole pass' worth past the token's ``sp_o`` row.
+                        if const_expr(SPLIT_SLOTS_WHOLE):
+                            reduce_pass()
+                        elif tid < SPLIT_SLOTS:
+                            reduce_pass()
+                        if const_expr(SPLIT_PASSES > 1):
+                            # The next pass overwrites opart, which this one has
+                            # just read -- and, less obviously, re-borrows ``p8``
+                            # for its selection while this pass' P still sits
+                            # there. Both need the separation; at TP4 there is no
+                            # next pass and no barrier.
+                            gpu.barrier()
+                    # every head's max and exp-sum, now that every pass has filled hst
                     if tid < H:
                         mb_put(
-                            mb("sp_m"),
+                            mba("sp_m"),
                             ts * H + tid,
                             fx.ptr_load(hst + (2 * WAVES * H + tid)),
                         )
                         lt = fx.ptr_load(hst + (WAVES * H + tid))
                         for w in range_constexpr(1, WAVES):
                             lt = lt + fx.ptr_load(hst + (WAVES * H + w * H + tid))
-                        mb_put(mb("sp_l"), ts * H + tid, lt)
+                        mb_put(mba("sp_l"), ts * H + tid, lt)
                     gpu.barrier()
 
             stage_select_long()
             stage_split()
 
+            def merge_live(rnd):
+                """Whether this thread's slot in merge round ``rnd`` is a real dim,
+                or None when every thread's is. Only the last round can be short,
+                and only where the map does not come out in whole THREADS rounds."""
+                if const_expr(MERGE_ROUNDS_WHOLE) or rnd < MERGE_PASSES - 1:
+                    return None
+                return tid < MERGE_TAIL_SLOTS
+
             def merge_token(k):
                 """Token k's partitions merged (the paged decode's reduce; thread = 4 dims
                 of one head) and quantized per token (standalone quant: scale = amax *
-                (1 / FP8_MAX), x * rcp(scale)) -> (this thread's fp8 word, scale)."""
-                hm = tid // (HEAD_DIM // 4)
-                e0 = tid * 4
+                (1 / FP8_MAX), x * rcp(scale)) -> (this thread's fp8 words, one per
+                merge round, and the token's scale).
+
+                One round at TP4, where the CTA's threads cover every head; two at
+                TP2. The quantization scale spans every round, because it is one
+                scale for the token's whole merged row.
+
+                At TP8 the map is 256 slots and the single round is half empty. The
+                surplus threads clamp onto the last real slot rather than running
+                off the end: ``hm`` would otherwise index ``sp_m`` / ``sp_l`` past H
+                into the next partition's slots, and polling a tag that is never
+                published is a hang, not a wrong number. Clamped, they recompute a
+                live thread's dims, so the amax below -- which must span the whole
+                row -- needs no mask: a duplicate changes no maximum. Only the
+                stores are masked, by ``merge_live``, since those are indexed by
+                ``tid`` and not by the clamped slot."""
                 sp0 = k * N_SPLIT  # token k's partitions
                 # wave 0 waits alone: a whole CTA spinning loads the memory the split reads
                 if wave == 0:
                     mb_poll(
                         [
-                            (mb("sp_l"), sp0 * H + lane + 64 * i, 1)
+                            (mba("sp_l"), sp0 * H + lane + 64 * i, 1)
                             for i in range(N_SPLIT * H // 64)
                         ]
                     )
                 gpu.barrier()
-                got = mb_poll(
-                    [(mb("sp_m"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
-                    + [(mb("sp_l"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
-                    + [
-                        (mb("sp_o"), ((sp0 + i) * O_K + e0) // 2, 2)
-                        for i in range(N_SPLIT)
-                    ],
-                    batch=3 * N_SPLIT,
-                )
-                mls = got[: 2 * N_SPLIT]
-                ovs = got[2 * N_SPLIT :]
-                m_i = [mls[i][0].bitcast(fx.Float32) for i in range(N_SPLIT)]
-                l_i = [mls[N_SPLIT + i][0].bitcast(fx.Float32) for i in range(N_SPLIT)]
-                gm = m_i[0]
-                for i in range_constexpr(1, N_SPLIT):
-                    gm = fx.max(gm, m_i[i])
-                sl = [l_i[i] * hw_exp2((m_i[i] - gm) * LOG2E) for i in range(N_SPLIT)]
-                gs = sl[0]
-                for i in range_constexpr(1, N_SPLIT):
-                    gs = gs + sl[i]
-                gs = (gs > 0.0).select(gs, fx.Float32(1.0))
-                av = [fx.Float32(0.0) for _ in range(4)]
-                for i in range_constexpr(N_SPLIT):
-                    wi = sl[i] / gs
-                    o01 = bf2_f32(ovs[i][0])
-                    o23 = bf2_f32(ovs[i][1])
-                    av = [
-                        av[0] + wi * o01[0],
-                        av[1] + wi * o01[1],
-                        av[2] + wi * o23[0],
-                        av[3] + wi * o23[1],
-                    ]
-                a0, a1, a2, a3 = (bf16_round(x) for x in av)
-                amax = block_max(
-                    fx.max(
-                        fx.max(fmath.absf(a0), fmath.absf(a1)),
-                        fx.max(fmath.absf(a2), fmath.absf(a3)),
+
+                def merge_round(rnd):
+                    """Round rnd's four merged dims: slot rnd * THREADS + tid holds
+                    dims 4 slot .. + 4, which belong to head slot / (HEAD_DIM / 4)."""
+                    slot = rnd * THREADS + tid
+                    if const_expr(not MERGE_ROUNDS_WHOLE):
+                        slot = fx.min(slot, MERGE_SLOTS - 1)
+                    hm = slot // (HEAD_DIM // 4)
+                    e0 = slot * 4
+                    # one batch: every partition's (m, l) and this thread's 4 outputs
+                    got = mb_poll(
+                        [(mba("sp_m"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
+                        + [(mba("sp_l"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
+                        + [
+                            (mba("sp_o"), ((sp0 + i) * O_K + e0) // 2, 2)
+                            for i in range(N_SPLIT)
+                        ],
+                        batch=3 * N_SPLIT,
                     )
-                )
+                    mls = got[: 2 * N_SPLIT]
+                    ovs = got[2 * N_SPLIT :]
+                    m_i = [mls[i][0].bitcast(fx.Float32) for i in range(N_SPLIT)]
+                    l_i = [
+                        mls[N_SPLIT + i][0].bitcast(fx.Float32) for i in range(N_SPLIT)
+                    ]
+                    gm = m_i[0]
+                    for i in range_constexpr(1, N_SPLIT):
+                        gm = fx.max(gm, m_i[i])
+                    sl = [
+                        l_i[i] * hw_exp2((m_i[i] - gm) * LOG2E) for i in range(N_SPLIT)
+                    ]
+                    gs = sl[0]
+                    for i in range_constexpr(1, N_SPLIT):
+                        gs = gs + sl[i]
+                    gs = (gs > 0.0).select(gs, fx.Float32(1.0))
+                    av = [fx.Float32(0.0) for _ in range(4)]
+                    for i in range_constexpr(N_SPLIT):
+                        wi = sl[i] / gs
+                        o01 = bf2_f32(ovs[i][0])
+                        o23 = bf2_f32(ovs[i][1])
+                        av = [
+                            av[0] + wi * o01[0],
+                            av[1] + wi * o01[1],
+                            av[2] + wi * o23[0],
+                            av[3] + wi * o23[1],
+                        ]
+                    return [bf16_round(x) for x in av]
+
+                # The round index must NOT be called `q`: that is the kernel's
+                # attention-q pointer parameter, and a name rebound inside a dynamic
+                # region is carried as that region's state (initialized to None,
+                # which cannot be an scf.for iter_arg). Shadowing it here fails the
+                # build with a message naming only `q`, which points nowhere near.
+                rounds = [merge_round(rnd) for rnd in range(MERGE_PASSES)]
+
+                def round_max(a):
+                    return fx.max(
+                        fx.max(fmath.absf(a[0]), fmath.absf(a[1])),
+                        fx.max(fmath.absf(a[2]), fmath.absf(a[3])),
+                    )
+
+                # one scale for the token's whole row, so the amax spans every round
+                amax = block_max(reduce(fx.max, [round_max(a) for a in rounds]))
                 x_scale = amax * (1.0 / FP8_MAX)
                 # an all-zero row (a pad row) quantizes to zeros, not 0 * inf
                 inv = (amax == 0.0).select(fx.Float32(0.0), hw_rcp(x_scale))
-                return fp8_pack4(a0 * inv, a1 * inv, a2 * inv, a3 * inv), x_scale
+                return [
+                    fp8_pack4(a[0] * inv, a[1] * inv, a[2] * inv, a[3] * inv)
+                    for a in rounds
+                ], x_scale
 
             # ======================================= 2b. attention merge (S > 1)
             # a task per token: in the o tasks, every o task would run every token's merge in turn
@@ -984,18 +1373,29 @@ def build_post_attn_kernel(
                 if const_expr(tokens > 1):
                     for k in range(start("merge"), tokens, G):
                         k = fx.Int32(k)
-                        word, x_scale = merge_token(k)
+                        words, x_scale = merge_token(k)
                         # plain words, then the scale: its pair is the flag
-                        bo.buffer_store(
-                            word,
-                            rsrc(mb("attnq")),
-                            k * (O_K // 4) + tid,
-                            cache_modifier=CM_DEV,
-                        )
+                        for qstore, w in enumerate(words):
+
+                            def put(w=w, qstore=qstore):
+                                bo.buffer_store(
+                                    w,
+                                    rsrc(mb("attnq")),
+                                    k * (O_K // 4) + qstore * THREADS + tid,
+                                    cache_modifier=CM_DEV,
+                                )
+
+                            # a short tail round would run past this token's
+                            # O_K / 4 words into token k + 1's attnq row
+                            live = merge_live(qstore)
+                            if live is None:
+                                put()
+                            elif live:
+                                put()
                         release_stores()
                         gpu.barrier()
                         if tid == 0:
-                            mb_put(mb("attnq_s"), k, x_scale)
+                            mb_put(mba("attnq_s"), k, x_scale)
 
             stage_merge()
 
@@ -1032,12 +1432,24 @@ def build_post_attn_kernel(
 
                     if const_expr(tokens == 1):
                         # the merge folded in: the partitions -> this CTA's fp8 input
-                        word, x_scale = merge_token(0)
+                        words, x_scale = merge_token(0)
                         x_scales = [x_scale]
-                        fx.ptr_store(word, xs + tid)
+                        # the second consumer of the merge's rounds: a short tail
+                        # here would run past the o stage's O_K / 4 input words
+                        for qo, w in enumerate(words):
+
+                            def put(w=w, qo=qo):
+                                fx.ptr_store(w, xs + (qo * THREADS + tid))
+
+                            live = merge_live(qo)
+                            if live is None:
+                                put()
+                            elif live:
+                                put()
                     else:
-                        # scales first: each is stored after its token's words, so it flags them
-                        got = mb_poll([(mb("attnq_s"), k, 1) for k in range(tokens)])
+                        # the merge tasks' fp8 inputs: every token's scale (published
+                        # after its plain words), then the words, 16 B a load
+                        got = mb_poll([(mba("attnq_s"), k, 1) for k in range(tokens)])
                         x_scales = [
                             got[k][0].bitcast(fx.Float32) for k in range(tokens)
                         ]
@@ -1192,8 +1604,9 @@ def build_post_attn_kernel(
                             r0, r1 = bf2_f32(hr)
                             a0 = bf16_round(t0) + r0
                             a1 = bf16_round(t1) + r1
-                            # sum only: the norm reads bf16(sum) + h unrounded, as the unfused path
-                            mb_put_bf(mb("a"), ptk * HIDDEN + row, [t0, t1])
+                            # the rank sum only: the router adds the residual in f32, so the
+                            # norm reads bf16(sum) + residual unrounded, as the unfused path
+                            mb_put_bf(mba("a"), ptk * HIDDEN + row, [t0, t1])
                             bo.buffer_store(
                                 fx.Vector.from_elements([a0, a1], fx.Float32).to(
                                     fx.BFloat16
@@ -1262,6 +1675,7 @@ def build_post_attn_kernel(
             MID8_LDS = tokens * MID16_WORDS
             MIDSC_WORDS = MOE_SLOTS * INTER // 32
             MIDSC_LDS = MID8_LDS + tokens * MID8_WORDS
+            assert MID8_SLOTS == MID8_WORDS // 2  # the module-level count, restated
 
             def mx8_scale(vals, offsets):
                 """E8M0 byte (>= 1) of the 32-block the lanes xor-``offsets`` apart share,
@@ -1286,8 +1700,10 @@ def build_post_attn_kernel(
                 fp8 k 16 g .. + 16 then 64 + 16 g .. + 16 (g = lane // 16), the
                 f8f6f4 MFMA's B layout."""
                 h = [
-                    fx.ptr_load(
-                        xs + (chunk_word + 16 * j + 4 * g4), result_type=v4f
+                    fx.Vector(
+                        fx.ptr_load(
+                            xs + (chunk_word + 16 * j + 4 * g4), result_type=v4f
+                        )
                     ).bitcast(fx.Int32)
                     for j in range(2)
                 ]
@@ -1361,8 +1777,9 @@ def build_post_attn_kernel(
                     gpu.barrier()
                     acquire()
                     hres = ld_bf16x12(rsrc(h_in), k * (HIDDEN // 2) + rw0, CM_K1)
-                    # the all-reduced row: the o tasks' ``a``, or with AG_RS the owners' a_ag
-                    a_src = sy(sym, "a_ag") if AG_RS else mb("a")
+                    # the all-reduced post-attention row (the o tasks finished it; with
+                    # AG_RS the owner ranks gathered it into this rank's a_ag)
+                    a_src = sy(sym, "a_ag") if AG_RS else mba("a")
                     arow = mb_poll(
                         [
                             (a_src, (k * HIDDEN + tid * RE) // 2 + 2 * h, 2)
@@ -1437,10 +1854,11 @@ def build_post_attn_kernel(
                                     e, rsrc(mb("xscp")), xsw, cache_modifier=CM_DEV
                                 )
                         else:
-                            mb_put_words(mb("xn8"), xw, [word])
+                            mb_put_words(mba("xn8"), xw, [word])
                             if tid % 8 == 0:
-                                mb_put_words(mb("xsc"), xsw, [e])
-                    # 4 accumulators: 12-long dot2 chains, not one 96-long FMA chain after widening
+                                mb_put_words(mba("xsc"), xsw, [e])
+                    # bf16 pair dot products, one accumulator per pair position: four
+                    # 12-long chains instead of one 96-long FMA chain behind 192 widenings
                     accs = [fx.Float32(0.0) for _ in range(4)]
                     for i in range_constexpr(HIDDEN // 512):
                         xv = fx.ptr_load(
@@ -1459,7 +1877,8 @@ def build_post_attn_kernel(
                     logit = bf16_round(
                         wave_sum((accs[0] + accs[1]) + (accs[2] + accs[3]))
                     )
-                    # key and sigmoid go out, not the logit: the consumers start at the max rounds
+                    # the routing key and sigmoid go out, not the logit: the consumers'
+                    # routing starts at the max rounds
                     sc = hw_rcp(1.0 + hw_exp2(-logit * LOG2E))
                     rk = route_key(sc + bias_r, e_r)
                     if lane < SCORE_COPIES:
@@ -1471,7 +1890,7 @@ def build_post_attn_kernel(
                         release_stores()
                         gpu.barrier()
                         if tid == 0:
-                            mb_put(mb("xndone"), tt, fx.Int32(1))
+                            mb_put(mba("xndone"), tt, fx.Int32(1))
 
             stage_router()
 
@@ -1486,7 +1905,9 @@ def build_post_attn_kernel(
             ROUTED_TASKS = TOP_K * UG_PER_SLOT * tokens
             TPT = TOP_K * UG_PER_SLOT  # routed tasks per token
             CPT = ug_ctas_per_token(tokens)
-            UG_ITERS = max(ug_tasks_of(c, tokens) for c in range(G))  # per CTA, at most
+            UG_ITERS = max(
+                layout.ug_tasks_of(c, tokens) for c in range(G)
+            )  # per CTA, at most
 
             def ug_task_id(it):
                 """(this CTA's it-th routed task, clamped; whether it exists)."""
@@ -1582,7 +2003,7 @@ def build_post_attn_kernel(
                         )
                     y = swiglu_mul_batch([gsum], [usum], fx.Float32(-swiglu_limit))[0]
                     mb_put(
-                        mb("mid"),
+                        mba("mid"),
                         (kk * MOE_SLOTS + slot) * INTER + cg * UG_ROWS + r,
                         bf16_round(y),
                     )
@@ -1656,7 +2077,7 @@ def build_post_attn_kernel(
                         )
                     y = swiglu_mul_batch([gsum], [usum], fx.Float32(-swiglu_limit))[0]
                     mb_put(
-                        mb("mid"),
+                        mba("mid"),
                         (col * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r,
                         bf16_round(y),
                     )
@@ -1799,8 +2220,9 @@ def build_post_attn_kernel(
             W_MIDSC = (MID_ROWS + 1) * MID_ROW
             # up / gate tasks go in pairs, a CTA runs both: an MXFP8 block is 32 rows
             UG_PAIRS = UG_PER_SLOT // 2
-            # up / gate tasks a CTA runs
-            UGW_ITERS = 2 * ((U_MAX * UG_PAIRS + G - 1) // G)
+            UGW_ITERS = 2 * (
+                (U_MAX * UG_PAIRS + G - 1) // G
+            )  # up / gate tasks a CTA runs
             DN_WITERS = (U_MAX * DN_KC + 3) // 4  # (expert, chunk) units a wave runs
             DN_DEPTH = 12  # units whose weights are in flight
             ROUTE_ITERS = (tokens + WAVES - 1) // WAVES  # tokens a wave routes
@@ -1968,7 +2390,7 @@ def build_post_attn_kernel(
                 release_stores()
                 gpu.barrier()
                 if tid == 0:
-                    mb_put(mb("ugdone"), pr, fx.Int32(1))
+                    mb_put(mba("ugdone"), pr, fx.Int32(1))
 
             def down_tables():
                 """urow / uwt := per (distinct expert, B column) the down stage's mid row
@@ -2053,7 +2475,7 @@ def build_post_attn_kernel(
                 if wave == 0:
                     mb_poll(
                         [
-                            (mb("xndone"), fx.min(lane + 64 * c, n_rt - 1), 1)
+                            (mba("xndone"), fx.min(lane + 64 * c, n_rt - 1), 1)
                             for c in range((n_rt + 63) // 64)
                         ]
                     )
@@ -2090,8 +2512,9 @@ def build_post_attn_kernel(
                     if const_expr(it % 2 == 0):
                         pair_scs = cur[1]
                     if has_t:
-                        # a pair: row groups cg, cg + 1
-                        y = wug_y(cur[0], pair_scs, it % 2)
+                        y = wug_y(
+                            cur[0], pair_scs, it % 2
+                        )  # a pair: row groups cg, cg + 1
                         if const_expr(it % 2 == 0):
                             y_lo = y
                         else:
@@ -2150,7 +2573,7 @@ def build_post_attn_kernel(
                 n_ug = (nu + 1) * UG_PAIRS
                 mb_poll(
                     [
-                        (mb("ugdone"), fx.min(tid + THREADS * i, n_ug - 1), 1)
+                        (mba("ugdone"), fx.min(tid + THREADS * i, n_ug - 1), 1)
                         for i in range((U_MAX * UG_PAIRS + THREADS - 1) // THREADS)
                     ]
                 )
@@ -2230,9 +2653,9 @@ def build_post_attn_kernel(
 
                 def xn_specs(k):
                     return [
-                        (mb("xn8"), k * XN8_WORDS + tid + i * THREADS, 1)
+                        (mba("xn8"), k * XN8_WORDS + tid + i * THREADS, 1)
                         for i in range(n_xw)
-                    ] + [(mb("xsc"), k * XSC_WORDS + fx.min(tid, XSC_WORDS - 1), 1)]
+                    ] + [(mba("xsc"), k * XSC_WORDS + fx.min(tid, XSC_WORDS - 1), 1)]
 
                 def stage_xn(k, got):
                     for i in range_constexpr(n_xw):
@@ -2252,7 +2675,7 @@ def build_post_attn_kernel(
                         mb_poll(
                             [
                                 (
-                                    mb("xn8"),
+                                    mba("xn8"),
                                     gate_tok * XN8_WORDS
                                     + (lane % N_ROUTER + 1) * (XN_SLICE // 4)
                                     - 1,
@@ -2268,7 +2691,7 @@ def build_post_attn_kernel(
                     else:
                         stage_xn(tok, mb_poll(xn_specs(tok)))
 
-                sh_late = shared_after_routing(tokens)
+                sh_late = layout.shared_after_routing(tokens)
                 if const_expr(sh_late):
                     sh_j = fx.min(start("shared"), SH_TASKS - 1)
                     sh_w = sh_load(sh_j, has_sh)
@@ -2305,8 +2728,9 @@ def build_post_attn_kernel(
                     gpu.barrier()
                     cur = ug_load(ug_task_id(0)[0])
                     if const_expr(sh_late):  # noqa: SIM102
-                        # while the first routed task's weights are in flight
-                        if has_sh:
+                        if (
+                            has_sh
+                        ):  # while the first routed task's weights are in flight
                             sh_compute(sh_j, sh_w[0], sh_w[1])
                     # task i + 1's weights go out before task i's GEMV; a spare load is clamped
                     for it in range_constexpr(UG_ITERS):
@@ -2336,17 +2760,17 @@ def build_post_attn_kernel(
                     mids = mb_poll(
                         [
                             (
-                                mb("mid"),
+                                mba("mid"),
                                 k * MOE_SLOTS * INTER
                                 + fx.min(
                                     tid * 2 + i * 2 * THREADS, MOE_SLOTS * INTER - 2
                                 ),
                                 2,
                             )
-                            for i in range(4)
+                            for i in range(MID_COPY_ROUNDS)
                         ]
                     )
-                    for i in range_constexpr(4):
+                    for i in range_constexpr(MID_COPY_ROUNDS):
                         e = tid * 2 + i * 2 * THREADS
                         if e < MOE_SLOTS * INTER:
                             fx.ptr_store(
@@ -2363,25 +2787,32 @@ def build_post_attn_kernel(
                 gpu.barrier()
                 # MXFP8 in its own pass: inside stage_mids it would serialize behind each poll
                 for k in range_constexpr(tokens):
-                    if tid < MID8_WORDS // 2:  # 8 elements a lane, 4 lanes a 32-block
-                        w = fx.ptr_load(
-                            xs + (k * MID16_WORDS + tid * 4), result_type=v4f
-                        ).bitcast(fx.Int32)
-                        f = [v for j in range(4) for v in bf2_f32(w[j])]
-                        sc, inv = mx8_scale(f, (1, 2))
-                        qv = [mx8_q(v, inv) for v in f]
-                        fx.ptr_store(
-                            fp8_pack4(*qv[:4]),
-                            xs + (MID8_LDS + k * MID8_WORDS + tid * 2),
-                        )
-                        fx.ptr_store(
-                            fp8_pack4(*qv[4:]),
-                            xs + (MID8_LDS + k * MID8_WORDS + tid * 2 + 1),
-                        )
-                        if tid % 4 == 0:
+                    # THREADS is a multiple of 64, so a round's offset never moves a
+                    # lane out of its wave: the 4-lane group mx8_scale xor-reduces
+                    # over is the same one it would be in the single-round case.
+                    for mr in range_constexpr(MID8_ROUNDS):
+                        ms = tid + mr * THREADS
+                        if ms < MID8_SLOTS:
+                            w = fx.Vector(
+                                fx.ptr_load(
+                                    xs + (k * MID16_WORDS + ms * 4), result_type=v4f
+                                )
+                            ).bitcast(fx.Int32)
+                            f = [v for j in range(4) for v in bf2_f32(w[j])]
+                            sc, inv = mx8_scale(f, (1, 2))
+                            qv = [mx8_q(v, inv) for v in f]
                             fx.ptr_store(
-                                sc, xs + (MIDSC_LDS + k * MIDSC_WORDS + tid // 4)
+                                fp8_pack4(*qv[:4]),
+                                xs + (MID8_LDS + k * MID8_WORDS + ms * 2),
                             )
+                            fx.ptr_store(
+                                fp8_pack4(*qv[4:]),
+                                xs + (MID8_LDS + k * MID8_WORDS + ms * 2 + 1),
+                            )
+                            if ms % 4 == 0:
+                                fx.ptr_store(
+                                    sc, xs + (MIDSC_LDS + k * MIDSC_WORDS + ms // 4)
+                                )
                 gpu.barrier()
                 # shared expert once, B column l16 = token l16 -> opart (free after the split)
                 col_tok = fx.min(l16, tokens - 1)
@@ -2489,6 +2920,7 @@ def build_post_attn_kernel(
         sym: Int64,
         peers: Int64,
         step: Int64,
+        epoch: Int64,
         rank: Int32,
         layer: Int32,
         bt_width: Int32,
@@ -2524,6 +2956,7 @@ def build_post_attn_kernel(
             sym,
             peers,
             step,
+            epoch,
             rank,
             layer,
             bt_width,
