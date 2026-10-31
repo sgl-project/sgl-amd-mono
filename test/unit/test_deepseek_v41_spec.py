@@ -29,6 +29,17 @@ FLASH = SimpleNamespace(
 )
 
 
+# the server args _config_disable_reasons reads: TP4, no CP, no PD
+SERVER = dict(
+    tp_size=4,
+    attn_cp_size=1,
+    dcp_size=1,
+    enable_prefill_cp=False,
+    disaggregation_mode="null",
+    disaggregation_transfer_backend="mori",
+)
+
+
 def test_the_forward_covers_every_flash_layer():
     # the first layer, the Engram layers, the index sources and DSpark's target layers (37-39) too
     assert dsv41._covered_layers(FLASH) == list(range(40))
@@ -135,9 +146,8 @@ def test_model_reasons(monkeypatch):
 
 def test_pd_runs_on_a_mori_decode_server_only():
     def reasons(mode, backend="mori"):
-        cfg = SimpleNamespace(
-            disaggregation_mode=mode, disaggregation_transfer_backend=backend
-        )
+        pd = dict(disaggregation_mode=mode, disaggregation_transfer_backend=backend)
+        cfg = SimpleNamespace(**SERVER | pd)
         return [
             r for r in dsv41._config_disable_reasons(cfg, FLASH) if "FlyDSL" not in r
         ]
@@ -150,3 +160,39 @@ def test_pd_runs_on_a_mori_decode_server_only():
     assert reasons("decode", "mooncake") == [
         "PD monokernels require the mori transfer backend"
     ]
+
+
+def test_prefill_cp_config_reasons():
+    def cp_reasons(**kw):
+        reasons = dsv41._config_disable_reasons(SimpleNamespace(**SERVER | kw), FLASH)
+        return [r for r in reasons if r.startswith("context parallelism")]
+
+    assert cp_reasons() == []
+    assert cp_reasons(enable_prefill_cp=True, attn_cp_size=4) == []
+    # a CP group narrower than TP, decode CP, attention CP without prefill CP
+    assert cp_reasons(enable_prefill_cp=True, attn_cp_size=2)
+    assert cp_reasons(enable_prefill_cp=True, attn_cp_size=4, dcp_size=2)
+    assert cp_reasons(attn_cp_size=4)
+    assert dsv41.Feature.CONTEXT_PARALLEL in dsv41.SPEC.features
+
+
+def _shuffle16(x):
+    """aiter's shuffle_weight(x, (16, 16)) of a one-byte [N, K] tensor."""
+    n, k = x.shape
+    tiles = x.view(n // 16, 16, k // 32, 2, 16).permute(0, 2, 3, 1, 4)
+    return tiles.contiguous().view(n, k)
+
+
+def test_prefill_cp_head_shards():
+    # wq_b / wo_a rows and wo_b columns of the replicated heads, row-major and preshuffled
+    w = torch.randint(0, 256, (64, 256), dtype=torch.uint8)
+    for shard in range(4):
+        r, c = slice(16 * shard, 16 * (shard + 1)), slice(64 * shard, 64 * (shard + 1))
+        assert torch.equal(dsv41.shard_rows(w, shard, 16), w[r])
+        assert torch.equal(dsv41.shard_cols(w, shard, 64), w[:, c])
+        shuffled = _shuffle16(w)
+        assert torch.equal(dsv41.shard_rows(shuffled, shard, 16), _shuffle16(w[r]))
+        assert torch.equal(
+            dsv41.shard_cols(shuffled, shard, 64, preshuffled=True),
+            _shuffle16(w[:, c].contiguous()),
+        )

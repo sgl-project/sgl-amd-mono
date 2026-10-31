@@ -126,10 +126,10 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     heads = Dims(get_parallel().tp_size).heads
     for i, stage in enumerate(model.stages):
         a, moe = stage.self_attn, stage.mlp
-        if a.compress_ratio != 0 or a.q_head_norm or a.n_local_heads != heads:
+        if a.compress_ratio != 0 or a.q_head_norm or not target.heads_served(a, heads):
             reasons.append(
                 f"stage {i}: needs a window-only attention with {heads} local heads "
-                "and no q head norm"
+                "(or all of them under prefill CP) and no q head norm"
             )
         if moe.gate.weight.shape[0] != EXPERTS or not getattr(
             moe.experts.w13_weight, "is_shuffled", False

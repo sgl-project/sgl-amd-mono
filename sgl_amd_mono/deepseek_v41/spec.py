@@ -28,6 +28,11 @@ processor, with SGLang's own modules where SGLang owns the state.
   size): a rank's residual and mix rows past its own are stale, so after the last
   layer one all-gather brings every row of the residual, the last pre and the DSpark
   captures from its owner.
+- Prefill context parallelism (``--enable-prefill-cp``, a CP group of the whole TP
+  group): SGLang keeps every attention head on every rank (attention TP 1) for its
+  CP prefill, and every rank holds the whole KV and index caches. Decode and verify
+  steps never run CP, so K1 and K2 run this rank's TP share of the heads as without
+  CP: wq_b's and wo_a's rows are views, wo_b's columns and its block codes a copy.
 
 A model with a layer of another kind is refused. The FFN launch (``gfx950/layer.py``)
 runs in no forward: the kernel checks use it as the reference for K2's FFN half. The
@@ -138,6 +143,10 @@ SGLANG_READS = {
         "expert_distribution_recorder_mode",
         "disaggregation_mode",
         "disaggregation_transfer_backend",
+        "enable_prefill_cp",
+        "attn_cp_size",
+        "dcp_size",
+        "tp_size",
     ),
     "srt/environ.py": (
         "SGLANG_DSV4_FP4_EXPERTS",
@@ -320,6 +329,7 @@ SGLANG_READS = {
         '"tp_rank"',
         '"tp_size"',
         '"tp_group"',
+        '"attn_tp_size"',
     ),
     "srt/utils/common.py": ("get_bool_env_var",),
 }
@@ -368,7 +378,8 @@ def _covered_layers(config) -> list[int]:
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """What ``SPEC.requires`` cannot state: PD roles other than a MoRI decode server, a
-    value SGLang's attention gate must not take, aiter's own flag, and FlyDSL."""
+    value SGLang's attention gate must not take, context parallelism other than prefill
+    CP over the whole TP group, aiter's own flag, and FlyDSL."""
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
     from sglang.srt.utils import get_bool_env_var
 
@@ -381,6 +392,22 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
             reasons.append("PD monokernels require the mori transfer backend")
     if is_unified_kv_triton():
         reasons.append("needs the paged SWA cache, not unified_kv")
+    # SPEC accepts context parallelism for prefill CP alone: decode CP or a CP group
+    # narrower than TP would leave a decode step's keys or heads off this rank
+    any_cp = (
+        cfg.enable_prefill_cp or (cfg.attn_cp_size or 1) > 1 or (cfg.dcp_size or 1) > 1
+    )
+    prefill_cp = (
+        cfg.enable_prefill_cp
+        and cfg.attn_cp_size == cfg.tp_size
+        and (cfg.dcp_size or 1) == 1
+    )
+    if any_cp and not prefill_cp:
+        reasons.append(
+            "context parallelism only as prefill CP over the whole TP group "
+            f"(attn_cp_size {cfg.attn_cp_size}, dcp_size {cfg.dcp_size}, tp_size "
+            f"{cfg.tp_size}, enable_prefill_cp {cfg.enable_prefill_cp})"
+        )
     if get_bool_env_var("AITER_FORCE_A8W4"):
         reasons.append(
             "needs the MXFP4 experts in aiter's gate / up interleaved layout, not "
@@ -395,6 +422,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.deepseek_v41.gfx950.attention.plan import (
+        N_HEADS,
         Dims,
     )
 
@@ -416,10 +444,10 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             for k in ("weight", "scale")
         ):
             unseen.append(i)
-        if a.q_head_norm or not a.fuse_wqa_wkv or a.n_local_heads != heads:
+        if a.q_head_norm or not a.fuse_wqa_wkv or not heads_served(a, heads):
             reasons.append(
-                f"layer {i}: K1 needs the fused wqkv_a, {heads} local heads and no "
-                "q head norm"
+                f"layer {i}: K1 needs the fused wqkv_a, {heads} local heads (or all "
+                f"{N_HEADS} under prefill CP) and no q head norm"
             )
         if (a.compressor is not None or a.indexer is not None) and (
             a.compress_ratio not in (1, 2)
@@ -441,6 +469,44 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             f"(layers {unseen})"
         )
     return reasons
+
+
+def head_shard(attn) -> int | None:
+    """The TP rank whose share of the heads K1 / K2 run when SGLang keeps all of
+    them on every rank (prefill CP's attention TP 1); None when SGLang already holds
+    only this rank's share."""
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_amd_mono.deepseek_v41.gfx950.attention.plan import N_HEADS
+
+    p = get_parallel()
+    if p.tp_size > 1 and p.attn_tp_size == 1 and attn.n_local_heads == N_HEADS:
+        return p.tp_rank
+    return None
+
+
+def heads_served(attn, heads: int) -> bool:
+    """Whether K1 / K2 can run this attention's heads at ``heads`` a rank."""
+    return attn.n_local_heads == heads or head_shard(attn) is not None
+
+
+def shard_rows(t: torch.Tensor, shard: int, n: int) -> torch.Tensor:
+    """Rows ``shard * n`` on of a head-replicated [N, K] tensor, as a view; in aiter's
+    (16, 16) preshuffle too, whose 16-row blocks are outermost."""
+    return t.narrow(0, shard * n, n)
+
+
+def shard_cols(
+    t: torch.Tensor, shard: int, n: int, preshuffled: bool = False
+) -> torch.Tensor:
+    """Columns ``shard * n`` on of a head-replicated [N, K] tensor, as a copy; in
+    aiter's (16, 16) preshuffle each 32-column block of a 16-row block is one tile
+    of 512 bytes, so the copy is the preshuffle of the columns."""
+    if not preshuffled:
+        return t.narrow(1, shard * n, n).contiguous()
+    m, k = t.shape
+    tiles = t.view(m // 16, k // 32, 512).narrow(1, shard * n // 32, n // 32)
+    return tiles.contiguous().view(m, n)
 
 
 def _qkv_linears(attn) -> list:
@@ -632,6 +698,17 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
     )
     ffn.check(p.tp_size, n)
     L = _Layer(i, layer, ffn)
+    shard = head_shard(a)
+
+    def rows(t, n):
+        return t if shard is None else shard_rows(t, shard, n)
+
+    def cols(t, n, what, preshuffled=False):
+        if shard is None:
+            return t
+        out = shard_cols(t, shard, n, preshuffled=preshuffled)
+        return _keep(copies, out, "prefill CP head shard", i, what)
+
     if a.fuse_wqa_wkv:
         wqkv, wqkv_s = a.wqkv_a.weight, _codes(copies, i, "wqkv_a", a.wqkv_a)
     else:  # the DSpark draft's wq_a and wkv as K1's one weight (a copy)
@@ -659,8 +736,8 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         wqkv_s=wqkv_s,
         q_norm=a.q_norm.weight,
         kv_norm=a.kv_norm.weight,
-        wqb=a.wq_b.weight,
-        wqb_s=_codes(copies, i, "wq_b", a.wq_b),
+        wqb=rows(a.wq_b.weight, d.q_rows),
+        wqb_s=rows(_codes(copies, i, "wq_b", a.wq_b), d.q_rows // 32),
         cos_sin=cos_sin,
     )
     ix = getattr(a, "indexer", None)
@@ -671,10 +748,12 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         L.k1.iw_scale = float(ix.head_weight_scale)
     L.k1.check(d)
     if a.wo_a.weight.dtype == e4m3:
-        woa, woa_s = a.wo_a.weight, _codes(copies, i, "wo_a", a.wo_a)
+        woa = rows(a.wo_a.weight, d.o_rows)
+        woa_s = rows(_codes(copies, i, "wo_a", a.wo_a), d.o_rows // 32)
     else:  # SGLang dequantized the checkpoint's FP8 wo_a to bf16 at load
         woa, woa_s = mxfp8_exact(
-            a.wo_a.weight.reshape(d.groups * 1024, d.group_k), f"layer {i} wo_a"
+            rows(a.wo_a.weight, d.o_rows).reshape(d.groups * 1024, d.group_k),
+            f"layer {i} wo_a",
         )
         _keep(copies, woa, "wo_a mxfp8", i, "weight")
         _keep(copies, woa_s, "wo_a mxfp8", i, "scale")
@@ -682,8 +761,13 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
     L.k2 = K2Weights(
         woa=woa,
         woa_s=woa_s,
-        wob=a.wo_b.weight,
-        wob_s=_codes(copies, i, "wo_b", a.wo_b),
+        wob=cols(
+            a.wo_b.weight,
+            d.o_rows,
+            "wo_b",
+            getattr(a.wo_b, "mxfp8_aiter_preshuffled", False),
+        ),
+        wob_s=cols(_codes(copies, i, "wo_b", a.wo_b), d.o_rows // 32, "wo_b codes"),
         sink=_keep(copies, sink.float().contiguous(), "f32 attention sinks", i),
         cos_sin=cos_sin,
     )
@@ -1213,8 +1297,15 @@ SPEC = MonoSpec(
             resident_blocks=BLOCKS,
         )
     },
-    # MoRI transfers into the same KV, compressor-state and index-key buffers the kernels use
-    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.PD_DISAGGREGATION}),
+    # MoRI transfers into the same KV, compressor-state and index-key buffers the kernels
+    # use; context parallelism as prefill CP alone (_config_disable_reasons)
+    features=frozenset(
+        {
+            Feature.SPECULATIVE_DECODING,
+            Feature.PD_DISAGGREGATION,
+            Feature.CONTEXT_PARALLEL,
+        }
+    ),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsv4"}),

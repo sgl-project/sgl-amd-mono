@@ -38,6 +38,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 - AMD Instinct MI350X or MI355X
 - MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--enable-amd-monokernel` refuses MiniMax-M3 and names them.
 - MiniMax-M3.1-Flash needs SGLang's MiniMax-M3.1-Flash support ([sgl-project/sglang#45925](https://github.com/sgl-project/sglang/pull/45925)) and its gfx950 path ([#45936](https://github.com/sgl-project/sglang/pull/45936)).
+- DeepSeek-V4.1-Flash with prefill context parallelism (`--enable-prefill-cp`) needs SGLang's V4.1 prefill CP on HIP ([sgl-project/sglang#43465](https://github.com/sgl-project/sglang/pull/43465)).
 
 ### Installation
 
