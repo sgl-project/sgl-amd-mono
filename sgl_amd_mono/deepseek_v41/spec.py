@@ -28,6 +28,11 @@ processor, with SGLang's own modules where SGLang owns the state.
   size): a rank's residual and mix rows past its own are stale, so after the last
   layer one all-gather brings every row of the residual, the last pre and the DSpark
   captures from its owner.
+- SGLang's FP8 unified KV (``SGLANG_DSV4_UNIFIED_KV_FP8``): K1 writes the step's
+  rows into the layer's two pools at SGLang's ring rows; K2 reads the window keys
+  from SGLang's ragged SWA stream and a compressed row past the layer's base, as the
+  paged record's words, so the attention core is the paged one. The DSpark draft's
+  ring is bf16: K2 quantizes each key's nope as K1 quantizes a record.
 
 A model with a layer of another kind is refused. The FFN launch (``gfx950/layer.py``)
 runs in no forward: the kernel checks use it as the reference for K2's FFN half. The
@@ -125,7 +130,10 @@ SGLANG_READS = {
         "rocm_router_gemv_split_k(x)",
         "rocm_router_gemv_split_k(w)",
     ),
-    "srt/layers/attention/dsv4/unified_kv_gate.py": ("is_unified_kv_triton",),
+    "srt/layers/attention/dsv4/unified_kv_gate.py": (
+        "is_unified_kv_triton",
+        "is_unified_kv_fp8",
+    ),
     "kernels/ops/layernorm/mhc.py": ("hc_broadcast", "mhc_combine"),
     "kernels/ops/layernorm/mhc_boundary_hip.py": ("tensors",),
     "srt/arg_groups/fields/*.py": (
@@ -163,6 +171,11 @@ SGLANG_READS = {
         "forward_metadata",
         "core_attn_metadata",
         "get_swa_out_cache_loc",
+        # FP8 unified KV: the ring rows K1 writes, the SWA stream and top-k lengths
+        "get_unified_swa_loc",
+        "unified",
+        "swa_indices",
+        "swa_indptr",
         "swa_page_indices",
         "swa_topk_lengths",
         "sparse_page_indices",
@@ -225,6 +238,9 @@ SGLANG_READS = {
         "get_index_k_fp4_scale_buffer",
         "low_ratio_index_k_is_split",
         "get_index_k_page_size",
+        "get_unified_kv",
+        "get_unified_kv_rope",
+        "DeepSeekV4TokenToKVPool",
     ),
     "srt/model_executor/forward_context.py": (
         "get_attn_backend",
@@ -366,10 +382,20 @@ def _covered_layers(config) -> list[int]:
     ]
 
 
+# the FP8 unified KV pool's per-layer compressed row base, which sgl-project/sglang#44031
+# adds (not in main yet): read by name, so an SGLang without it is refused with a reason;
+# pin in SGLANG_READS once merged
+PENDING_POOL_READS = ("get_unified_compress_row_base",)
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """What ``SPEC.requires`` cannot state: PD roles other than a MoRI decode server, a
-    value SGLang's attention gate must not take, aiter's own flag, and FlyDSL."""
-    from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
+    value SGLang's attention gate must not take, an FP8 unified KV pool without
+    ``PENDING_POOL_READS``, aiter's own flag, and FlyDSL."""
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+        is_unified_kv_fp8,
+        is_unified_kv_triton,
+    )
     from sglang.srt.utils import get_bool_env_var
 
     reasons = []
@@ -379,8 +405,22 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
             reasons.append("PD monokernels support the decode role only")
         elif cfg.disaggregation_transfer_backend != "mori":
             reasons.append("PD monokernels require the mori transfer backend")
-    if is_unified_kv_triton():
-        reasons.append("needs the paged SWA cache, not unified_kv")
+    if is_unified_kv_triton() and not is_unified_kv_fp8():
+        # K1 / K2 read the FP8 two-pool rows (``attention/plan.py`` UNI_ROW)
+        reasons.append(
+            "needs the paged KV cache or the FP8 unified KV "
+            "(SGLANG_DSV4_UNIFIED_KV_FP8=1), not the bf16 unified_kv"
+        )
+    if is_unified_kv_fp8():
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        reasons += [
+            f"the FP8 unified KV needs SGLang's DeepSeekV4TokenToKVPool.{name}"
+            for name in PENDING_POOL_READS
+            if not hasattr(DeepSeekV4TokenToKVPool, name)
+        ]
     if get_bool_env_var("AITER_FORCE_A8W4"):
         reasons.append(
             "needs the MXFP4 experts in aiter's gate / up interleaved layout, not "
@@ -560,10 +600,12 @@ class _Layer(msgspec.Struct):
     ratio: int = 0  # the compress ratio: which sparse key table K1 reads (0: none)
     # an index source: SGLang's compressor and indexer run between K1 and K2
     index: bool = False
-    swa: Any = None  # the SWA cache, uint8 [pages, page bytes]
+    swa: Any = None  # the SWA cache, uint8 [pages, page bytes] (unified: the nope pool)
     swa_block: int = 0
-    comp: Any = None  # the compressed cache, the same layout
+    comp: Any = None  # the compressed cache, the same layout (unified: the nope pool)
     comp_block: int = 0
+    rope: Any = None  # unified KV: the rope pool, bf16 [rows, 64]
+    comp_base: int = 0  # unified KV: the layer's first compressed row
     plane: Any = None  # an indexer's FP4 index plane: (payload, scales)
 
 
@@ -706,6 +748,33 @@ def _boundary_out(layer, defer_post, x, residual, post, comb, pre):
     return layer.hc_post(x, residual, post, comb), pre, None
 
 
+def _bind_caches(L, kv: str) -> None:
+    """The layer's caches, at its first launch. A unified layout (``runner.kv``): one
+    row index addresses the layer's pools, its ring rows first, its kv_source group's
+    compressed rows from ``comp_base``; the DSpark draft's bf16 ring is one pool."""
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    pool = get_token_to_kv_pool()
+    if kv == "paged":
+        L.swa, L.swa_block = pool.get_swa_raw_buffer(L.i), pool.get_swa_key_page_size()
+        if L.ratio:
+            # SGLang types the compressed cache as e4m3; K2 addresses its records' bytes
+            L.comp = pool.get_extra_key_buffer(L.i).view(torch.uint8)
+            L.comp_block = pool.get_extra_key_page_size(L.i)
+        return
+    nope = pool.get_unified_kv(L.i)
+    if (nope.dtype == torch.bfloat16) != (kv == "bf16"):
+        raise RuntimeError(
+            f"monokernel: layer {L.i}: a {nope.dtype} unified_kv pool, the launches "
+            f"built for {kv} rows"
+        )
+    L.swa, L.swa_block = nope.view(torch.uint8), 1
+    L.rope = None if kv == "bf16" else pool.get_unified_kv_rope(L.i)
+    if L.ratio:
+        L.comp, L.comp_block = L.swa, 1
+        L.comp_base = pool.get_unified_compress_row_base(L.i)
+
+
 def _launch(
     runner,
     L,
@@ -722,35 +791,41 @@ def _launch(
     post pending. With no post owed (x None) the residual arrives settled: the
     first layer's broadcast embedding (no pre: copy 0), an Engram layer's
     residual, or a draft stage's input."""
-    from sglang.srt.model_executor.forward_context import (
-        get_attn_backend,
-        get_token_to_kv_pool,
-    )
+    from sglang.srt.model_executor.forward_context import get_attn_backend
 
     from sgl_amd_mono.deepseek_v41.gfx950.runner import SLOT_DTYPES
 
     x, residual, post, comb = pending_post
-    if L.swa is None:  # the layer's caches, at its first launch
-        pool = get_token_to_kv_pool()
-        L.swa, L.swa_block = pool.get_swa_raw_buffer(L.i), pool.get_swa_key_page_size()
-        if L.ratio:
-            # SGLang types the compressed cache as e4m3; K2 addresses its records' bytes
-            L.comp = pool.get_extra_key_buffer(L.i).view(torch.uint8)
-            L.comp_block = pool.get_extra_key_page_size(L.i)
+    if L.swa is None:
+        _bind_caches(L, runner.kv)
+    unified = runner.kv != "paged"
     backend, M = get_attn_backend(), residual.shape[0]
     if "k1" not in plan.state:
         # the forward's first K1 converts them where needed; a graph records the copies
-        slot = backend.get_swa_out_cache_loc(forward_batch)[:M]
+        if unified:  # the ring rows SGLang's fused K store writes
+            slot = backend.get_unified_swa_loc(forward_batch)[:M]
+        else:
+            slot = backend.get_swa_out_cache_loc(forward_batch)[:M]
         if not (slot.dtype in SLOT_DTYPES and slot.is_contiguous()):
             slot = slot.long().contiguous()
         plan.state["k1"] = (positions[:M].long().contiguous(), slot)
     pos, slot = plan.state["k1"]
     md = backend.forward_metadata.core_attn_metadata
     if L.ratio:  # the top-k of the layer's index source (its own, after K1)
-        topk = (md.sparse_page_indices(L.ratio), md.sparse_topk_lengths(L.ratio))
+        # unified: the lengths its decode reads (unclamped: a request with no
+        # compressed row yet reads none)
+        lens = (
+            getattr(md.unified, f"c{L.ratio}_len")
+            if unified
+            else md.sparse_topk_lengths(L.ratio)
+        )
+        topk = (md.sparse_page_indices(L.ratio), lens)
     else:
         topk = (runner.no_topk, runner.no_topk_lens)
-    keys = (md.swa_page_indices, md.swa_topk_lengths, *topk)
+    if unified:  # the window's rows: SGLang's ragged SWA stream (rows, indptr)
+        keys = (md.unified.swa_indices, md.unified.swa_indptr, *topk)
+    else:
+        keys = (md.swa_page_indices, md.swa_topk_lengths, *topk)
     if x is None:
         residual = residual.contiguous()  # the broadcast embedding may be a view
         if prev_pre is None:
@@ -758,7 +833,7 @@ def _launch(
     runner.k1(
         L.k1, x, residual, post, comb, prev_pre, pos, slot, L.swa, L.swa_block,
         keys, index=L.index, tok_par=tok_par,
-        aux=None if capture is None else capture(L, M),
+        aux=None if capture is None else capture(L, M), kv_rope=L.rope,
     )  # fmt: skip
     if L.index:
         _select(
@@ -768,7 +843,8 @@ def _launch(
     # K2 reads K1's outputs from the runner's buffers
     return runner.k2(
         L.k2, L.ffn, M, pos, L.swa, L.swa_block, L.comp, L.comp_block,
-        slot=slot, keys=keys, index=L.index, tok_par=tok_par,
+        slot=slot, keys=keys, index=L.index, tok_par=tok_par, kv_rope=L.rope,
+        comp_base=L.comp_base,
     )  # fmt: skip
 
 
@@ -1161,6 +1237,7 @@ def _longest_context(hf_config) -> int:
 
 
 def _build(model, hf_config, ctx) -> _Built:
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.deepseek_v41.gfx950.runner import (
@@ -1183,6 +1260,8 @@ def _build(model, hf_config, ctx) -> _Built:
         p.tp_group.cpu_group,
         device,
         shuffled=bool(shuffled_layout(L.module.self_attn for L in layers.values())),
+        # FP8 unified KV (_config_disable_reasons refuses the bf16 one)
+        kv="fp8" if is_unified_kv_triton() else "paged",
     )
     runner.set_deadline(ctx.deadline_s)
     k2i = any(L.module.self_attn.indexer is not None for L in layers.values())

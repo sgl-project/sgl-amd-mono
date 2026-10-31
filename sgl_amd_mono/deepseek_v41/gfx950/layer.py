@@ -94,9 +94,14 @@ class MonoBuild(msgspec.Struct, frozen=True):
     iq: bool = False
     # wqkv, wq_b and wo_b in SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE's (16, 16) layout; wo_a row-major
     shuffled: bool = False
+    # the KV cache K1 writes and K2 reads (``attention/plan.py`` KV_LAYOUTS)
+    kv: str = "paged"
 
 
 ROUTE = ("experts", "topk", "ug_groups", "swa_width")
+# a kernel name's KV layout: the unified ones' short names (the bf16 ring is the
+# unified KV's DSpark draft ring)
+_KV_VARIANT = {"paged": {}, "fp8": {"uk": 1}, "bf16": {"uk": 1, "bk": 1}}
 
 
 def route_of(key: MonoBuild) -> dict:
@@ -113,6 +118,7 @@ def _variant(key: MonoBuild) -> dict:
         | ({"tl": 1} if key.timeline else {})
         | ({"p": 1} if key.tok_par else {})
         | ({"sh": 1} if key.shuffled else {})
+        | _KV_VARIANT[key.kv]
     )
 
 
@@ -122,14 +128,23 @@ def _moe_key(key: MonoBuild) -> MoeBuild:
 
 def _front_key(key: MonoBuild):
     return mb_front.FrontBuild(
-        key.tokens, key.tp, key.kt, key.swa_width, shuffled=key.shuffled
+        key.tokens,
+        key.tp,
+        key.kt,
+        key.swa_width,
+        shuffled=key.shuffled,
+        kv=key.kv,
     )
 
 
 def _back_key(key: MonoBuild):
     # 0: the window only (compress ratio 0); 1: also top-k compressed rows
     return mb_back.BackBuild(
-        key.tokens, key.tp, 1 if key.compressed else 0, shuffled=key.shuffled
+        key.tokens,
+        key.tp,
+        1 if key.compressed else 0,
+        shuffled=key.shuffled,
+        kv=key.kv,
     )
 
 
@@ -216,6 +231,8 @@ def publish_x8(c, t):
 def build_mono_k1(key: MonoBuild):
     s, tp = key.tokens, key.tp
     assert 1 <= s <= MAX_TOKENS
+    # the bf16 ring is the draft's, whose steps run no token parallel
+    assert not (key.kv == "bf16" and key.tok_par), key
     layout = scratch_layout(s, tp, key.timeline, **route_of(key))
     fkey = _front_key(key)
     FrontLds = mb_front.front_lds(s, Dims(tp))
@@ -283,6 +300,7 @@ def build_mono_k1(key: MonoBuild):
         swa_block: Int32,
         swa_idx: Int64,
         swa_lens: Int64,
+        kv_rope: Int64,
         topk: Int64,
         topk_lens: Int64,
         kt: Int64,
@@ -341,6 +359,7 @@ def build_mono_k1(key: MonoBuild):
                 "swa_block": swa_block,
                 "swa_idx": swa_idx,
                 "swa_lens": swa_lens,
+                "kv_rope": kv_rope,
                 "topk": topk,
                 "topk_lens": topk_lens,
                 "kt": kt,
@@ -507,6 +526,7 @@ def build_mono_k1(key: MonoBuild):
         swa_block: Int32,
         swa_idx: Int64,
         swa_lens: Int64,
+        kv_rope: Int64,
         topk: Int64,
         topk_lens: Int64,
         kt: Int64,
@@ -560,6 +580,7 @@ def build_mono_k1(key: MonoBuild):
             swa_block,
             swa_idx,
             swa_lens,
+            kv_rope,
             topk,
             topk_lens,
             kt,
@@ -978,6 +999,8 @@ def build_mono_k2(key: MonoBuild):
     then ``run_ffn``."""
     s, tp = key.tokens, key.tp
     assert 1 <= s <= MAX_TOKENS
+    # the bf16 ring is the draft's window, whose steps run no token parallel
+    assert not (key.kv == "bf16" and (key.tok_par or key.compressed)), key
     layout = scratch_layout(s, tp, key.timeline, **route_of(key))
     bkey = _back_key(key)
     rs = route_shape(_moe_key(key))
@@ -1010,6 +1033,8 @@ def build_mono_k2(key: MonoBuild):
         comp: Int64,
         comp_stride: Int64,
         comp_block: Int32,
+        kv_rope: Int64,
+        comp_base: Int32,
         kt: Int64,
         klen: Int64,
         slot: Int64,
@@ -1085,6 +1110,8 @@ def build_mono_k2(key: MonoBuild):
                 "comp": comp,
                 "comp_stride": comp_stride,
                 "comp_block": comp_block,
+                "kv_rope": kv_rope,
+                "comp_base": comp_base,
                 "kt": kt,
                 "klen": klen,
                 "pos": pos,
@@ -1116,6 +1143,7 @@ def build_mono_k2(key: MonoBuild):
                     "S": s,
                     "tid": c["tid"],
                     "dev": True,
+                    "kv": key.kv,
                     "args": {
                         "slot": slot,
                         "slot_words": slot_words,
@@ -1170,6 +1198,8 @@ def build_mono_k2(key: MonoBuild):
         comp: Int64,
         comp_stride: Int64,
         comp_block: Int32,
+        kv_rope: Int64,
+        comp_base: Int32,
         kt: Int64,
         klen: Int64,
         slot: Int64,
@@ -1226,6 +1256,8 @@ def build_mono_k2(key: MonoBuild):
             comp,
             comp_stride,
             comp_block,
+            kv_rope,
+            comp_base,
             kt,
             klen,
             slot,

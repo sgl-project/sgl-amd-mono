@@ -150,3 +150,46 @@ def test_pd_runs_on_a_mori_decode_server_only():
     assert reasons("decode", "mooncake") == [
         "PD monokernels require the mori transfer backend"
     ]
+
+
+def _unified(monkeypatch, triton: bool, fp8: bool):
+    from sglang.srt.layers.attention.dsv4 import unified_kv_gate as gate
+
+    monkeypatch.setattr(gate, "is_unified_kv_triton", lambda: triton)
+    monkeypatch.setattr(gate, "is_unified_kv_fp8", lambda: fp8)
+
+
+def test_unified_kv_config_reasons(monkeypatch):
+    cfg = SimpleNamespace(
+        disaggregation_mode="null", disaggregation_transfer_backend="mori"
+    )
+
+    def kv_reasons():
+        reasons = dsv41._config_disable_reasons(cfg, FLASH)
+        return [r for r in reasons if "unified" in r]
+
+    _unified(monkeypatch, triton=False, fp8=False)
+    assert kv_reasons() == []
+    # the FP8 two-pool rows K1 writes and K2 reads
+    _unified(monkeypatch, triton=True, fp8=True)
+    assert kv_reasons() == []
+    _unified(monkeypatch, triton=True, fp8=False)
+    assert kv_reasons() and "SGLANG_DSV4_UNIFIED_KV_FP8" in kv_reasons()[0]
+    # an SGLang without the pool's compressed row base (PENDING_POOL_READS)
+    from sglang.srt.mem_cache import deepseek_v4_memory_pool as pools
+
+    monkeypatch.delattr(pools.DeepSeekV4TokenToKVPool, "get_unified_compress_row_base")
+    _unified(monkeypatch, triton=True, fp8=True)
+    assert kv_reasons() and "get_unified_compress_row_base" in kv_reasons()[0]
+
+
+def test_unified_kv_row_layout():
+    # K1 / K2 address SGLang's FP8 unified rows by these sizes
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
+
+    from sgl_amd_mono.deepseek_v41.gfx950.attention import plan
+
+    assert plan.UNI_ROW == layout.DSV4_FP8_NOPE_ROW_BYTES
+    assert plan.NOPE // layout.DSV4_FP8_QUANT_TILE == 7
+    # the doubled codes end inside the row, 16 B aligned for K2's one load
+    assert plan.NOPE % 16 == 0 and plan.NOPE + 16 <= plan.UNI_ROW

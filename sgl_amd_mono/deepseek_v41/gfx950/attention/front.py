@@ -42,6 +42,7 @@ from .device import (
     Mailbox,
     ceil_exp,
     div_rn,
+    dup_scales,
     fma,
     ld_i32,
     mx_code,
@@ -73,6 +74,9 @@ from .plan import (
     ROPE,
     ROWS,
     TOPK,
+    UNI_BF16_ROW,
+    UNI_ROPE,
+    UNI_ROW,
     WINDOW,
     WQKV_KPARTS,
     WQKV_TASKS,
@@ -96,6 +100,10 @@ class FrontBuild(msgspec.Struct, frozen=True):
     # a row's window index slots: the window, plus the block's keys for the DSpark draft
     swa_width: int = WINDOW
     shuffled: bool = False  # wqkv and wq_b in aiter's (16, 16) preshuffle
+    # the KV cache (``KV_LAYOUTS``); the unified ones: a ring or compressed row's record
+    # in its pools ("fp8": nope and rope apart; "bf16": one bf16 row, no scales), the
+    # window's rows from SGLang's ragged SWA stream
+    kv: str = "paged"
 
 
 @flyc.jit
@@ -124,19 +132,28 @@ def stage_kt(c, t):
     """Token t's keys for K2: ``KT[t][k] = slot | 1 << 31`` for its top-k compressed
     rows (k < ntopk), its window slots for k in [ntopk, kv_len), -1 past them or
     for an invalid slot; KLEN[t] = kv_len (0 for a pad row), KLEN[S + t] = ntopk.
-    ``dev``: device scope, for a table the same launch reads (K2's)."""
+    ``dev``: device scope, for a table the same launch reads (K2's). Unified KV: the
+    window's rows are SGLang's ragged stream, ``swa_lens`` its indptr: row t's at
+    ``swa_idx[swa_lens[t]:swa_lens[t + 1]]``."""
     tid = c["tid"]
     a = c["args"]
     cm = CM_DEV if const_expr(c.get("dev", False)) else 0
     sw = c.get("swa_width", WINDOW)
     live = ld_i32(a["slot"], a["slot_words"] * t) >= 0
-    nswa = live.select(fx.min(ld_i32(a["swa_lens"], t), fx.Int32(sw)), fx.Int32(0))
+    if const_expr(c.get("kv", "paged") != "paged"):
+        p0 = ld_i32(a["swa_lens"], t)
+        n_row = ld_i32(a["swa_lens"], t + 1) - p0
+    else:
+        p0 = t * sw
+        n_row = ld_i32(a["swa_lens"], t)
+    nswa = live.select(fx.min(n_row, fx.Int32(sw)), fx.Int32(0))
     ntopk = live.select(fx.min(ld_i32(a["topk_lens"], t), fx.Int32(TOPK)), fx.Int32(0))
     kv_len = ntopk + nswa
     for i in range_constexpr((KEYS + THREADS - 1) // THREADS):
         k = fresh(tid) + THREADS * i
-        sidx = fx.min(fx.max(k - ntopk, 0), sw - 1)
-        s_slot = ld_i32(a["swa_idx"], t * sw + sidx)
+        # within the row's own entries: a ragged stream's last row ends the buffer
+        sidx = fx.min(fx.max(k - ntopk, 0), fx.max(nswa - 1, 0))
+        s_slot = ld_i32(a["swa_idx"], p0 + sidx)
         val = ((k < kv_len) & (s_slot >= 0)).select(s_slot, fx.Int32(-1))
         local = ld_i32(a["topk"], t * TOPK + fx.min(k, TOPK - 1))
         c_val = (local >= 0).select(local | fx.Int32(-2147483648), fx.Int32(-1))
@@ -304,23 +321,51 @@ def stage_qkv(c, t):
         .to(fx.BFloat16)
         .bitcast(fx.Int32)[0]
     )
-    blk = a["swa_block"]
-    sblock = slot // blk
-    soff = slot % blk
-    base = a["swa"] + fx.Int64(sblock) * fx.Int64(a["swa_stride"])
-    rec = base + fx.Int64(soff * DATA)
+    kv = c.get("kv", "paged")
+    # the bf16 ring: every pair as bf16, nope and rope alike
+    if const_expr(kv == "bf16"):
+        rec = a["swa"] + fx.Int64(slot) * fx.Int64(UNI_BF16_ROW)
+        # SGLang's draft writer (fused_norm_rope_inplace) rotates the bf16 normed pair
+        kb = [bf16_round(v) for v in kn]
+        b0 = is_rope.select(fma(kb[0], cs, -(kb[1] * sn)), kb[0])
+        b1 = is_rope.select(fma(kb[0], sn, kb[1] * cs), kb[1])
+        rope_word = (
+            fx.Vector.from_elements([b0, b1], fx.Float32)
+            .to(fx.BFloat16)
+            .bitcast(fx.Int32)[0]
+        )
+    elif const_expr(kv == "fp8"):
+        rec = a["swa"] + fx.Int64(slot) * fx.Int64(UNI_ROW)
+        rope_at = a["kv_rope"] + fx.Int64(slot) * fx.Int64(UNI_ROPE)
+    else:
+        blk = a["swa_block"]
+        sblock = slot // blk
+        soff = slot % blk
+        base = a["swa"] + fx.Int64(sblock) * fx.Int64(a["swa_stride"])
+        rec = base + fx.Int64(soff * DATA)
+        rope_at = rec + fx.Int64(NOPE)
     if mine & (tt % 32 == 0) & (tt < NOPE // 2):
         fx.ptr_store(rcode.bitcast(fx.Float32), red + 8 + tt // 32)
     gpu.barrier()
-    if mine & (slot >= 0):
-        if tt < NOPE // 2:
-            if tt % 2 == 0:
-                gstore(rec + fx.Int64(2 * tt), word, words=1)
-        else:
-            gstore(rec + fx.Int64(NOPE + 4 * (tt - NOPE // 2)), rope_word, words=1)
-        if tt == 0:
-            sc = base + fx.Int64(blk * DATA + soff * 8)
-            gstore(sc, fx.Vector.from_elements(record_scales(red), fx.Int32), words=2)
+    if const_expr(kv == "bf16"):  # the pair's place in the row
+        if mine & (slot >= 0):
+            gstore(rec + fx.Int64(4 * tt), rope_word, words=1)
+    else:
+        if mine & (slot >= 0):
+            if tt < NOPE // 2:
+                if tt % 2 == 0:
+                    gstore(rec + fx.Int64(2 * tt), word, words=1)
+            else:
+                gstore(rope_at + fx.Int64(4 * (tt - NOPE // 2)), rope_word, words=1)
+            if tt == 0:
+                scales = record_scales(red)
+                if const_expr(kv == "fp8"):
+                    # each code twice past the nope, then the pad bytes' zeros
+                    dup = dup_scales(scales[0]) + dup_scales(scales[1])
+                    gstore(rec + fx.Int64(NOPE), fx.Vector.from_elements(dup, fx.Int32))
+                else:
+                    sc = base + fx.Int64(blk * DATA + soff * 8)
+                    gstore(sc, fx.Vector.from_elements(scales, fx.Int32), words=2)
     if const_expr(tok_par):
         # the record to every other rank's KG (``record_from``), a pad row's too
         if mine:
@@ -356,18 +401,40 @@ def record_from(c, kg, t):
     stores)."""
     tid = c["tid"]
     a = c["args"]
+    # read outside the traced branches: a dict lookup there makes ``c`` branch state
+    kv = c.get("kv", "paged")
     if tid < KG_WORDS:
         (w,) = c["mb"].poll([(kg, t * KG_WORDS + tid, 1)])
         slot = ld_i32(a["slot"], a["slot_words"] * t)
         if slot >= 0:
-            blk = a["swa_block"]
-            soff = slot % blk
-            base = a["swa"] + fx.Int64(slot // blk) * fx.Int64(a["swa_stride"])
-            data = tid < DATA // 4
-            off = data.select(
-                soff * DATA + 4 * tid, blk * DATA + soff * 8 + 4 * (tid - DATA // 4)
-            )
-            gstore(base + fx.Int64(off), w[0], words=1)
+            if const_expr(kv == "fp8"):  # (the bf16 ring's steps run no token parallel)
+                unified_word_from(a, slot, tid, w[0])
+            else:
+                blk = a["swa_block"]
+                soff = slot % blk
+                base = a["swa"] + fx.Int64(slot // blk) * fx.Int64(a["swa_stride"])
+                data = tid < DATA // 4
+                off = data.select(
+                    soff * DATA + 4 * tid,
+                    blk * DATA + soff * 8 + 4 * (tid - DATA // 4),
+                )
+                gstore(base + fx.Int64(off), w[0], words=1)
+
+
+@flyc.jit
+def unified_word_from(a, slot, tid, w):
+    """``record_from``'s word ``tid`` of a KG record (nope, rope, then the two packed
+    scale words) to its place in the unified pools' row ``slot``."""
+    rec = a["swa"] + fx.Int64(slot) * fx.Int64(UNI_ROW)
+    data_at = (tid < NOPE // 4).select(
+        rec + fx.Int64(4 * tid),
+        a["kv_rope"] + fx.Int64(slot) * fx.Int64(UNI_ROPE) + fx.Int64(4 * tid - NOPE),
+    )
+    if tid < DATA // 4:
+        gstore(data_at, w, words=1)
+    else:
+        codes = fx.Vector.from_elements(dup_scales(w), fx.Int32)
+        gstore(rec + fx.Int64(NOPE + 8 * (tid - DATA // 4)), codes, words=2)
 
 
 @flyc.jit
@@ -491,6 +558,7 @@ def front_context(key, lds, args: dict, scratch, tag, layout=None) -> dict:
         "d": d,
         "swa_width": key.swa_width,
         "shuffled": key.shuffled,
+        "kv": key.kv,
         "ldbf": lambda ptr, i: fx.Float32(
             fx.BFloat16(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.bf16))
         ),

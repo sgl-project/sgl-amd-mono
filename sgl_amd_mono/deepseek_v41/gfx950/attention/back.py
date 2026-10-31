@@ -45,7 +45,17 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     lds_row,
 )
 
-from .device import Mailbox, fp8x8_bf16, ld_i32, mx_code, mx_mul, pow2
+from .device import (
+    Mailbox,
+    ceil_exp,
+    div_rn,
+    fp8x8_bf16,
+    ld_i32,
+    mx_code,
+    mx_mul,
+    pow2,
+    undup_scales,
+)
 from .gemv import (
     RED,
     bf16_gemv_loads,
@@ -66,6 +76,9 @@ from .plan import (
     NOPE,
     ROPE,
     ROWS,
+    UNI_BF16_ROW,
+    UNI_ROPE,
+    UNI_ROW,
     WOA_ROWS,
     Dims,
     cdiv,
@@ -90,6 +103,9 @@ class BackBuild(msgspec.Struct, frozen=True):
     ratio: int  # 0: window only; 1 / 2: top-k over a compressed cache
     timeline: bool = False
     shuffled: bool = False  # wo_b in aiter's (16, 16) preshuffle (wo_a stays row-major)
+    # the KV cache (``front.FrontBuild``); on the bf16 ring K2 quantizes each key's nope
+    # tiles as K1 does a paged record's, so the core runs as on the paged cache
+    kv: str = "paged"
 
 
 def plus(t0, v):
@@ -135,15 +151,29 @@ def await_flags(c, region, n, index):
 
 
 def key_rec(c, t, k):
-    """(data address, scale address, valid) of token t's key k from K1's key
-    table: slot | 1 << 31 for a compressed row, a window slot otherwise, -1 for
-    none (it reads a zero record: its scores are masked, its values zeros)."""
+    """(data address, rope address, scale address, valid) of token t's key k from
+    K1's key table: slot | 1 << 31 for a compressed row, a window slot otherwise, -1
+    for none (it reads a zero record: its scores are masked, its values zeros).
+    Unified KV: a slot is a row of the layer's two pools, a compressed one past
+    ``comp_base``; the scale address is the row's 16 B of doubled codes."""
     a, ratio = c["args"], c["ratio"]
     # a table this launch wrote (``krdy``: an index source's) is read past the CU's cache
     cm = CM_DEV if const_expr("krdy" in c) else 0
     val = ld_i32(a["kt"], t * KEYS + fx.min(fx.max(k, 0), KEYS - 1), cm)
     ok = val != fx.Int32(-1)
     slot = ok.select(val & fx.Int32(0x7FFFFFFF), fx.Int32(0))
+    z = a["zrec"]
+    kv = c.get("kv", "paged")
+    if const_expr(kv == "bf16"):
+        data = ok.select(a["swa"] + fx.Int64(slot) * fx.Int64(UNI_BF16_ROW), z)
+        return data, data + fx.Int64(NOPE * 2), data, ok
+    if const_expr(kv == "fp8"):
+        if const_expr(ratio > 0):
+            slot = slot + (ok & (val < 0)).select(a["comp_base"], fx.Int32(0))
+        row = fx.Int64(slot)
+        data = ok.select(a["swa"] + row * fx.Int64(UNI_ROW), z)
+        rope = ok.select(a["kv_rope"] + row * fx.Int64(UNI_ROPE), z + fx.Int64(NOPE))
+        return data, rope, data + fx.Int64(NOPE), ok
     if const_expr(ratio > 0):
         is_c = ok & (val < 0)
         blk = is_c.select(a["comp_block"], a["swa_block"])
@@ -154,10 +184,56 @@ def key_rec(c, t, k):
     b = slot // blk
     off = slot % blk
     page = base + fx.Int64(b) * stride
-    z = a["zrec"]
     data = ok.select(page + fx.Int64(off * DATA), z)
     sc = ok.select(page + fx.Int64(blk * DATA + off * 8), z + fx.Int64(DATA))
-    return data, sc, ok
+    return data, data + fx.Int64(NOPE), sc, ok
+
+
+def load_bf16_nope(data, g):
+    """A bf16 ring key's nope slices for lane g, quantized per 64-value tile as K1's
+    record quant does (the four lanes of a key's tile share its code): the e4m3
+    words of dims 64 c + 16 g .. and the seven codes as the record's two words."""
+    words, codes = [], []
+    for c4 in range_constexpr(NOPE // 64):
+        at = data + fx.Int64((64 * c4 + 16 * g) * 2)
+        raw = [global_load(at, words=4), global_load(at + fx.Int64(16), words=4)]
+        v = []
+        for h in range_constexpr(2):
+            for j in range_constexpr(4):
+                v += [bf_lo(raw[h][j]), bf_hi(raw[h][j])]
+        amax = abs(v[0])
+        for x in v[1:]:
+            amax = fx.max(amax, abs(x))
+        amax = butterfly(amax, (16, 32), fx.max)
+        code = ceil_exp(
+            div_rn(
+                fx.max(amax, fx.Float32(1e-4)),
+                fx.Float32(448.0),
+                fx.Float32(1.0 / 448.0),
+            )
+        )
+        inv = mx_mul(code)
+        q = [clamp_fp8(x * inv) for x in v]
+        words.append(
+            fx.Vector.from_elements(
+                [fp8_pack4(*q[4 * i : 4 * i + 4]) for i in range(4)], fx.Int32
+            )
+        )
+        codes.append(code)
+    w0 = codes[0] | (codes[1] << 8) | (codes[2] << 16) | (codes[3] << 24)
+    w1 = codes[4] | (codes[5] << 8) | (codes[6] << 16)
+    return words, fx.Vector.from_elements([w0, w1], fx.Int32)
+
+
+def load_scales(c, sc):
+    """A key's seven scale codes as the paged record's two words; unified KV's row
+    holds each code twice."""
+    if const_expr(c.get("kv", "paged") == "fp8"):
+        u = global_load(sc, words=4)
+        return fx.Vector.from_elements(
+            [undup_scales(u[0], u[1]), undup_scales(u[2], u[3])], fx.Int32
+        )
+    return global_load(sc, words=2)
 
 
 def _scale_byte(scw, blk64):
@@ -188,6 +264,8 @@ def stage_split(c, unit):
     64 w .. of the PV over every key and head."""
     tid, lane, wave, d, s = c["tid"], c["lane"], c["wave"], c["d"], c["S"]
     a, sl = c["args"], c["sl"]
+    # before the traced branches (``record_from``)
+    bf16_kv = c.get("kv", "paged") == "bf16"
     nchunk = c["nchunk"]
     t = unit // nchunk
     ch = unit % nchunk
@@ -221,16 +299,19 @@ def stage_split(c, unit):
     # kv_len and this lane's key load together: the table holds -1 past a token's keys
     kv_len = ld_i32(a["klen"], t, CM_DEV if const_expr("krdy" in c) else 0)
     key = k0 + kt * 16 + r16
-    data, sc, okv = key_rec(c, t, key)
+    data, rope_at, sc, okv = key_rec(c, t, key)
     if k0 < kv_len:
         # lane g's 16 B slices: e4m3 dims 64 c + 16 g .., bf16 rope dims 32 c + 8 g ..
-        scw = global_load(sc, words=2)
-        nope = [
-            global_load(data + fx.Int64(64 * c4 + 16 * g), words=4)
-            for c4 in range(NOPE // 64)
-        ]
+        if const_expr(bf16_kv):
+            nope, scw = load_bf16_nope(data, g)
+        else:
+            scw = load_scales(c, sc)
+            nope = [
+                global_load(data + fx.Int64(64 * c4 + 16 * g), words=4)
+                for c4 in range(NOPE // 64)
+            ]
         rope = [
-            global_load(data + fx.Int64(NOPE + (cc * 32 + 8 * g) * 2), words=4)
+            global_load(rope_at + fx.Int64((cc * 32 + 8 * g) * 2), words=4)
             for cc in range(ROPE // 32)
         ]
         for i in range_constexpr(cdiv(qrow, THREADS)):
@@ -686,6 +767,7 @@ def back_context(key, lds, args: dict, scratch, tag, layout: dict) -> dict:
         "d": d,
         "ratio": key.ratio,
         "shuffled": key.shuffled,
+        "kv": key.kv,
         "mb": Mailbox(tag),
         "nchunk": back_plan(key)[0],
         "sl": {"q": spl.q.ptr, "raw": spl.raw.ptr, "p": spl.p.ptr, "st": spl.st.ptr},

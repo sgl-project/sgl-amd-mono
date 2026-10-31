@@ -185,6 +185,19 @@ def pow2(code):
     return (code << 23).bitcast(fx.Float32)
 
 
+def dup_scales(w):
+    """A packed scale word (codes a, b, c, d) as the unified row's two: (a a b b, c c d d)."""
+    a, b = w & 0xFF, (w >> 8) & 0xFF
+    c, d = (w >> 16) & 0xFF, (w >> 24) & 0xFF
+    return [a | (a << 8) | (b << 16) | (b << 24), c | (c << 8) | (d << 16) | (d << 24)]
+
+
+def undup_scales(u0, u1):
+    """Two unified scale words (a a b b, c c d d) as one packed word (a, b, c, d)."""
+    hi = (u1 << 8) & fx.Int32(-16777216)  # byte 3: 0xFF000000 as an i32
+    return (u0 & 0xFF) | ((u0 >> 8) & 0xFF00) | ((u1 & 0xFF) << 16) | hi
+
+
 def fp8x8_bf16(w0, w1, scale):
     """Eight E4M3 of two dwords times an f32 ``scale`` -> eight bf16 as a 4-dword
     Vector (exact for a power-of-two scale in range)."""

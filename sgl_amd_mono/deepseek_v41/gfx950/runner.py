@@ -18,7 +18,19 @@ from sgl_amd_mono.common.plan import BLOCKS
 from .attention.index_query import DIM as IQ_DIM
 from .attention.index_query import HEADS as IQ_HEADS
 from .attention.index_query import fused as iq_fused
-from .attention.plan import DATA, HEAD_DIM, KEYS, Q_RANK, TOPK, WINDOW, Dims
+from .attention.plan import (
+    DATA,
+    HEAD_DIM,
+    KEYS,
+    KV_LAYOUTS,
+    Q_RANK,
+    ROPE,
+    TOPK,
+    UNI_BF16_ROW,
+    UNI_ROW,
+    WINDOW,
+    Dims,
+)
 from .layer import (
     EPOCH_WORDS,
     HIDDEN,
@@ -121,6 +133,36 @@ def check_cache(tag: str, cache: torch.Tensor, block: int) -> None:
         raise RuntimeError(
             f"{tag}: {cache.dtype} {tuple(cache.shape)} {cache.stride()}, "
             f"want uint8 pages of {block} x {RECORD} B"
+        )
+
+
+def check_unified(
+    tag: str, kv: str, nope: torch.Tensor, rope: torch.Tensor | None
+) -> None:
+    """Raise unless ``nope`` and ``rope`` are a layer's pools of the unified layout
+    ``kv``: "fp8", uint8 [rows, UNI_ROW] and bf16 [rows, ROPE], dense, as many rows;
+    "bf16" (the ring), uint8 [rows, UNI_BF16_ROW] and no rope pool."""
+    if kv == "bf16":
+        row, rope_ok, want = UNI_BF16_ROW, rope is None, "no rope pool"
+    else:
+        row, want = UNI_ROW, f"bf16 [rows, {ROPE}]"
+        rope_ok = (
+            rope is not None
+            and rope.dtype == torch.bfloat16
+            and rope.shape == (nope.shape[0], ROPE)
+            and rope.is_contiguous()
+        )
+    if not (
+        rope_ok
+        and nope.dtype == torch.uint8
+        and nope.dim() == 2
+        and nope.shape[1] == row
+        and nope.is_contiguous()
+    ):
+        raise RuntimeError(
+            f"{tag}: nope {nope.dtype} {tuple(nope.shape)} {nope.stride()}, rope "
+            + ("None" if rope is None else f"{rope.dtype} {tuple(rope.shape)}")
+            + f", want uint8 [rows, {row}] and {want}"
         )
 
 
@@ -281,6 +323,7 @@ class DSV41MonoRunner:
         ug_groups: int | None = None,
         swa_width: int = WINDOW,
         shuffled: bool = False,
+        kv: str = "paged",
     ):
         _ensure_writable_flydsl_cache()
         from sgl_amd_mono.common.peer import PeerBuffer
@@ -293,10 +336,17 @@ class DSV41MonoRunner:
                 f"width), got {ug_groups}"
             )
         self.ug_groups = ug_groups
+        if kv not in KV_LAYOUTS:
+            raise ValueError(
+                f"kv is the KV cache's layout, one of {KV_LAYOUTS}, got {kv}"
+            )
         self.timeline_on = os.environ.get("SGLANG_AMD_MONO_TIMELINE") == "1"
         self.token_par_on = os.environ.get("SGLANG_AMD_MONO_TOKEN_PAR", "1") == "1"
         # K1 / K2 read wqkv, wq_b and wo_b in aiter's (16, 16) preshuffle
         self.shuffled = shuffled
+        # the KV cache K1 / K2 address: SGLang's paged one, its FP8 unified KV (two
+        # pools a layer) or that KV's bf16 ring (one pool, the DSpark draft's)
+        self.kv = kv
         self.d = Dims(tp)
         dev = torch.device(device)
         if dev.index is None:
@@ -335,8 +385,9 @@ class DSV41MonoRunner:
         )
         self.iqs = torch.zeros(MAX_TOKENS, 1, 4, 16, 4, dtype=torch.uint8, device=dev)
         self.iw = torch.zeros(MAX_TOKENS, IQ_HEADS, dtype=torch.bfloat16, device=dev)
-        # the record an absent key reads: zero data and scales, masked anyway
-        self.zero_rec = torch.zeros(1024, dtype=torch.uint8, device=dev)
+        # the record an absent key reads: zero data and scales, masked anyway; as wide as
+        # the widest key K2 reads, a bf16 ring row
+        self.zero_rec = torch.zeros(UNI_BF16_ROW, dtype=torch.uint8, device=dev)
         self.qk_scale = (
             torch.tensor([HEAD_DIM**-0.5 * _LOG2E], dtype=torch.float32)
             .view(torch.int32)
@@ -429,7 +480,8 @@ class DSV41MonoRunner:
         source (whose top-k comes after K1). ``iq``: the index query too, where
         ``iq_fused``."""
         iq = iq and self.iq_fused(tokens, tok_par)
-        key = (tokens, "k1", fold, index, iq, tok_par)
+        # ``kv`` too: the kernel checks run one runner on each layout
+        key = (tokens, "k1", fold, index, iq, tok_par, self.kv)
         if key not in self._kernels:
             no_capture(f"K1 width {tokens}")
             self._kernels[key] = build_mono_k1(
@@ -445,6 +497,7 @@ class DSV41MonoRunner:
                     timeline=self.timeline_on,
                     tok_par=tok_par,
                     iq=iq,
+                    kv=self.kv,
                     **self.route_at(tokens),
                 )
             )
@@ -492,7 +545,7 @@ class DSV41MonoRunner:
     def k2_kernel(
         self, tokens: int, compressed: bool = True, index: bool = False, tok_par=False
     ):
-        key = (tokens, "k2", compressed, index, tok_par)
+        key = (tokens, "k2", compressed, index, tok_par, self.kv)
         if key not in self._kernels:
             no_capture(f"K2 width {tokens}")
             self._kernels[key] = build_mono_k2(
@@ -507,6 +560,7 @@ class DSV41MonoRunner:
                     fault_after=self.fault_after,
                     timeline=self.timeline_on,
                     tok_par=tok_par,
+                    kv=self.kv,
                     **self.route_at(tokens),
                 )
             )
@@ -616,6 +670,7 @@ class DSV41MonoRunner:
         index: bool = False,
         tok_par: bool = False,
         aux: torch.Tensor | None = None,  # [>= M, 5120] bf16: DSpark's capture
+        kv_rope: torch.Tensor | None = None,  # unified KV: the layer's rope pool
     ):
         """Run K1: the pending post, this layer's attention seam and the attention front.
 
@@ -625,7 +680,10 @@ class DSV41MonoRunner:
         write). ``index``: an index source, whose top-k comes after K1, so K1 writes
         ``normed`` and ``qr`` for the indexer and leaves the key table to K2.
         ``tok_par`` (``token_par``): the residual, post, comb and pre rows in and out
-        are this rank's alone. ``aux`` receives the residual streams' mean for DSpark."""
+        are this rank's alone. ``aux`` receives the residual streams' mean for DSpark.
+        A unified ``self.kv``: ``swa`` and ``kv_rope`` are the layer's pools,
+        ``slot`` its ring rows, and the window keys SGLang's ragged SWA stream: its row
+        indices (flat) and indptr ([>= M + 1]) in place of the slots and lengths."""
         M = residual.shape[0]
         if not self.supports(M):
             raise RuntimeError(f"DSv4.1 mono decode: {M} rows")
@@ -652,17 +710,27 @@ class DSV41MonoRunner:
         ):
             if not (t.dtype in dtypes and t.numel() >= M and t.is_contiguous()):
                 raise RuntimeError(f"K1 {name}: {tuple(t.shape)} {t.dtype}")
-        check_cache("K1 SWA cache", swa, swa_block)
-        for name, t, width in zip(
+        if self.kv != "paged":
+            check_unified("K1 unified KV", self.kv, swa, kv_rope)
+            # the ragged stream: flat rows, then M + 1 offsets
+            widths, at_least = ((), (), (TOPK,), None), (1, M + 1, M, M)
+        else:
+            check_cache("K1 SWA cache", swa, swa_block)
+            widths, at_least = (
+                ((self.route["swa_width"],), None, (TOPK,), None),
+                (M,) * 4,
+            )
+        for name, t, width, n in zip(
             ("window slots", "window lengths", "top-k slots", "top-k lengths"),
             keys,
-            ((self.route["swa_width"],), None, (TOPK,), None),
+            widths,
+            at_least,
         ):
             if not (
                 t is not None
                 and t.dtype == torch.int32
                 and t.is_contiguous()
-                and t.shape[0] >= M
+                and t.shape[0] >= n
                 and (width is None or tuple(t.shape[1:]) == width)
             ):
                 raise RuntimeError(
@@ -670,6 +738,7 @@ class DSV41MonoRunner:
                     + ("None" if t is None else f"{tuple(t.shape)} {t.dtype}")
                 )
         swa_idx, swa_lens, topk, topk_lens = (t.data_ptr() for t in keys)
+        rope_ptr = 0 if kv_rope is None else kv_rope.data_ptr()
         iq = w.iq_w is not None and self.iq_fused(M, tok_par)
         iqa = (
             (w.iq_w.data_ptr(), w.iq_ws.data_ptr(), w.iw_w.data_ptr())
@@ -708,6 +777,7 @@ class DSV41MonoRunner:
             swa_block,
             swa_idx,
             swa_lens,
+            rope_ptr,
             topk,
             topk_lens,
             self.kt.data_ptr(),
@@ -751,11 +821,15 @@ class DSV41MonoRunner:
         keys: tuple | None = None,
         index: bool = False,
         tok_par: bool = False,
+        kv_rope: torch.Tensor | None = None,  # unified KV: the layer's rope pool
+        comp_base: int = 0,  # unified KV: the layer's first compressed row
     ):
         """Run K2 on K1's outputs: attention back, TP reduce, FFN seam, MoE and all-reduce.
 
         ``comp`` None: a window-only layer. ``index``: an index source; K2 first builds
-        the key table from ``keys``, whose top-k the indexer selected after K1."""
+        the key table from ``keys``, whose top-k the indexer selected after K1. Unified
+        KV: ``swa`` and ``kv_rope`` are the layer's two pools, ``comp`` (not None on a
+        compressed layer) the same nope pool, its rows from ``comp_base`` on."""
         M = rows
         if not self.supports(M):
             raise RuntimeError(f"DSv4.1 mono decode: {M} rows")
@@ -777,12 +851,20 @@ class DSV41MonoRunner:
                 "pre_out": (pre_out, HC, f32),
             },
         )
-        check_cache("K2 SWA cache", swa, swa_block)
         compressed = comp is not None
-        if compressed:
-            check_cache("K2 compressed cache", comp, comp_block)
-        else:  # unread: the window's keys only
+        if self.kv != "paged":
+            check_unified("K2 unified KV", self.kv, swa, kv_rope)
+            if compressed and comp.data_ptr() != swa.data_ptr():
+                raise RuntimeError(
+                    "K2 unified KV: the compressed rows are the nope pool's"
+                )
             comp, comp_block = swa, swa_block
+        else:
+            check_cache("K2 SWA cache", swa, swa_block)
+            if compressed:
+                check_cache("K2 compressed cache", comp, comp_block)
+            else:  # unread: the window's keys only
+                comp, comp_block = swa, swa_block
         if not (pos.dtype == torch.int64 and pos.numel() >= M and pos.is_contiguous()):
             raise RuntimeError(f"K2 positions: {tuple(pos.shape)} {pos.dtype}")
         if index:
@@ -801,6 +883,8 @@ class DSV41MonoRunner:
             comp.data_ptr(),
             comp.stride(0),
             comp_block,
+            0 if kv_rope is None else kv_rope.data_ptr(),
+            comp_base,
             self.kt.data_ptr(),
             self.klen.data_ptr(),
             slot_ptr,

@@ -3,7 +3,9 @@
 Variants: the owed post folded in, a settled residual (after an Engram write), the first layer
 (copy 0 of the broadcast embedding) and an index source (normed input, qr, index query); each
 also token parallel where the width allows (the seam's outputs on this rank's rows, the rest
-whole)."""
+whole). ``--unified``: the KV write into SGLang's FP8 unified KV (two pools, ring rows) against
+SGLang's own writer of that layout, ``fused_qk_norm_rope_fp8_2buff``; ``--bf16-ring``: into the
+DSpark draft's bf16 unified ring against SGLang's draft writer (``fused_norm_rope_inplace``)."""
 
 import argparse
 import math
@@ -26,6 +28,10 @@ from check_ffn import (
 from sgl_amd_mono.deepseek_v41.spec import NUMERICS, SPEC
 
 RECORD, BLOCK, PAGES, POSITIONS = 584, 64, 64, 131072
+# FP8 unified KV: a 512 B nope row (448 e4m3, the 7 codes twice, pad), a 64 bf16 rope row
+UNI_ROW, UNI_SCALES = 512, 14
+# the bf16 ring's share of values 1 ulp from SGLang's draft writer it tolerates
+BF16_FLIPS = 1e-3
 Q_RANK, NOPE, HEAD = 1280, 448, 512
 # the spec's bound; measured mixes <= 5.4e-7 (TP2 / TP4 synthetic, TP4 server)
 MIX_TOL = NUMERICS.bound("k1.mix.max_abs")
@@ -160,12 +166,18 @@ def main():
     )
     # K1 reads wqkv and wq_b in aiter's (16, 16) preshuffle; the references keep row-major
     ap.add_argument("--shuffled", action="store_true")
+    # the KV write into SGLang's FP8 unified KV, against its fused_qk_norm_rope_fp8_2buff
+    ap.add_argument("--unified", action="store_true")
+    # the bf16 unified ring (the DSpark draft's) against SGLang's fused_norm_rope_inplace
+    ap.add_argument("--bf16-ring", action="store_true")
     args = ap.parse_args()
+    args.unified = args.unified or args.bf16_ring
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
     dev = torch.device("cuda", rank)
     dist.init_process_group("nccl")
     cpu = dist.new_group(backend="gloo")
+    from sglang.kernels.ops.attention.dsv4 import fused_norm_rope_inplace
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
         index_q_rope_pack_weights_flydsl,
     )
@@ -197,7 +209,8 @@ def main():
     del w
     if args.timeline:  # the runner builds its launches with stage marks
         os.environ["SGLANG_AMD_MONO_TIMELINE"] = "1"
-    r = DSV41MonoRunner(tp, rank, cpu, dev)
+    layout = "bf16" if args.bf16_ring else "fp8" if args.unified else "paged"
+    r = DSV41MonoRunner(tp, rank, cpu, dev, kv=layout)
     heads = r.q.shape[1]
     g = torch.Generator(device=dev).manual_seed(11)
     a = attn_weights(heads, dev, g)
@@ -236,11 +249,41 @@ def main():
     edges = torch.tensor([BLOCK - 1, BLOCK, PAGES * BLOCK - 1], device=dev)
 
     def records(buf, s):
-        """Return the 584 bytes of slots ``s``: 448 NOPE e4m3, 64 bf16 rope, then 8 scale bytes (7, pad)."""
+        """Return the 584 bytes of slots ``s``: 448 NOPE e4m3, 64 bf16 rope, then 8 scale bytes (7, pad).
+        Unified (``buf`` the pools' pair): 448 NOPE, 128 B rope, then the row's 14 doubled codes."""
+        if args.bf16_ring:  # a 1024 B row: nope then rope, bf16
+            return buf[0][s]
+        if args.unified:
+            nope, rope = buf
+            return torch.cat([nope[s, :NOPE], rope[s].view(torch.uint8),
+                              nope[s, NOPE : NOPE + UNI_SCALES]], 1)  # fmt: skip
         page, off = s // BLOCK, s % BLOCK
         col = torch.cat([off[:, None] * 576 + torch.arange(576, device=dev),
                          BLOCK * 576 + off[:, None] * 8 + torch.arange(8, device=dev)], 1)  # fmt: skip
         return buf[page[:, None].expand_as(col), col]
+
+    def kv_cache():
+        """The step's cache, every byte 255: paged pages, or the unified pools' pair."""
+        if args.bf16_ring:
+            return (
+                torch.full(
+                    (PAGES * BLOCK, 2 * HEAD), 255, dtype=torch.uint8, device=dev
+                ),
+            )
+        if args.unified:
+            return (
+                torch.full(
+                    (PAGES * BLOCK, UNI_ROW), 255, dtype=torch.uint8, device=dev
+                ),
+                torch.full(
+                    (PAGES * BLOCK, 128), 255, dtype=torch.uint8, device=dev
+                ).view(torch.bfloat16),
+            )
+        return torch.full((PAGES, stride), 255, dtype=torch.uint8, device=dev)
+
+    def refill(buf):
+        for b in buf if args.unified else (buf,):
+            b.view(torch.uint8).fill_(255)
 
     def inputs(M):
         _, res, post, comb, pre = seam_inputs(M, tp, rank, dev)
@@ -267,7 +310,7 @@ def main():
     runs += [
         (M, v, True)
         for M, v, _ in list(runs)
-        if v[0] in TOKEN_PAR_VARIANTS and token_par(M, tp)
+        if v[0] in TOKEN_PAR_VARIANTS and token_par(M, tp) and not args.bf16_ring
     ]
     for M, (vname, fold, index, first), tok_par in runs:
         ok, route = check_wqkv_route(M)
@@ -277,7 +320,7 @@ def main():
         k1 = build_mono_k1(
             MonoBuild(
                 M, tp, fold=fold, index=index, timeline=tl, tok_par=tok_par, iq=iq,
-                shuffled=args.shuffled,
+                shuffled=args.shuffled, kv=layout,
                 **route,
             )
         )  # fmt: skip
@@ -288,7 +331,14 @@ def main():
         lay = scratch_layout(M, tp, tl, **route)
         sc = r.scratch(M)
         static = [t.clone() for t in inputs(M)]
-        swa = torch.full((PAGES, stride), 255, dtype=torch.uint8, device=dev)
+        swa = kv_cache()
+        # unified: the nope pool's rows, the rope pool beside it
+        if args.bf16_ring:
+            kv = (swa[0], 2 * HEAD, 1, 0)
+        elif args.unified:
+            kv = (swa[0], UNI_ROW, 1, swa[1].data_ptr())
+        else:
+            kv = (swa, swa.stride(0), BLOCK, 0)
         res, x, post, comb, pre, pos, slot = static
         if first:
             pre = r.first_pre[:M]
@@ -307,7 +357,8 @@ def main():
                 r.res_mid.data_ptr(), aux.data_ptr(), r.post_a.data_ptr(), r.comb_a.data_ptr(),
                 r.pre_a.data_ptr(), kw["wqkv"].data_ptr(), a["wqkv_s"].data_ptr(), a["q_norm"].data_ptr(), a["kv_norm"].data_ptr(),
                 kw["wqb"].data_ptr(), a["wqb_s"].data_ptr(), cos_sin.data_ptr(), pos.data_ptr(),
-                slot.data_ptr(), 1, swa.data_ptr(), swa.stride(0), BLOCK, 0, 0, 0, 0, 0, 0, r.q.data_ptr(),
+                slot.data_ptr(), 1, kv[0].data_ptr(), kv[1], kv[2], 0, 0, kv[3], 0, 0, 0, 0,
+                r.q.data_ptr(),
                 r.normed.data_ptr(), r.qr.data_ptr(), kw["iq_w"].data_ptr(), iq_ws.data_ptr(),
                 iw_w.data_ptr(), iw_bits, cos_sin.shape[0], r.iq.data_ptr(),
                 r.iqs.data_ptr(), r.iw.data_ptr(), sc.data_ptr(),
@@ -332,10 +383,12 @@ def main():
         if iq:
             diff |= dict(iq=0, iqs=0, iw=0)
         mix, q_cos, q_rel, qr_rel = 0.0, 1.0, 0.0, 0.0
+        # the bf16 ring: values 1 ulp from SGLang's draft writer, and values compared
+        flips, vals = dict(nope=0, rope=0), dict(nope=0, rope=0)
         for _ in range(args.trials):
             for t, v in zip(static, inputs(M)):
                 t.copy_(v)
-            swa.fill_(255)
+            refill(swa)
             launch()
             torch.cuda.synchronize()
             o = lay["x8"][0]
@@ -359,7 +412,7 @@ def main():
             # the same step replayed: every output and record bitwise equal to eager
             for t in (r.q, r.res_mid, r.post_a, r.comb_a, r.pre_a):
                 t.fill_(float("nan"))
-            swa.fill_(255)
+            refill(swa)
             graph.replay()
             torch.cuda.synchronize()
             replayed = [
@@ -396,17 +449,36 @@ def main():
             qkv = mxfp8_native_blockscaled_linear(
                 xq.q[:M], w_sh, w_su, input_scale=xq.scale[:M]
             )
-            ref = torch.full((PAGES, stride), 255, dtype=torch.uint8, device=dev)
-            fused_k_norm_rope_flashmla(
-                qkv[:, Q_RANK:].contiguous(),
-                a["kv_norm"],
-                RMS_EPS,
-                freqs,
-                pos,
-                slot.int(),
-                ref,
-                BLOCK,
-            )
+            ref = kv_cache()
+            if args.bf16_ring:
+                # SGLang's draft writer: norm + RoPE in place, then the bf16 row at its loc
+                kr = qkv[:, Q_RANK:].contiguous()
+                fused_norm_rope_inplace(kr, a["kv_norm"], RMS_EPS, freqs, pos)
+                ref[0][slot.long()] = kr.view(torch.uint8)
+            elif args.unified:
+                from sglang.kernels.ops.attention.dsv4.norm_rope import (
+                    fused_qk_norm_rope_fp8_2buff,
+                )
+
+                # SGLang's decode writer of the two pools (its packed query: a scratch head)
+                qd = torch.zeros(M, 1, HEAD, dtype=torch.bfloat16, device=dev)
+                fused_qk_norm_rope_fp8_2buff(
+                    qd, qkv[:, Q_RANK:].contiguous(), a["kv_norm"], RMS_EPS, freqs, pos,
+                    slot.int(), ref[0].view(torch.float8_e4m3fn), ref[1],
+                    torch.empty(M, 1, HEAD, dtype=torch.float8_e4m3fn, device=dev),
+                    torch.empty(M, 1, 64, dtype=torch.bfloat16, device=dev),
+                )  # fmt: skip
+            else:
+                fused_k_norm_rope_flashmla(
+                    qkv[:, Q_RANK:].contiguous(),
+                    a["kv_norm"],
+                    RMS_EPS,
+                    freqs,
+                    pos,
+                    slot.int(),
+                    ref,
+                    BLOCK,
+                )
             want = records(ref, slot.long())
 
             diff["res"] += int(
@@ -422,12 +494,28 @@ def main():
                 ).sum()
             )
             # byte 583 pads the 7 scales: no reader, and SGLang's store leaves it as it was
-            for name, cols in (
-                ("nope", slice(0, 448)),
-                ("rope", slice(448, 576)),
-                ("scale", slice(576, 583)),
-            ):
-                diff[name] += int((got[:, cols] != want[:, cols]).sum())
+            # (unified: the 14 doubled codes; the row's pad past them likewise)
+            cols_of = (
+                (("nope", slice(0, 2 * NOPE)), ("rope", slice(2 * NOPE, 2 * HEAD)))
+                if args.bf16_ring
+                else (
+                    ("nope", slice(0, 448)),
+                    ("rope", slice(448, 576)),
+                    ("scale", slice(576, 590 if args.unified else 583)),
+                )
+            )
+            for name, cols in cols_of:
+                g_c, w_c = got[:, cols], want[:, cols]
+                if args.bf16_ring:
+                    # SGLang's draft writer sums the squares in its own order: a bf16 value
+                    # 1 ulp apart is a rounding flip (counted below), more is a difference
+                    gi = g_c.contiguous().view(torch.int16).int()
+                    wi = w_c.contiguous().view(torch.int16).int()
+                    flips[name] += int(((gi - wi).abs() == 1).sum())
+                    diff[name] += int(((gi - wi).abs() > 1).sum())
+                    vals[name] += gi.numel()
+                    continue
+                diff[name] += int((g_c != w_c).sum())
             for k1_t, ref_t in (
                 (eager[4], pre_r),
                 (eager[2], post_r),
@@ -482,9 +570,11 @@ def main():
             ["q"] if q_cos < Q_COS or q_rel > Q_REL else []
         )
         bad += ["qr"] if qr_rel > QR_REL else []
+        # rounding flips of the draft writer's own sum order: rare (measured <= 2 in 48 rows)
+        bad += [f"{k} flips" for k in flips if flips[k] > BF16_FLIPS * max(vals[k], 1)]
         if rank == 0:
             print(f"M={M:2d} {vname:7s} {'PASS' if not bad else 'FAIL ' + ','.join(bad)} | qr rel {qr_rel:.1e} | wqkv_a {route} | differing: "
-                  f"{diff} | pre/post/comb max|d| {mix:.2e} (bound {MIX_TOL:.0e}) | q cos {q_cos:.7f} "
+                  f"{diff}{f' 1-ulp flips {flips}' if args.bf16_ring else ''} | pre/post/comb max|d| {mix:.2e} (bound {MIX_TOL:.0e}) | q cos {q_cos:.7f} "
                   f"rel {q_rel:.2e}", flush=True)  # fmt: skip
         fails += [f"M={M} {vname} {b}" for b in bad]
     finish(fails, dev)

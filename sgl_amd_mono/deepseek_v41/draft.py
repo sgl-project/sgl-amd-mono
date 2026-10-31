@@ -80,6 +80,7 @@ SGLANG_READS = {
         "compress_ratio",
     ),
     "srt/runtime_context.py": ("get_parallel", "get_spec", '"tp_group"'),
+    "srt/layers/attention/dsv4/unified_kv_gate.py": ("is_unified_kv_triton",),
     "srt/speculative/dspark_components/dspark_config.py": (
         "dspark_gamma_from_num_draft_tokens",
     ),
@@ -210,6 +211,7 @@ class _Draft:
 
 
 def _build(model, hf_config, ctx) -> _Draft:
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.deepseek_v41.gfx950.runner import DSV41MonoRunner
@@ -232,6 +234,9 @@ def _build(model, hf_config, ctx) -> _Draft:
         ug_groups=UG_GROUPS,
         swa_width=SWA_WIDTH,
         shuffled=bool(target.shuffled_layout(s.self_attn for s in model.stages)),
+        # under unified_kv the draft's ring is bf16 (SGLang's DSpark draft pool), its
+        # rows the block streams SGLang builds for the draft (``target._launch``)
+        kv="bf16" if is_unified_kv_triton() else "paged",
     )
     runner.set_deadline(ctx.deadline_s)
     widths = list(ctx.widths)
