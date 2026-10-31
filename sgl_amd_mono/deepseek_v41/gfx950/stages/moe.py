@@ -948,8 +948,46 @@ def ug_epilogue(c, part0, idx, first, count):
 
 # ---------------------------------------------------------------- down
 @flyc.jit
-def stage_down(c, tasks):
-    """Run the CTA's down tasks: routed experts of U, the shared expert, their sum pushed to every rank."""
+def down_round(c, tasks, sl, sw, slots, nu, us, firsts, counts, mids, avs):
+    """One down round's MFMAs: each of its slots on every task, a pick tile at a time."""
+    s, n = c["S"], len(tasks)
+    for i in range_constexpr(slots):
+        for j in range_constexpr(n):
+            down_mfma(
+                c,
+                j,
+                tasks[j],
+                sl + (j * slots + i) * sw,
+                mids[i],
+                firsts[i],
+                counts[i],
+                avs[j * slots + i],
+                us[i] < nu,
+            )
+        # a slot of more than 16 picks: its next pick tile's rows
+        if const_expr(s > TILE):
+            for j0 in range_constexpr(TILE, s, TILE):
+                if j0 < counts[i]:
+                    more = mid_operands(c, firsts[i] + j0, counts[i] - j0)
+                    for j in range_constexpr(n):
+                        down_mfma(
+                            c,
+                            j,
+                            tasks[j],
+                            sl + (j * slots + i) * sw,
+                            more,
+                            firsts[i] + j0,
+                            counts[i] - j0,
+                            avs[j * slots + i],
+                            us[i] < nu,
+                        )
+
+
+@flyc.jit
+def stage_down(c, tasks, ahead):
+    """Run the CTA's down tasks: routed experts of U, the shared expert, their sum pushed to every rank.
+
+    ``ahead`` (``MoeBuild.down_ahead``): round r + 1's weights load while round r multiplies."""
     s, wave, tab, d = c["S"], c["wave"], c["tab"], c["d"]
     n = len(tasks)
     nu = c["rs"].n_union(tab, s)
@@ -959,52 +997,38 @@ def stage_down(c, tasks):
     slots = DOWN_R_MAX // n
     per_round = WAVES * slots
     rounds = (nu + per_round - 1) // per_round
-    # round r + 1's loads go out while round r multiplies, round 0's before the shared down
-    loads = down_weights(c, tasks, 0, slots, nu)
-    # the shared expert's down projection first: its input is ready long before the routed results
-    down_shared(c, tasks)
-    for rnd in range(0, rounds, 1):
-        svs, avs = loads
-        us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
-        ucs = [fx.min(u, nu - 1) for u in us]
-        firsts = [c["rs"].slot_first(tab, u) for u in ucs]
-        # wait only on this round's slots' ug tasks
-        c["poll"]([(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)])
-        counts = [c["rs"].slot_first(tab, u + 1) - f for u, f in zip(ucs, firsts)]
-        mids = [mid_operands(c, f, k) for f, k in zip(firsts, counts)]
-        for q in range_constexpr(len(svs)):
-            scale_block_store(c, svs[q], sl + q * sw)
-        loads = down_weights(c, tasks, rnd + 1, slots, nu)
-        for i in range_constexpr(slots):
-            for j in range_constexpr(n):
-                down_mfma(
-                    c,
-                    j,
-                    tasks[j],
-                    sl + (j * slots + i) * sw,
-                    mids[i],
-                    firsts[i],
-                    counts[i],
-                    avs[j * slots + i],
-                    us[i] < nu,
-                )
-            # a slot of more than 16 picks: its next pick tile's rows
-            if const_expr(s > TILE):
-                for j0 in range_constexpr(TILE, s, TILE):
-                    if j0 < counts[i]:
-                        more = mid_operands(c, firsts[i] + j0, counts[i] - j0)
-                        for j in range_constexpr(n):
-                            down_mfma(
-                                c,
-                                j,
-                                tasks[j],
-                                sl + (j * slots + i) * sw,
-                                more,
-                                firsts[i] + j0,
-                                counts[i] - j0,
-                                avs[j * slots + i],
-                                us[i] < nu,
-                            )
+    if const_expr(ahead):
+        # round r + 1's loads go out while round r multiplies, round 0's before the shared down
+        loads = down_weights(c, tasks, 0, slots, nu)
+        # the shared expert's down projection first: its input is ready long before the routed results
+        down_shared(c, tasks)
+        for rnd in range(0, rounds, 1):
+            svs, avs = loads
+            us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
+            ucs = [fx.min(u, nu - 1) for u in us]
+            firsts = [c["rs"].slot_first(tab, u) for u in ucs]
+            # wait only on this round's slots' ug tasks
+            c["poll"]([(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)])
+            counts = [c["rs"].slot_first(tab, u + 1) - f for u, f in zip(ucs, firsts)]
+            mids = [mid_operands(c, f, k) for f, k in zip(firsts, counts)]
+            for q in range_constexpr(len(svs)):
+                scale_block_store(c, svs[q], sl + q * sw)
+            loads = down_weights(c, tasks, rnd + 1, slots, nu)
+            down_round(c, tasks, sl, sw, slots, nu, us, firsts, counts, mids, avs)
+    else:
+        down_shared(c, tasks)
+        for rnd in range(0, rounds, 1):
+            us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
+            ucs = [fx.min(u, nu - 1) for u in us]
+            firsts = [c["rs"].slot_first(tab, u) for u in ucs]
+            # this round's weights still go out before its wait
+            svs, avs = down_weights(c, tasks, rnd, slots, nu)
+            c["poll"]([(c["ugf"], f, 1) for f in down_ug_flags(c, ucs)])
+            counts = [c["rs"].slot_first(tab, u + 1) - f for u, f in zip(ucs, firsts)]
+            mids = [mid_operands(c, f, k) for f, k in zip(firsts, counts)]
+            for q in range_constexpr(len(svs)):
+                scale_block_store(c, svs[q], sl + q * sw)
+            down_round(c, tasks, sl, sw, slots, nu, us, firsts, counts, mids, avs)
     gpu.barrier()
     for t0, nn in token_tiles(s):
         for j in range_constexpr(n):
@@ -1354,6 +1378,11 @@ def moe_context(s, rs, lds, mb, bases, layout, scratch, args, rank, sym):
     return c
 
 
+def ug_free(key, rs) -> int:
+    """The CTAs a one-tile step's ug tasks are spread over (``MoeBuild.ug_all``)."""
+    return BLOCKS if key.ug_all else BLOCKS - rs.shared_units
+
+
 @flyc.jit
 def run_moe(c, key, bid, before_ug=None):
     """The MoE stages, in order (``before_ug``: work for this CTA once its shared
@@ -1409,9 +1438,10 @@ def run_moe(c, key, bid, before_ug=None):
         while task < ug_total:
             task = stage_ug_tile(c, task, ug_total)
     else:
-        # one token tile: every task placed; shared-unit CTAs reach ug late, so take none (``ug0``)
+        # one token tile: every task placed; shared-unit CTAs reach ug late, so without
+        # ``ug_all`` they take none (``ug0``)
         loaded = fx.Int32(0)
-        free = BLOCKS - c["rs"].shared_units
+        free = ug_free(key, c["rs"])
         at = first_task(bid, c["rs"].ug0)
         for task in range(at, (at < free).select(fx.Int32(ug_tasks), at), free):
             if loaded == 0:
@@ -1429,9 +1459,9 @@ def run_moe(c, key, bid, before_ug=None):
     down_task = first_task(bid, DOWN0)
     rank = take_down_rank(c)
     if rank < DOWN_TASKS - BLOCKS:
-        stage_down(c, [down_task, BLOCKS + rank])
+        stage_down(c, [down_task, BLOCKS + rank], key.down_ahead)
     else:
-        stage_down(c, [down_task])
+        stage_down(c, [down_task], key.down_ahead)
     stamp(c, 25)
     # token parallel: this rank's rows' sums alone, ``out`` from its first row
     cr = c if const_expr(c["own"] is None) else c["own_view"]

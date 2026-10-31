@@ -94,6 +94,10 @@ class MonoBuild(msgspec.Struct, frozen=True):
     iq: bool = False
     # wqkv, wq_b and wo_b in SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE's (16, 16) layout; wo_a row-major
     shuffled: bool = False
+    # the MoE's down loads a round ahead, and one tile's ug on every CTA; the runner
+    # sets both by TP and width (``runner.down_ahead_at`` / ``ug_all_at``)
+    down_ahead: bool = True
+    ug_all: bool = False
 
 
 ROUTE = ("experts", "topk", "ug_groups", "swa_width")
@@ -113,11 +117,21 @@ def _variant(key: MonoBuild) -> dict:
         | ({"tl": 1} if key.timeline else {})
         | ({"p": 1} if key.tok_par else {})
         | ({"sh": 1} if key.shuffled else {})
+        | ({"d": key.down_ahead} if key.down_ahead != base.down_ahead else {})
+        | ({"a": key.ug_all} if key.ug_all != base.ug_all else {})
     )
 
 
 def _moe_key(key: MonoBuild) -> MoeBuild:
-    return MoeBuild(key.tokens, key.tp, key.experts, key.topk, key.ug_groups)
+    return MoeBuild(
+        key.tokens,
+        key.tp,
+        key.experts,
+        key.topk,
+        key.ug_groups,
+        down_ahead=key.down_ahead,
+        ug_all=key.ug_all,
+    )
 
 
 def _front_key(key: MonoBuild):
