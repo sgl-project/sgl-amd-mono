@@ -1,6 +1,7 @@
 """Qwen3.5-397B-A17B block-FP8 spec on CPU: family registration, TP4 and TP8
-shapes, and the refusals for MXFP4, per-channel FP8, a plain RMSNorm and a
-projection with a bias."""
+shapes, the MTP verify widths and their refusals, the fallback routing, and the
+refusals for MXFP4, per-channel FP8, a plain RMSNorm and a projection with a
+bias."""
 
 from types import SimpleNamespace
 
@@ -53,8 +54,20 @@ def _hf(**quant):
     )
 
 
-def _cfg():
-    return SimpleNamespace()
+def _cfg(**overrides):
+    return SimpleNamespace(**overrides)
+
+
+def _mtp(**overrides):
+    values = dict(
+        speculative_algorithm="EAGLE",
+        speculative_eagle_topk=1,
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        enable_linear_replayssm=False,
+    )
+    values.update(overrides)
+    return _cfg(**values)
 
 
 class _Tensor:
@@ -158,7 +171,8 @@ def test_the_plugin_registers_the_family_on_gfx950():
     limits = found.devices["gfx950"]
     assert limits.tp_sizes == (4, 8)
     assert fp8.SPEC.devices["gfx950"].tp_sizes == (4, 8)
-    assert limits.widths == tuple(range(1, 9))
+    assert limits.widths == (1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 28, 32)
+    assert registry.Feature.SPECULATIVE_DECODING in found.features
     missing, why = registry.find_spec(
         backend=sgl_amd_mono.BACKEND, architectures=ARCH, isa="gfx942"
     )
@@ -206,6 +220,61 @@ def test_model_refuses_a_plain_rmsnorm():
     assert reasons == [
         "layer 5 post_attention_layernorm is RMSNorm, not a Gemma RMSNorm"
     ], reasons
+
+
+def test_config_accepts_the_mtp_chain_and_refuses_other_drafts():
+    assert fp8.SPEC.config_disable_reasons(_mtp(), _hf()) == []
+    assert family.SPEC.config_disable_reasons(_mtp(), _hf()) == []
+    for bad in (
+        _mtp(speculative_eagle_topk=4),
+        _mtp(speculative_num_steps=5, speculative_num_draft_tokens=6),
+        _mtp(speculative_num_steps=2, speculative_num_draft_tokens=4),
+    ):
+        joined = " | ".join(fp8.SPEC.config_disable_reasons(bad, _hf()))
+        assert "one draft chain of 4 tokens" in joined, joined
+    replay = fp8.SPEC.config_disable_reasons(_mtp(enable_linear_replayssm=True), _hf())
+    assert any("--enable-linear-replayssm" in r for r in replay), replay
+    # ReplaySSM alone, without a draft, keeps the decode kernels' in-place update
+    assert (
+        fp8.SPEC.config_disable_reasons(
+            _cfg(speculative_algorithm=None, enable_linear_replayssm=True), _hf()
+        )
+        == []
+    )
+
+
+class _Fallback:
+    """A model whose own forward records the steps the monokernel hands back."""
+
+    def __init__(self):
+        self.calls = []
+
+    def forward(self, input_ids, positions, forward_batch, *rest):
+        self.calls.append(forward_batch)
+        return "standard"
+
+
+def test_forward_hands_unserved_steps_to_the_standard_forward():
+    model = _Fallback()
+    built = fp8._Built(model, runtime=None, layout=TP4)
+    batch = SimpleNamespace(contains_image_inputs=lambda: False)
+    for mode, bs, tokens in (
+        ("decode", 9, 1),  # wider than the decode kernels
+        ("target_verify", 9, 4),  # more than 8 requests
+        ("target_verify", 4, 2),  # another draft chain
+        ("extend", 1, 1),
+    ):
+        key = registry.ShapeKey(
+            forward_mode=mode, batch_size=bs, tokens_per_request=tokens
+        )
+        out = built.forward(registry.Plan(key=key), None, None, batch)
+        assert out == "standard", (mode, bs, tokens)
+    assert len(model.calls) == 4
+    image = SimpleNamespace(contains_image_inputs=lambda: True)
+    key = registry.ShapeKey(
+        forward_mode="target_verify", batch_size=2, tokens_per_request=4
+    )
+    assert built.forward(registry.Plan(key=key), None, None, image) == "standard"
 
 
 def test_model_refuses_a_projection_with_a_bias():

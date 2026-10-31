@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The two guarded peer barriers that open each decode step.
+"""The two guarded peer barriers that open each decode or target-verify step.
 
 Each phase publishes its own tag, then polls that tag on every rank. Phases 0
 and 1 use different pair slots and run once each per step, in that order, so a

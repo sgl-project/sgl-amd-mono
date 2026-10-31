@@ -323,7 +323,7 @@ def gdn_core(mod, hidden, hidden_q, conv, ssm, idx, rows: int, layout=None):
     bias = mod.conv1d.bias
     mixed = torch.empty(rows, conv_dim, dtype=x.dtype, device=x.device)
     slot_stride, dim_stride, win_stride = _conv_strides(conv)
-    if wg_fits(rows, hidden_size, w) and conv_dim % WG_BN == 0:
+    if rows <= WG_ROWS and wg_fits(rows, hidden_size, w) and conv_dim % WG_BN == 0:
         # Only z's columns are written: the conv columns go straight to ``mixed``
         qkvz = torch.empty(rows, qkvz_n, dtype=x.dtype, device=x.device)
         q, q_scale = hidden_q

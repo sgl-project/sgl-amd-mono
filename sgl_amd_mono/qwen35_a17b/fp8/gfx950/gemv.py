@@ -31,10 +31,12 @@ SGLANG_READS = {
 }
 
 # block_fp8_gemv_wg: one 16-row block of the preshuffle per workgroup, K in 8
-# slices over 4 warps; tl.dot takes at least 16 rows
+# slices over 4 warps; tl.dot takes at least 16 rows. Verify steps (4 rows a
+# request, up to 8 requests) take the 32-row tile.
 WG_BN = 16
 WG_SPLIT = 8
 WG_ROWS = 16
+WG_MAX_ROWS = 32
 WG_WARPS = 4
 
 
@@ -170,10 +172,15 @@ def _wg_kernel(
     tl.store(out, acc.to(out_ptr.dtype.element_ty), mask=m[:, None] < M)
 
 
+def wg_rows(rows: int) -> int:
+    """The row tile of ``block_fp8_gemv_wg`` for ``rows`` rows."""
+    return WG_ROWS if rows <= WG_ROWS else WG_MAX_ROWS
+
+
 def wg_fits(rows: int, k: int, weight: torch.Tensor) -> bool:
     """Whether ``block_fp8_gemv_wg`` serves ``rows`` of K ``k`` on ``weight``."""
     return (
-        0 < rows <= WG_ROWS
+        0 < rows <= WG_MAX_ROWS
         and _shuffled(weight)
         and k % (WG_SPLIT * BLOCK) == 0
         and weight.shape[0] % WG_BN == 0
@@ -206,7 +213,7 @@ def block_fp8_gemv_wg(
         S=WG_SPLIT,
         GROUP=BLOCK,
         BN=WG_BN,
-        ROWS=WG_ROWS,
+        ROWS=wg_rows(m),
         num_warps=WG_WARPS,
     )
     return out

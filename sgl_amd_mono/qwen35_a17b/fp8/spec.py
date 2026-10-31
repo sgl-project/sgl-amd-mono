@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3.5-397B-A17B block-FP8 on gfx950, TP4 and TP8.
 
-Decode steps of 1 to 8 rows open with two guarded peer barriers, then run each
+Decode steps of 1 to 8 rows, and with EAGLE/MTP the target-verify steps of 1 to
+8 requests x 4 draft tokens (4 to 32 rows), open with two guarded peer barriers, then run each
 layer as K1 and K2. A GDN layer's K1 is the previous layer's MoE all-reduce,
 fused with the residual add, the input norm and the FP8 quant of its output,
 then the block-FP8 projections, the conv and the gated delta, whose gated norm
@@ -9,8 +10,10 @@ also quantizes the core. K2 is the output projection, its all-reduce fused with
 the post-norm, and the block-FP8 MoE. A full-attention layer takes the same
 fused input into its block-FP8 ``qkv_proj``, runs SGLang's q/k norm, rope and
 aiter attention, which writes the KV cache, and then the same K2 with the output
-gate and its FP8 quant ahead of ``o_proj``. Wider steps, and anything this spec
-does not declare, keep the standard forward.
+gate and its FP8 quant ahead of ``o_proj``. A verify step's GDN K1 runs each
+request's draft chain and writes SGLang's per-token conv and SSM scratch, which
+SGLang's accept step commits from. Wider steps, and anything this spec does not
+declare, keep the standard forward.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import os
 import torch
 from sglang.srt.monokernels.spec import (
     DeviceLimits,
+    Feature,
     MonoSpec,
     Numerics,
     NumericsKind,
@@ -34,13 +38,23 @@ from sgl_amd_mono.qwen35_a17b.fp8.gfx950.layout import (
     HIDDEN,
     LAYERS,
     ROWS,
+    VERIFY_TOKENS,
+    WIDTHS,
 )
 from sgl_amd_mono.qwen35_a17b.fp8.gfx950.shapes import BY_O_K, TP_SIZES, for_tp
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
+    "srt/arg_groups/fields/*.py": (
+        "enable_linear_replayssm",
+        "speculative_algorithm",
+        "speculative_eagle_topk",
+        "speculative_num_steps",
+        "speculative_num_draft_tokens",
+    ),
     "srt/monokernels/spec.py": (
         "DeviceLimits",
+        "Feature",
         "MonoSpec",
         "Numerics",
         "NumericsKind",
@@ -53,6 +67,7 @@ NUMERICS = Numerics(
     NumericsKind.TOLERANCE,
     {
         "k1.conv.cosine": 0.999,
+        "k1.iconv.cosine": 0.999,
         "k1.state.cosine": 0.999,
         "k1.proj.cosine": 0.99,
         "k1.proj.rel": 0.05,
@@ -60,6 +75,9 @@ NUMERICS = Numerics(
         "k2.proj.rel": 0.05,
         "k2.moe.cosine": 0.99,
         "k2.moe.rel": 0.05,
+        "k1.core.cosine": 0.999,
+        "k2.moe_nd.cosine": 0.9,
+        "k2.moe_nd.rel": 0.5,
     },
 )
 
@@ -101,11 +119,33 @@ def _quant(config) -> dict:
     return dict(raw or {})
 
 
+def _speculative_reasons(cfg) -> list[str]:
+    if getattr(cfg, "speculative_algorithm", None) is None:
+        return []
+    reasons = []
+    topk = cfg.speculative_eagle_topk or 1
+    tokens, steps = cfg.speculative_num_draft_tokens, cfg.speculative_num_steps
+    if topk != 1 or tokens != VERIFY_TOKENS or (steps or 0) + 1 != tokens:
+        reasons.append(
+            "the verify step runs one draft chain of "
+            f"{VERIFY_TOKENS} tokens: needs --speculative-eagle-topk 1, "
+            f"--speculative-num-steps {VERIFY_TOKENS - 1} and "
+            f"--speculative-num-draft-tokens {VERIFY_TOKENS}, got topk {topk}, "
+            f"{steps} steps, {tokens} tokens"
+        )
+    if getattr(cfg, "enable_linear_replayssm", False):
+        reasons.append(
+            "--enable-linear-replayssm: the verify step writes SGLang's per-token "
+            "SSM scratch, which ReplaySSM replaces with a ring"
+        )
+    return reasons
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     _install_block_fp8_linear()
-    del cfg
+    reasons = _speculative_reasons(cfg) if cfg is not None else []
     text = _text(hf_config)
-    reasons = [
+    reasons += [
         f"needs Qwen3.5-397B-A17B's {key} = {want!r}, got {getattr(text, key, None)!r}"
         for key, want in _TEXT.items()
         if getattr(text, key, None) != want
@@ -355,20 +395,29 @@ class _Built:
         get_embedding=False,
         pp_proxy_tensors=None,
     ):
-        """``Qwen3_5MoeForConditionalGeneration.forward`` for a routed decode step."""
+        """``Qwen3_5MoeForConditionalGeneration.forward`` for a routed decode or
+        target-verify step."""
         from sgl_amd_mono.qwen35_a17b.fp8.gfx950.forward import (
             final_norm,
             run_attn,
             run_k1,
+            run_k1_verify,
             run_k2,
         )
+        from sgl_amd_mono.qwen35_a17b.fp8.gfx950.verify import verify_slots
 
         lm = self.model
         contains = getattr(forward_batch, "contains_image_inputs", None)
+        key = plan.key
+        verify = key.forward_mode == "target_verify"
+        if verify:
+            served = key.tokens_per_request == VERIFY_TOKENS and key.rows <= WIDTHS[-1]
+        else:
+            served = key.forward_mode == "decode" and key.rows <= ROWS[-1]
         if (
             get_embedding
             or pp_proxy_tensors is not None
-            or plan.key.rows > ROWS[-1]
+            or not served
             or (contains is not None and contains())
         ):
             return type(lm).forward(
@@ -386,21 +435,39 @@ class _Built:
             raise RuntimeError(
                 f"decode step has {hidden.shape[0]} rows, the routed width is {rows}"
             )
+        step_slots = (
+            verify_slots(forward_batch, rows // key.tokens_per_request)
+            if verify
+            else None
+        )
         residual = None
         start = getattr(inner, "start_layer", 0)
         end = getattr(inner, "end_layer", len(inner.layers))
         for i in range(start, end):
             layer = inner.layers[i]
             if hasattr(layer, "linear_attn"):
-                core, residual = run_k1(
-                    layer,
-                    hidden,
-                    residual,
-                    forward_batch,
-                    rows,
-                    self.check,
-                    self.layout,
-                )
+                if verify:
+                    core, residual = run_k1_verify(
+                        layer,
+                        hidden,
+                        residual,
+                        forward_batch,
+                        rows,
+                        key.tokens_per_request,
+                        step_slots,
+                        self.check,
+                        self.layout,
+                    )
+                else:
+                    core, residual = run_k1(
+                        layer,
+                        hidden,
+                        residual,
+                        forward_batch,
+                        rows,
+                        self.check,
+                        self.layout,
+                    )
                 proj = layer.linear_attn.out_proj
             else:
                 core, residual = run_attn(
@@ -449,9 +516,9 @@ def _build(model, hf_config, ctx):
 SPEC = MonoSpec(
     name="qwen35_a17b_fp8",
     devices={
-        "gfx950": DeviceLimits(widths=ROWS, tp_sizes=TP_SIZES, resident_blocks=BLOCKS)
+        "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=TP_SIZES, resident_blocks=BLOCKS)
     },
-    features=frozenset(),
+    features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"aiter"}),

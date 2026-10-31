@@ -23,7 +23,13 @@ BA_N = GDN_V_HEADS * 2  # b, a
 CONV_DIM = GDN_K_HEADS * GDN_HEAD * 2 + GDN_V_HEADS * GDN_HEAD  # q, k, v
 O_K = GDN_V_HEADS * GDN_HEAD  # local out_proj / o_proj K
 TP = 4
-ROWS = (1, 2, 3, 4, 5, 6, 7, 8)
+ROWS = (1, 2, 3, 4, 5, 6, 7, 8)  # decode rows
+VERIFY_TOKENS = 4  # EAGLE/MTP: 3 draft steps, topk 1
+VERIFY_REQUESTS = 8
+# a server serves its own mode's widths: decode 1-8, verify 4, 8, ..., 32
+WIDTHS = tuple(
+    sorted(set(ROWS) | {VERIFY_TOKENS * r for r in range(1, VERIFY_REQUESTS + 1)})
+)
 BLOCKS = 256
 THREADS = 512
 PHASE_BYTES = 8192
