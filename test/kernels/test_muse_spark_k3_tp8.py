@@ -21,14 +21,23 @@ LAYER = 9
 
 def _worker(rank, rows, tpx, port, q):
     import torch.distributed as dist
+    from test_muse_spark_k3 import _epoch, _fp4_weight
 
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.muse_spark.gfx950.build_k3 import K3Build, build_k3
-    from sgl_amd_mono.muse_spark.gfx950.config import HIDDEN, INTER, MAX_TOKENS, MOE_HIDDEN, TOP_K
+    from sgl_amd_mono.muse_spark.gfx950.config import (
+        HIDDEN,
+        INTER,
+        MAX_TOKENS,
+        MOE_HIDDEN,
+        TOP_K,
+    )
     from sgl_amd_mono.muse_spark.gfx950.layout import scratch_bytes
-    from sgl_amd_mono.muse_spark.gfx950.stages.ffn import k3_scratch_layout, k3_sym_layout
-    from test_muse_spark_k3 import _epoch, _fp4_weight, _reference
+    from sgl_amd_mono.muse_spark.gfx950.stages.ffn import (
+        k3_scratch_layout,
+        k3_sym_layout,
+    )
 
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     torch.cuda.set_device(rank)
@@ -36,7 +45,9 @@ def _worker(rank, rows, tpx, port, q):
     dev = torch.device("cuda", rank)
     try:
         E = E_RANK * NP
-        gen = torch.Generator(device=dev).manual_seed(900 + rows)  # the same tables on every rank
+        gen = torch.Generator(device=dev).manual_seed(
+            900 + rows
+        )  # the same tables on every rank
         torch.manual_seed(900 + rows)
         bf = torch.bfloat16
         w13, s13, dec13 = _fp4_weight(E, 2 * INTER, MOE_HIDDEN, dev, gen)
@@ -45,7 +56,9 @@ def _worker(rank, rows, tpx, port, q):
         ids = torch.empty(rows, TOP_K, dtype=torch.int32, device=dev)
         for t in range(rows):
             ids[t, 0] = 0  # every token's slot 0: expert 0 (its widest column set)
-            ids[t, 1:] = (torch.randperm(E - 1, device=dev, generator=gen)[: TOP_K - 1] + 1).to(torch.int32)
+            ids[t, 1:] = (
+                torch.randperm(E - 1, device=dev, generator=gen)[: TOP_K - 1] + 1
+            ).to(torch.int32)
         scores = torch.rand(rows, TOP_K, device=dev) * 0.3
         stream = torch.randn(rows, HIDDEN, device=dev)
         w = {
@@ -58,17 +71,36 @@ def _worker(rank, rows, tpx, port, q):
         }
         if tpx:
             RS, CS = INTER // NP, MOE_HIDDEN // NP
-            sl = lambda t: torch.cat([t[:, rank * RS : (rank + 1) * RS], t[:, INTER + rank * RS : INTER + (rank + 1) * RS]], dim=1).contiguous()  # noqa: E731
+            sl = lambda t: torch.cat(
+                [
+                    t[:, rank * RS : (rank + 1) * RS],
+                    t[:, INTER + rank * RS : INTER + (rank + 1) * RS],
+                ],
+                dim=1,
+            ).contiguous()  # noqa: E731
             kw13, ks13 = sl(w13), sl(s13)
-            kw2, ks2 = w2[:, rank * CS : (rank + 1) * CS].contiguous(), s2[:, rank * CS : (rank + 1) * CS].contiguous()
+            kw2, ks2 = (
+                w2[:, rank * CS : (rank + 1) * CS].contiguous(),
+                s2[:, rank * CS : (rank + 1) * CS].contiguous(),
+            )
             local_start = 0
         else:
             lo = rank * E_RANK
-            kw13, ks13, kw2, ks2 = (t[lo : lo + E_RANK].contiguous() for t in (w13, s13, w2, s2))
+            kw13, ks13, kw2, ks2 = (
+                t[lo : lo + E_RANK].contiguous() for t in (w13, s13, w2, s2)
+            )
             local_start = lo
         attn_out = torch.full((MAX_TOKENS, HIDDEN), float("nan"), device=dev, dtype=bf)
-        scratch = torch.zeros(scratch_bytes(k3_scratch_layout()), dtype=torch.uint8, device=dev)
-        peers = PeerBuffer(scratch_bytes(k3_sym_layout(NP)) + guard.FLAG_BYTES, dist.group.WORLD, rank, NP, dev)
+        scratch = torch.zeros(
+            scratch_bytes(k3_scratch_layout()), dtype=torch.uint8, device=dev
+        )
+        peers = PeerBuffer(
+            scratch_bytes(k3_sym_layout(NP)) + guard.FLAG_BYTES,
+            dist.group.WORLD,
+            rank,
+            NP,
+            dev,
+        )
         peers.bytes.zero_()
         torch.cuda.synchronize()
         dist.barrier()
@@ -95,7 +127,10 @@ def _worker(rank, rows, tpx, port, q):
             torch.cuda.synchronize()
             dist.barrier()
             n = int(os.environ.get("K3_ITERS", "30"))
-            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0, e1 = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
             e0.record()
             for _ in range(n):
                 launch(*args, stream=st)
@@ -106,10 +141,21 @@ def _worker(rank, rows, tpx, port, q):
             from sgl_amd_mono.muse_spark.gfx950.device import TRACE_LAYERS, TRACE_SLOTS
 
             off, nbytes = k3_scratch_layout()["k3_trace"]
-            t = scratch[off : off + nbytes].view(torch.int64)[: TRACE_LAYERS * BLOCKS * TRACE_SLOTS]
+            t = scratch[off : off + nbytes].view(torch.int64)[
+                : TRACE_LAYERS * BLOCKS * TRACE_SLOTS
+            ]
             t = t.reshape(TRACE_LAYERS, BLOCKS, TRACE_SLOTS)[LAYER % TRACE_LAYERS].cpu()
             out = os.environ.get("K3_TRACE_OUT", "/tmp")
-            torch.save({"stamps": t, "launch_us": e0.elapsed_time(e1) * 1000 / n, "rows": rows, "tpx": tpx, "ids": ids.cpu()}, os.path.join(out, f"k3trace_r{rank}.pt"))
+            torch.save(
+                {
+                    "stamps": t,
+                    "launch_us": e0.elapsed_time(e1) * 1000 / n,
+                    "rows": rows,
+                    "tpx": tpx,
+                    "ids": ids.cpu(),
+                },
+                os.path.join(out, f"k3trace_r{rank}.pt"),
+            )
             q.put((rank, [0, 0, 0], 1.0, 1.0, 0.0))
             peers.close()
             return
@@ -144,6 +190,7 @@ def _reference_all(xin, ids, scores, dec13, dec2, w, stream):
     """``test_muse_spark_k3._reference`` over every expert of the table (its one-rank form
     keeps a rank's LOCAL_EXPERTS): temporarily the local window is the whole table."""
     import test_muse_spark_k3 as T
+
     from sgl_amd_mono.muse_spark.gfx950 import config
 
     keep = config.LOCAL_EXPERTS
@@ -160,7 +207,9 @@ def run(rows, tpx):
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     port = 29500 + (os.getpid() % 2000)
-    procs = [ctx.Process(target=_worker, args=(r, rows, tpx, port, q)) for r in range(NP)]
+    procs = [
+        ctx.Process(target=_worker, args=(r, rows, tpx, port, q)) for r in range(NP)
+    ]
     for p in procs:
         p.start()
     res = [q.get(timeout=900) for _ in range(NP)]
@@ -169,7 +218,10 @@ def run(rows, tpx):
     return sorted(res)
 
 
-@pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.device_count() >= NP), reason="needs eight GPUs")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.device_count() >= NP),
+    reason="needs eight GPUs",
+)
 @pytest.mark.parametrize("rows,tpx", [(8, True), (16, True), (8, False)])
 def test_k3_tp8(rows, tpx):
     for rank, errs, cos, cos_a, bad in run(rows, tpx):
@@ -180,7 +232,17 @@ def test_k3_tp8(rows, tpx):
 def report(out, rows):
     """The traced launches' stage times (median / last CTA, us from the first entry)
     on rank 0, and the ug / dn ends a die (CTA bid % 8) on every rank."""
-    names = {0: "entry", 2: "plan", 3: "ug done", 4: "dn done", 12: "dn mids", 5: "fin done", 13: "fin polled", 6: "unpool done", 7: "end"}
+    names = {
+        0: "entry",
+        2: "plan",
+        3: "ug done",
+        4: "dn done",
+        12: "dn mids",
+        5: "fin done",
+        13: "fin polled",
+        6: "unpool done",
+        7: "end",
+    }
     for r in range(NP):
         d = torch.load(os.path.join(out, f"k3trace_r{r}.pt"))
         t = d["stamps"].double()
@@ -206,4 +268,6 @@ if __name__ == "__main__":
     rows = int(sys.argv[1]) if len(sys.argv) > 1 else 8
     tpx = (sys.argv[2] if len(sys.argv) > 2 else "tpx") == "tpx"
     for rank, errs, cos, cos_a, bad in run(rows, tpx):
-        print(f"rank {rank}: errors {errs} stream cosine min {cos:.6f} attn_input cosine min {cos_a:.6f} off {bad:.4%}")
+        print(
+            f"rank {rank}: errors {errs} stream cosine min {cos:.6f} attn_input cosine min {cos_a:.6f} off {bad:.4%}"
+        )

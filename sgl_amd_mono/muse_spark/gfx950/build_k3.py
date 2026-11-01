@@ -15,12 +15,11 @@ from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import peer_bases
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
+from sgl_amd_mono.muse_spark.gfx950 import compat
 from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
 from sgl_amd_mono.muse_spark.gfx950.device import step_tag
 from sgl_amd_mono.muse_spark.gfx950.layout import scratch_bytes
 from sgl_amd_mono.muse_spark.gfx950.stages import ffn
-
-from sgl_amd_mono.muse_spark.gfx950 import compat
 
 BRIDGE = compat.install()  # FlyDSL 0.3.2: the upstream helpers the image lacks
 SOURCES = kernel_sources(__name__)
@@ -41,14 +40,28 @@ class K3Build(msgspec.Struct, frozen=True):
     fault_site: int = 0
     fault_after: int = 0
     trace: bool = False
-    fp8_unpool: bool = False  # w_unpool is a packed FP8 copy (codes, then fp32 row scales)
+    fp8_unpool: bool = (
+        False  # w_unpool is a packed FP8 copy (codes, then fp32 row scales)
+    )
     tpx: bool = False  # TP experts: w13 / s13 / w2 / s2 are the rank's slices of every expert (ffn module notes)
     defer_k1: bool = False  # the boundary publishes a token's two norm scalars (``k3_nscal``) for the next K1
     xq_pre: bool = False  # the expert input's MXFP4 blocks come from K2 (``xinq`` arg), staged once for every token
     ug_dyn: bool = False  # the ug items past each CTA's first from a launch-wide queue (``k3_ugq``; merged + xq_pre)
 
 
-def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, sym_layout: dict, layer=None) -> dict:
+def k3_context(
+    key: K3Build,
+    lds,
+    args: dict,
+    scratch,
+    sym,
+    peers,
+    rank,
+    tag,
+    layout: dict,
+    sym_layout: dict,
+    layer=None,
+) -> dict:
     """K3's context: LDS views, the mailbox, the scratch and peer regions (this
     rank's own ``ffn`` / ``unp`` for polling, every rank's for the pushes, the peer
     bases loaded once), the CTA map and the arguments."""
@@ -101,7 +114,13 @@ def k3_context(key: K3Build, lds, args: dict, scratch, sym, peers, rank, tag, la
             c["own_" + region] = preg(sym, off, region)
             c["peer_" + region] = [preg(base, off, region) for base in bases]
     else:
-        c.update(ug_t=ffn.UG_T, dn_t=ffn.DN_T, up_row0=ffn.INTER, w13_rows=2 * ffn.INTER, w2_rows=ffn.MOE_HIDDEN)
+        c.update(
+            ug_t=ffn.UG_T,
+            dn_t=ffn.DN_T,
+            up_row0=ffn.INTER,
+            w13_rows=2 * ffn.INTER,
+            w2_rows=ffn.MOE_HIDDEN,
+        )
     for region, (off, _) in layout.items():
         c[region[3:]] = sreg(scratch, off, region)  # "k3_mid" -> c["mid"]
     return c
@@ -122,7 +141,19 @@ def build_k3(key: K3Build):
     last-layer rule, when the build did not compile it in)."""
     S, npes = key.tokens, key.npes
     assert 1 <= S <= MAX_TOKENS and 1 <= npes <= WAVES, (S, npes)
-    name = kernel_symbol("muse_spark_k3", s=S, w=npes, l=int(key.last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_unpool), x=int(key.tpx), d=int(key.defer_k1), xq=int(key.xq_pre), u=int(key.ug_dyn))
+    name = kernel_symbol(
+        "muse_spark_k3",
+        s=S,
+        w=npes,
+        l=int(key.last),
+        f=key.fault_site,
+        t=int(key.trace),
+        p8=int(key.fp8_unpool),
+        x=int(key.tpx),
+        d=int(key.defer_k1),
+        xq=int(key.xq_pre),
+        u=int(key.ug_dyn),
+    )
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = ffn.k3_scratch_layout()
@@ -163,7 +194,9 @@ def build_k3(key: K3Build):
                 fault_site=fault_site or None, fault_after=fault_after,
             )  # fmt: skip
         else:
-            g = guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)
+            g = guard.Guard(
+                epoch, fault_site=fault_site or None, fault_after=fault_after
+            )
         with guard.scope(g):
             lds = fx.SharedAllocator().allocate(Lds).peek()
             args = {
@@ -173,8 +206,18 @@ def build_k3(key: K3Build):
                 "attn_out": attn_out, "last": last,
             }  # fmt: skip
             c = k3_context(
-                key, lds, args, scratch, sym, peers, rank, step_tag(epoch, layer), layout, sym_layout
-            , layer=layer)
+                key,
+                lds,
+                args,
+                scratch,
+                sym,
+                peers,
+                rank,
+                step_tag(epoch, layer),
+                layout,
+                sym_layout,
+                layer=layer,
+            )
             ffn.run_k3(c)
 
     @flyc.jit

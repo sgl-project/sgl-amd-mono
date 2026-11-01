@@ -21,6 +21,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 import sgl_amd_mono
 from sgl_amd_mono.muse_spark import HF_CONFIG
 from sgl_amd_mono.muse_spark import spec as muse
+from sgl_amd_mono.muse_spark import weights as muse_weights
 from sgl_amd_mono.muse_spark.gfx950.config import (
     EXPERTS,
     GATE_TEMPERATURE,
@@ -43,14 +44,15 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     TOP_K,
     WINDOW,
 )
-from sgl_amd_mono.muse_spark import weights as muse_weights
 from sgl_amd_mono.muse_spark.weights import LayerViews, expert_kind, layer_reasons
 
 # Muse Spark's text config (config.json, text_config): 46 sliding + 16 full layers
 LAYERS = HF_CONFIG["num_hidden_layers"]
 TEXT = SimpleNamespace(
     **HF_CONFIG,
-    layer_types=["full_attention" if i % 4 == 1 else "sliding_attention" for i in range(LAYERS)],
+    layer_types=[
+        "full_attention" if i % 4 == 1 else "sliding_attention" for i in range(LAYERS)
+    ],
     mlp_layer_types=["sparse"] * LAYERS,
 )
 OMNI = SimpleNamespace(
@@ -83,9 +85,13 @@ def test_the_plugin_registers_the_architecture():
     # the DFlash2 draft's spec, by its architecture
     from sgl_amd_mono.muse_spark import draft
 
-    found, why = registry.find_spec(backend=sgl_amd_mono.BACKEND, architectures=["DFlash2DraftModel"], isa="gfx950")
+    found, why = registry.find_spec(
+        backend=sgl_amd_mono.BACKEND, architectures=["DFlash2DraftModel"], isa="gfx950"
+    )
     assert found is draft.SPEC, why
-    assert draft.SPEC.tokens_per_request is not None and draft.SPEC.widths("gfx950") == muse.SPEC.widths("gfx950")
+    assert draft.SPEC.tokens_per_request is not None and draft.SPEC.widths(
+        "gfx950"
+    ) == muse.SPEC.widths("gfx950")
 
 
 def test_the_draft_config_is_accepted():
@@ -96,7 +102,12 @@ def test_the_draft_config_is_accepted():
     hf = SimpleNamespace(
         model_type="qwen3",
         architectures=["DFlash2DraftModel"],
-        dflash_config={"block_size": 8, "conv_kernel_size": 2, "conv_group_size": 16, "attention_mode": "gqa"},
+        dflash_config={
+            "block_size": 8,
+            "conv_kernel_size": 2,
+            "conv_group_size": 16,
+            "attention_mode": "gqa",
+        },
         layer_types=["sliding_attention"] * 5,
         **draft.DRAFT_CONFIG,
     )
@@ -127,7 +138,9 @@ def test_the_recipe_is_accepted():
     ids=["draft tokens", "hidden size", "top-k", "q scale", "dense layer"],
 )
 def test_each_unsupported_setting_is_one_reason(cfg, text):
-    assert len(_config_reasons(cfg=cfg, hf_config=_replace(OMNI, text_config=text))) == 1
+    assert (
+        len(_config_reasons(cfg=cfg, hf_config=_replace(OMNI, text_config=text))) == 1
+    )
 
 
 def test_the_recipe_routes_verify_batches_of_one_to_eight():
@@ -141,7 +154,9 @@ def test_the_recipe_routes_verify_batches_of_one_to_eight():
     assert covered_capture_sizes(
         widths=(8, 16, 32, 64), tokens_per_request=8, sizes=[1, 2, 4, 8, 16, 32]
     ) == [1, 2, 4, 8, 16, 32]
-    assert covered_capture_sizes(widths=(8,), tokens_per_request=8, sizes=[1, 2, 4, 8, 16, 32]) == [1, 2, 4, 8, 16, 32]
+    assert covered_capture_sizes(
+        widths=(8,), tokens_per_request=8, sizes=[1, 2, 4, 8, 16, 32]
+    ) == [1, 2, 4, 8, 16, 32]
     # without speculation the same launches serve decode batches of 8 to 64
     assert covered_capture_sizes(
         widths=(8, 16, 32, 64), tokens_per_request=1, sizes=[1, 8, 128]
@@ -211,7 +226,8 @@ def _mxfp4_experts():
 def _bf16_experts():
     E = LOCAL_EXPERTS
     return MuseSpark1xNativeExperts(
-        w13_weight=_meta(E, 2 * INTER, MOE_HIDDEN), w2_weight=_meta(E, MOE_HIDDEN, INTER)
+        w13_weight=_meta(E, 2 * INTER, MOE_HIDDEN),
+        w2_weight=_meta(E, MOE_HIDDEN, INTER),
     )
 
 
@@ -293,25 +309,64 @@ def test_the_checks_accept_every_layer_kind():
         {"self_attn.num_kv_heads": 4},  # TP4
         {"self_attn.use_qk_norm": False},
         {"self_attn.scale_query_by": 1.0},
-        {"self_attn.qkv_proj": SimpleNamespace(weight=_meta(QKVG_ROWS, HIDDEN, dtype=torch.float8_e4m3fn))},
-        {"self_attn.attn": SimpleNamespace(sliding_window_size=4095, k_scale=None, v_scale=None)},
-        {"self_attn.attn": SimpleNamespace(sliding_window_size=WINDOW, k_scale=_meta(2, dtype=torch.float32), v_scale=None)},
+        {
+            "self_attn.qkv_proj": SimpleNamespace(
+                weight=_meta(QKVG_ROWS, HIDDEN, dtype=torch.float8_e4m3fn)
+            )
+        },
+        {
+            "self_attn.attn": SimpleNamespace(
+                sliding_window_size=4095, k_scale=None, v_scale=None
+            )
+        },
+        {
+            "self_attn.attn": SimpleNamespace(
+                sliding_window_size=WINDOW,
+                k_scale=_meta(2, dtype=torch.float32),
+                v_scale=None,
+            )
+        },
         {"post_attn_norm": MuseSpark1xRMSNorm(HIDDEN, POST_EPS)},  # weighted post norm
-        {"post_feedforward_layernorm": SimpleNamespace(weight=_meta(HIDDEN))},  # not a Muse norm
+        {
+            "post_feedforward_layernorm": SimpleNamespace(weight=_meta(HIDDEN))
+        },  # not a Muse norm
         {"post_attention_residual_gate": _Gate(_meta(1))},
         {"mlp.ep_size": 4},
         {"mlp.top_k": 4},
         {"mlp.router_multiplier": 1.0},
-        {"mlp.router": SimpleNamespace(weight=_meta(EXPERTS, HIDDEN, dtype=torch.float32))},  # transposed
+        {
+            "mlp.router": SimpleNamespace(
+                weight=_meta(EXPERTS, HIDDEN, dtype=torch.float32)
+            )
+        },  # transposed
         {"mlp.expert_bias": None},
         {"mlp.pre_expert_proj": None},
         {"mlp.experts": SimpleNamespace(w13_weight=None)},  # NVFP4 (another class)
-        {"mlp.experts": MuseSpark1xMxfp4Experts(**{**vars(_mxfp4_experts()), "w2_weight_scale": None})},
+        {
+            "mlp.experts": MuseSpark1xMxfp4Experts(
+                **{**vars(_mxfp4_experts()), "w2_weight_scale": None}
+            )
+        },
     ],
     ids=[
-        "dense layer", "tp4 heads", "no qk norm", "q scale", "fp8 qkv", "window", "per-head k scale",
-        "weighted post norm", "norm type", "scalar gate", "ep4", "top-k", "router multiplier",
-        "transposed router", "no routing bias", "no pooler", "nvfp4 experts", "no block scales",
+        "dense layer",
+        "tp4 heads",
+        "no qk norm",
+        "q scale",
+        "fp8 qkv",
+        "window",
+        "per-head k scale",
+        "weighted post norm",
+        "norm type",
+        "scalar gate",
+        "ep4",
+        "top-k",
+        "router multiplier",
+        "transposed router",
+        "no routing bias",
+        "no pooler",
+        "nvfp4 experts",
+        "no block scales",
     ],  # fmt: skip
 )
 def test_each_unsupported_layer_is_refused(changes):
@@ -326,8 +381,13 @@ def test_the_views_read_in_place_and_log_the_copies():
     assert v.kind == "mxfp4" and v.is_swa and v.use_rope
     assert v.w_qkvg.data_ptr() == layer.self_attn.qkv_proj.weight.data_ptr()
     assert tuple(v.gate_hi.shape) == tuple(v.gate_lo.shape) == (EXPERTS, HIDDEN)
-    assert tuple(v.alpha.shape) == tuple(v.beta2.shape) == (HIDDEN,) and v.alpha.dtype == torch.float32
-    assert v.pre_w.dtype == v.npw.dtype == torch.bfloat16 and v.pen_w.numel() == MOE_HIDDEN
+    assert (
+        tuple(v.alpha.shape) == tuple(v.beta2.shape) == (HIDDEN,)
+        and v.alpha.dtype == torch.float32
+    )
+    assert (
+        v.pre_w.dtype == v.npw.dtype == torch.bfloat16 and v.pen_w.numel() == MOE_HIDDEN
+    )
     # no packed router and no cached norms on this layer: the split and the effective weights are copies
     kinds = {k[0] for k in copies}
     from sgl_amd_mono.muse_spark import weights as W
@@ -348,9 +408,17 @@ def test_the_views_read_in_place_and_log_the_copies():
     with mock.patch.object(muse_weights, "QUANT_BF16", True):
         q = LayerViews.build(bf16, 0, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), copies)
     assert q.quantized and q.kind == "mxfp4"
-    assert tuple(q.w13.shape) == (LOCAL_EXPERTS, 2 * INTER, MOE_HIDDEN // 2) and q.w13.dtype == torch.uint8
-    assert tuple(q.s2.shape) == (LOCAL_EXPERTS, MOE_HIDDEN, INTER // 32) and q.s2.dtype == torch.uint8
-    assert {k[0] for k in copies} >= {"online MXFP4 experts"} and all(torch.is_tensor(v) for v in copies.values())
+    assert (
+        tuple(q.w13.shape) == (LOCAL_EXPERTS, 2 * INTER, MOE_HIDDEN // 2)
+        and q.w13.dtype == torch.uint8
+    )
+    assert (
+        tuple(q.s2.shape) == (LOCAL_EXPERTS, MOE_HIDDEN, INTER // 32)
+        and q.s2.dtype == torch.uint8
+    )
+    assert {k[0] for k in copies} >= {"online MXFP4 experts"} and all(
+        torch.is_tensor(v) for v in copies.values()
+    )
     with mock.patch.object(muse_weights, "QUANT_BF16", False):
         plain = LayerViews.build(bf16, 0, MuseSpark1xRMSNorm(HIDDEN, RMS_EPS), {})
     assert plain.kind == "bf16" and plain.w13 is None and not plain.quantized

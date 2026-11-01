@@ -63,7 +63,12 @@ DRAFT_CONFIG = dict(
     sliding_window=2048,
     rms_norm_eps=1e-5,
 )
-DFLASH_CONFIG = dict(block_size=DRAFT_TOKENS, conv_kernel_size=2, conv_group_size=16, attention_mode="gqa")
+DFLASH_CONFIG = dict(
+    block_size=DRAFT_TOKENS,
+    conv_kernel_size=2,
+    conv_group_size=16,
+    attention_mode="gqa",
+)
 
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
@@ -96,13 +101,21 @@ SGLANG_READS = {
         "gate_up_proj",
         "down_proj",
     ),
-    "srt/layers/logits_processor.py": ("LogitsProcessorOutput", "next_token_logits", "hidden_states"),
+    "srt/layers/logits_processor.py": (
+        "LogitsProcessorOutput",
+        "next_token_logits",
+        "hidden_states",
+    ),
     "srt/runtime_context.py": ("get_parallel", "get_spec"),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "srt/layers/attention/triton_backend.py": ("token_to_kv_pool", "req_to_token_pool"),
     "srt/mem_cache/memory_pool.py": ("get_kv_buffer", "req_to_token"),
     "srt/layers/radix_attention.py": ("layer_id", "scaling", "k_scale", "v_scale"),
-    "srt/model_executor/forward_batch_info.py": ("out_cache_loc", "req_pool_indices", "seq_lens"),
+    "srt/model_executor/forward_batch_info.py": (
+        "out_cache_loc",
+        "req_pool_indices",
+        "seq_lens",
+    ),
 }
 
 # on by default; SGLANG_AMD_MONO_DRAFT_KERNELS=0 keeps the draft on SGLang's modules (stage 0)
@@ -156,10 +169,21 @@ def _attn_view_reasons(i: int, views: dict) -> list[str]:
     reasons = []
     for name, want in shapes.items():
         t = views[name]
-        if not isinstance(t, torch.Tensor) or t.dtype != torch.bfloat16 or not t.is_contiguous() or tuple(t.shape) != want:
+        if (
+            not isinstance(t, torch.Tensor)
+            or t.dtype != torch.bfloat16
+            or not t.is_contiguous()
+            or tuple(t.shape) != want
+        ):
             reasons.append(f"draft layer {i} {name}: {getattr(t, 'dtype', None)} {tuple(getattr(t, 'shape', ()))}, want contiguous bf16 {want}")  # fmt: skip
     cs = views["cos_sin"]
-    if not isinstance(cs, torch.Tensor) or cs.dtype != torch.float32 or not cs.is_contiguous() or cs.dim() != 2 or cs.shape[1] != DH.HEAD_DIM:
+    if (
+        not isinstance(cs, torch.Tensor)
+        or cs.dtype != torch.float32
+        or not cs.is_contiguous()
+        or cs.dim() != 2
+        or cs.shape[1] != DH.HEAD_DIM
+    ):
         reasons.append(f"draft layer {i} rotary table: {getattr(cs, 'dtype', None)} {tuple(getattr(cs, 'shape', ()))}, D-pre reads fp32 [*, {DH.HEAD_DIM}]")  # fmt: skip
     return reasons
 
@@ -172,7 +196,12 @@ def _mlp_view_reasons(i: int, views: dict) -> list[str]:
     }  # fmt: skip
     reasons = []
     for name, t in views.items():
-        if not isinstance(t, torch.Tensor) or t.dtype != torch.bfloat16 or not t.is_contiguous() or tuple(t.shape) != shapes[name]:
+        if (
+            not isinstance(t, torch.Tensor)
+            or t.dtype != torch.bfloat16
+            or not t.is_contiguous()
+            or tuple(t.shape) != shapes[name]
+        ):
             reasons.append(f"draft layer {i} {name}: {getattr(t, 'dtype', None)} {tuple(getattr(t, 'shape', ()))}, want contiguous bf16 {shapes[name]}")  # fmt: skip
     return reasons
 
@@ -194,9 +223,13 @@ class DraftRunner:
         self.rank, self.npes, self.device = rank, npes, torch.device(device)
         dev = self.device
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
-        self.scratch = torch.zeros(scratch_bytes(D.dm_scratch_layout()), dtype=torch.uint8, device=dev)
+        self.scratch = torch.zeros(
+            scratch_bytes(D.dm_scratch_layout()), dtype=torch.uint8, device=dev
+        )
         # the peer handshake is collective: every rank gets here (attach agreed first)
-        self.peers = PeerBuffer(D.dm_sym_bytes(npes) + guard.FLAG_BYTES, cpu_group, rank, npes, dev)
+        self.peers = PeerBuffer(
+            D.dm_sym_bytes(npes) + guard.FLAG_BYTES, cpu_group, rank, npes, dev
+        )
         self.peers.bytes.zero_()
         self.res_out = torch.empty(MAX_TOKENS, D.H, dtype=torch.bfloat16, device=dev)
         self.out = torch.empty(MAX_TOKENS, D.H, dtype=torch.bfloat16, device=dev)
@@ -207,16 +240,28 @@ class DraftRunner:
             from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
 
             self.aviews = [_attn_views(layer) for layer in layers]
-            self.scratch_pre = torch.zeros(scratch_bytes(DH.dp_scratch_layout()), dtype=torch.uint8, device=dev)
+            self.scratch_pre = torch.zeros(
+                scratch_bytes(DH.dp_scratch_layout()), dtype=torch.uint8, device=dev
+            )
             self.scratch_attn = torch.zeros(scratch_bytes(DA.dattn_scratch_layout(MAX_TOKENS, DRAFT_TOKENS)), dtype=torch.uint8, device=dev)  # fmt: skip
-            self.scratch_post = torch.zeros(scratch_bytes(DH.do_scratch_layout()), dtype=torch.uint8, device=dev)
-            self.peers_post = PeerBuffer(DH.do_sym_bytes(npes) + guard.FLAG_BYTES, cpu_group, rank, npes, dev)
+            self.scratch_post = torch.zeros(
+                scratch_bytes(DH.do_scratch_layout()), dtype=torch.uint8, device=dev
+            )
+            self.peers_post = PeerBuffer(
+                DH.do_sym_bytes(npes) + guard.FLAG_BYTES, cpu_group, rank, npes, dev
+            )
             self.peers_post.bytes.zero_()
             self.q = torch.empty(MAX_TOKENS, DH.Q_K, dtype=torch.bfloat16, device=dev)
             self.o = torch.empty(MAX_TOKENS, DH.Q_K, dtype=torch.bfloat16, device=dev)
-            self.coef = torch.empty(MAX_TOKENS, D.COEF_ROWS, dtype=torch.float32, device=dev)
-            self.attn_out = torch.empty(MAX_TOKENS, D.H, dtype=torch.bfloat16, device=dev)
-            self.res_pre = torch.empty(MAX_TOKENS, D.H, dtype=torch.bfloat16, device=dev)
+            self.coef = torch.empty(
+                MAX_TOKENS, D.COEF_ROWS, dtype=torch.float32, device=dev
+            )
+            self.attn_out = torch.empty(
+                MAX_TOKENS, D.H, dtype=torch.bfloat16, device=dev
+            )
+            self.res_pre = torch.empty(
+                MAX_TOKENS, D.H, dtype=torch.bfloat16, device=dev
+            )
             self._pre: dict = {}
             self._attn: dict = {}
             self._post: dict = {}
@@ -243,8 +288,12 @@ class DraftRunner:
 
         if rows not in self._pre:
             self._pre[rows] = DH.build_dpre(DH.DPreBuild(tokens=rows))
-            self._attn[rows] = DA.build_dattn(DA.DAttnBuild(tokens=rows, q_len=DRAFT_TOKENS))
-            self._post[rows] = DH.build_dpost(DH.DPostBuild(tokens=rows, npes=self.npes))
+            self._attn[rows] = DA.build_dattn(
+                DA.DAttnBuild(tokens=rows, q_len=DRAFT_TOKENS)
+            )
+            self._post[rows] = DH.build_dpost(
+                DH.DPostBuild(tokens=rows, npes=self.npes)
+            )
         return self._pre[rows], self._attn[rows], self._post[rows]
 
     def precompile(self, rows: int) -> None:
@@ -274,13 +323,28 @@ class DraftRunner:
                     raise RuntimeError(f"Muse Spark draft layer {i} {what} cache: {t.dtype} {tuple(t.shape)}, the kernels take contiguous fp8 [*, {DA.LOCAL_KV_HEADS}, {DA.HEAD_DIM}]")  # fmt: skip
             a = layer.self_attn.attn
             if a.k_scale is not None or a.v_scale is not None:
-                raise RuntimeError(f"Muse Spark draft layer {i}: a K / V cache scale; the kernels write fp8 at unit scale")
+                raise RuntimeError(
+                    f"Muse Spark draft layer {i}: a K / V cache scale; the kernels write fp8 at unit scale"
+                )
         table = backend.req_to_token_pool.req_to_token
         if table.dtype != torch.int32 or table.dim() != 2 or not table.is_contiguous():
-            raise RuntimeError(f"Muse Spark draft: page table {table.dtype} {tuple(table.shape)}, the kernels take a contiguous int32 [pool, ctx]")
+            raise RuntimeError(
+                f"Muse Spark draft: page table {table.dtype} {tuple(table.shape)}, the kernels take a contiguous int32 [pool, ctx]"
+            )
         self._cache_checked = True
 
-    def launch_attn(self, i: int, rows: int, hidden, residual, first: bool, positions, forward_batch, stream, trace: bool = False):
+    def launch_attn(
+        self,
+        i: int,
+        rows: int,
+        hidden,
+        residual,
+        first: bool,
+        positions,
+        forward_batch,
+        stream,
+        trace: bool = False,
+    ):
         """Layer ``i``'s attention half on ``rows`` rows (D-pre, D-attn, D-post): (attn_out,
         the residual after the input norm's fused add), bf16. ``trace`` (check mode):
         every launch synchronized and logged, so a hang names its launch."""
@@ -301,10 +365,20 @@ class DraftRunner:
         table = backend.req_to_token_pool.req_to_token
         rpi = forward_batch.req_pool_indices
         lens = forward_batch.seq_lens
-        if slots.numel() < rows or positions.numel() < rows or lens.numel() * DRAFT_TOKENS < rows:
+        if (
+            slots.numel() < rows
+            or positions.numel() < rows
+            or lens.numel() * DRAFT_TOKENS < rows
+        ):
             raise RuntimeError(f"Muse Spark draft: slots {tuple(slots.shape)} positions {tuple(positions.shape)} seq_lens {tuple(lens.shape)} for {rows} rows")  # fmt: skip
         pre, dattn, post = self.attn_kernels(rows)
-        res_pre, q, o, coef, attn_out = self.res_pre[:rows], self.q[:rows], self.o[:rows], self.coef[:rows], self.attn_out[:rows]
+        res_pre, q, o, coef, attn_out = (
+            self.res_pre[:rows],
+            self.q[:rows],
+            self.o[:rows],
+            self.coef[:rows],
+            self.attn_out[:rows],
+        )
         pre(
             _ptr(hidden), _ptr(residual), int(first), _ptr(v["w_in"]), _ptr(v["w_kpa"]), _ptr(v["base_a"]), _ptr(v["w_qkv"]),
             _ptr(v["q_norm"]), _ptr(v["k_norm"]), _ptr(v["cos_sin"]), _ptr(positions), int(positions.dtype == torch.int64),
@@ -328,7 +402,9 @@ class DraftRunner:
         mark("D-post")
         return attn_out, res_pre
 
-    def launch(self, i: int, rows: int, attn_out: torch.Tensor, residual: torch.Tensor, stream):
+    def launch(
+        self, i: int, rows: int, attn_out: torch.Tensor, residual: torch.Tensor, stream
+    ):
         """Layer ``i``'s MLP half on ``rows`` rows: (out, the updated residual), bf16."""
         from sgl_amd_mono.muse_spark.gfx950.runner import _ptr
 
@@ -363,7 +439,9 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
             reasons.append(f"draft dflash_config.{k} {got}: the kernels take {want}")
     types = getattr(hf_config, "layer_types", None)
     if types is not None and any(t != "sliding_attention" for t in types):
-        reasons.append(f"draft layer_types {types}: the kernels take sliding layers only")
+        reasons.append(
+            f"draft layer_types {types}: the kernels take sliding layers only"
+        )
     return reasons
 
 
@@ -383,9 +461,13 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         from sglang.srt.runtime_context import get_spec
 
         if get_spec().speculative_draft_window_size is None:
-            reasons.append("draft stage 2 takes the compact (windowed) draft cache: set --speculative-draft-window-size")
+            reasons.append(
+                "draft stage 2 takes the compact (windowed) draft cache: set --speculative-draft-window-size"
+            )
     if int(model.block_size) != DRAFT_TOKENS:
-        reasons.append(f"draft block {model.block_size}: the kernels take {DRAFT_TOKENS}")
+        reasons.append(
+            f"draft block {model.block_size}: the kernels take {DRAFT_TOKENS}"
+        )
     if getattr(model, "candidate_selector", None) is None:
         reasons.append("the draft has no candidate selector (not a DFlash2 draft)")
     if len(model.layers) != DRAFT_CONFIG["num_hidden_layers"]:
@@ -395,7 +477,9 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             reasons.append(f"draft layer {i}: no grouped convolutions")
         a = layer.self_attn
         if a.num_heads * TP != DRAFT_CONFIG["num_attention_heads"] or a.num_kv_heads * TP != DRAFT_CONFIG["num_key_value_heads"]:  # fmt: skip
-            reasons.append(f"draft layer {i}: heads {a.num_heads} / {a.num_kv_heads} a rank")
+            reasons.append(
+                f"draft layer {i}: heads {a.num_heads} / {a.num_kv_heads} a rank"
+            )
         if a.v_scale is not None or a.attention_sink_bias is not None:
             reasons.append(f"draft layer {i}: a V scale or attention sinks")
     return reasons
@@ -409,10 +493,26 @@ class _Draft:
         self.model, self.original, self.runner = model, original, runner
         self.check = os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1"
 
-    def forward(self, plan, input_ids, positions, forward_batch, input_embeds=None, *args, **kwargs):
+    def forward(
+        self,
+        plan,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        *args,
+        **kwargs,
+    ):
         """``DFlash2DraftModel.forward`` for a routed draft step."""
         if self.runner is None:
-            return self.original(input_ids, positions, forward_batch, input_embeds=input_embeds, *args, **kwargs)
+            return self.original(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds=input_embeds,
+                *args,
+                **kwargs,
+            )
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         m = self.model
@@ -422,7 +522,9 @@ class _Draft:
         rows = int(plan.key.rows)
         hidden, residual = input_embeds, None
         if SKIP_LAYERS:
-            return LogitsProcessorOutput(next_token_logits=None, hidden_states=m.norm(hidden))
+            return LogitsProcessorOutput(
+                next_token_logits=None, hidden_states=m.norm(hidden)
+            )
         stream = torch.cuda.current_stream()
         check = self.check and not torch.cuda.is_current_stream_capturing()
         for i, layer in enumerate(m.layers):
@@ -430,7 +532,15 @@ class _Draft:
                 first = residual is None
                 h_in, r_in = hidden, (hidden if first else residual)
                 attn_out, residual = self.runner.launch_attn(
-                    i, rows, h_in.contiguous(), r_in.contiguous(), first, positions, forward_batch, stream, trace=check
+                    i,
+                    rows,
+                    h_in.contiguous(),
+                    r_in.contiguous(),
+                    first,
+                    positions,
+                    forward_batch,
+                    stream,
+                    trace=check,
                 )
                 if check:
                     _log_check_pair(i, "attn", (attn_out, residual), self._attention_reference(layer, h_in, None if first else r_in, positions, forward_batch))  # fmt: skip
@@ -442,10 +552,16 @@ class _Draft:
                 else:
                     hidden, residual = layer.input_layernorm(hidden, residual)
                 hidden, kernel = layer.attention_conv.prepare(hidden)
-                attn_out = layer.self_attn(positions=positions, hidden_states=hidden, forward_batch=forward_batch)
+                attn_out = layer.self_attn(
+                    positions=positions,
+                    hidden_states=hidden,
+                    forward_batch=forward_batch,
+                )
                 attn_out = layer.attention_conv.finish(attn_out, kernel)
             ref = self._reference(layer, attn_out, residual) if check else None
-            hidden, residual = self.runner.launch(i, rows, attn_out.contiguous(), residual.contiguous(), stream)
+            hidden, residual = self.runner.launch(
+                i, rows, attn_out.contiguous(), residual.contiguous(), stream
+            )
             if ref is not None:
                 _log_check(i, (hidden, residual), ref)
         self.runner.end_step()
@@ -463,7 +579,9 @@ class _Draft:
         else:
             h, res = layer.input_layernorm(h, residual.clone())
         h, kernel = layer.attention_conv.prepare(h)
-        ao = layer.self_attn(positions=positions, hidden_states=h, forward_batch=forward_batch)
+        ao = layer.self_attn(
+            positions=positions, hidden_states=h, forward_batch=forward_batch
+        )
         return layer.attention_conv.finish(ao, kernel), res
 
     @staticmethod
@@ -499,7 +617,13 @@ def _shard_fc(model) -> bool:
     that does not match (another TP size or shape) runs the model's own."""
     fc = getattr(model, "fc", None)
     w = getattr(fc, "weight", None)
-    if w is None or w.dtype != torch.bfloat16 or w.dim() != 2 or w.shape[0] % TP or getattr(fc, "bias", None) is not None:
+    if (
+        w is None
+        or w.dtype != torch.bfloat16
+        or w.dim() != 2
+        or w.shape[0] % TP
+        or getattr(fc, "bias", None) is not None
+    ):
         return False
     original = model.project_target_hidden
 
@@ -507,10 +631,16 @@ def _shard_fc(model) -> bool:
         from sglang.srt.runtime_context import get_parallel
 
         p = get_parallel()
-        if p.tp_size != TP or target_hidden.ndim != 2 or target_hidden.shape[-1] != w.shape[1]:
+        if (
+            p.tp_size != TP
+            or target_hidden.ndim != 2
+            or target_hidden.shape[-1] != w.shape[1]
+        ):
             return original(target_hidden)
         n = w.shape[0] // TP
-        part = torch.nn.functional.linear(target_hidden.to(w.dtype), w.narrow(0, p.tp_rank * n, n))
+        part = torch.nn.functional.linear(
+            target_hidden.to(w.dtype), w.narrow(0, p.tp_rank * n, n)
+        )
         return model.hidden_norm(p.tp_group.all_gather(part, dim=-1))
 
     model.project_target_hidden = project_target_hidden
@@ -520,12 +650,20 @@ def _shard_fc(model) -> bool:
 def _build(model, hf_config, ctx) -> _Draft:
     original = type(model).forward.__get__(model, type(model))
     if not USE_KERNELS:
-        logger.info("monokernel: muse_spark DFlash2 draft attached at stage 0 (the model's own forward)")
+        logger.info(
+            "monokernel: muse_spark DFlash2 draft attached at stage 0 (the model's own forward)"
+        )
         return _Draft(model, original)
     from sglang.srt.runtime_context import get_parallel
 
     p = get_parallel()
-    runner = DraftRunner(list(model.layers), p.tp_rank, p.tp_size, p.tp_group.cpu_group, model.norm.weight.device)
+    runner = DraftRunner(
+        list(model.layers),
+        p.tp_rank,
+        p.tp_size,
+        p.tp_group.cpu_group,
+        model.norm.weight.device,
+    )
     runner.set_deadline(ctx.deadline_s)
     widths = list(ctx.widths)
     start = len(widths) * p.tp_rank // max(p.tp_size, 1)
@@ -539,10 +677,14 @@ def _build(model, hf_config, ctx) -> _Draft:
 
 SPEC = MonoSpec(
     name="muse_spark_dflash2_draft_hip",
-    devices={"gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS)},
+    devices={
+        "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS)
+    },
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     # the launcher checks the target's requirements; the draft's attention backend is its own
-    requires=Requirements(attention_backends=frozenset({"triton"}), hf_config={"model_type": "qwen3"}),
+    requires=Requirements(
+        attention_backends=frozenset({"triton"}), hf_config={"model_type": "qwen3"}
+    ),
     numerics=target.NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,

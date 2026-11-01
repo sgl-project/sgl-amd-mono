@@ -57,7 +57,9 @@ def _fp4_weight(experts, rows, k, device, gen):
     mag = E2M1.to(device)[(codes & 7).long()]
     val = torch.where(codes & 8 != 0, -mag, mag)
     scale = torch.ldexp(torch.ones(1, device=device), scales.to(torch.int32) - 127)
-    dec = (val.reshape(experts, rows, k // 32, 32) * scale[..., None]).reshape(experts, rows, k)
+    dec = (val.reshape(experts, rows, k // 32, 32) * scale[..., None]).reshape(
+        experts, rows, k
+    )
     return packed, scales, dec.to(torch.bfloat16)
 
 
@@ -75,7 +77,9 @@ def _mx_dequant(x):
     ab = a.view(torch.int32)
     den = ((a + 4194304.0).view(torch.int32) - (149 << 23)) & 0xFF
     nrm = ((ab + ((-126 << 23) + 0x1FFFFF) + ((ab >> 22) & 1)) >> 22) & 0xFF
-    code = torch.where(a >= 6.0, torch.full_like(den, 7), torch.where(a < 1.0, den, nrm))
+    code = torch.where(
+        a >= 6.0, torch.full_like(den, 7), torch.where(a < 1.0, den, nrm)
+    )
     mag = E2M1.to(x.device)[code.long()]
     val = torch.where(qx < 0, -mag, mag)
     return (val * torch.ldexp(torch.ones_like(amax), unb)).reshape(shape)
@@ -113,7 +117,9 @@ def _reference(xin, ids, scores, local_start, dec13, dec2, w, stream, last):
     part = _bf(out)
     branch = _bf(part @ w["w_unpool"].float().T)
     post_input = _bf(branch * w["pfw"].float())
-    nb = _bf(post_input * torch.rsqrt(post_input.pow(2).mean(-1, keepdim=True) + POST_EPS))
+    nb = _bf(
+        post_input * torch.rsqrt(post_input.pow(2).mean(-1, keepdim=True) + POST_EPS)
+    )
     new = w["alpha"] * stream + w["beta"] * nb
     pre = _bf(new) if last else new
     attn_in = (pre * torch.rsqrt(pre.pow(2).mean(-1, keepdim=True) + RMS_EPS) * w["npw"].float()).to(torch.bfloat16)  # fmt: skip
@@ -125,7 +131,9 @@ def _close(got, ref, rtol, atol, what):
     bad = ((got - ref).abs() > rtol * ref.abs() + atol).float().mean().item()
     assert bad == 0.0, f"{what}: {bad:.2%} of the elements off by more than {rtol} relative + {atol}"  # fmt: skip
     cos = torch.nn.functional.cosine_similarity(got, ref, dim=-1)
-    assert cos.min().item() >= 0.996, f"{what}: a row's cosine is {cos.min().item():.4f}"
+    assert cos.min().item() >= 0.996, (
+        f"{what}: a row's cosine is {cos.min().item():.4f}"
+    )
 
 
 def _picks(rows, device, gen):
@@ -136,7 +144,10 @@ def _picks(rows, device, gen):
 
     ids = torch.empty(rows, TOP_K, dtype=torch.int64, device=device)
     for t in range(rows):
-        others = torch.randperm(EXPERT_ROWS + 7, device=device, generator=gen)[: TOP_K - 1] + 1
+        others = (
+            torch.randperm(EXPERT_ROWS + 7, device=device, generator=gen)[: TOP_K - 1]
+            + 1
+        )
         ids[t, 0] = 0
         ids[t, 1:] = others
     ids[0, 1] = LOCAL_EXPERTS + 3  # past the rank's table
@@ -146,7 +157,16 @@ def _picks(rows, device, gen):
 
 
 @pytest.mark.parametrize(
-    "rows,last,fp8", [(8, False, False), (16, True, False), (32, False, False), (64, False, False), (64, True, False), (8, False, True), (64, True, True)]
+    "rows,last,fp8",
+    [
+        (8, False, False),
+        (16, True, False),
+        (32, False, False),
+        (64, False, False),
+        (64, True, False),
+        (8, False, True),
+        (64, True, True),
+    ],
 )
 def test_k3_matches_the_compact_a4_math(rows, last, fp8):
     from sgl_amd_mono.common import guard
@@ -160,7 +180,10 @@ def test_k3_matches_the_compact_a4_math(rows, last, fp8):
         TOP_K,
     )
     from sgl_amd_mono.muse_spark.gfx950.layout import scratch_bytes
-    from sgl_amd_mono.muse_spark.gfx950.stages.ffn import k3_scratch_layout, k3_sym_layout
+    from sgl_amd_mono.muse_spark.gfx950.stages.ffn import (
+        k3_scratch_layout,
+        k3_sym_layout,
+    )
 
     dev = torch.device("cuda")
     gen = torch.Generator(device=dev).manual_seed(300 + rows)
@@ -181,19 +204,29 @@ def test_k3_matches_the_compact_a4_math(rows, last, fp8):
         "w_unpool": (torch.randn(HIDDEN, MOE_HIDDEN, device=dev) * 0.02).to(bf),
     }
     unpool_ptr = w["w_unpool"].data_ptr()
-    if fp8:  # the kernel streams the packed codes + row scales; the reference their values
+    if (
+        fp8
+    ):  # the kernel streams the packed codes + row scales; the reference their values
         from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows, unpack_fp8_rows
 
         packed = pack_fp8_rows(w["w_unpool"])
         w["w_unpool"] = unpack_fp8_rows(packed, HIDDEN, MOE_HIDDEN)
         unpool_ptr = packed.data_ptr()
     attn_out = torch.full((MAX_TOKENS, HIDDEN), float("nan"), device=dev, dtype=bf)
-    scratch = torch.zeros(scratch_bytes(k3_scratch_layout()), dtype=torch.uint8, device=dev)
-    peers = PeerBuffer(scratch_bytes(k3_sym_layout(1)) + guard.FLAG_BYTES, None, 0, 1, dev)
+    scratch = torch.zeros(
+        scratch_bytes(k3_scratch_layout()), dtype=torch.uint8, device=dev
+    )
+    peers = PeerBuffer(
+        scratch_bytes(k3_sym_layout(1)) + guard.FLAG_BYTES, None, 0, 1, dev
+    )
     peers.bytes.zero_()
     epoch = _epoch(dev)
-    launch = build_k3(K3Build(tokens=rows, npes=1, fp8_unpool=fp8))  # the rule from the launch's ``last``
-    new_ref, attn_ref = _reference(xin, ids, scores, LOCAL_START, dec13, dec2, w, stream, last)
+    launch = build_k3(
+        K3Build(tokens=rows, npes=1, fp8_unpool=fp8)
+    )  # the rule from the launch's ``last``
+    new_ref, attn_ref = _reference(
+        xin, ids, scores, LOCAL_START, dec13, dec2, w, stream, last
+    )
     got = stream.clone()
     try:
         for step in range(2):  # the second step's tags differ from the first's
@@ -209,7 +242,9 @@ def test_k3_matches_the_compact_a4_math(rows, last, fp8):
             )  # fmt: skip
             epoch[0] += 1
         torch.cuda.synchronize()
-        assert (epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1] == 0).all(), "a wait failed"
+        assert (epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1] == 0).all(), (
+            "a wait failed"
+        )
         _close(got, new_ref, 1 / 32, 2e-2, "stream")
         _close(attn_out[:rows], attn_ref, 1 / 32, 2e-2, "attention input")
         assert attn_out[rows:].isnan().all(), "rows past the step were written"
@@ -225,9 +260,18 @@ def test_k3_tpx_matches_the_compact_a4_math(rows, last):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.muse_spark.gfx950.build_k3 import K3Build, build_k3
-    from sgl_amd_mono.muse_spark.gfx950.config import HIDDEN, INTER, MAX_TOKENS, MOE_HIDDEN, TOP_K
+    from sgl_amd_mono.muse_spark.gfx950.config import (
+        HIDDEN,
+        INTER,
+        MAX_TOKENS,
+        MOE_HIDDEN,
+        TOP_K,
+    )
     from sgl_amd_mono.muse_spark.gfx950.layout import scratch_bytes
-    from sgl_amd_mono.muse_spark.gfx950.stages.ffn import k3_scratch_layout, k3_sym_layout
+    from sgl_amd_mono.muse_spark.gfx950.stages.ffn import (
+        k3_scratch_layout,
+        k3_sym_layout,
+    )
 
     dev = torch.device("cuda")
     gen = torch.Generator(device=dev).manual_seed(700 + rows)
@@ -240,7 +284,9 @@ def test_k3_tpx_matches_the_compact_a4_math(rows, last):
     ids = torch.empty(rows, TOP_K, dtype=torch.int32, device=dev)
     for t in range(rows):
         ids[t, 0] = 0
-        ids[t, 1:] = (torch.randperm(EXPERT_ROWS - 1, device=dev, generator=gen)[: TOP_K - 1] + 1).to(torch.int32)
+        ids[t, 1:] = (
+            torch.randperm(EXPERT_ROWS - 1, device=dev, generator=gen)[: TOP_K - 1] + 1
+        ).to(torch.int32)
     scores = torch.rand(rows, TOP_K, device=dev) * 0.3
     stream = torch.randn(rows, HIDDEN, device=dev)
     w = {
@@ -252,8 +298,12 @@ def test_k3_tpx_matches_the_compact_a4_math(rows, last):
         "w_unpool": (torch.randn(HIDDEN, MOE_HIDDEN, device=dev) * 0.02).to(bf),
     }
     attn_out = torch.full((MAX_TOKENS, HIDDEN), float("nan"), device=dev, dtype=bf)
-    scratch = torch.zeros(scratch_bytes(k3_scratch_layout()), dtype=torch.uint8, device=dev)
-    peers = PeerBuffer(scratch_bytes(k3_sym_layout(1)) + guard.FLAG_BYTES, None, 0, 1, dev)
+    scratch = torch.zeros(
+        scratch_bytes(k3_scratch_layout()), dtype=torch.uint8, device=dev
+    )
+    peers = PeerBuffer(
+        scratch_bytes(k3_sym_layout(1)) + guard.FLAG_BYTES, None, 0, 1, dev
+    )
     peers.bytes.zero_()
     epoch = _epoch(dev)
     launch = build_k3(K3Build(tokens=rows, npes=1, tpx=True))
@@ -273,7 +323,9 @@ def test_k3_tpx_matches_the_compact_a4_math(rows, last):
             )  # fmt: skip
             epoch[0] += 1
         torch.cuda.synchronize()
-        assert (epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1] == 0).all(), "a wait failed"
+        assert (epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1] == 0).all(), (
+            "a wait failed"
+        )
         _close(got, new_ref, 1 / 32, 2e-2, "stream")
         _close(attn_out[:rows], attn_ref, 1 / 32, 2e-2, "attention input")
         assert attn_out[rows:].isnan().all(), "rows past the step were written"

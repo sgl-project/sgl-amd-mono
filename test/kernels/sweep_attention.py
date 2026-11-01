@@ -8,7 +8,15 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_muse_spark_layer import LAYER, LENS, Buffers, Layer, _attn_args, _epoch, _time_graph  # noqa: E402
+from test_muse_spark_layer import (  # noqa: E402
+    LAYER,
+    LENS,
+    Buffers,
+    Layer,
+    _attn_args,
+    _epoch,
+    _time_graph,
+)
 
 CASES = (
     (8, 0, [300000]),
@@ -44,7 +52,9 @@ def main():
                 ka(*_attn_args(L, B), epoch.data_ptr(), LAYER, stream=cur())
                 epoch[0] += 1
 
-            print(f"attn S={S:2d} window={window:4d} lens={lens}: graph {_time_graph(fn) * 1000:7.1f} us")
+            print(
+                f"attn S={S:2d} window={window:4d} lens={lens}: graph {_time_graph(fn) * 1000:7.1f} us"
+            )
         finally:
             B.close()
 

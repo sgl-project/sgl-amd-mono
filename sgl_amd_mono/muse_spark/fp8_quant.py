@@ -10,7 +10,9 @@ import torch
 FP8_MAX = 448.0  # E4M3's largest finite value
 
 
-def quantize_fp8_rows(w: torch.Tensor, chunk: int = 1024) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_fp8_rows(
+    w: torch.Tensor, chunk: int = 1024
+) -> tuple[torch.Tensor, torch.Tensor]:
     """``w`` [N, K] (bf16 or fp32) -> (codes float8_e4m3fn [N, K], scales fp32 [N]):
     row r's codes are ``w[r] / scales[r]`` rounded to E4M3, ``scales[r]`` = the row's
     largest magnitude / 448 (a zero row keeps scale 1). ``chunk`` rows at a time."""
@@ -22,7 +24,9 @@ def quantize_fp8_rows(w: torch.Tensor, chunk: int = 1024) -> tuple[torch.Tensor,
         x = w[r0 : r0 + chunk].float()
         amax = x.abs().amax(dim=1)
         sc = torch.where(amax > 0, amax / FP8_MAX, torch.ones_like(amax))
-        codes[r0 : r0 + chunk] = (x / sc[:, None]).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+        codes[r0 : r0 + chunk] = (
+            (x / sc[:, None]).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+        )
         scales[r0 : r0 + chunk] = sc
     return codes, scales
 
@@ -53,8 +57,12 @@ def pack_fp8_rows_pooler(w: torch.Tensor) -> torch.Tensor:
     codes, scales = quantize_fp8_rows(w)
     N, K = codes.shape
     assert K % 128 == 0, K
-    c8 = codes.view(torch.uint8).reshape(N, K // 128, 2, 2, 4, 8)  # [n][block][kc / 2][kc % 2][g4][j]
-    c8 = c8.permute(0, 1, 2, 4, 3, 5).contiguous().reshape(N, K)  # -> [n][block][kc / 2][g4][kc % 2][j]
+    c8 = codes.view(torch.uint8).reshape(
+        N, K // 128, 2, 2, 4, 8
+    )  # [n][block][kc / 2][kc % 2][g4][j]
+    c8 = (
+        c8.permute(0, 1, 2, 4, 3, 5).contiguous().reshape(N, K)
+    )  # -> [n][block][kc / 2][g4][kc % 2][j]
     out = torch.empty(N * K + 4 * N, dtype=torch.uint8, device=w.device)
     out[: N * K] = c8.reshape(-1)
     out[N * K :] = scales.view(torch.uint8)

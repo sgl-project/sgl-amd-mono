@@ -10,16 +10,54 @@ import torch
 
 BLOCKS, SLOTS, TRACE_LAYERS = 256, 16, 64
 STAMPS = {
-    "attn": ["entry", "tasks done", "merge done", "loop begins", "first chunk", "loop done"],
-    "k2": ["entry", "og", "o done", "a_part", "x arrived", "passes", "pooled", "end", "ar polled", "ss polled"],
-    "k3": ["entry", "flags", "plan", "ug done", "dn done", "fin done", "unpool done", "end", "unp flags", "unp dma", "unp mfma", "unp pushed", "dn mids", "fin polled"],
+    "attn": [
+        "entry",
+        "tasks done",
+        "merge done",
+        "loop begins",
+        "first chunk",
+        "loop done",
+    ],
+    "k2": [
+        "entry",
+        "og",
+        "o done",
+        "a_part",
+        "x arrived",
+        "passes",
+        "pooled",
+        "end",
+        "ar polled",
+        "ss polled",
+    ],
+    "k3": [
+        "entry",
+        "flags",
+        "plan",
+        "ug done",
+        "dn done",
+        "fin done",
+        "unpool done",
+        "end",
+        "unp flags",
+        "unp dma",
+        "unp mfma",
+        "unp pushed",
+        "dn mids",
+        "fin polled",
+    ],
     "k1": ["entry", "x ready", "gemv done", "head/gate done"],
 }
 WINDOW_US = 600.0  # a launch's stamps lie within this of its latest entry (older ones: the previous step)
 
 
 def stamps(snap, name):
-    t = snap[name].view(torch.int64).reshape(-1)[: TRACE_LAYERS * BLOCKS * SLOTS].reshape(TRACE_LAYERS, BLOCKS, SLOTS)
+    t = (
+        snap[name]
+        .view(torch.int64)
+        .reshape(-1)[: TRACE_LAYERS * BLOCKS * SLOTS]
+        .reshape(TRACE_LAYERS, BLOCKS, SLOTS)
+    )
     return t
 
 
@@ -34,7 +72,9 @@ def clean(t):
     t = t.clone()
     t[~keep] = 0
     for i in range(1, SLOTS):
-        bad = (t[:, i] != 0) & ((t[:, i] < t[:, 0]) | (t[:, i] > t[:, 0] + int(WINDOW_US * 100)))
+        bad = (t[:, i] != 0) & (
+            (t[:, i] < t[:, 0]) | (t[:, i] > t[:, 0] + int(WINDOW_US * 100))
+        )
         t[bad, i] = 0
     return t
 
@@ -56,7 +96,9 @@ def main():
     snap = torch.load(path, weights_only=False)
     n = len(snap["kinds"])
     swa = snap["swa"]
-    print(f"rank {snap['rank']} rows {snap['rows']} q_len {snap['q_len']} layers {n} (sliding {sum(swa)}, full {n - sum(swa)}) use_layer {snap['use_layer']}")
+    print(
+        f"rank {snap['rank']} rows {snap['rows']} q_len {snap['q_len']} layers {n} (sliding {sum(swa)}, full {n - sum(swa)}) use_layer {snap['use_layer']}"
+    )
     T = {k: stamps(snap, k) for k in ("attn", "k2", "k3", "k1")}
     want = None
     if "--layers" in sys.argv:
@@ -73,11 +115,13 @@ def main():
         k2 = clean(T["k2"][l])
         k3 = clean(T["k3"][l])
         k1n = clean(T["k1"][(l + 1) % TRACE_LAYERS]) if l + 1 < n else None
+
         def end(t):
             if t is None:
                 return None
             v = t[t != 0]
             return (v.max().item() - base.item()) / 100.0 if v.numel() else None
+
         ends = [end(a), end(k2), end(k3), end(k1n)]
         # the next launch's first entry, from this launch's start
         nxt = None
@@ -90,21 +134,27 @@ def main():
         per.append((l, swa[l], ends, nxt))
         if want is None or l in want:
             rows_out.append((l, swa[l], base, a, k2, k3, k1n, ends, nxt))
+
     # the summary
     def mean(xs):
         xs = [x for x in xs if x is not None]
         return sum(xs) / len(xs) if xs else float("nan")
+
     for label, sel in (("sliding", True), ("full", False)):
         ps = [p for p in per if p[1] == sel]
         if not ps:
             continue
-        print(f"== {label} layers (n={len(ps)}): attn end {mean([p[2][0] for p in ps]):6.1f}  K2 end {mean([p[2][1] for p in ps]):6.1f}  "
-              f"K3 end {mean([p[2][2] for p in ps]):6.1f}  next K1 end {mean([p[2][3] for p in ps]):6.1f}  next launch entry {mean([p[3] for p in ps]):6.1f} us")
+        print(
+            f"== {label} layers (n={len(ps)}): attn end {mean([p[2][0] for p in ps]):6.1f}  K2 end {mean([p[2][1] for p in ps]):6.1f}  "
+            f"K3 end {mean([p[2][2] for p in ps]):6.1f}  next K1 end {mean([p[2][3] for p in ps]):6.1f}  next launch entry {mean([p[3] for p in ps]):6.1f} us"
+        )
     verbose = "--all" in sys.argv or want is not None
     for l, is_swa, base, a, k2, k3, k1n, ends, nxt in rows_out:
         if not verbose and l not in (0, 1, 2, 5, n - 2, n - 1):
             continue
-        print(f"-- layer {l} ({'sliding' if is_swa else 'full'}): ends attn {ends[0]} K2 {ends[1]} K3 {ends[2]} K1next {ends[3]}; next launch entry {nxt}")
+        print(
+            f"-- layer {l} ({'sliding' if is_swa else 'full'}): ends attn {ends[0]} K2 {ends[1]} K3 {ends[2]} K1next {ends[3]}; next launch entry {nxt}"
+        )
         print(f"   attn: {row(a, STAMPS['attn'], base)}")
         if k2 is not None:
             print(f"   K2  : {row(k2, STAMPS['k2'], base)}")

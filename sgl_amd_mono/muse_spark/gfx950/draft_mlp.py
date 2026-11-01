@@ -43,12 +43,29 @@ from sgl_amd_mono.common.ops import (
     rsrc,
     sum_partials,
 )
-from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple, pair_layout
+from sgl_amd_mono.common.plan import (
+    BLOCKS,
+    THREADS,
+    WAVES,
+    kernel_sources,
+    key_tuple,
+    pair_layout,
+)
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.muse_spark.gfx950 import compat
 from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
-from sgl_amd_mono.muse_spark.gfx950.device import TRACE_LAYERS, TRACE_SLOTS, stamp, step_tag
-from sgl_amd_mono.muse_spark.gfx950.layout import RED_FLOATS, TILE, scratch_bytes, token_tiles
+from sgl_amd_mono.muse_spark.gfx950.device import (
+    TRACE_LAYERS,
+    TRACE_SLOTS,
+    stamp,
+    step_tag,
+)
+from sgl_amd_mono.muse_spark.gfx950.layout import (
+    RED_FLOATS,
+    TILE,
+    scratch_bytes,
+    token_tiles,
+)
 from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import sigmoid
 
 BRIDGE = compat.install()
@@ -63,21 +80,44 @@ GROUP = 16  # channels a convolution group
 GROUPS = H // GROUP  # 512
 TAPS = 2
 SIDES = 2
-COEF_ROWS = SIDES * TAPS * GROUPS  # 2048: the kernel projection's rows, (side, tap, group)
+COEF_ROWS = (
+    SIDES * TAPS * GROUPS
+)  # 2048: the kernel projection's rows, (side, tap, group)
 BLOCK = 8  # rows a request: the convolution shifts within it
 EPS = 1e-5
 ROWS = 16  # an MFMA tile's rows
 K_PARTS, K_PART, K_PER_WAVE, K_STEP = 16, 512, 64, 32
 K_STEPS = K_PER_WAVE // K_STEP  # 2
 C_ROWS, C_TILES = 128, 8  # a coefficient GEMV task's rows
-G_ROWS, G_TILES, G_ROUND = 448, 28, 4  # a gate / up GEMV task's rows, in rounds of 4 tiles (32 + 32 VGPRs in flight)
-D_KPARTS, D_RGS, D_ROWS, D_TILES, D_ROUND = 7, 32, 256, 16, 4  # the down GEMV: 224 tasks, rounds of 4 tiles
+G_ROWS, G_TILES, G_ROUND = (
+    448,
+    28,
+    4,
+)  # a gate / up GEMV task's rows, in rounds of 4 tiles (32 + 32 VGPRs in flight)
+D_KPARTS, D_RGS, D_ROWS, D_TILES, D_ROUND = (
+    7,
+    32,
+    256,
+    16,
+    4,
+)  # the down GEMV: 224 tasks, rounds of 4 tiles
 D_TASKS = D_KPARTS * D_RGS
-C_RED, G_RED, D_RED = COEF_ROWS // BLOCKS, I // BLOCKS, H // BLOCKS  # rows a reducer CTA: 8, 14, 32
-RED_TILES = max(C_TILES, G_ROUND, D_ROUND)  # reduction row sets in LDS (the coefficient task's 8)
+C_RED, G_RED, D_RED = (
+    COEF_ROWS // BLOCKS,
+    I // BLOCKS,
+    H // BLOCKS,
+)  # rows a reducer CTA: 8, 14, 32
+RED_TILES = max(
+    C_TILES, G_ROUND, D_ROUND
+)  # reduction row sets in LDS (the coefficient task's 8)
 assert K_PARTS * K_PART == H and C_TILES * ROWS == C_ROWS and 16 * C_ROWS == COEF_ROWS
 assert G_TILES * ROWS == G_ROWS and 16 * G_ROWS == GU_ROWS and G_TILES % G_ROUND == 0
-assert D_KPARTS * K_PART == I and D_RGS * D_ROWS == H and D_TILES * ROWS == D_ROWS and D_TILES % D_ROUND == 0
+assert (
+    D_KPARTS * K_PART == I
+    and D_RGS * D_ROWS == H
+    and D_TILES * ROWS == D_ROWS
+    and D_TILES % D_ROUND == 0
+)
 assert D_TASKS <= BLOCKS and G_RED % 2 == 0 and D_RED % 2 == 0 and THREADS == 64 * WAVES
 
 
@@ -117,9 +157,13 @@ def dm_lds(tokens: int):
         hbuf: fx.Array[fx.BFloat16, S * K_PART, 16]  # h, then hc, of this K part
         ssl: fx.Array[fx.Float32, S * K_PARTS, 16]  # the K parts' sums of squares
         nf: fx.Array[fx.Float32, S, 16]  # 1 / rms a token
-        cf: fx.Array[fx.Float32, S * TAPS * (K_PART // GROUP), 16]  # side 0 deltas of this K part's groups
+        cf: fx.Array[
+            fx.Float32, S * TAPS * (K_PART // GROUP), 16
+        ]  # side 0 deltas of this K part's groups
         dbuf: fx.Array[fx.Float32, S * D_RED, 16]  # the summed down rows of this CTA
-        cf1: fx.Array[fx.Float32, S * TAPS * (D_RED // GROUP), 16]  # side 1 deltas of this CTA's groups
+        cf1: fx.Array[
+            fx.Float32, S * TAPS * (D_RED // GROUP), 16
+        ]  # side 1 deltas of this CTA's groups
 
     return Lds
 
@@ -143,8 +187,15 @@ def w_loads(c, w, width, row0, tiles, kpart):
         [
             fx.Vector(
                 bo.buffer_load(
-                    r_w, ((row0 + it * ROWS + lane % 16) * width + gemv_k(lane, wave, kpart, kc)) // 2,
-                    vec_width=4, dtype=T.i32, cache_modifier=CM_NT,
+                    r_w,
+                    (
+                        (row0 + it * ROWS + lane % 16) * width
+                        + gemv_k(lane, wave, kpart, kc)
+                    )
+                    // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_NT,
                 )  # fmt: skip
             )
             for kc in range(K_STEPS)
@@ -175,7 +226,9 @@ def gemv_tiles(c, w, xb_of, tiles, publish):
             if idx < n_out:
                 r = idx % (tiles * ROWS)
                 tk = t * TILE + idx // (tiles * ROWS)
-                v = row_sum(red + (r // ROWS) * RED_FLOATS, r % ROWS, idx // (tiles * ROWS))
+                v = row_sum(
+                    red + (r // ROWS) * RED_FLOATS, r % ROWS, idx // (tiles * ROWS)
+                )
                 publish(r, tk, v)
         gpu.barrier()  # ``red`` is reused
 
@@ -186,7 +239,10 @@ def lds_b(c, base, tok_of, k_of):
 
     def xb_of(t):
         tok = tok_of(t)
-        return [fx.Vector(fx.ptr_load(base + (tok * K_PART + k_of(kc)), result_type=V8B)) for kc in range(K_STEPS)]
+        return [
+            fx.Vector(fx.ptr_load(base + (tok * K_PART + k_of(kc)), result_type=V8B))
+            for kc in range(K_STEPS)
+        ]
 
     return xb_of
 
@@ -203,13 +259,19 @@ def stage_norm(c, rg, kp):
     V8B = fx.Vector.make_type(8, fx.BFloat16)
     ch = kp * K_PART + 8 * lane  # this lane's eight channels
     r_res, r_attn, r_out = rsrc(a["res"]), rsrc(a["attn_out"]), rsrc(a["res_out"])
-    wv = fx.Vector(bo.buffer_load(rsrc(a["w_post"]), ch // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16)
+    wv = fx.Vector(
+        bo.buffer_load(rsrc(a["w_post"]), ch // 2, vec_width=4, dtype=T.i32)
+    ).bitcast(fx.BFloat16)
     TPW = S // WAVES  # tokens a wave
     rp = []
     for j in range_constexpr(TPW):
         t = wave + WAVES * j
-        rv = fx.Vector(bo.buffer_load(r_res, (t * H + ch) // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16)
-        av = fx.Vector(bo.buffer_load(r_attn, (t * H + ch) // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16)
+        rv = fx.Vector(
+            bo.buffer_load(r_res, (t * H + ch) // 2, vec_width=4, dtype=T.i32)
+        ).bitcast(fx.BFloat16)
+        av = fx.Vector(
+            bo.buffer_load(r_attn, (t * H + ch) // 2, vec_width=4, dtype=T.i32)
+        ).bitcast(fx.BFloat16)
         r8 = [bf16_round(fx.Float32(rv[e]) + fx.Float32(av[e])) for e in range(8)]
         ss = r8[0] * r8[0]
         for e in range_constexpr(1, 8):
@@ -237,7 +299,9 @@ def stage_norm(c, rg, kp):
     for j in range_constexpr(TPW):
         t = wave + WAVES * j
         f = fx.ptr_load(nf + t)
-        hv = fx.Vector.from_elements([rp[j][e] * f * fx.Float32(wv[e]) for e in range(8)], fx.Float32).to(fx.BFloat16)
+        hv = fx.Vector.from_elements(
+            [rp[j][e] * f * fx.Float32(wv[e]) for e in range(8)], fx.Float32
+        ).to(fx.BFloat16)
         fx.ptr_store(hv, hbuf + (t * K_PART + 8 * lane))
     gpu.barrier()
 
@@ -275,14 +339,22 @@ def stage_coef_reduce(c, bid):
         idx = fx.min(tid + p * THREADS, N - 1)
         j, t = idx % C_RED, idx // C_RED
         row = bid * C_RED + j
-        got = poll([(cpart, (kp * MAX_TOKENS + t) * COEF_ROWS + row, 1) for kp in range(K_PARTS)], batch=K_PARTS)
+        got = poll(
+            [
+                (cpart, (kp * MAX_TOKENS + t) * COEF_ROWS + row, 1)
+                for kp in range(K_PARTS)
+            ],
+            batch=K_PARTS,
+        )
         v = got[0][0].bitcast(fx.Float32)
         for kp in range_constexpr(1, K_PARTS):
             v = v + got[kp][0].bitcast(fx.Float32)
         if tid + p * THREADS < N:
             put(coef, t * COEF_ROWS + row, v)
             if const_expr("coef_out" in a):
-                bo.buffer_store(v, rsrc(a["coef_out"]), t * COEF_ROWS + row, cache_modifier=CM_DEV)
+                bo.buffer_store(
+                    v, rsrc(a["coef_out"]), t * COEF_ROWS + row, cache_modifier=CM_DEV
+                )
 
 
 # ---------------------------------------------------------------- S2: conv0, the gate / up GEMV
@@ -290,7 +362,15 @@ def stage_coef_reduce(c, bid):
 def stage_conv0(c, kp):
     """``hbuf`` <- conv0(h) on this K part: coefficient = base[0][tap][channel] +
     delta[token][0][tap][group], tap 1 reads the block's previous row."""
-    S, tid, lane, wave, poll, hbuf, cf = c["S"], c["tid"], c["lane"], c["wave"], c["poll"], c["hbuf"], c["cf"]
+    S, tid, lane, wave, poll, hbuf, cf = (
+        c["S"],
+        c["tid"],
+        c["lane"],
+        c["wave"],
+        c["poll"],
+        c["hbuf"],
+        c["cf"],
+    )
     a = c["args"]
     GP = K_PART // GROUP  # groups a K part: 32
     V8B = fx.Vector.make_type(8, fx.BFloat16)
@@ -299,13 +379,19 @@ def stage_conv0(c, kp):
     for p in range_constexpr(-(-N // THREADS)):
         idx = fx.min(tid + p * THREADS, N - 1)
         t, tap, g = idx // (TAPS * GP), (idx // GP) % TAPS, idx % GP
-        got = poll([(c["coef"], t * COEF_ROWS + (0 * TAPS + tap) * GROUPS + kp * GP + g, 1)])
+        got = poll(
+            [(c["coef"], t * COEF_ROWS + (0 * TAPS + tap) * GROUPS + kp * GP + g, 1)]
+        )
         if tid + p * THREADS < N:
             fx.ptr_store(got[0][0].bitcast(fx.Float32), cf + idx)
     ch = kp * K_PART + 8 * lane
     r_base = rsrc(a["base"])
     b0 = [
-        fx.Vector(bo.buffer_load(r_base, ((0 * TAPS + tap) * H + ch) // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16)
+        fx.Vector(
+            bo.buffer_load(
+                r_base, ((0 * TAPS + tap) * H + ch) // 2, vec_width=4, dtype=T.i32
+            )
+        ).bitcast(fx.BFloat16)
         for tap in range(TAPS)
     ]
     gpu.barrier()  # the deltas are in
@@ -324,7 +410,9 @@ def stage_conv0(c, kp):
         for e in range_constexpr(8):
             c0 = fx.Float32(b0[0][e]) + d0
             c1 = fx.Float32(b0[1][e]) + d1
-            v = c0 * fx.Float32(hv[e]) + has_prev.select(c1 * fx.Float32(pv[e]), fx.Float32(0.0))
+            v = c0 * fx.Float32(hv[e]) + has_prev.select(
+                c1 * fx.Float32(pv[e]), fx.Float32(0.0)
+            )
             vals.append(v)
         outs.append(fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16))
     gpu.barrier()  # every read of h is done
@@ -353,10 +441,19 @@ def stage_gu(c, rg, kp):
     cur = w_loads(c, a["w_gu"], H, rg * G_ROWS, G_ROUND, kp)
     for rd in range_constexpr(G_TILES // G_ROUND):
         if const_expr(rd + 1 < G_TILES // G_ROUND):
-            nxt = w_loads(c, a["w_gu"], H, rg * G_ROWS + (rd + 1) * G_ROUND * ROWS, G_ROUND, kp)
+            nxt = w_loads(
+                c, a["w_gu"], H, rg * G_ROWS + (rd + 1) * G_ROUND * ROWS, G_ROUND, kp
+            )
 
         def publish(r, tk, v, rd=rd):
-            put(gpart, (kp * MAX_TOKENS + tk) * GU_ROWS + rg * G_ROWS + rd * G_ROUND * ROWS + r, v)
+            put(
+                gpart,
+                (kp * MAX_TOKENS + tk) * GU_ROWS
+                + rg * G_ROWS
+                + rd * G_ROUND * ROWS
+                + r,
+                v,
+            )
 
         gemv_tiles(c, cur, xb_of, G_ROUND, publish)
         if const_expr(rd + 1 < G_TILES // G_ROUND):
@@ -379,10 +476,18 @@ def stage_act(c, bid):
         d0 = bid * G_RED + 2 * j
         gu = poll(
             [(gpart, (kp * MAX_TOKENS + t) * GU_ROWS + d0, 2) for kp in range(K_PARTS)]
-            + [(gpart, (kp * MAX_TOKENS + t) * GU_ROWS + I + d0, 2) for kp in range(K_PARTS)],
+            + [
+                (gpart, (kp * MAX_TOKENS + t) * GU_ROWS + I + d0, 2)
+                for kp in range(K_PARTS)
+            ],
             batch=2 * K_PARTS,
         )
-        g0, g1, u0, u1 = fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0), fx.Float32(0.0)
+        g0, g1, u0, u1 = (
+            fx.Float32(0.0),
+            fx.Float32(0.0),
+            fx.Float32(0.0),
+            fx.Float32(0.0),
+        )
         for kp in range_constexpr(K_PARTS):
             g0 = g0 + gu[kp][0].bitcast(fx.Float32)
             g1 = g1 + gu[kp][1].bitcast(fx.Float32)
@@ -404,7 +509,10 @@ def stage_down(c, rg, kp):
     S, lane, wave, put, poll = c["S"], c["lane"], c["wave"], c["put"], c["poll"]
     dpart, act = c["dpart"], c["act"]
     a = c["args"]
-    k_lane = [kp * K_PART + wave * K_PER_WAVE + kc * K_STEP + 8 * (lane // 16) for kc in range(K_STEPS)]
+    k_lane = [
+        kp * K_PART + wave * K_PER_WAVE + kc * K_STEP + 8 * (lane // 16)
+        for kc in range(K_STEPS)
+    ]
 
     def xb_of(t):
         tok = fx.min(t * TILE + lane % 16, S - 1)
@@ -412,7 +520,12 @@ def stage_down(c, rg, kp):
         got = poll([(act, (tok * I + k_lane[kc]) // 2 + 2 * q, 2) for kc in range(K_STEPS) for q in range(2)], batch=2 * K_STEPS)  # fmt: skip
         return [
             fx.Vector.from_elements(
-                [fx.Int32(got[2 * kc][0]), fx.Int32(got[2 * kc][1]), fx.Int32(got[2 * kc + 1][0]), fx.Int32(got[2 * kc + 1][1])],
+                [
+                    fx.Int32(got[2 * kc][0]),
+                    fx.Int32(got[2 * kc][1]),
+                    fx.Int32(got[2 * kc + 1][0]),
+                    fx.Int32(got[2 * kc + 1][1]),
+                ],
                 fx.Int32,
             ).bitcast(fx.BFloat16)
             for kc in range(K_STEPS)
@@ -421,10 +534,16 @@ def stage_down(c, rg, kp):
     cur = w_loads(c, a["w_down"], I, rg * D_ROWS, D_ROUND, kp)
     for rd in range_constexpr(D_TILES // D_ROUND):
         if const_expr(rd + 1 < D_TILES // D_ROUND):
-            nxt = w_loads(c, a["w_down"], I, rg * D_ROWS + (rd + 1) * D_ROUND * ROWS, D_ROUND, kp)
+            nxt = w_loads(
+                c, a["w_down"], I, rg * D_ROWS + (rd + 1) * D_ROUND * ROWS, D_ROUND, kp
+            )
 
         def publish(r, tk, v, rd=rd):
-            put(dpart, (kp * MAX_TOKENS + tk) * H + rg * D_ROWS + rd * D_ROUND * ROWS + r, v)
+            put(
+                dpart,
+                (kp * MAX_TOKENS + tk) * H + rg * D_ROWS + rd * D_ROUND * ROWS + r,
+                v,
+            )
 
         gemv_tiles(c, cur, xb_of, D_ROUND, publish)
         if const_expr(rd + 1 < D_TILES // D_ROUND):
@@ -448,7 +567,9 @@ def stage_out(c, bid):
     for p in range_constexpr(-(-N1 // THREADS)):
         idx = fx.min(tid + p * THREADS, N1 - 1)
         t, tap, g = idx // (TAPS * GP), (idx // GP) % TAPS, idx % GP
-        got = poll([(c["coef"], t * COEF_ROWS + (1 * TAPS + tap) * GROUPS + bid * GP + g, 1)])
+        got = poll(
+            [(c["coef"], t * COEF_ROWS + (1 * TAPS + tap) * GROUPS + bid * GP + g, 1)]
+        )
         if tid + p * THREADS < N1:
             fx.ptr_store(got[0][0].bitcast(fx.Float32), cf1 + idx)
     N = PAIRS * S
@@ -456,7 +577,10 @@ def stage_out(c, bid):
         idx = fx.min(tid + p * THREADS, N - 1)
         j, t = idx % PAIRS, idx // PAIRS
         col = bid * D_RED + 2 * j
-        got = poll([(dpart, (kp * MAX_TOKENS + t) * H + col, 2) for kp in range(D_KPARTS)], batch=D_KPARTS)
+        got = poll(
+            [(dpart, (kp * MAX_TOKENS + t) * H + col, 2) for kp in range(D_KPARTS)],
+            batch=D_KPARTS,
+        )
         v0, v1 = fx.Float32(0.0), fx.Float32(0.0)
         for kp in range_constexpr(D_KPARTS):
             v0 = v0 + got[kp][0].bitcast(fx.Float32)
@@ -502,7 +626,9 @@ def run_dmlp(c):
     bid, n = c["bid"], c["stages"]
     rg, kp = bid // K_PARTS, bid % K_PARTS
     stamp(c, 0)
-    w0 = w_loads(c, c["args"]["w_kp"], H, rg * C_ROWS, C_TILES, kp)  # the coefficient task's weights, in flight
+    w0 = w_loads(
+        c, c["args"]["w_kp"], H, rg * C_ROWS, C_TILES, kp
+    )  # the coefficient task's weights, in flight
     stage_norm(c, rg, kp)
     stamp(c, 1)
     if const_expr(n > 1):
@@ -538,7 +664,19 @@ class DMLPBuild(msgspec.Struct, frozen=True):
     stages: int = 8  # the stages run (fewer: a bisection build)
 
 
-def dmlp_context(key: DMLPBuild, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, sym_layout: dict, layer=None) -> dict:
+def dmlp_context(
+    key: DMLPBuild,
+    lds,
+    args: dict,
+    scratch,
+    sym,
+    peers,
+    rank,
+    tag,
+    layout: dict,
+    sym_layout: dict,
+    layer=None,
+) -> dict:
     s, npes = key.tokens, key.npes
     tid = fx.thread_idx.x
     mb = Mailbox(tag)
@@ -583,7 +721,9 @@ def build_dmlp(key: DMLPBuild):
     ``peers`` (the ranks' peer bases, int64 [npes]), ``rank``, ``epoch``, ``layer``."""
     S, npes = key.tokens, key.npes
     assert S % WAVES == 0 and 1 <= S <= MAX_TOKENS
-    name = kernel_symbol("muse_spark_dmlp", s=S, w=npes, f=key.fault_site, t=int(key.trace), n=key.stages)
+    name = kernel_symbol(
+        "muse_spark_dmlp", s=S, w=npes, f=key.fault_site, t=int(key.trace), n=key.stages
+    )
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout, sym_layout = dm_scratch_layout(), dm_sym_layout(npes)
@@ -594,13 +734,27 @@ def build_dmlp(key: DMLPBuild):
         res: Int64, attn_out: Int64, w_post: Int64, w_kp: Int64, base: Int64, w_gu: Int64, w_down: Int64,
         res_out: Int64, out: Int64, scratch: Int64, sym: Int64, peers: Int64, rank: Int32, epoch: Int64, layer: Int32,
     ):  # fmt: skip
-        with guard.scope(guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)):
+        with guard.scope(
+            guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)
+        ):
             lds = fx.SharedAllocator().allocate(Lds).peek()
             args = {
                 "res": res, "attn_out": attn_out, "w_post": w_post, "w_kp": w_kp, "base": base,
                 "w_gu": w_gu, "w_down": w_down, "res_out": res_out, "out": out,
             }  # fmt: skip
-            c = dmlp_context(key, lds, args, scratch, sym, peers, rank, step_tag(epoch, layer), layout, sym_layout, layer=layer)
+            c = dmlp_context(
+                key,
+                lds,
+                args,
+                scratch,
+                sym,
+                peers,
+                rank,
+                step_tag(epoch, layer),
+                layout,
+                sym_layout,
+                layer=layer,
+            )
             run_dmlp(c)
 
     @flyc.jit
@@ -610,8 +764,22 @@ def build_dmlp(key: DMLPBuild):
         stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
-        dmlp(res, attn_out, w_post, w_kp, base, w_gu, w_down, res_out, out, scratch, sym, peers, rank, epoch, layer).launch(
-            grid=(BLOCKS,), block=(THREADS,), stream=stream
-        )
+        dmlp(
+            res,
+            attn_out,
+            w_post,
+            w_kp,
+            base,
+            w_gu,
+            w_down,
+            res_out,
+            out,
+            scratch,
+            sym,
+            peers,
+            rank,
+            epoch,
+            layer,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch

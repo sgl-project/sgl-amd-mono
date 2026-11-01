@@ -21,7 +21,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
@@ -40,21 +40,31 @@ from sgl_amd_mono.common.ops import (
     rsrc,
     sum_partials,
 )
-from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple, pair_layout
+from sgl_amd_mono.common.plan import (
+    BLOCKS,
+    THREADS,
+    WAVES,
+    kernel_sources,
+    key_tuple,
+    pair_layout,
+)
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.muse_spark.gfx950 import compat
 from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
-from sgl_amd_mono.muse_spark.gfx950.device import TRACE_LAYERS, TRACE_SLOTS, stamp, step_tag
+from sgl_amd_mono.muse_spark.gfx950.device import (
+    TRACE_LAYERS,
+    TRACE_SLOTS,
+    stamp,
+    step_tag,
+)
 from sgl_amd_mono.muse_spark.gfx950.draft_mlp import (
     BLOCK,
-    C_RED,
     C_ROWS,
     C_TILES,
     COEF_ROWS,
     EPS,
     GROUP,
     GROUPS,
-    H,
     K_PART,
     K_PARTS,
     K_PER_WAVE,
@@ -62,6 +72,7 @@ from sgl_amd_mono.muse_spark.gfx950.draft_mlp import (
     K_STEPS,
     ROWS,
     TAPS,
+    H,
     gemv_tiles,
     lds_b,
     stage_coef,
@@ -69,7 +80,12 @@ from sgl_amd_mono.muse_spark.gfx950.draft_mlp import (
     stage_conv0,
     w_loads,
 )
-from sgl_amd_mono.muse_spark.gfx950.layout import RED_FLOATS, TILE, scratch_bytes, token_tiles
+from sgl_amd_mono.muse_spark.gfx950.layout import (
+    RED_FLOATS,
+    TILE,
+    scratch_bytes,
+    token_tiles,
+)
 
 BRIDGE = compat.install()
 SOURCES = kernel_sources(__name__)
@@ -84,7 +100,12 @@ QKV_HEADS = Q_HEADS + 2  # head-rows a token of the qkv reduce
 A_ROWS, A_TILES = 80, 5  # a qkv GEMV task's rows: 16 row groups x 16 K parts
 O_ROWS, O_TILES = 32, 2  # an o GEMV task's rows: 256 tasks x full K (1024)
 O_KPARTS = Q_K // K_PART  # 2 K parts of 512 a lane's wave split: the task sums them
-assert A_TILES * ROWS == A_ROWS and 16 * A_ROWS == QKV_ROWS and O_ROWS * BLOCKS == H and O_TILES * ROWS == O_ROWS
+assert (
+    A_TILES * ROWS == A_ROWS
+    and 16 * A_ROWS == QKV_ROWS
+    and O_ROWS * BLOCKS == H
+    and O_TILES * ROWS == O_ROWS
+)
 assert HEAD_DIM == 2 * 64
 
 
@@ -167,14 +188,25 @@ def stage_norm_in(c, rg, kp):
     first = a["first"] != 0
     ch = kp * K_PART + 8 * lane
     r_res, r_x, r_out = rsrc(a["res"]), rsrc(a["x"]), rsrc(a["res_out"])
-    wv = fx.Vector(bo.buffer_load(rsrc(a["w_in"]), ch // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16)
+    wv = fx.Vector(
+        bo.buffer_load(rsrc(a["w_in"]), ch // 2, vec_width=4, dtype=T.i32)
+    ).bitcast(fx.BFloat16)
     TPW = S // WAVES
     rp = []
     for j in range_constexpr(TPW):
         t = wave + WAVES * j
-        xv = fx.Vector(bo.buffer_load(r_x, (t * H + ch) // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16)
-        rv = fx.Vector(bo.buffer_load(r_res, (t * H + ch) // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16)
-        r8 = [first.select(fx.Float32(xv[e]), bf16_round(fx.Float32(rv[e]) + fx.Float32(xv[e]))) for e in range(8)]
+        xv = fx.Vector(
+            bo.buffer_load(r_x, (t * H + ch) // 2, vec_width=4, dtype=T.i32)
+        ).bitcast(fx.BFloat16)
+        rv = fx.Vector(
+            bo.buffer_load(r_res, (t * H + ch) // 2, vec_width=4, dtype=T.i32)
+        ).bitcast(fx.BFloat16)
+        r8 = [
+            first.select(
+                fx.Float32(xv[e]), bf16_round(fx.Float32(rv[e]) + fx.Float32(xv[e]))
+            )
+            for e in range(8)
+        ]
         ss = r8[0] * r8[0]
         for e in range_constexpr(1, 8):
             ss = ss + r8[e] * r8[e]
@@ -200,7 +232,9 @@ def stage_norm_in(c, rg, kp):
     for j in range_constexpr(TPW):
         t = wave + WAVES * j
         f = fx.ptr_load(nf + t)
-        hv = fx.Vector.from_elements([rp[j][e] * f * fx.Float32(wv[e]) for e in range(8)], fx.Float32).to(fx.BFloat16)
+        hv = fx.Vector.from_elements(
+            [rp[j][e] * f * fx.Float32(wv[e]) for e in range(8)], fx.Float32
+        ).to(fx.BFloat16)
         fx.ptr_store(hv, hbuf + (t * K_PART + 8 * lane))
     gpu.barrier()
 
@@ -246,7 +280,13 @@ def stage_heads(c, bid):
         row0 = hd * HEAD_DIM  # the head's first qkv row
         # the dim a thread (threads 128 .. idle): the K parts' partials summed in order
         d = fx.min(tid, HEAD_DIM - 1)
-        got = poll([(apart, (kp * MAX_TOKENS + t) * QKV_ROWS + row0 + d, 1) for kp in range(K_PARTS)], batch=K_PARTS)
+        got = poll(
+            [
+                (apart, (kp * MAX_TOKENS + t) * QKV_ROWS + row0 + d, 1)
+                for kp in range(K_PARTS)
+            ],
+            batch=K_PARTS,
+        )
         v = got[0][0].bitcast(fx.Float32)
         for kp in range_constexpr(1, K_PARTS):
             v = v + got[kp][0].bitcast(fx.Float32)
@@ -270,7 +310,14 @@ def stage_heads(c, bid):
             fx.ptr_store(val, hrow + d)
         gpu.barrier()
         # neox RoPE: dims (d, d + 64) rotate by the position's angle d % 64
-        pos = fx.Int32(bo.buffer_load(rsrc(a["positions"]), (a["pos64"] != 0).select(2 * t, t), vec_width=1, dtype=T.i32))
+        pos = fx.Int32(
+            bo.buffer_load(
+                rsrc(a["positions"]),
+                (a["pos64"] != 0).select(2 * t, t),
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
         half = d % 64
         cs = _cs(r_cs, pos * HEAD_DIM + half)
         sn = _cs(r_cs, pos * HEAD_DIM + 64 + half)
@@ -283,13 +330,30 @@ def stage_heads(c, bid):
                 # q: bf16 pairs (even dims store the pair)
                 if (d % 2) == 0:
                     nxt = (d < 64).select(
-                        bf16_round(fx.ptr_load(hrow + (half + 1)) * _cs(r_cs, pos * HEAD_DIM + half + 1) - fx.ptr_load(hrow + (half + 65)) * _cs(r_cs, pos * HEAD_DIM + 64 + half + 1)),  # fmt: skip
-                        bf16_round(fx.ptr_load(hrow + (half + 65)) * _cs(r_cs, pos * HEAD_DIM + half + 1) + fx.ptr_load(hrow + (half + 1)) * _cs(r_cs, pos * HEAD_DIM + 64 + half + 1)),  # fmt: skip
+                        bf16_round(
+                            fx.ptr_load(hrow + (half + 1))
+                            * _cs(r_cs, pos * HEAD_DIM + half + 1)
+                            - fx.ptr_load(hrow + (half + 65))
+                            * _cs(r_cs, pos * HEAD_DIM + 64 + half + 1)
+                        ),  # fmt: skip
+                        bf16_round(
+                            fx.ptr_load(hrow + (half + 65))
+                            * _cs(r_cs, pos * HEAD_DIM + half + 1)
+                            + fx.ptr_load(hrow + (half + 1))
+                            * _cs(r_cs, pos * HEAD_DIM + 64 + half + 1)
+                        ),  # fmt: skip
                     )
                     bo.buffer_store(fx.Vector.from_elements([out, nxt], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0], r_q, (t * Q_K + row0 + d) // 2)  # fmt: skip
             else:
                 # k / v: fp8, four dims a dword, at the row's cache slot
-                slot = fx.Int32(bo.buffer_load(rsrc(a["slots"]), (a["slot64"] != 0).select(2 * t, t), vec_width=1, dtype=T.i32))
+                slot = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(a["slots"]),
+                        (a["slot64"] != 0).select(2 * t, t),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
                 if (d % 4) == 0:
                     vals = [out]
                     for e in range_constexpr(1, 4):
@@ -299,10 +363,23 @@ def stage_heads(c, bid):
                         xe2 = fx.ptr_load(hrow + (he + 64))
                         cse = _cs(r_cs, pos * HEAD_DIM + he)
                         sne = _cs(r_cs, pos * HEAD_DIM + 64 + he)
-                        rote = (de < 64).select(xe1 * cse - xe2 * sne, xe2 * cse + xe1 * sne)
-                        vals.append(is_v.select(fx.ptr_load(hrow + de), bf16_round(rote)))
-                    packed = fp8_pack4(clamp_fp8(vals[0]), clamp_fp8(vals[1]), clamp_fp8(vals[2]), clamp_fp8(vals[3]))
-                    bo.buffer_store(packed, rsrc(is_v.select(a["v_cache"], a["k_cache"])), (slot * HEAD_DIM + d) // 4)
+                        rote = (de < 64).select(
+                            xe1 * cse - xe2 * sne, xe2 * cse + xe1 * sne
+                        )
+                        vals.append(
+                            is_v.select(fx.ptr_load(hrow + de), bf16_round(rote))
+                        )
+                    packed = fp8_pack4(
+                        clamp_fp8(vals[0]),
+                        clamp_fp8(vals[1]),
+                        clamp_fp8(vals[2]),
+                        clamp_fp8(vals[3]),
+                    )
+                    bo.buffer_store(
+                        packed,
+                        rsrc(is_v.select(a["v_cache"], a["k_cache"])),
+                        (slot * HEAD_DIM + d) // 4,
+                    )
         gpu.barrier()  # ``hrow`` / ``hss`` are reused by the next head-row
 
 
@@ -336,15 +413,27 @@ def stage_o(c, bid):
     dbuf = c["dbuf"]
     a = c["args"]
     r_o = rsrc(a["o"])
-    ws = [w_loads(c, a["w_o"], Q_K, bid * O_ROWS, O_TILES, kp) for kp in range(O_KPARTS)]  # [part][tile][step]
+    ws = [
+        w_loads(c, a["w_o"], Q_K, bid * O_ROWS, O_TILES, kp) for kp in range(O_KPARTS)
+    ]  # [part][tile][step]
     for t in range_constexpr(token_tiles(S)):
         tok = fx.min(t * TILE + lane % 16, S - 1)
         xb = [
             [
                 fx.Vector(
                     bo.buffer_load(
-                        r_o, (tok * Q_K + kp * K_PART + wave * K_PER_WAVE + kc * K_STEP + 8 * (lane // 16)) // 2,
-                        vec_width=4, dtype=T.i32, cache_modifier=CM_DEV,
+                        r_o,
+                        (
+                            tok * Q_K
+                            + kp * K_PART
+                            + wave * K_PER_WAVE
+                            + kc * K_STEP
+                            + 8 * (lane // 16)
+                        )
+                        // 2,
+                        vec_width=4,
+                        dtype=T.i32,
+                        cache_modifier=CM_DEV,
                     )  # fmt: skip
                 ).bitcast(fx.BFloat16)
                 for kc in range(K_STEPS)
@@ -355,7 +444,9 @@ def stage_o(c, bid):
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for kp in range_constexpr(O_KPARTS):
                 for kc in range_constexpr(K_STEPS):
-                    acc = mfma_bf16(ws[kp][it][kc].bitcast(fx.BFloat16), xb[kp][kc], acc)
+                    acc = mfma_bf16(
+                        ws[kp][it][kc].bitcast(fx.BFloat16), xb[kp][kc], acc
+                    )
             fx.ptr_store(acc, red + (it * RED_FLOATS + (wave * 64 + lane) * 4))
         gpu.barrier()
         nt = min(TILE, S - t * TILE)
@@ -365,7 +456,10 @@ def stage_o(c, bid):
             if idx < n_out:
                 r = idx % O_ROWS
                 tk = t * TILE + idx // O_ROWS
-                fx.ptr_store(row_sum(red + (r // ROWS) * RED_FLOATS, r % ROWS, idx // O_ROWS), dbuf + (tk * O_ROWS + r))
+                fx.ptr_store(
+                    row_sum(red + (r // ROWS) * RED_FLOATS, r % ROWS, idx // O_ROWS),
+                    dbuf + (tk * O_ROWS + r),
+                )
         gpu.barrier()
 
 
@@ -489,7 +583,9 @@ def build_dpre(key: DPreBuild):
         cos_sin: Int64, positions: Int64, pos64: Int32, slots: Int64, slot64: Int32, k_cache: Int64, v_cache: Int64,
         res_out: Int64, q: Int64, coef: Int64, scratch: Int64, epoch: Int64, layer: Int32,
     ):  # fmt: skip
-        with guard.scope(guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)):
+        with guard.scope(
+            guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)
+        ):
             lds = fx.SharedAllocator().allocate(Lds).peek()
             args = {
                 "x": x, "res": res, "first": first, "w_in": w_in, "w_kp": w_kp, "base": base, "w_qkv": w_qkv,
@@ -525,7 +621,9 @@ def build_dpost(key: DPostBuild):
     H], ``scratch``, ``sym``, ``peers``, ``rank``, ``epoch``, ``layer``."""
     S, npes = key.tokens, key.npes
     assert S % WAVES == 0 and 1 <= S <= MAX_TOKENS
-    name = kernel_symbol("muse_spark_dpost", s=S, w=npes, f=key.fault_site, t=int(key.trace))
+    name = kernel_symbol(
+        "muse_spark_dpost", s=S, w=npes, f=key.fault_site, t=int(key.trace)
+    )
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout, sym_layout = do_scratch_layout(), do_sym_layout(npes)
@@ -536,12 +634,25 @@ def build_dpost(key: DPostBuild):
         o: Int64, w_o: Int64, coef: Int64, base: Int64, attn_out: Int64, scratch: Int64, sym: Int64, peers: Int64,
         rank: Int32, epoch: Int64, layer: Int32,
     ):  # fmt: skip
-        with guard.scope(guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)):
+        with guard.scope(
+            guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)
+        ):
             lds = fx.SharedAllocator().allocate(Lds).peek()
-            args = {"o": o, "w_o": w_o, "coef": coef, "base": base, "attn_out": attn_out}
+            args = {
+                "o": o,
+                "w_o": w_o,
+                "coef": coef,
+                "base": base,
+                "attn_out": attn_out,
+            }
             bases = peer_bases(peers, npes)
             do_off = sym_layout["do"][0]
-            extra = {"W": npes, "rank": rank, "own_do": preg(sym, do_off, "do"), "peer_do": [preg(b, do_off, "do") for b in bases]}
+            extra = {
+                "W": npes,
+                "rank": rank,
+                "own_do": preg(sym, do_off, "do"),
+                "peer_do": [preg(b, do_off, "do") for b in bases],
+            }
             members = {"red": lds.red.ptr, "dbuf": lds.dbuf.ptr, "cf1": lds.cf1.ptr}
             c = _common(key, members, args, step_tag(epoch, layer), extra, layer=layer)
             for region, (off, _) in layout.items():
@@ -554,8 +665,8 @@ def build_dpost(key: DPostBuild):
         rank: Int32, epoch: Int64, layer: Int32, stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
-        dpost(o, w_o, coef, base, attn_out, scratch, sym, peers, rank, epoch, layer).launch(
-            grid=(BLOCKS,), block=(THREADS,), stream=stream
-        )
+        dpost(
+            o, w_o, coef, base, attn_out, scratch, sym, peers, rank, epoch, layer
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     return launch

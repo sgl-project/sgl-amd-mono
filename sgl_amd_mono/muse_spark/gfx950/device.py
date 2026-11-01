@@ -54,7 +54,9 @@ def stamp(c, idx: int):
     if const_expr(layer is None):
         base = c["bid"] * TRACE_SLOTS
     else:
-        base = (layer % TRACE_LAYERS) * (TRACE_BLOCKS * TRACE_SLOTS) + c["bid"] * TRACE_SLOTS
+        base = (layer % TRACE_LAYERS) * (TRACE_BLOCKS * TRACE_SLOTS) + c[
+            "bid"
+        ] * TRACE_SLOTS
     if c["tid"] == 0:
         now = clock()
         addr = c["trace"].value + fx.Int64((base + idx) * 8)
@@ -98,8 +100,14 @@ def lds_dma_16(rsrc_v, lds_ptr, voffset, policy: str = ""):
     base = uniform(fx.Int32(llvm.ptrtoint(T.i32, lds_ptr.llvm_ptr)))
     llvm.inline_asm(
         None,
-        [as_ir_value(rs), as_ir_value(base), as_ir_value(fx.Int32(voffset)), as_ir_value(uniform(fx.Int32(0)))],
-        "s_mov_b32 m0, $1\n\ts_nop 0\n\tbuffer_load_dwordx4 $2, $0, $3 offen lds" + (" " + policy if policy else ""),
+        [
+            as_ir_value(rs),
+            as_ir_value(base),
+            as_ir_value(fx.Int32(voffset)),
+            as_ir_value(uniform(fx.Int32(0))),
+        ],
+        "s_mov_b32 m0, $1\n\ts_nop 0\n\tbuffer_load_dwordx4 $2, $0, $3 offen lds"  # codespell:ignore offen
+        + (" " + policy if policy else ""),
         "s,s,v,s,~{m0},~{memory}",
         has_side_effects=True,
     )
@@ -120,6 +128,10 @@ def lds_atomic_add(ptr, val):
     """Atomic add of ``val`` to the LDS word at ``ptr`` (workgroup scope); the word's
     previous value."""
     op = llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.add, ptr.llvm_ptr, as_ir_value(fx.Int32(val)), llvm.AtomicOrdering.monotonic, syncscope="workgroup"
+        llvm.AtomicBinOp.add,
+        ptr.llvm_ptr,
+        as_ir_value(fx.Int32(val)),
+        llvm.AtomicOrdering.monotonic,
+        syncscope="workgroup",
     )
     return fx.Int32(op.result)

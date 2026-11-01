@@ -41,5 +41,7 @@ MAX_TOKENS = 64  # C8 x 8 draft tokens
 # rows beat SGLang's own path (95k, 机器2: 11.88 vs 12.26 ms a step at n = 2); 32 and
 # 64 rows are under test (the expert bytes grow with the rows while the hand-offs
 # stay). SGLANG_AMD_MONO_MUSE_WIDTHS="8,16,32,64" serves them all, "8" only C1.
-WIDTHS = tuple(int(x) for x in os.environ.get("SGLANG_AMD_MONO_MUSE_WIDTHS", "8,16").split(","))
+WIDTHS = tuple(
+    int(x) for x in os.environ.get("SGLANG_AMD_MONO_MUSE_WIDTHS", "8,16").split(",")
+)
 assert all(w in (8, 16, 32, 64) for w in WIDTHS) and WIDTHS, WIDTHS

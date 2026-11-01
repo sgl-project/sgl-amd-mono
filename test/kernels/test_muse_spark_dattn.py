@@ -35,7 +35,9 @@ def _epoch(device, deadline_s=20.0):
     return e
 
 
-def _reference(q, k_cache, v_cache, req_to_token, req_pool, prefix_lens, ql, window, scale):
+def _reference(
+    q, k_cache, v_cache, req_to_token, req_pool, prefix_lens, ql, window, scale
+):
     """Per request and head: softmax attention of each block row over the prefix's
     last ``window`` keys and the whole block; K / V exact in fp32, P rounded to bf16."""
     from sgl_amd_mono.muse_spark.gfx950.draft_attn import GQA, HEAD_DIM, Q_K
@@ -50,7 +52,11 @@ def _reference(q, k_cache, v_cache, req_to_token, req_pool, prefix_lens, ql, win
         K = k_cache[slots, 0].float()  # [keys, 128]
         V = v_cache[slots, 0].float()
         kidx = torch.arange(keys, device=q.device)
-        ok = (kidx >= ctx) | ((ctx - kidx) <= window) if window else torch.ones(keys, dtype=torch.bool, device=q.device)
+        ok = (
+            (kidx >= ctx) | ((ctx - kidx) <= window)
+            if window
+            else torch.ones(keys, dtype=torch.bool, device=q.device)
+        )
         for qpos in range(ql):
             t = r * ql + qpos
             qh = q[t].float().reshape(GQA, HEAD_DIM)  # [8, 128]
@@ -85,8 +91,12 @@ def test_dattn_matches_the_block_attention(R, window, part, lens):
         lens = [int(x) for x in torch.randint(0, 2600, (R,))]  # prefix lengths
     prefix = torch.tensor(lens, dtype=torch.int32, device=dev)
     q = (torch.randn(S, D.Q_K, device=dev) * 0.4).to(bf)
-    k_cache = (torch.randn(PAGES * 16, D.LOCAL_KV_HEADS, D.HEAD_DIM, device=dev) * 1.5).to(torch.float8_e4m3fn)
-    v_cache = torch.randn(PAGES * 16, D.LOCAL_KV_HEADS, D.HEAD_DIM, device=dev).to(torch.float8_e4m3fn)
+    k_cache = (
+        torch.randn(PAGES * 16, D.LOCAL_KV_HEADS, D.HEAD_DIM, device=dev) * 1.5
+    ).to(torch.float8_e4m3fn)
+    v_cache = torch.randn(PAGES * 16, D.LOCAL_KV_HEADS, D.HEAD_DIM, device=dev).to(
+        torch.float8_e4m3fn
+    )
     # per-token slots: distinct pages a request, the rows at shuffled pool indices
     perm = torch.randperm(PAGES - 1, device=dev) + 1
     req_to_token = torch.zeros(R + 3, MAX_CTX, dtype=torch.int32, device=dev)
@@ -97,12 +107,16 @@ def test_dattn_matches_the_block_attention(R, window, part, lens):
         n = (keys + 15) // 16
         assert at + n <= PAGES - 1, "the test's pages do not cover these lengths"
         pages = perm[at : at + n]
-        slots = (pages[:, None] * 16 + torch.arange(16, device=dev)[None, :]).reshape(-1)[:keys]
+        slots = (pages[:, None] * 16 + torch.arange(16, device=dev)[None, :]).reshape(
+            -1
+        )[:keys]
         req_to_token[int(req_pool[r]), :keys] = slots.to(torch.int32)
         at += n
     scale = D.HEAD_DIM**-0.5
     o = torch.full((S, D.Q_K), float("nan"), device=dev, dtype=bf)
-    scratch = torch.zeros(scratch_bytes(D.dattn_scratch_layout(S, ql)), dtype=torch.uint8, device=dev)
+    scratch = torch.zeros(
+        scratch_bytes(D.dattn_scratch_layout(S, ql)), dtype=torch.uint8, device=dev
+    )
     epoch = _epoch(dev)
     launch = D.build_dattn(D.DAttnBuild(tokens=S, q_len=ql))
     scale_bits = struct.unpack("i", struct.pack("f", scale))[0]
@@ -115,7 +129,9 @@ def test_dattn_matches_the_block_attention(R, window, part, lens):
         )  # fmt: skip
         epoch[0] += 1
     torch.cuda.synchronize()
-    ref = _reference(q, k_cache, v_cache, req_to_token, req_pool, prefix, ql, window, scale)
+    ref = _reference(
+        q, k_cache, v_cache, req_to_token, req_pool, prefix, ql, window, scale
+    )
     got = o.float()
     assert not got.isnan().any(), "NaN in the attention output"
     err = (got - ref).abs()

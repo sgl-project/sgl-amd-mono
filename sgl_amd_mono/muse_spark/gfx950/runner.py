@@ -30,6 +30,7 @@ import torch
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
+from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.muse_spark.gfx950.config import (
     HEAD_DIM,
     HIDDEN,
@@ -40,11 +41,9 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     MOE_HIDDEN,
     PAGE,
     Q_K,
-    SOFTMAX_SCALE,
     TOP_K,
     WINDOW,
 )
-from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     TRACE_LAYERS,
     TRACE_SLOTS,
@@ -169,13 +168,22 @@ def _f32_bits(value: float) -> int:
 class MuseMonoRunner:
     """The buffers, kernels and launches of one TP rank's Muse Spark layers."""
 
-    def __init__(self, *, views, modules, boundaries, rank: int, npes: int, cpu_group, device):
+    def __init__(
+        self, *, views, modules, boundaries, rank: int, npes: int, cpu_group, device
+    ):
         from sgl_amd_mono.muse_spark.gfx950.stages.ffn import k3_scratch_layout
-        from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import k2_scratch_layout, sym_bytes
+        from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import (
+            k2_scratch_layout,
+            sym_bytes,
+        )
 
         _ensure_writable_flydsl_cache()
         assert len(views) == len(modules) == len(boundaries) <= LAYER_SLOTS
-        self.views, self.modules, self.boundaries = list(views), list(modules), list(boundaries)
+        self.views, self.modules, self.boundaries = (
+            list(views),
+            list(modules),
+            list(boundaries),
+        )
         self.tpx = TPX and USE_KERNELS
         self.tpx_w = None  # the TP-experts slices: built at bind, after SGLang sized the KV cache
         self.pool_rows = None  # the sharded pooler's row slices a layer: built at bind
@@ -183,7 +191,11 @@ class MuseMonoRunner:
         self.use_kernels = USE_KERNELS
         self.use_layer = USE_LAYER
         # the pooler / unpooler as FP8 copies when every kernel layer carries them
-        self.fp8_dense = all(v.w_pool_fp8 is not None and v.w_unpool_fp8 is not None for v in views if v.kind == "mxfp4")
+        self.fp8_dense = all(
+            v.w_pool_fp8 is not None and v.w_unpool_fp8 is not None
+            for v in views
+            if v.kind == "mxfp4"
+        )
         self.pshard = PSHARD and npes == 8 and not self.fp8_dense
         self._k1_done = -1  # the layer whose K1 the previous merged launch ran
         self._trace_shape = None  # (rows, q_len) of the last launch, for the attention trace region's offset
@@ -191,16 +203,24 @@ class MuseMonoRunner:
         dev, bf16 = self.device, torch.bfloat16
         self.deadline_s = None
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
-        self.scratch_k1 = torch.zeros(scratch_bytes(k1_scratch_layout()), dtype=torch.uint8, device=dev)
+        self.scratch_k1 = torch.zeros(
+            scratch_bytes(k1_scratch_layout()), dtype=torch.uint8, device=dev
+        )
         self.scratch_attn = torch.zeros(
             max(scratch_bytes(kattn_scratch_layout(MAX_TOKENS, q)) for q in (1, 8)),
             dtype=torch.uint8, device=dev,
         )  # fmt: skip
-        self.scratch_k2 = torch.zeros(scratch_bytes(k2_scratch_layout()), dtype=torch.uint8, device=dev)
-        self.scratch_k3 = torch.zeros(scratch_bytes(k3_scratch_layout()), dtype=torch.uint8, device=dev)
+        self.scratch_k2 = torch.zeros(
+            scratch_bytes(k2_scratch_layout()), dtype=torch.uint8, device=dev
+        )
+        self.scratch_k3 = torch.zeros(
+            scratch_bytes(k3_scratch_layout()), dtype=torch.uint8, device=dev
+        )
         # the peers' error flags follow the partial-row regions (Guard's flags_offset);
         # the handshake is collective: every rank gets here (attach agreed first)
-        self.peers = PeerBuffer(sym_bytes(npes) + guard.FLAG_BYTES, cpu_group, rank, npes, dev)
+        self.peers = PeerBuffer(
+            sym_bytes(npes) + guard.FLAG_BYTES, cpu_group, rank, npes, dev
+        )
         self.peers.bytes.zero_()
         # row k = token k of the step
         self.q = torch.empty(MAX_TOKENS, Q_K, dtype=bf16, device=dev)
@@ -242,7 +262,14 @@ class MuseMonoRunner:
             from sgl_amd_mono.muse_spark.gfx950.layer import K1Build, build_k1
 
             no_capture(f"the {rows}-row K1 first reached")
-            self._k1[rows] = build_k1(K1Build(tokens=rows, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR)))
+            self._k1[rows] = build_k1(
+                K1Build(
+                    tokens=rows,
+                    fault_site=self.fault_site,
+                    fault_after=self.fault_after,
+                    trace=bool(TRACE_DIR),
+                )
+            )
         return self._k1[rows]
 
     def kattn_kernel(self, rows: int, q_len: int):
@@ -251,7 +278,13 @@ class MuseMonoRunner:
 
             no_capture(f"the {rows}-row K-attn first reached")
             self._kattn[(rows, q_len)] = build_kattn(
-                KAttnBuild(tokens=rows, q_len=q_len, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR))
+                KAttnBuild(
+                    tokens=rows,
+                    q_len=q_len,
+                    fault_site=self.fault_site,
+                    fault_after=self.fault_after,
+                    trace=bool(TRACE_DIR),
+                )
             )
         return self._kattn[(rows, q_len)]
 
@@ -261,7 +294,15 @@ class MuseMonoRunner:
 
             no_capture(f"the {rows}-row K2 first reached")
             self._k2[rows] = build_k2(
-                K2Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_pool=self.fp8_dense, pshard=self._pshard(rows))
+                K2Build(
+                    tokens=rows,
+                    npes=self.npes,
+                    fault_site=self.fault_site,
+                    fault_after=self.fault_after,
+                    trace=bool(TRACE_DIR),
+                    fp8_pool=self.fp8_dense,
+                    pshard=self._pshard(rows),
+                )
             )
         return self._k2[rows]
 
@@ -271,7 +312,15 @@ class MuseMonoRunner:
 
             no_capture(f"the {rows}-row K3 first reached")
             self._k3[rows] = build_k3(
-                K3Build(tokens=rows, npes=self.npes, fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_unpool=self.fp8_dense, tpx=self.tpx)
+                K3Build(
+                    tokens=rows,
+                    npes=self.npes,
+                    fault_site=self.fault_site,
+                    fault_after=self.fault_after,
+                    trace=bool(TRACE_DIR),
+                    fp8_unpool=self.fp8_dense,
+                    tpx=self.tpx,
+                )
             )
         return self._k3[rows]
 
@@ -282,9 +331,19 @@ class MuseMonoRunner:
             no_capture(f"the {rows}-row layer launch first reached")
             self._layer[(rows, q_len, next_k1)] = build_layer(
                 LayerBuild(
-                    tokens=rows, q_len=q_len, npes=self.npes, next_k1=next_k1,
-                    fault_site=self.fault_site, fault_after=self.fault_after, trace=bool(TRACE_DIR), fp8_dense=self.fp8_dense,
-                    tpx=self.tpx, defer_k1=DEFER_K1, xq_pre=XQ_PRE, ug_dyn=UG_DYN, pshard=self._pshard(rows),
+                    tokens=rows,
+                    q_len=q_len,
+                    npes=self.npes,
+                    next_k1=next_k1,
+                    fault_site=self.fault_site,
+                    fault_after=self.fault_after,
+                    trace=bool(TRACE_DIR),
+                    fp8_dense=self.fp8_dense,
+                    tpx=self.tpx,
+                    defer_k1=DEFER_K1,
+                    xq_pre=XQ_PRE,
+                    ug_dyn=UG_DYN,
+                    pshard=self._pshard(rows),
                 )  # fmt: skip
             )
         return self._layer[(rows, q_len, next_k1)]
@@ -303,7 +362,9 @@ class MuseMonoRunner:
         t0 = time.time()
         free0 = torch.cuda.mem_get_info(self.device)[0]
         group = get_parallel().tp_group.device_group if self.npes > 1 else None
-        self.tpx_w = tp_expert_copies(self.views, self.modules, self.rank, self.npes, group)
+        self.tpx_w = tp_expert_copies(
+            self.views, self.modules, self.rank, self.npes, group
+        )
         torch.cuda.synchronize(self.device)
         gb = sum(sum(t.numel() for t in w) for w in self.tpx_w if w is not None) / 2**30
         free1 = torch.cuda.mem_get_info(self.device)[0]
@@ -328,7 +389,9 @@ class MuseMonoRunner:
         if self.tpx:
             w = self.tpx_w[i] if self.tpx_w is not None else None
             if w is None:
-                raise RuntimeError(f"Muse Spark layer {i}: TP-experts launch without its slices")
+                raise RuntimeError(
+                    f"Muse Spark layer {i}: TP-experts launch without its slices"
+                )
             return tuple(_ptr(t) for t in w)
         L = self.views[i]
         return (_ptr(L.w13), _ptr(L.s13), _ptr(L.w2), _ptr(L.s2))
@@ -350,7 +413,11 @@ class MuseMonoRunner:
         if rows % q_len == 0:
             compile_only(self.kattn_kernel(rows, q_len))
             if self.use_layer:
-                for next_k1 in {self._next_k1(i) for i in range(len(self.views)) if self.views[i].kind == "mxfp4"}:
+                for next_k1 in {
+                    self._next_k1(i)
+                    for i in range(len(self.views))
+                    if self.views[i].kind == "mxfp4"
+                }:
                     compile_only(self.layer_kernel(rows, q_len, next_k1))
         if not (self.use_layer and rows % q_len == 0):
             compile_only(self.k2_kernel(rows))
@@ -362,7 +429,9 @@ class MuseMonoRunner:
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
         if not isinstance(backend, AiterAttnBackend):
-            return [f"attention backend {type(backend).__name__}, the kernels read the aiter backend's caches"]
+            return [
+                f"attention backend {type(backend).__name__}, the kernels read the aiter backend's caches"
+            ]
         why = []
         if backend.page_size != PAGE:
             why.append(f"page size {backend.page_size}, built for {PAGE}")
@@ -371,13 +440,21 @@ class MuseMonoRunner:
         if not backend.use_triton_unified_attention:
             why.append("the kernels mirror aiter's unified attention")
         if not backend.use_sliding_window_kv_pool or type(pool).__name__ != "SWAKVPool":
-            return why + [f"KV pool {type(pool).__name__}, the kernels read the sliding-window pool"]
+            return why + [
+                f"KV pool {type(pool).__name__}, the kernels read the sliding-window pool"
+            ]
         m = pool.full_to_swa_index_mapping
-        if m is None or m.dtype not in (torch.int32, torch.int64) or not m.is_contiguous():
+        if (
+            m is None
+            or m.dtype not in (torch.int32, torch.int64)
+            or not m.is_contiguous()
+        ):
             why.append("no contiguous int32 / int64 full-to-SWA slot table")
         for name in ("k_scale", "v_scale"):
             s = getattr(backend, name, None)
-            if s is not None and (not isinstance(s, torch.Tensor) or s.numel() != 1 or float(s) != 1.0):
+            if s is not None and (
+                not isinstance(s, torch.Tensor) or s.numel() != 1 or float(s) != 1.0
+            ):
                 why.append(f"backend {name} {s}: the kernels write fp8 at unit scale")
         for i, layer in enumerate(self.modules):
             attn = layer.self_attn.attn
@@ -385,7 +462,9 @@ class MuseMonoRunner:
                 why.append(f"layer {i}: a per-layer K / V scale")
             _, is_swa = pool.layers_mapping[attn.layer_id]
             if is_swa != (attn.sliding_window_size == WINDOW):
-                why.append(f"layer {i}: pool {'sliding' if is_swa else 'full'} vs window {attn.sliding_window_size}")
+                why.append(
+                    f"layer {i}: pool {'sliding' if is_swa else 'full'} vs window {attn.sliding_window_size}"
+                )
             k, v = pool.get_kv_buffer(attn.layer_id)
             for t, what in ((k, "K"), (v, "V")):
                 if not (t.dtype == FP8_CACHE and t.is_contiguous() and t.dim() == 3 and tuple(t.shape[-2:]) == (LOCAL_KV_HEADS, HEAD_DIM)):  # fmt: skip
@@ -415,9 +494,16 @@ class MuseMonoRunner:
         if TRACE_DIR:
             # the pinned host buffers before any capture (no host allocation inside
             # one); the save thread is CPU-only, so it may run through the captures
-            regions = {"k1": self.scratch_k1, "attn": self.scratch_attn, "k2": self.scratch_k2, "k3": self.scratch_k3}
+            regions = {
+                "k1": self.scratch_k1,
+                "attn": self.scratch_attn,
+                "k2": self.scratch_k2,
+                "k3": self.scratch_k3,
+            }
             self._trace_host = {k: torch.empty(TRACE_LAYERS * BLOCKS * TRACE_SLOTS * 8, dtype=torch.uint8, pin_memory=True) for k in regions}  # fmt: skip
-            self._trace_epoch_host = torch.empty_like(self.epoch, device="cpu", pin_memory=True)
+            self._trace_epoch_host = torch.empty_like(
+                self.epoch, device="cpu", pin_memory=True
+            )
             self._start_trace_thread()
 
     # ---------------------------------------------------------------- stage trace
@@ -433,7 +519,9 @@ class MuseMonoRunner:
 
         return {
             "k1": region(self.scratch_k1, k1_scratch_layout(), "k1_trace"),
-            "attn": region(self.scratch_attn, kattn_scratch_layout(rows, q_len), "attn_trace"),
+            "attn": region(
+                self.scratch_attn, kattn_scratch_layout(rows, q_len), "attn_trace"
+            ),
             "k2": region(self.scratch_k2, k2_scratch_layout(), "k2_trace"),
             "k3": region(self.scratch_k3, k3_scratch_layout(), "k3_trace"),
         }
@@ -477,10 +565,15 @@ class MuseMonoRunner:
                     torch.save(snap, path + ".tmp")
                     os.replace(path + ".tmp", path)
                 except Exception as e:  # noqa: BLE001 - a diagnostic thread never takes the server down
-                    print(f"[muse mono trace] rank {self.rank}: snapshot failed: {e!r}", flush=True)
+                    print(
+                        f"[muse mono trace] rank {self.rank}: snapshot failed: {e!r}",
+                        flush=True,
+                    )
                     time.sleep(10.0)
 
-        threading.Thread(target=loop, name=f"muse-mono-trace-{self.rank}", daemon=True).start()
+        threading.Thread(
+            target=loop, name=f"muse-mono-trace-{self.rank}", daemon=True
+        ).start()
 
     # ---------------------------------------------------------------- launches
     def _attn_args(self, i: int, rows: int, forward_batch, q_len: int) -> tuple:
@@ -489,7 +582,12 @@ class MuseMonoRunner:
         meta = self.backend.forward_metadata
         k_cache, v_cache, is_swa = self.caches[i]
         table = meta.swa_page_table if is_swa else meta.kv_indices
-        if table is None or table.dtype != torch.int32 or table.dim() != 2 or not table.is_contiguous():
+        if (
+            table is None
+            or table.dtype != torch.int32
+            or table.dim() != 2
+            or not table.is_contiguous()
+        ):
             raise RuntimeError(f"K-attn layer {i}: page table {None if table is None else (table.dtype, tuple(table.shape))}")  # fmt: skip
         lens = forward_batch.seq_lens
         if lens.dtype not in (torch.int32, torch.int64) or lens.numel() * q_len < rows:
@@ -502,7 +600,18 @@ class MuseMonoRunner:
             _ptr(self.scratch_attn),
         )  # fmt: skip
 
-    def launch(self, *, i: int, rows: int, q_len: int, positions, forward_batch, stream, attn_input, pre_norm_dtype):
+    def launch(
+        self,
+        *,
+        i: int,
+        rows: int,
+        q_len: int,
+        positions,
+        forward_batch,
+        stream,
+        attn_input,
+        pre_norm_dtype,
+    ):
         """Layer ``i`` on ``rows`` rows (``q_len`` a request): (stream, next
         layer's attention input)."""
         L = self.views[i]
@@ -515,13 +624,23 @@ class MuseMonoRunner:
             return out[0], out[1]
         if self.pool is None:
             raise RuntimeError("Muse Spark monokernels: launch before bind")
-        if not (stream.dtype == torch.float32 and stream.is_contiguous() and tuple(stream.shape) == (rows, HIDDEN)):
-            raise RuntimeError(f"Muse Spark launch: stream {tuple(stream.shape)} {stream.dtype}")
+        if not (
+            stream.dtype == torch.float32
+            and stream.is_contiguous()
+            and tuple(stream.shape) == (rows, HIDDEN)
+        ):
+            raise RuntimeError(
+                f"Muse Spark launch: stream {tuple(stream.shape)} {stream.dtype}"
+            )
         if not (attn_input.dtype == torch.bfloat16 and attn_input.is_contiguous() and tuple(attn_input.shape) == (rows, HIDDEN)):  # fmt: skip
-            raise RuntimeError(f"Muse Spark launch: attention input {tuple(attn_input.shape)} {attn_input.dtype}")
+            raise RuntimeError(
+                f"Muse Spark launch: attention input {tuple(attn_input.shape)} {attn_input.dtype}"
+            )
         slots = forward_batch.out_cache_loc
         if slots.dtype not in (torch.int32, torch.int64) or slots.numel() < rows:
-            raise RuntimeError(f"Muse Spark launch: out_cache_loc {slots.dtype} {tuple(slots.shape)}")
+            raise RuntimeError(
+                f"Muse Spark launch: out_cache_loc {slots.dtype} {tuple(slots.shape)}"
+            )
         if SKIP_LAYERS:
             return stream, attn_input
         if TRACE_DIR:
@@ -542,7 +661,9 @@ class MuseMonoRunner:
         if self.merged(i, rows, q_len):
             next_k1 = self._next_k1(i)
             L1 = self.views[i + 1] if next_k1 else L
-            k_cache1, v_cache1, is_swa1 = self.caches[i + 1] if next_k1 else self.caches[i]
+            k_cache1, v_cache1, is_swa1 = (
+                self.caches[i + 1] if next_k1 else self.caches[i]
+            )
             cos_sin1 = L1.cos_sin if L1.cos_sin is not None else self.any_cos_sin
             self.layer_kernel(rows, q_len, next_k1)(
                 _ptr(self.q), _ptr(self.o), *self._attn_args(i, rows, forward_batch, q_len),

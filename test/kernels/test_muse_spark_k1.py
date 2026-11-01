@@ -24,7 +24,9 @@ THETA = 500000.0
 def _cos_sin(device):
     from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM
 
-    inv = 1.0 / (THETA ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM))
+    inv = 1.0 / (
+        THETA ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
+    )
     freqs = torch.arange(POSITIONS, dtype=torch.float32)[:, None] * inv[None, :]
     return torch.cat([freqs.cos(), freqs.sin()], dim=-1).to(device)
 
@@ -78,7 +80,11 @@ def _reference(x, w, cos_sin, positions, rope):
         d = torch.arange(HEAD_DIM, device=value.device)
         cos = _bf(cs[:, None, d // 2])
         sin = _bf(cs[:, None, HEAD_DIM // 2 + d // 2])
-        other = value.reshape(rows, value.shape[1], HEAD_DIM // 2, 2).flip(-1).reshape(rows, value.shape[1], HEAD_DIM)
+        other = (
+            value.reshape(rows, value.shape[1], HEAD_DIM // 2, 2)
+            .flip(-1)
+            .reshape(rows, value.shape[1], HEAD_DIM)
+        )
         rotated = torch.where(d % 2 == 0, -other, other)
         return (_bf(value * cos) + _bf(rotated * sin)).to(torch.bfloat16)
 
@@ -98,7 +104,9 @@ def _close(got, ref, rtol, what, flips=1e-3):
     err = (got - ref).abs()
     bad = (err > rtol * ref.abs() + 1e-3).float().mean().item()
     worst = (err > 4 * rtol * ref.abs() + 1e-3).float().mean().item()
-    assert bad <= flips and worst == 0.0, f"{what}: {bad:.3%} of the elements off by more than {rtol} relative, {worst:.3%} by more than {4 * rtol}"
+    assert bad <= flips and worst == 0.0, (
+        f"{what}: {bad:.3%} of the elements off by more than {rtol} relative, {worst:.3%} by more than {4 * rtol}"
+    )
 
 
 def _one_ulp_fp8(got, ref, what):
@@ -111,7 +119,13 @@ def _one_ulp_fp8(got, ref, what):
 
 @pytest.mark.parametrize(
     "rows,rope,swa,slot64",
-    [(8, True, True, True), (16, True, False, True), (32, False, True, False), (64, True, True, True), (5, True, False, True)],
+    [
+        (8, True, True, True),
+        (16, True, False, True),
+        (32, False, True, False),
+        (64, True, True, True),
+        (5, True, False, True),
+    ],
 )
 def test_k1_matches_the_fused_kernel_math(rows, rope, swa, slot64):
     from sgl_amd_mono.muse_spark.gfx950.config import (
@@ -137,13 +151,17 @@ def test_k1_matches_the_fused_kernel_math(rows, rope, swa, slot64):
     slots = full if slot64 else full.to(torch.int32)
     # the sliding layers' table: full slot -> SWA slot, a permutation here
     swa_map = torch.randperm(SLOTS, device=dev, dtype=torch.int64)
-    k_cache = torch.zeros(SLOTS, LOCAL_KV_HEADS, HEAD_DIM, device=dev).to(torch.float8_e4m3fn)
+    k_cache = torch.zeros(SLOTS, LOCAL_KV_HEADS, HEAD_DIM, device=dev).to(
+        torch.float8_e4m3fn
+    )
     v_cache = torch.zeros_like(k_cache)
     q = torch.full((MAX_TOKENS, Q_K), float("nan"), device=dev, dtype=bf)
     k = torch.full((MAX_TOKENS, KV_K), float("nan"), device=dev, dtype=bf)
     v = torch.full_like(k, float("nan"))
     g = torch.full_like(q, float("nan"))
-    scratch = torch.zeros(scratch_bytes(k1_scratch_layout()), dtype=torch.uint8, device=dev)
+    scratch = torch.zeros(
+        scratch_bytes(k1_scratch_layout()), dtype=torch.uint8, device=dev
+    )
     epoch = _epoch(dev)
     launch = build_k1(K1Build(tokens=rows))
     for step in range(2):  # the second step's tags differ from the first's
@@ -167,7 +185,9 @@ def test_k1_matches_the_fused_kernel_math(rows, rope, swa, slot64):
     _one_ulp_fp8(v_cache[at].reshape(rows, -1), _fp8(v_ref), "V cache")
     untouched = torch.ones(SLOTS, dtype=torch.bool, device=dev)
     untouched[at] = False
-    assert (k_cache[untouched].float() == 0).all() and (v_cache[untouched].float() == 0).all()
+    assert (k_cache[untouched].float() == 0).all() and (
+        v_cache[untouched].float() == 0
+    ).all()
 
 
 @pytest.mark.parametrize("rows", [8, 16, 32, 64])

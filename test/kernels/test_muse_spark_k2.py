@@ -86,7 +86,9 @@ def _reference(o, g, stream, w):
     logits = x.float() @ w["w_hi"].float().T + x.float() @ w["w_lo"].float().T
     sc = torch.sigmoid(logits * ROUTER_MULT)
     biased = sc + w["bias"]
-    order = torch.argsort(biased, dim=-1, descending=True, stable=True)  # a tie: the lower id first
+    order = torch.argsort(
+        biased, dim=-1, descending=True, stable=True
+    )  # a tie: the lower id first
     ids = order[:, :TOP_K]
     picks = sc.gather(1, ids)
     scores = picks / (picks.sum(-1, keepdim=True) + ROUTE_EPS) * ROUTE_SCALE
@@ -118,10 +120,26 @@ def _check_routing(ids, scores, ids_ref, scores_ref, biased):
         ref_at = {e: s for e, s in zip(ref, scores_ref[t].tolist())}
         for e, s in zip(got, scores[t].tolist()):
             if e in ref_at:
-                assert abs(s - ref_at[e]) <= 1e-3 + 1e-2 * abs(ref_at[e]), (t, e, s, ref_at[e])
+                assert abs(s - ref_at[e]) <= 1e-3 + 1e-2 * abs(ref_at[e]), (
+                    t,
+                    e,
+                    s,
+                    ref_at[e],
+                )
 
 
-@pytest.mark.parametrize("rows,fp8", [(8, False), (16, False), (32, False), (64, False), (24, False), (8, True), (64, True)])
+@pytest.mark.parametrize(
+    "rows,fp8",
+    [
+        (8, False),
+        (16, False),
+        (32, False),
+        (64, False),
+        (24, False),
+        (8, True),
+        (64, True),
+    ],
+)
 def test_k2_matches_the_ops_math(rows, fp8):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
@@ -135,7 +153,10 @@ def test_k2_matches_the_ops_math(rows, fp8):
         TOP_K,
     )
     from sgl_amd_mono.muse_spark.gfx950.layout import scratch_bytes
-    from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import k2_scratch_layout, sym_bytes
+    from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import (
+        k2_scratch_layout,
+        sym_bytes,
+    )
 
     torch.manual_seed(100 + rows)
     dev = torch.device("cuda")
@@ -143,9 +164,13 @@ def test_k2_matches_the_ops_math(rows, fp8):
     o = torch.randn(rows, Q_K, device=dev).to(bf)
     g = torch.randn(rows, Q_K, device=dev).to(bf)
     stream = torch.randn(rows, HIDDEN, device=dev)
-    router = torch.randn(HIDDEN, EXPERTS, device=dev) * 0.02  # the fp32 router [HIDDEN, EXPERTS]
+    router = (
+        torch.randn(HIDDEN, EXPERTS, device=dev) * 0.02
+    )  # the fp32 router [HIDDEN, EXPERTS]
     w_hi = router.T.to(bf).contiguous()
-    w_lo = (router.T - w_hi.float()).to(bf).contiguous()  # pack_joint_router_pooler_weight's split
+    w_lo = (
+        (router.T - w_hi.float()).to(bf).contiguous()
+    )  # pack_joint_router_pooler_weight's split
     w = {
         "w_o": (torch.randn(HIDDEN, Q_K, device=dev) * 0.02).to(bf),
         "alpha": torch.rand(HIDDEN, device=dev) * 0.5 + 0.5,
@@ -161,15 +186,23 @@ def test_k2_matches_the_ops_math(rows, fp8):
     # takes the values they encode (fp32)
     pool_ptr = w["w_pool"].data_ptr()
     if fp8:
-        from sgl_amd_mono.muse_spark.fp8_quant import pack_fp8_rows, pack_fp8_rows_pooler, unpack_fp8_rows
+        from sgl_amd_mono.muse_spark.fp8_quant import (
+            pack_fp8_rows,
+            pack_fp8_rows_pooler,
+            unpack_fp8_rows,
+        )
 
         packed = pack_fp8_rows_pooler(w["w_pool"])  # the kernel's lane-swizzled layout
-        w["w_pool"] = unpack_fp8_rows(pack_fp8_rows(w["w_pool"]), MOE_HIDDEN, HIDDEN)  # the same codes, row-major
+        w["w_pool"] = unpack_fp8_rows(
+            pack_fp8_rows(w["w_pool"]), MOE_HIDDEN, HIDDEN
+        )  # the same codes, row-major
         pool_ptr = packed.data_ptr()
     ids = torch.full((MAX_TOKENS, TOP_K), -7, dtype=torch.int32, device=dev)
     scores = torch.full((MAX_TOKENS, TOP_K), float("nan"), device=dev)
     xn = torch.full((MAX_TOKENS, MOE_HIDDEN), float("nan"), device=dev, dtype=bf)
-    scratch = torch.zeros(scratch_bytes(k2_scratch_layout()), dtype=torch.uint8, device=dev)
+    scratch = torch.zeros(
+        scratch_bytes(k2_scratch_layout()), dtype=torch.uint8, device=dev
+    )
     peers = PeerBuffer(sym_bytes(1) + guard.FLAG_BYTES, None, 0, 1, dev)
     epoch = _epoch(dev)
     launch = build_k2(K2Build(tokens=rows, npes=1, fp8_pool=fp8))
@@ -192,7 +225,11 @@ def test_k2_matches_the_ops_math(rows, fp8):
         _close(got_stream, new_ref, 1 / 64, 1e-2, "stream")
         _close(xn[:rows], xn_ref, 1 / 32, 2e-2, "expert input")
         _check_routing(ids[:rows], scores[:rows], ids_ref, scores_ref, biased)
-        assert (ids[rows:] == -7).all() and scores[rows:].isnan().all() and xn[rows:].isnan().all()
+        assert (
+            (ids[rows:] == -7).all()
+            and scores[rows:].isnan().all()
+            and xn[rows:].isnan().all()
+        )
         assert epoch[list(guard.ERROR_WORDS)].eq(0).all(), "a wait failed"
     finally:
         peers.close()
@@ -202,6 +239,7 @@ def test_k2_matches_the_ops_math(rows, fp8):
 def test_every_width_compiles(rows):
     from sgl_amd_mono.muse_spark.gfx950.build_k2 import K2Build, build_k2
     from sgl_amd_mono.muse_spark.gfx950.runner import compile_only
+
     # every width compiles, served (SGLANG_AMD_MONO_MUSE_WIDTHS, default 8) or not
     compile_only(build_k2(K2Build(tokens=rows)))
 

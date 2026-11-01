@@ -14,6 +14,7 @@ from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import peer_bases
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
+from sgl_amd_mono.muse_spark.gfx950 import compat
 from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
 from sgl_amd_mono.muse_spark.gfx950.device import step_tag
 from sgl_amd_mono.muse_spark.gfx950.stages import post_attn
@@ -22,8 +23,6 @@ from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import (
     sym_bytes,
     sym_layout,
 )
-
-from sgl_amd_mono.muse_spark.gfx950 import compat
 
 BRIDGE = compat.install()  # FlyDSL 0.3.2: the upstream helpers the image lacks
 SOURCES = kernel_sources(__name__)
@@ -63,12 +62,27 @@ class K2Build(msgspec.Struct, frozen=True):
     fault_after: int = 0
     trace: bool = False
     fp8_pool: bool = False  # w_pool is a packed FP8 copy (codes, then fp32 row scales)
-    defer_k1: bool = False  # the boundary also writes the next K1's first operand half (``k2_c1``)
-    xq_pre: bool = False  # xn also writes the expert input as MXFP4 blocks (``k2_xinq``) for K3
+    defer_k1: bool = (
+        False  # the boundary also writes the next K1's first operand half (``k2_c1``)
+    )
+    xq_pre: bool = (
+        False  # xn also writes the expert input as MXFP4 blocks (``k2_xinq``) for K3
+    )
     pshard: bool = False  # w_pool is the rank's 1 / npes of the pooler rows; partials to every rank (``poolx``)
 
 
-def k2_context(key: K2Build, lds, args: dict, scratch, sym, peers, rank, tag, layout: dict, layer=None) -> dict:
+def k2_context(
+    key: K2Build,
+    lds,
+    args: dict,
+    scratch,
+    sym,
+    peers,
+    rank,
+    tag,
+    layout: dict,
+    layer=None,
+) -> dict:
     """K2's context: LDS views, the mailbox, the scratch and peer regions, the
     ranks' peer buffer bases (loaded once a CTA) and the arguments."""
     tid = fx.thread_idx.x
@@ -106,7 +120,9 @@ def k2_context(key: K2Build, lds, args: dict, scratch, sym, peers, rank, tag, la
     c["peer_poolx"] = [preg(base, sy["poolx"][0], "poolx") for base in c["bases"]]
     for region, (off, _) in layout.items():
         if region in ("k2_xbuf", "k2_xbuf2", "k2_c1", "k2_xinq"):
-            c[region[3:]] = scratch + fx.Int64(off)  # plain bf16 words, not a mailbox region
+            c[region[3:]] = scratch + fx.Int64(
+                off
+            )  # plain bf16 words, not a mailbox region
         else:
             c[region[3:]] = sreg(scratch, off, region)  # "k2_og" -> c["og"]
     return c
@@ -117,7 +133,17 @@ def build_k2(key: K2Build):
     of a ``key.npes``-way TP group."""
     S, W = key.tokens, key.npes
     assert 1 <= S <= MAX_TOKENS and 1 <= W <= guard.FLAG_WORDS
-    name = kernel_symbol("muse_spark_k2", s=S, w=W, f=key.fault_site, t=int(key.trace), p8=int(key.fp8_pool), d=int(key.defer_k1), xq=int(key.xq_pre), ps=int(key.pshard))
+    name = kernel_symbol(
+        "muse_spark_k2",
+        s=S,
+        w=W,
+        f=key.fault_site,
+        t=int(key.trace),
+        p8=int(key.fp8_pool),
+        d=int(key.defer_k1),
+        xq=int(key.xq_pre),
+        ps=int(key.pshard),
+    )
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     flags_offset = sym_bytes(W)
@@ -168,7 +194,18 @@ def build_k2(key: K2Build):
                 "pre_w": pre_w, "w_hi": w_hi, "w_lo": w_lo, "bias": bias, "w_pool": w_pool,
                 "xn_w": xn_w, "ids": ids, "scores": scores, "xin": xin,
             }  # fmt: skip
-            c = k2_context(key, lds, args, scratch, sym, peers, rank, step_tag(epoch, layer), layout, layer=layer)
+            c = k2_context(
+                key,
+                lds,
+                args,
+                scratch,
+                sym,
+                peers,
+                rank,
+                step_tag(epoch, layer),
+                layout,
+                layer=layer,
+            )
             post_attn.run_k2(c)
 
     @flyc.jit

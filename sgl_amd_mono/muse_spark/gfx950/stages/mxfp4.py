@@ -56,5 +56,7 @@ def lanes_before(bal, lane):
     lo = fx.Int32(bal & fx.Int64(0xFFFFFFFF))
     hi = fx.Int32(bal >> fx.Int64(32))
     low_part = popcount(lo & ((fx.Int32(1) << fx.min(lane, 31)) - 1))
-    high_part = popcount(lo) + popcount(hi & ((fx.Int32(1) << fx.max(lane - 32, 0)) - 1))
+    high_part = popcount(lo) + popcount(
+        hi & ((fx.Int32(1) << fx.max(lane - 32, 0)) - 1)
+    )
     return (lane < 32).select(low_part, high_part)

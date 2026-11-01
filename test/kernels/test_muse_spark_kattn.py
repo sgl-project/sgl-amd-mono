@@ -43,7 +43,10 @@ def _reference(q, k_cache, v_cache, table, seq_lens, ql, window, scale):
     for r in range(R):
         keys = int(seq_lens[r])
         ctx = keys - ql
-        slots = table[r, : (keys + 15) // 16].long()[:, None] * 16 + torch.arange(16, device=q.device)[None, :]
+        slots = (
+            table[r, : (keys + 15) // 16].long()[:, None] * 16
+            + torch.arange(16, device=q.device)[None, :]
+        )
         slots = slots.reshape(-1)[:keys]
         K = k_cache[slots].float()  # [keys, KV_HEADS, 64]
         V = v_cache[slots].float()
@@ -70,26 +73,48 @@ def _reference(q, k_cache, v_cache, table, seq_lens, ql, window, scale):
         (8, 2, 2047, 256, [3000, 2200]),
         (8, 4, 0, 1024, [5000, 17, 700, 2049]),
         (8, 8, 2047, 0, None),  # the kernel sizes the partition
-        (8, 8, 0, 0, [20000, 300, 8, 95000, 4096, 2048, 2047, 9]),  # C8 at the AgentX context (a request holds >= its 8 rows)
+        (
+            8,
+            8,
+            0,
+            0,
+            [20000, 300, 8, 95000, 4096, 2048, 2047, 9],
+        ),  # C8 at the AgentX context (a request holds >= its 8 rows)
         (8, 2, 2047, 0, [95000, 60000]),
         (1, 16, 2047, 256, None),
     ],
 )
 def test_kattn_matches_the_verify_attention(ql, R, window, part, lens, peaks=None):
-    from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, Q_K, SOFTMAX_SCALE
+    from sgl_amd_mono.muse_spark.gfx950.config import (
+        HEAD_DIM,
+        LOCAL_KV_HEADS,
+        Q_K,
+        SOFTMAX_SCALE,
+    )
     from sgl_amd_mono.muse_spark.gfx950.layer import KAttnBuild, build_kattn
-    from sgl_amd_mono.muse_spark.gfx950.layout import kattn_scratch_layout, scratch_bytes
+    from sgl_amd_mono.muse_spark.gfx950.layout import (
+        kattn_scratch_layout,
+        scratch_bytes,
+    )
 
     torch.manual_seed(7 * ql + R)
     dev = torch.device("cuda")
     bf = torch.bfloat16
     S = ql * R
     if lens is None:
-        lens = [int(x) for x in torch.randint(ql, 2600, (R,))]  # keys include the step's ql rows
+        lens = [
+            int(x) for x in torch.randint(ql, 2600, (R,))
+        ]  # keys include the step's ql rows
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
-    q = (torch.randn(S, Q_K, device=dev) * 5.47).to(bf)  # K1 hands q scaled by qk_scale_factor
-    k_cache = (torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=dev) * 2).to(torch.float8_e4m3fn)
-    v_cache = (torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=dev)).to(torch.float8_e4m3fn)
+    q = (torch.randn(S, Q_K, device=dev) * 5.47).to(
+        bf
+    )  # K1 hands q scaled by qk_scale_factor
+    k_cache = (torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=dev) * 2).to(
+        torch.float8_e4m3fn
+    )
+    v_cache = (torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=dev)).to(
+        torch.float8_e4m3fn
+    )
     # distinct pages a request, the rest of the rows zero
     perm = torch.randperm(PAGES - 1, device=dev) + 1
     table = torch.zeros(R, MAX_BLOCKS, dtype=torch.int32, device=dev)
@@ -110,14 +135,19 @@ def test_kattn_matches_the_verify_attention(ql, R, window, part, lens, peaks=Non
                 for h in range(LOCAL_KV_HEADS):
                     for g in range(8):
                         rel = peaks[(qpos + g) % len(peaks)]
-                        kidx = min(max(int(rel * ctx) if isinstance(rel, float) else rel, 0), ctx + qpos)
+                        kidx = min(
+                            max(int(rel * ctx) if isinstance(rel, float) else rel, 0),
+                            ctx + qpos,
+                        )
                         page = int(table[r, kidx // 16])
                         kv = k_cache[page * 16 + kidx % 16, h].float()
                         a = 30.0 / (scale * float(kv.pow(2).sum()))
                         qh = (a * kv + 0.02 * torch.randn(HEAD_DIM, device=dev)).to(bf)
                         q[t, (h * 8 + g) * HEAD_DIM : (h * 8 + g + 1) * HEAD_DIM] = qh
     o = torch.full((S, Q_K), float("nan"), device=dev, dtype=bf)
-    scratch = torch.zeros(scratch_bytes(kattn_scratch_layout(S, ql)), dtype=torch.uint8, device=dev)
+    scratch = torch.zeros(
+        scratch_bytes(kattn_scratch_layout(S, ql)), dtype=torch.uint8, device=dev
+    )
     epoch = _epoch(dev)
     launch = build_kattn(KAttnBuild(tokens=S, q_len=ql))
     scale_bits = struct.unpack("i", struct.pack("f", scale))[0]
@@ -145,7 +175,10 @@ def test_kattn_matches_the_verify_attention(ql, R, window, part, lens, peaks=Non
 @pytest.mark.parametrize(
     "lens,peaks",
     [
-        ([95000], [0, 0.5, 0.999]),  # a sink, a middle key, a recent one: maxima in different partitions
+        (
+            [95000],
+            [0, 0.5, 0.999],
+        ),  # a sink, a middle key, a recent one: maxima in different partitions
         ([95000], [0.999]),  # the max in the last partition (a late rescale)
         ([95000], [0]),  # the max in the first partition
         ([20000, 95000], [3, 0.25, 0.75]),
@@ -170,9 +203,17 @@ def test_kattn_scratch_reuse_with_new_inputs(lens):
     stood for every task of its row tiles: at ~95k keys a partition's two tasks
     ran in different rounds and the merge read the other tasks' rows of the
     previous launch; repeating one input could not show it.)"""
-    from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, Q_K, SOFTMAX_SCALE
+    from sgl_amd_mono.muse_spark.gfx950.config import (
+        HEAD_DIM,
+        LOCAL_KV_HEADS,
+        Q_K,
+        SOFTMAX_SCALE,
+    )
     from sgl_amd_mono.muse_spark.gfx950.layer import KAttnBuild, build_kattn
-    from sgl_amd_mono.muse_spark.gfx950.layout import kattn_scratch_layout, scratch_bytes
+    from sgl_amd_mono.muse_spark.gfx950.layout import (
+        kattn_scratch_layout,
+        scratch_bytes,
+    )
 
     ql, R = 8, len(lens)
     torch.manual_seed(31 + R)
@@ -181,8 +222,12 @@ def test_kattn_scratch_reuse_with_new_inputs(lens):
     S = ql * R
     seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
     qs = [(torch.randn(S, Q_K, device=dev) * 5.47).to(bf) for _ in range(2)]
-    k_cache = (torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=dev) * 2).to(torch.float8_e4m3fn)
-    v_cache = (torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=dev)).to(torch.float8_e4m3fn)
+    k_cache = (torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=dev) * 2).to(
+        torch.float8_e4m3fn
+    )
+    v_cache = (torch.randn(PAGES * 16, LOCAL_KV_HEADS, HEAD_DIM, device=dev)).to(
+        torch.float8_e4m3fn
+    )
     perm = torch.randperm(PAGES - 1, device=dev) + 1
     table = torch.zeros(R, MAX_BLOCKS, dtype=torch.int32, device=dev)
     at = 0
@@ -190,9 +235,14 @@ def test_kattn_scratch_reuse_with_new_inputs(lens):
         n = (lens[r] + 15) // 16
         table[r, :n] = perm[at : at + n].to(torch.int32)
         at += n
-    refs = [_reference(q, k_cache, v_cache, table, seq_lens, ql, 0, SOFTMAX_SCALE) for q in qs]
+    refs = [
+        _reference(q, k_cache, v_cache, table, seq_lens, ql, 0, SOFTMAX_SCALE)
+        for q in qs
+    ]
     o = torch.full((S, Q_K), float("nan"), device=dev, dtype=bf)
-    scratch = torch.zeros(scratch_bytes(kattn_scratch_layout(S, ql)), dtype=torch.uint8, device=dev)
+    scratch = torch.zeros(
+        scratch_bytes(kattn_scratch_layout(S, ql)), dtype=torch.uint8, device=dev
+    )
     epoch = _epoch(dev)
     launch = build_kattn(KAttnBuild(tokens=S, q_len=ql))
     scale_bits = struct.unpack("i", struct.pack("f", SOFTMAX_SCALE))[0]
@@ -210,5 +260,7 @@ def test_kattn_scratch_reuse_with_new_inputs(lens):
         torch.cuda.synchronize()
         got = o.float()
         assert not got.isnan().any(), f"launch {step}: NaN in the attention output"
-        heads = torch.nn.functional.cosine_similarity(got.reshape(S, -1, HEAD_DIM), ref.reshape(S, -1, HEAD_DIM), dim=-1)
+        heads = torch.nn.functional.cosine_similarity(
+            got.reshape(S, -1, HEAD_DIM), ref.reshape(S, -1, HEAD_DIM), dim=-1
+        )
         assert heads.min().item() > 0.999, f"launch {step}: (row, head) {(heads <= 0.999).nonzero().tolist()[:8]} off, least cosine {heads.min().item():.5f}"  # fmt: skip

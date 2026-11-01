@@ -35,7 +35,9 @@ def _store(ptr, value, words=None, volatile=False):
 def _load(ptr, count=1, nontemporal=False):
     i32 = ir.IntegerType.get_signless(32)
     ty = i32 if count == 1 else ir.VectorType.get([count], i32)
-    r = llvm.LoadOp(ty, ptr, alignment=4 * count, nontemporal=nontemporal or None).result
+    r = llvm.LoadOp(
+        ty, ptr, alignment=4 * count, nontemporal=nontemporal or None
+    ).result
     return fx.Int32(r) if count == 1 else fx.Vector(r)
 
 
@@ -61,7 +63,11 @@ def _scope_name(scope) -> str:
 
 def memory_fence(syncscope="workgroup", ordering="release"):
     """``llvm.fence`` at ``syncscope`` (workgroup / agent / system) with ``ordering``."""
-    order = ordering if isinstance(ordering, str) else getattr(ordering, "value", str(ordering))
+    order = (
+        ordering
+        if isinstance(ordering, str)
+        else getattr(ordering, "value", str(ordering))
+    )
     llvm.FenceOp(_ORDERINGS[str(order).lower()], syncscope=_scope_name(syncscope))
 
 
@@ -97,10 +103,14 @@ def install() -> list[str]:
 
     done = []
     if not hasattr(fx, "generic_store"):
-        fx.generic_store = lambda ptr, value, volatile=False: _store(ptr, value, volatile=volatile)
+        fx.generic_store = lambda ptr, value, volatile=False: _store(
+            ptr, value, volatile=volatile
+        )
         done.append("fx.generic_store")
     if not hasattr(fx, "generic_load"):
-        fx.generic_load = lambda ptr, count=1, nontemporal=False: _load(ptr, count, nontemporal)
+        fx.generic_load = lambda ptr, count=1, nontemporal=False: _load(
+            ptr, count, nontemporal
+        )
         done.append("fx.generic_load")
     if not hasattr(fx, "memory_fence"):
         fx.memory_fence = memory_fence
@@ -114,6 +124,11 @@ def install() -> list[str]:
         _ops.global_load = _global_load
         _epoch.gstore = _gstore
         _guard.stop_launch = _stop_launch
-        done += ["ops.global_ptr", "ops.global_load", "epoch.gstore", "guard.stop_launch"]
+        done += [
+            "ops.global_ptr",
+            "ops.global_load",
+            "epoch.gstore",
+            "guard.stop_launch",
+        ]
     _DONE = done
     return done

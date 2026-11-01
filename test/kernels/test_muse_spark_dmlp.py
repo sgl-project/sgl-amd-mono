@@ -48,7 +48,9 @@ def _conv32(x, delta, base, rows):
     from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
 
     xb = x.reshape(rows, D.GROUPS, D.GROUP)
-    c = base.float().reshape(1, D.TAPS, D.GROUPS, D.GROUP) + delta.reshape(rows, D.TAPS, D.GROUPS, 1)
+    c = base.float().reshape(1, D.TAPS, D.GROUPS, D.GROUP) + delta.reshape(
+        rows, D.TAPS, D.GROUPS, 1
+    )
     pos = torch.arange(rows, device=x.device) % D.BLOCK
     prev = torch.cat([torch.zeros_like(xb[:1]), xb[:-1]], 0) * (pos >= 1).view(-1, 1, 1)
     return (c[:, 0] * xb + c[:, 1] * prev).reshape(rows, D.H)
@@ -73,14 +75,18 @@ def _reference(res, attn, w, eps=1e-5):
     g, u = gu[:, : D.I], gu[:, D.I :]
     a = (torch.nn.functional.silu(g.float()).to(bf).float() * u.float()).to(bf)
     d = a @ w["w_down"].T  # one rank: its partial is the sum
-    out_sglang = _grouped_conv(d, coef[:, 1], w["base"][1], D.BLOCK, D.GROUPS, D.GROUP, D.TAPS)
+    out_sglang = _grouped_conv(
+        d, coef[:, 1], w["base"][1], D.BLOCK, D.GROUPS, D.GROUP, D.TAPS
+    )
     # the kernel's chain
     coef32 = (h.float() @ w["w_kp"].float().T).reshape(-1, 2, D.TAPS, D.GROUPS)
     hc32 = _conv32(h.float(), coef32[:, 0], w["base"][0], rows).to(bf)
     gu32 = hc32.float() @ w["w_gu"].float().T
     g32, u32 = gu32[:, : D.I].to(bf).float(), gu32[:, D.I :].to(bf).float()
     a32 = (torch.nn.functional.silu(g32).to(bf).float() * u32).to(bf)
-    d32 = (a32.float() @ w["w_down"].float().T).to(bf).float()  # the rank partial, a bf16 pair
+    d32 = (
+        (a32.float() @ w["w_down"].float().T).to(bf).float()
+    )  # the rank partial, a bf16 pair
     out_fp32 = _conv32(d32, coef32[:, 1], w["base"][1], rows).to(bf)
     return res2, out_sglang, out_fp32
 
@@ -88,9 +94,13 @@ def _reference(res, attn, w, eps=1e-5):
 def _close(got, ref, rtol, atol, what, bad_max=0.001, cos_min=0.9999):
     got, ref = got.float(), ref.float()
     bad = ((got - ref).abs() > rtol * ref.abs() + atol).float().mean().item()
-    assert bad < bad_max, f"{what}: {bad:.2%} of the elements off by more than {rtol} relative + {atol}"
+    assert bad < bad_max, (
+        f"{what}: {bad:.2%} of the elements off by more than {rtol} relative + {atol}"
+    )
     cos = torch.nn.functional.cosine_similarity(got, ref, dim=-1)
-    assert cos.min().item() >= cos_min, f"{what}: a row's cosine is {cos.min().item():.5f}"
+    assert cos.min().item() >= cos_min, (
+        f"{what}: a row's cosine is {cos.min().item():.5f}"
+    )
 
 
 @pytest.mark.parametrize("rows", [8, 16, 64])
@@ -117,13 +127,17 @@ def test_dmlp_matches_the_draft_mlp(rows):
     res_ref, out_sglang, out_fp32 = _reference(res, attn, w)
     res_out = torch.full((rows, D.H), float("nan"), device=dev, dtype=bf)
     out = torch.full((rows, D.H), float("nan"), device=dev, dtype=bf)
-    scratch = torch.zeros(scratch_bytes(D.dm_scratch_layout()), dtype=torch.uint8, device=dev)
+    scratch = torch.zeros(
+        scratch_bytes(D.dm_scratch_layout()), dtype=torch.uint8, device=dev
+    )
     peers = PeerBuffer(D.dm_sym_bytes(1) + guard.FLAG_BYTES, None, 0, 1, dev)
     peers.bytes.zero_()
     epoch = _epoch(dev)
     import os
 
-    stages = int(os.environ.get("DMLP_STAGES", "8"))  # a bisection: run the first stages only
+    stages = int(
+        os.environ.get("DMLP_STAGES", "8")
+    )  # a bisection: run the first stages only
     launch = D.build_dmlp(D.DMLPBuild(tokens=rows, npes=1, stages=stages))
     try:
         for step in range(2):  # the second step's tags differ from the first's
@@ -134,7 +148,9 @@ def test_dmlp_matches_the_draft_mlp(rows):
             )  # fmt: skip
             epoch[0] += 1
         torch.cuda.synchronize()
-        assert (epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1] == 0).all(), "a wait failed"
+        assert (epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1] == 0).all(), (
+            "a wait failed"
+        )
         if stages < 8:
             return
         assert not res_out.isnan().any() and not out.isnan().any(), "NaN in the outputs"
@@ -143,7 +159,15 @@ def test_dmlp_matches_the_draft_mlp(rows):
         # near-cancellations differ by a bf16 ulp of their terms), rows at cosine 0.9999
         _close(out, out_fp32, 1 / 32, 2e-2, "out vs the kernel's arithmetic in torch")
         # SGLang's grouped convolution rounds every op to bf16: rows at cosine 0.999
-        _close(out, out_sglang, 1 / 8, 1e-1, "out vs SGLang's bf16 chain", bad_max=0.02, cos_min=0.999)
+        _close(
+            out,
+            out_sglang,
+            1 / 8,
+            1e-1,
+            "out vs SGLang's bf16 chain",
+            bad_max=0.02,
+            cos_min=0.999,
+        )
     finally:
         peers.close()
 

@@ -45,7 +45,7 @@ from sgl_amd_mono.common.ops import (
     row_sum,
     rsrc,
 )
-from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES
+from sgl_amd_mono.common.plan import BLOCKS, THREADS
 from sgl_amd_mono.muse_spark.gfx950.config import (
     G_OFF,
     HEAD_DIM,
@@ -61,13 +61,13 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     RMS_EPS,
     V_OFF,
 )
-from sgl_amd_mono.muse_spark.gfx950.device import acquire_loads, poll_flags, stamp
+from sgl_amd_mono.muse_spark.gfx950.device import poll_flags, stamp
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     ELEMS,
-    GEMV_TASKS,
     G_ROWS,
     G_TILES,
     GATE_TASKS,
+    GEMV_TASKS,
     GT0,
     HEAD_TASKS,
     HT0,
@@ -107,7 +107,11 @@ def gemv_w_loads(c, rg, kpart, w):
             fx.Vector(
                 bo.buffer_load(
                     r_w,
-                    ((rg * G_ROWS + it * ROWS + lane % 16) * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2,
+                    (
+                        (rg * G_ROWS + it * ROWS + lane % 16) * HIDDEN
+                        + gemv_k(lane, wave, kpart, kc)
+                    )
+                    // 2,
                     vec_width=4,
                     dtype=T.i32,
                     cache_modifier=CM_NT,
@@ -148,7 +152,11 @@ def stage_gemv(c, rg, kpart, first=None):
         xb = [
             fx.Vector(
                 bo.buffer_load(
-                    r_x, (tok * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2, vec_width=4, dtype=T.i32, cache_modifier=x_cm
+                    r_x,
+                    (tok * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=x_cm,
                 )  # fmt: skip
             )
             for kc in range(K_STEPS)
@@ -156,7 +164,9 @@ def stage_gemv(c, rg, kpart, first=None):
         for it in range_constexpr(G_TILES):
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for kc in range_constexpr(K_STEPS):
-                acc = mfma_bf16(w[it][kc].bitcast(fx.BFloat16), xb[kc].bitcast(fx.BFloat16), acc)
+                acc = mfma_bf16(
+                    w[it][kc].bitcast(fx.BFloat16), xb[kc].bitcast(fx.BFloat16), acc
+                )
             fx.ptr_store(acc, red + (it * RED_FLOATS + (wave * 64 + lane) * 4))
         gpu.barrier()
         # this token tile's partials of the part: thread (row of the group, token of the tile)
@@ -194,9 +204,22 @@ def stage_gemv_deferred(c, rg, kpart, w):
     fwv, bev, nwv = [], [], []
     for kc in range_constexpr(K_STEPS):
         k = gemv_k(lane, wave, kpart, kc)
-        fwv.append(fx.Vector(bo.buffer_load(r_fw, k // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16).to(fx.Float32))
-        bev.append([fx.Vector(bo.buffer_load(r_be, k + 4 * h, vec_width=4, dtype=T.f32)) for h in range(2)])
-        nwv.append(fx.Vector(bo.buffer_load(r_nw, k // 2, vec_width=4, dtype=T.i32)).bitcast(fx.BFloat16).to(fx.Float32))
+        fwv.append(
+            fx.Vector(bo.buffer_load(r_fw, k // 2, vec_width=4, dtype=T.i32))
+            .bitcast(fx.BFloat16)
+            .to(fx.Float32)
+        )
+        bev.append(
+            [
+                fx.Vector(bo.buffer_load(r_be, k + 4 * h, vec_width=4, dtype=T.f32))
+                for h in range(2)
+            ]
+        )
+        nwv.append(
+            fx.Vector(bo.buffer_load(r_nw, k // 2, vec_width=4, dtype=T.i32))
+            .bitcast(fx.BFloat16)
+            .to(fx.Float32)
+        )
     for t in range_constexpr(tiles):
         tok = fx.min(t * TILE + lane % 16, S - 1)
         nt = min(TILE, S - t * TILE)
@@ -204,23 +227,45 @@ def stage_gemv_deferred(c, rg, kpart, w):
         rounds = -(-n_out // THREADS)
         # ---- c1: the first half's MFMAs and row sums
         xb = [
-            fx.Vector(bo.buffer_load(r_x, (tok * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))  # fmt: skip
+            fx.Vector(
+                bo.buffer_load(
+                    r_x,
+                    (tok * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )  # fmt: skip
             for kc in range(K_STEPS)
         ]
         for it in range_constexpr(G_TILES):
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for kc in range_constexpr(K_STEPS):
-                acc = mfma_bf16(w[it][kc].bitcast(fx.BFloat16), xb[kc].bitcast(fx.BFloat16), acc)
+                acc = mfma_bf16(
+                    w[it][kc].bitcast(fx.BFloat16), xb[kc].bitcast(fx.BFloat16), acc
+                )
             fx.ptr_store(acc, red + (it * RED_FLOATS + (wave * 64 + lane) * 4))
         gpu.barrier()
         r1 = []
         for p in range_constexpr(rounds):
             idx = fx.min(tid + p * THREADS, n_out - 1)
-            r1.append(row_sum(red + ((idx % G_ROWS) // ROWS) * RED_FLOATS, (idx % G_ROWS) % ROWS, idx // G_ROWS))
+            r1.append(
+                row_sum(
+                    red + ((idx % G_ROWS) // ROWS) * RED_FLOATS,
+                    (idx % G_ROWS) % ROWS,
+                    idx // G_ROWS,
+                )
+            )
         gpu.barrier()
         # ---- c2 from the unpooled rows of this lane's token and steps
         # (two pairs a spec: a poll load is at most four dwords)
-        got = d_poll([(d_unp, (tok * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2 + 2 * hf, 2) for kc in range(K_STEPS) for hf in range(2)])
+        got = d_poll(
+            [
+                (d_unp, (tok * HIDDEN + gemv_k(lane, wave, kpart, kc)) // 2 + 2 * hf, 2)
+                for kc in range(K_STEPS)
+                for hf in range(2)
+            ]
+        )
         ub = []
         for kc in range_constexpr(K_STEPS):
             words = []
@@ -230,13 +275,17 @@ def stage_gemv_deferred(c, rg, kpart, w):
                 for h, u in ((0, lo), (1, hi)):
                     j = 2 * q + h
                     pp = bf16_round(u * fx.Float32(fwv[kc][j]))
-                    vals.append(fx.Float32(nwv[kc][j]) * fx.Float32(bev[kc][j // 4][j % 4]) * pp)
+                    vals.append(
+                        fx.Float32(nwv[kc][j]) * fx.Float32(bev[kc][j // 4][j % 4]) * pp
+                    )
                 words.append(bf16_pair(vals[0], vals[1]).bitcast(fx.Int32))
             ub.append(fx.Vector.from_elements(words, fx.Int32))
         for it in range_constexpr(G_TILES):
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for kc in range_constexpr(K_STEPS):
-                acc = mfma_bf16(w[it][kc].bitcast(fx.BFloat16), ub[kc].bitcast(fx.BFloat16), acc)
+                acc = mfma_bf16(
+                    w[it][kc].bitcast(fx.BFloat16), ub[kc].bitcast(fx.BFloat16), acc
+                )
             fx.ptr_store(acc, red + (it * RED_FLOATS + (wave * 64 + lane) * 4))
         gpu.barrier()
         # ---- the token's scalars, the fold, the partials
@@ -248,7 +297,11 @@ def stage_gemv_deferred(c, rg, kpart, w):
                 r2 = row_sum(red + (r // ROWS) * RED_FLOATS, r % ROWS, idx // G_ROWS)
                 sc = d_poll([(d_ns, 2 * tk, 2)])
                 rstd, rstd2 = sc[0][0].bitcast(fx.Float32), sc[0][1].bitcast(fx.Float32)
-                put(part, (kpart * MAX_TOKENS + tk) * QKVG_ROWS + rg * G_ROWS + r, rstd2 * (r1[p] + rstd * r2))
+                put(
+                    part,
+                    (kpart * MAX_TOKENS + tk) * QKVG_ROWS + rg * G_ROWS + r,
+                    rstd2 * (r1[p] + rstd * r2),
+                )
         gpu.barrier()  # ``red`` is reused by the next token tile / task
 
 
@@ -300,7 +353,10 @@ def stage_head(c, h):
             )
             slot = fx.Int32(
                 bo.buffer_load(
-                    rsrc(a["slots"]), (slot64 != 0).select(2 * tk, tk), vec_width=1, dtype=T.i32
+                    rsrc(a["slots"]),
+                    (slot64 != 0).select(2 * tk, tk),
+                    vec_width=1,
+                    dtype=T.i32,
                 )
             )
             if (use_swa != 0) & (slot >= 0):
@@ -313,9 +369,16 @@ def stage_head(c, h):
                     )
                 )
             # this lane's two RoPE pairs: cos / sin of dims d0 / 2 and d0 / 2 + 1
-            cs = fx.Vector(bo.buffer_load(r_cs, pos * HEAD_DIM + d0 // 2, vec_width=2, dtype=T.f32))
+            cs = fx.Vector(
+                bo.buffer_load(r_cs, pos * HEAD_DIM + d0 // 2, vec_width=2, dtype=T.f32)
+            )
             sn = fx.Vector(
-                bo.buffer_load(r_cs, pos * HEAD_DIM + HEAD_DIM // 2 + d0 // 2, vec_width=2, dtype=T.f32)
+                bo.buffer_load(
+                    r_cs,
+                    pos * HEAD_DIM + HEAD_DIM // 2 + d0 // 2,
+                    vec_width=2,
+                    dtype=T.f32,
+                )
             )
             e0, e1, e2, e3 = half_sum(poll, part, tk, col0 + d0)
             e = [e0, e1, e2, e3]
@@ -348,12 +411,19 @@ def stage_head(c, h):
                 bo.buffer_store(vec, rsrc(a["q_out"]), tk * Q_K + h * HEAD_DIM + d0)
             else:
                 if is_k:
-                    bo.buffer_store(vec, rsrc(a["k_out"]), tk * KV_K + kv_head * HEAD_DIM + d0)
+                    bo.buffer_store(
+                        vec, rsrc(a["k_out"]), tk * KV_K + kv_head * HEAD_DIM + d0
+                    )
                 else:
-                    bo.buffer_store(vec, rsrc(a["v_out"]), tk * KV_K + kv_head * HEAD_DIM + d0)
+                    bo.buffer_store(
+                        vec, rsrc(a["v_out"]), tk * KV_K + kv_head * HEAD_DIM + d0
+                    )
                 if slot >= 0:
                     packed = fp8_pack4(
-                        clamp_fp8(out[0]), clamp_fp8(out[1]), clamp_fp8(out[2]), clamp_fp8(out[3])
+                        clamp_fp8(out[0]),
+                        clamp_fp8(out[1]),
+                        clamp_fp8(out[2]),
+                        clamp_fp8(out[3]),
                     )
                     # NHD page-16 fp8: slot s, head hh, dim d at byte (s KV_HEADS + hh) HEAD_DIM + d
                     idx = (slot * LOCAL_KV_HEADS + kv_head) * (HEAD_DIM // 4) + d0 // 4
@@ -400,7 +470,9 @@ def run_k1(c, bid, x_flag=None):
         extra = gemv_w_loads(c, t2 // K_PARTS, t2 % K_PARTS, c["args"]["w"])
         rocdl.sched_barrier(0)
         if const_expr(not c.get("defer", False)):
-            poll_flags(c, [(x_flag, S)])  # (deferred: the GEMV polls its unpooled rows itself)
+            poll_flags(
+                c, [(x_flag, S)]
+            )  # (deferred: the GEMV polls its unpooled rows itself)
     stamp(c, 1)  # x arrived (a merged launch) / entry
     if const_expr(x_flag is not None):
         if bid >= S:

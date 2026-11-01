@@ -23,7 +23,6 @@ from flydsl.expr.typing import T
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     ballot,
-    butterfly,
     fp8_to_bf16x8,
     hw_exp2,
     mfma_bf16,
@@ -32,16 +31,20 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, pair_layout
 from sgl_amd_mono.muse_spark.gfx950.config import LOG2E, MAX_TOKENS
-from sgl_amd_mono.muse_spark.gfx950.device import TRACE_LAYERS, TRACE_SLOTS, acquire_loads, lds_dma_16, poll_flags, release_stores, stamp
-from sgl_amd_mono.muse_spark.gfx950.layout import (
-    ATTN_CHUNK as CHUNK,
-    ATTN_KEY_SPLITS as KEY_SPLITS,
-    ATTN_KEY_TILES as KEY_TILES,
-    ATTN_KEYS_PER_WAVE as KEYS_PER_WAVE,
-    ATTN_RING_DEPTH as RING_DEPTH,
-    ATTN_MERGE_GROUPS as GROUPS,
-    ATTN_V_STEPS as V_STEPS,
+from sgl_amd_mono.muse_spark.gfx950.device import (
+    TRACE_LAYERS,
+    TRACE_SLOTS,
+    lds_dma_16,
+    poll_flags,
+    release_stores,
+    stamp,
 )
+from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_CHUNK as CHUNK
+from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_KEY_TILES as KEY_TILES
+from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_KEYS_PER_WAVE as KEYS_PER_WAVE
+from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_MERGE_GROUPS as GROUPS
+from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_RING_DEPTH as RING_DEPTH
+from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_V_STEPS as V_STEPS
 
 # the draft's geometry (a rank of TP 8)
 HEAD_DIM = 128
@@ -53,7 +56,9 @@ D_TILES = HEAD_DIM // 16  # 8 dim tiles of the PV MFMA
 MAX_PARTS = 16  # partitions a request at most: a window of 2048 + 8 keys is 9 chunks
 IDS_CHUNKS = 16  # chunks whose page ids a task stages in LDS (the window's 9)
 PART_ROW = 4 + HEAD_DIM  # fp32 words a partial row: (m, l, pad, pad, O[128])
-Q_PITCH = HEAD_DIM + 4  # the Q tile's LDS pitch (bf16 elements, 16 B aligned, bank-spread)
+Q_PITCH = (
+    HEAD_DIM + 4
+)  # the Q tile's LDS pitch (bf16 elements, 16 B aligned, bank-spread)
 
 
 def attn_rows(q_len: int) -> int:
@@ -71,7 +76,10 @@ def dattn_scratch_layout(tokens: int, q_len: int) -> dict:
     return pair_layout(
         [
             ("attn_part", part_words // 2),
-            ("attn_pflag", R * LOCAL_KV_HEADS * tiles * MAX_PARTS),  # a flag a task (its first row tile)
+            (
+                "attn_pflag",
+                R * LOCAL_KV_HEADS * tiles * MAX_PARTS,
+            ),  # a flag a task (its first row tile)
             ("attn_l2", l2_words // 2),
             ("attn_l2flag", R * LOCAL_KV_HEADS * tiles * GROUPS),
             ("attn_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
@@ -86,12 +94,20 @@ NO_MAX = -1.0e29  # a running max below this is "no key yet": exp2 then takes 0
 O_OFF = 4  # a partial row: m, l, pad, pad, O[128] (O 16 B aligned)
 COMB_ROW = PART_ROW  # a tile row's (m, l, pad, pad, O[64]) in the LDS tree
 MERGE_LANES = 4  # partitions folded side by side a (row, 8 dims): 16 x 8 x 4 = THREADS
-PAGE_WORDS = 16 * HEAD_DIM // 4  # a 16-key fp8 page of one head in LDS: 2 KB, chunk-major (dims 16 c .., key)
-PAGE_DMAS = HEAD_DIM // 64  # DMA instructions a page: 64 lanes x 16 B cover 16 keys x 64 dims
+PAGE_WORDS = (
+    16 * HEAD_DIM // 4
+)  # a 16-key fp8 page of one head in LDS: 2 KB, chunk-major (dims 16 c .., key)
+PAGE_DMAS = (
+    HEAD_DIM // 64
+)  # DMA instructions a page: 64 lanes x 16 B cover 16 keys x 64 dims
 V_SKEW = 16  # words between the two V pages beyond a page: the transposed reads of both hit distinct banks
-SLOT_WORDS = 2 * KEY_TILES * PAGE_WORDS + V_SKEW  # a ring slot: a wave's chunk, its K pages then its V pages
+SLOT_WORDS = (
+    2 * KEY_TILES * PAGE_WORDS + V_SKEW
+)  # a ring slot: a wave's chunk, its K pages then its V pages
 TAU = 8.0  # a row's reference max moves only when a chunk's max exceeds it by this (log2 units): P <= 256
-DIRECT_MAX = 16  # partitions a level-2 job folds itself (four a lane); more go through level 1
+DIRECT_MAX = (
+    16  # partitions a level-2 job folds itself (four a lane); more go through level 1
+)
 
 
 def comb_floats(nt: int) -> int:
@@ -106,10 +122,16 @@ def dattn_lds(nt: int):
 
     @fx.struct
     class Loop:
-        qs: fx.Array[fx.BFloat16, nt * 16 * Q_PITCH, 16]  # the task's Q rows (its row tiles)
+        qs: fx.Array[
+            fx.BFloat16, nt * 16 * Q_PITCH, 16
+        ]  # the task's Q rows (its row tiles)
         red: fx.Array[fx.Float32, THREADS * 10, 16]  # the merge jobs' lane combine
-        ring: fx.Array[fx.Int32, WAVES * RING_DEPTH * SLOT_WORDS, 16]  # each wave's K / V chunks (DMA ring)
-        ids: fx.Array[fx.Int32, IDS_CHUNKS * 16, 16]  # the task's page ids, a block of chunks
+        ring: fx.Array[
+            fx.Int32, WAVES * RING_DEPTH * SLOT_WORDS, 16
+        ]  # each wave's K / V chunks (DMA ring)
+        ids: fx.Array[
+            fx.Int32, IDS_CHUNKS * 16, 16
+        ]  # the task's page ids, a block of chunks
 
     @fx.struct
     class Tree:
@@ -147,7 +169,12 @@ def run_dattn(c, o_flag=None):
     V4F = fx.Vector.make_type(4, fx.Float32)
     qs, ring, ids, comb, red = c["qs"], c["ring"], c["ids"], c["comb"], c["red"]
     wring = ring + wave * (RING_DEPTH * SLOT_WORDS)  # this wave's K / V ring
-    table_stride, extra, window, part_in = a["table_stride"], a["extra"], a["window"], a["part_in"]
+    table_stride, extra, window, part_in = (
+        a["table_stride"],
+        a["extra"],
+        a["window"],
+        a["part_in"],
+    )
     lens64, rpi64 = a["lens64"], a["rpi64"]
     qk_scale = a["scale_bits"].bitcast(fx.Float32) * fx.Float32(LOG2E)
     r_k = rsrc(a["k_cache"])
@@ -160,14 +187,24 @@ def run_dattn(c, o_flag=None):
 
     def req_pool_of(r):
         """Request r's row of ``req_to_token`` (int32, or the low word of its int64)."""
-        return fx.Int32(bo.buffer_load(rsrc(a["req_pool"]), (rpi64 != 0).select(2 * r, r), vec_width=1, dtype=T.i32))
+        return fx.Int32(
+            bo.buffer_load(
+                rsrc(a["req_pool"]),
+                (rpi64 != 0).select(2 * r, r),
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
 
     def seq_len_of(r):
         """Request r's keys (int32, or the low word of its int64), the step's rows included."""
         return (
             fx.Int32(
                 bo.buffer_load(
-                    rsrc(a["seq_lens"]), (lens64 != 0).select(2 * r, r), vec_width=1, dtype=T.i32
+                    rsrc(a["seq_lens"]),
+                    (lens64 != 0).select(2 * r, r),
+                    vec_width=1,
+                    dtype=T.i32,
                 )
             )
             + extra
@@ -178,7 +215,9 @@ def run_dattn(c, o_flag=None):
         first row's position leaves unmasked (every chunk of a full one)."""
         hi = (keys + CHUNK - 1) // CHUNK
         ctx = keys - QL
-        first = fx.max(ctx - window, fx.Int32(0))  # the prefix's last ``window`` keys, then the block
+        first = fx.max(
+            ctx - window, fx.Int32(0)
+        )  # the prefix's last ``window`` keys, then the block
         lo = (window > 0).select(first // CHUNK, fx.Int32(0))
         return lo, hi
 
@@ -195,6 +234,7 @@ def run_dattn(c, o_flag=None):
         sp = span_of(fx.Int32(rr))
         max_span = fx.max(max_span, sp)
         total_span = total_span + sp
+
     # the partition (chunks a task) from the step's total chunk work, so that the
     # step has one task a CTA whatever the request mix (a task costs ~12 us beside
     # its chunks of ~1.8 us: its Q and page ids, the first chunk's exposed
@@ -215,7 +255,9 @@ def run_dattn(c, o_flag=None):
     for _ in range_constexpr(3):
         pc = (tasks_of(pc) > BLOCKS).select(pc + 1, pc)
     part = (part_in > 0).select(part_in, pc * CHUNK)
-    n_parts = (max_span * CHUNK + part - 1) // part  # partitions a (request, head) at most
+    n_parts = (
+        max_span * CHUNK + part - 1
+    ) // part  # partitions a (request, head) at most
 
     def n_parts_of(r):
         """Request r's partitions (its span's, the rest of the task slots idle)."""
@@ -235,7 +277,9 @@ def run_dattn(c, o_flag=None):
 
     def l2_row(r, h, rt, g, row16):
         """Float index of (request r, head h, row tile rt, group g)'s level-2 row record."""
-        return ((((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS + g) * 16 + row16) * PART_ROW
+        return (
+            (((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS + g) * 16 + row16
+        ) * PART_ROW
 
     def fold(m, l, ov, m2, l2, v2, ok):
         """(m, l, O) with a partial folded in (``ok``: it exists)."""
@@ -261,16 +305,26 @@ def run_dattn(c, o_flag=None):
             t = r * QL + fx.min(row, ROWS - 1) // GQA
             qv = fx.Vector(
                 bo.buffer_load(
-                    r_q, (t * Q_K + (h * GQA + fx.min(row, ROWS - 1) % GQA) * HEAD_DIM + d0) // 2,
-                    vec_width=4, dtype=T.i32,
+                    r_q,
+                    (t * Q_K + (h * GQA + fx.min(row, ROWS - 1) % GQA) * HEAD_DIM + d0)
+                    // 2,
+                    vec_width=4,
+                    dtype=T.i32,
                 )  # fmt: skip
             )
-            fx.ptr_store(qv.bitcast(fx.BFloat16), qs + ((i_t * 16 + q_row) * Q_PITCH + d0))
+            fx.ptr_store(
+                qv.bitcast(fx.BFloat16), qs + ((i_t * 16 + q_row) * Q_PITCH + d0)
+            )
         gpu.barrier()
         # each tile's A operands of this lane: row l16, dims 8 g4 + 32 step
         qa = [
             [
-                fx.Vector(fx.ptr_load(qs + ((it * 16 + l16) * Q_PITCH + 32 * step + 8 * g4), result_type=V8B))  # fmt: skip
+                fx.Vector(
+                    fx.ptr_load(
+                        qs + ((it * 16 + l16) * Q_PITCH + 32 * step + 8 * g4),
+                        result_type=V8B,
+                    )
+                )  # fmt: skip
                 for step in range(D_STEPS)
             ]
             for it in range(NT)
@@ -285,9 +339,16 @@ def run_dattn(c, o_flag=None):
         r_lane = [(rt0 + it) * 16 + l16 for it in range(NT)]
         qpos = [fx.min(fx.min(r_lane[it], ROWS - 1) // GQA, QL - 1) for it in range(NT)]
         row_live = [r_lane[it] < ROWS for it in range(NT)]
-        m_ref = [fx.Float32(NEG) for _ in range(NT)]  # the row's reference max (its running max, lazily)
-        l_lane = [fx.Float32(0.0) for _ in range(NT)]  # this lane's keys' share of the row sum
-        accs = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(D_TILES)] for _ in range(NT)]
+        m_ref = [
+            fx.Float32(NEG) for _ in range(NT)
+        ]  # the row's reference max (its running max, lazily)
+        l_lane = [
+            fx.Float32(0.0) for _ in range(NT)
+        ]  # this lane's keys' share of the row sum
+        accs = [
+            [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(D_TILES)]
+            for _ in range(NT)
+        ]
         lo, hi = chunk_range(keys, 0)
         c_lo = fx.max(lo, lo + p * (part // CHUNK))
         c_hi = fx.min(hi, lo + (p + 1) * (part // CHUNK))
@@ -301,7 +362,10 @@ def run_dattn(c, o_flag=None):
         # The page ids of a block of IDS_CHUNKS chunks are staged in LDS first.
         assert KEY_TILES == 2 and V_STEPS == 1
         c_last = fx.max(c_hi - 1, c_lo)
-        l16d, c16d = lane % 16, lane // 16  # the DMA lane: key l16d, dims chunk c16d of a page
+        l16d, c16d = (
+            lane % 16,
+            lane // 16,
+        )  # the DMA lane: key l16d, dims chunk c16d of a page
         # the transposed V read: this lane addresses key 4 g4 + (l16 / 2) % 4 of page (l16 / 2) / 4
         v_page = (l16 // 2) // 4
         v_key = 4 * g4 + (l16 // 2) % 4
@@ -312,9 +376,15 @@ def run_dattn(c, o_flag=None):
             for kt in range_constexpr(KEY_TILES):
                 pg = fx.ptr_load(ids + ((cc - b_lo) * 16 + 2 * ks + kt))  # uniform
                 for hf in range_constexpr(PAGE_DMAS):
-                    voff = ((pg * 16 + l16d) * LOCAL_KV_HEADS + h) * HEAD_DIM + (c16d + 4 * hf) * 16
+                    voff = ((pg * 16 + l16d) * LOCAL_KV_HEADS + h) * HEAD_DIM + (
+                        c16d + 4 * hf
+                    ) * 16
                     lds_dma_16(r_k, slot + (kt * PAGE_WORDS + hf * 256), voff)
-                    lds_dma_16(r_v, slot + ((KEY_TILES + kt) * PAGE_WORDS + kt * V_SKEW + hf * 256), voff)
+                    lds_dma_16(
+                        r_v,
+                        slot + ((KEY_TILES + kt) * PAGE_WORDS + kt * V_SKEW + hf * 256),
+                        voff,
+                    )
 
         def quad_max(v):
             """The max over the four lanes sharing a row (l16, l16 + 16, + 32, + 48)."""
@@ -349,12 +419,19 @@ def run_dattn(c, o_flag=None):
                 sl = (cc - b_lo) % 2
                 slot = wring + sl * SLOT_WORDS
                 key0 = cc * CHUNK + ks * KEYS_PER_WAVE
-                rocdl.s_waitcnt(vmcnt=2 * KEY_TILES * PAGE_DMAS)  # chunk cc's pages landed (cc + 1's in flight)
+                rocdl.s_waitcnt(
+                    vmcnt=2 * KEY_TILES * PAGE_DMAS
+                )  # chunk cc's pages landed (cc + 1's in flight)
                 # the chunk's K operands (tile kt, step: key l16, dims 32 step + 8 g4)
                 kb = []
                 for kt in range_constexpr(KEY_TILES):
                     for step in range_constexpr(D_STEPS):
-                        widx = slot + kt * PAGE_WORDS + ((2 * step + g4 // 2) * 256 + l16 * 16 + (g4 % 2) * 8) // 4
+                        widx = (
+                            slot
+                            + kt * PAGE_WORDS
+                            + ((2 * step + g4 // 2) * 256 + l16 * 16 + (g4 % 2) * 8)
+                            // 4
+                        )
                         w = fx.Vector(fx.ptr_load(widx, result_type=V2I))
                         kb.append(fp8_to_bf16x8(w[0], w[1]))
                 # ---- S^T: tile (it, kt): row l16, keys 4 g4 + e of key tile kt; scaled and masked
@@ -370,7 +447,9 @@ def run_dattn(c, o_flag=None):
                         for e in range_constexpr(4):
                             kidx = key0 + kt * TILE + 4 * g4 + e
                             ok = row_live[it] & (inner | ((kidx < keys) & ((window == 0) | ((ctx - kidx) <= window))))  # fmt: skip
-                            vals.append(ok.select(fx.Float32(st[e]) * qk_scale, fx.Float32(NEG)))
+                            vals.append(
+                                ok.select(fx.Float32(st[e]) * qk_scale, fx.Float32(NEG))
+                            )
                     sc.append(vals)
                     m8 = vals[0]
                     for j in range_constexpr(1, 2 * KEY_TILES * 4 // 2):
@@ -387,12 +466,18 @@ def run_dattn(c, o_flag=None):
                 for it in range_constexpr(NT):
                     m_new = move.select(fx.max(m_ref[it], mx[it]), m_ref[it])
                     m_g = (m_new > fx.Float32(NO_MAX)).select(m_new, fx.Float32(0.0))
-                    alpha = hw_exp2(m_ref[it] - m_g)  # 0 from NEG (a first chunk), 1 when nothing moved
+                    alpha = hw_exp2(
+                        m_ref[it] - m_g
+                    )  # 0 from NEG (a first chunk), 1 when nothing moved
                     l_lane[it] = l_lane[it] * alpha
                     m_ref[it] = m_new
                     # O rows 4 g4 + e take the alpha of row 4 g4 + e: from lane 4 g4 + e (its g4 = 0 copy)
                     a_rows = [
-                        fx.Int32(rocdl.ds_bpermute(T.i32, (4 * g4 + e) * 4, alpha.bitcast(fx.Int32))).bitcast(fx.Float32)
+                        fx.Int32(
+                            rocdl.ds_bpermute(
+                                T.i32, (4 * g4 + e) * 4, alpha.bitcast(fx.Int32)
+                            )
+                        ).bitcast(fx.Float32)
                         for e in range(4)
                     ]
                     al = fx.Vector.from_elements(a_rows, fx.Float32)
@@ -400,26 +485,46 @@ def run_dattn(c, o_flag=None):
                 # ---- P = exp2(S - m) as the PV A operand (eight bf16 a lane), the lane's row sums
                 p_ops = []
                 for it in range_constexpr(NT):
-                    m_g = (m_ref[it] > fx.Float32(NO_MAX)).select(m_ref[it], fx.Float32(0.0))
-                    ps = [hw_exp2(sc[it][j] - m_g) for j in range(2 * KEY_TILES * 4 // 2)]
+                    m_g = (m_ref[it] > fx.Float32(NO_MAX)).select(
+                        m_ref[it], fx.Float32(0.0)
+                    )
+                    ps = [
+                        hw_exp2(sc[it][j] - m_g) for j in range(2 * KEY_TILES * 4 // 2)
+                    ]
                     acc_l = ps[0]
                     for j in range_constexpr(1, len(ps)):
                         acc_l = acc_l + ps[j]
                     l_lane[it] = l_lane[it] + acc_l
-                    p_ops.append(fx.Vector.from_elements(ps, fx.Float32).to(fx.BFloat16))
+                    p_ops.append(
+                        fx.Vector.from_elements(ps, fx.Float32).to(fx.BFloat16)
+                    )
                 # ---- PV: V^T operands by transposed LDS reads (dim tile dt: lane (g4, l16) gets
                 # dim 16 dt + l16 at keys 4 g4 .. of page 0 then of page 1)
                 b_v = []
                 for dt in range_constexpr(D_TILES):
                     widx = slot + ((KEY_TILES + v_page) * PAGE_WORDS + v_page * V_SKEW) + (dt * 256 + v_key * 16 + (l16 % 2) * 8) // 4  # fmt: skip
-                    w = fx.Vector(rocdl_raw.ds_read_tr8_b64(T.vec(2, T.i32), widx.llvm_ptr).result, (2,), fx.Int32)  # gfx950 ds_read_b64_tr_b8
+                    w = fx.Vector(
+                        rocdl_raw.ds_read_tr8_b64(
+                            T.vec(2, T.i32), widx.llvm_ptr
+                        ).result,
+                        (2,),
+                        fx.Int32,
+                    )  # gfx950 ds_read_b64_tr_b8
                     b_v.append(fp8_to_bf16x8(w[0], w[1]))
-                accs = [[mfma_bf16(p_ops[it], b_v[dt], accs[it][dt]) for dt in range(D_TILES)] for it in range(NT)]
+                accs = [
+                    [
+                        mfma_bf16(p_ops[it], b_v[dt], accs[it][dt])
+                        for dt in range(D_TILES)
+                    ]
+                    for it in range(NT)
+                ]
                 rocdl.s_waitcnt(lgkmcnt=0)  # every read of the slot is done
                 issue(fx.min(cc + 2, b_last), sl, b_lo)  # chunk cc + 2 into this slot
                 if cc == b_lo:
                     stamp(c, 4)  # the first chunk done
-            rocdl.s_waitcnt(vmcnt=0)  # the tail's repeated loads land before the LDS is reused
+            rocdl.s_waitcnt(
+                vmcnt=0
+            )  # the tail's repeated loads land before the LDS is reused
         stamp(c, 5)  # the chunk loop done
         gpu.barrier()  # every wave is done with the ring: the merge tree reuses the LDS
 
@@ -452,7 +557,10 @@ def run_dattn(c, o_flag=None):
                     for e in range_constexpr(4):
                         base = comb_at(ks % (WAVES // 2), it, 4 * g4 + e)
                         for dt in range_constexpr(D_TILES):
-                            fx.ptr_store(fx.Float32(accs[it][dt][e]), base + (O_OFF + dt * 16 + l16))
+                            fx.ptr_store(
+                                fx.Float32(accs[it][dt][e]),
+                                base + (O_OFF + dt * 16 + l16),
+                            )
             gpu.barrier()
             for src in range_constexpr(WAVES // 2):
                 base = comb_at(src, it_f, row_f)
@@ -470,10 +578,19 @@ def run_dattn(c, o_flag=None):
         if row < ROWS:
             base = part_row(r, h, p, row)
             if lane % LPR == 0:
-                bo.buffer_store(fx.Vector.from_elements([m_f, l_f], fx.Float32), r_part, base, cache_modifier=CM_DEV)
+                bo.buffer_store(
+                    fx.Vector.from_elements([m_f, l_f], fx.Float32),
+                    r_part,
+                    base,
+                    cache_modifier=CM_DEV,
+                )
             for hf in range_constexpr(DPL // 4):
-                quad = fx.Vector.from_elements([fx.Float32(o_f[4 * hf + j]) for j in range(4)], fx.Float32)
-                bo.buffer_store(quad, r_part, base + O_OFF + dd + 4 * hf, cache_modifier=CM_DEV)
+                quad = fx.Vector.from_elements(
+                    [fx.Float32(o_f[4 * hf + j]) for j in range(4)], fx.Float32
+                )
+                bo.buffer_store(
+                    quad, r_part, base + O_OFF + dd + 4 * hf, cache_modifier=CM_DEV
+                )
         release_stores()
         gpu.barrier()
         if tid == 0:
@@ -482,7 +599,9 @@ def run_dattn(c, o_flag=None):
     # the tasks, request-major over the requests' own partition counts (a short
     # request has few): job -> (request, head, tile pair, partition) through the
     # requests' cumulative task counts, so a CTA iterates real tasks only
-    counts = [n_parts_of(fx.Int32(rr)) * (LOCAL_KV_HEADS * TASK_TILES) for rr in range(R)]
+    counts = [
+        n_parts_of(fx.Int32(rr)) * (LOCAL_KV_HEADS * TASK_TILES) for rr in range(R)
+    ]
     starts = [fx.Int32(0)]
     for rr in range_constexpr(1, R):
         starts.append(starts[-1] + counts[rr - 1])
@@ -508,15 +627,35 @@ def run_dattn(c, o_flag=None):
     dch = (tid // 4) % 8
     pl = tid % 4
     D_PASSES = HEAD_DIM // 64
-    mbid = BLOCKS - 1 - bid  # the last CTAs: the task loop's extra tasks sit on the first
+    mbid = (
+        BLOCKS - 1 - bid
+    )  # the last CTAs: the task loop's extra tasks sit on the first
     n_l1 = R * LOCAL_KV_HEADS * ROW_TILES * GROUPS
     n_l2 = R * LOCAL_KV_HEADS * ROW_TILES
 
     def load_rec(r_src, base, d0):
         """A record's (m, l) and this thread's 8 dims of O from ``d0`` (plain words)."""
-        ml = fx.Vector(bo.buffer_load(r_src, base, vec_width=2, dtype=T.f32, cache_modifier=CM_DEV))
-        o0 = fx.Vector(bo.buffer_load(r_src, base + O_OFF + d0, vec_width=4, dtype=T.f32, cache_modifier=CM_DEV))
-        o1 = fx.Vector(bo.buffer_load(r_src, base + O_OFF + d0 + 4, vec_width=4, dtype=T.f32, cache_modifier=CM_DEV))
+        ml = fx.Vector(
+            bo.buffer_load(r_src, base, vec_width=2, dtype=T.f32, cache_modifier=CM_DEV)
+        )
+        o0 = fx.Vector(
+            bo.buffer_load(
+                r_src,
+                base + O_OFF + d0,
+                vec_width=4,
+                dtype=T.f32,
+                cache_modifier=CM_DEV,
+            )
+        )
+        o1 = fx.Vector(
+            bo.buffer_load(
+                r_src,
+                base + O_OFF + d0 + 4,
+                vec_width=4,
+                dtype=T.f32,
+                cache_modifier=CM_DEV,
+            )
+        )
         return ml, o0, o1
 
     def fold_rec(m, l, o0, o1, rec, ok):
@@ -547,8 +686,12 @@ def run_dattn(c, o_flag=None):
             s2 = base + src * 10
             m2 = fx.ptr_load(s2)
             l2 = fx.ptr_load(s2 + 1)
-            p0 = fx.Vector.from_elements([fx.ptr_load(s2 + (2 + j)) for j in range(4)], fx.Float32)
-            p1 = fx.Vector.from_elements([fx.ptr_load(s2 + (6 + j)) for j in range(4)], fx.Float32)
+            p0 = fx.Vector.from_elements(
+                [fx.ptr_load(s2 + (2 + j)) for j in range(4)], fx.Float32
+            )
+            p1 = fx.Vector.from_elements(
+                [fx.ptr_load(s2 + (6 + j)) for j in range(4)], fx.Float32
+            )
             mn = fx.max(m, m2)
             mg = (mn > fx.Float32(NO_MAX)).select(mn, fx.Float32(0.0))
             a1 = hw_exp2(m - mg)
@@ -576,7 +719,12 @@ def run_dattn(c, o_flag=None):
             # four partitions a lane in flight a round
             for k0 in range(0, (ppg + MERGE_LANES * 4 - 1) // (MERGE_LANES * 4)):
                 ps = [p_lo + (k0 * 4 + k) * MERGE_LANES + pl for k in range(4)]
-                recs = [load_rec(r_part, part_row(r, h, fx.min(pk, p_lo + cnt - 1), row), d0) for pk in ps]
+                recs = [
+                    load_rec(
+                        r_part, part_row(r, h, fx.min(pk, p_lo + cnt - 1), row), d0
+                    )
+                    for pk in ps
+                ]
                 for k in range_constexpr(4):
                     m, l, o0, o1 = fold_rec(m, l, o0, o1, recs[k], ps[k] < p_lo + cnt)
             m, l, o0, o1 = combine_lanes(m, l, o0, o1)
@@ -584,13 +732,22 @@ def run_dattn(c, o_flag=None):
                 base = l2_row(r, h, rt, g, row16)
                 if dch == 0:
                     if const_expr(dp == 0):
-                        bo.buffer_store(fx.Vector.from_elements([m, l], fx.Float32), r_l2, base, cache_modifier=CM_DEV)
+                        bo.buffer_store(
+                            fx.Vector.from_elements([m, l], fx.Float32),
+                            r_l2,
+                            base,
+                            cache_modifier=CM_DEV,
+                        )
                 bo.buffer_store(o0, r_l2, base + O_OFF + d0, cache_modifier=CM_DEV)
                 bo.buffer_store(o1, r_l2, base + O_OFF + d0 + 4, cache_modifier=CM_DEV)
         release_stores()
         gpu.barrier()
         if tid == 0:
-            put(l2flag, ((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS + g, fx.Int32(1))
+            put(
+                l2flag,
+                ((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS + g,
+                fx.Int32(1),
+            )
 
     def merge_l2(r, h, rt):
         """Level-2 job: the groups' records (or, with at most DIRECT_MAX partitions,
@@ -604,7 +761,16 @@ def run_dattn(c, o_flag=None):
         if direct:
             poll_flags(c, [(pflag, pflag_at(r, h, rt, 0), np_r)])
         else:
-            poll_flags(c, [(l2flag, ((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS, GROUPS)])
+            poll_flags(
+                c,
+                [
+                    (
+                        l2flag,
+                        ((r * LOCAL_KV_HEADS + h) * ROW_TILES + rt) * GROUPS,
+                        GROUPS,
+                    )
+                ],
+            )
         r_src = rsrc(direct.select(part_w.value, l2_w.value))
         for dp in range_constexpr(D_PASSES):
             d0 = (dch + 8 * dp) * 8
@@ -614,7 +780,10 @@ def run_dattn(c, o_flag=None):
             o1 = fx.Vector.filled(4, 0.0, fx.Float32)
             for k in range_constexpr(DIRECT_MAX // MERGE_LANES):
                 g = k * MERGE_LANES + pl  # a partition (direct) or a group (g < GROUPS)
-                idx = direct.select(part_row(r, h, fx.min(g, np_r - 1), row), l2_row(r, h, rt, fx.min(g, GROUPS - 1), row16))
+                idx = direct.select(
+                    part_row(r, h, fx.min(g, np_r - 1), row),
+                    l2_row(r, h, rt, fx.min(g, GROUPS - 1), row16),
+                )
                 ok = direct.select(g < np_r, g < GROUPS)
                 m, l, o0, o1 = fold_rec(m, l, o0, o1, load_rec(r_src, idx, d0), ok)
             m, l, o0, o1 = combine_lanes(m, l, o0, o1)
@@ -640,7 +809,9 @@ def run_dattn(c, o_flag=None):
         rt = (j // GROUPS) % ROW_TILES
         h = (j // (GROUPS * ROW_TILES)) % LOCAL_KV_HEADS
         r = j // (GROUPS * ROW_TILES * LOCAL_KV_HEADS)
-        if n_parts_of(r) > DIRECT_MAX:  # else the level-2 job folds the partitions itself
+        if (
+            n_parts_of(r) > DIRECT_MAX
+        ):  # else the level-2 job folds the partitions itself
             merge_l1(r, h, rt, g)
     if mbid < n_l2:
         rt = mbid % ROW_TILES
@@ -652,6 +823,7 @@ def run_dattn(c, o_flag=None):
 
 # ---------------------------------------------------------------- the launch
 import msgspec  # noqa: E402
+from flydsl.expr.typing import Int32, Int64  # noqa: E402
 
 from sgl_amd_mono.common import guard  # noqa: E402
 from sgl_amd_mono.common.epoch import kernel_symbol  # noqa: E402
@@ -659,7 +831,6 @@ from sgl_amd_mono.common.plan import kernel_sources, key_tuple  # noqa: E402
 from sgl_amd_mono.common.sync import Mailbox, sreg  # noqa: E402
 from sgl_amd_mono.muse_spark.gfx950 import compat  # noqa: E402
 from sgl_amd_mono.muse_spark.gfx950.device import step_tag  # noqa: E402
-from flydsl.expr.typing import Int32, Int64  # noqa: E402
 
 BRIDGE = compat.install()
 SOURCES = kernel_sources(__name__)
@@ -682,7 +853,9 @@ def _attn_views(lds):
     return lds.loop.peek(), lds.tree.peek()
 
 
-def dattn_context(key: DAttnBuild, lds, args: dict, scratch, tag, layout: dict, layer=None) -> dict:
+def dattn_context(
+    key: DAttnBuild, lds, args: dict, scratch, tag, layout: dict, layer=None
+) -> dict:
     tid = fx.thread_idx.x
     mb = Mailbox(tag)
     c = {
@@ -701,7 +874,9 @@ def dattn_context(key: DAttnBuild, lds, args: dict, scratch, tag, layout: dict, 
         "layer": layer,
     }
     for region in ("attn_part", "attn_pflag", "attn_l2", "attn_l2flag", "attn_trace"):
-        c[region[5:]] = sreg(scratch, layout[region][0], region)  # "attn_part" -> c["part"]
+        c[region[5:]] = sreg(
+            scratch, layout[region][0], region
+        )  # "attn_part" -> c["part"]
     return c
 
 
@@ -718,7 +893,9 @@ def build_dattn(key: DAttnBuild):
     row_tiles = (attn_rows(QL) + 15) // 16
     NT = min(NT, row_tiles)
     assert row_tiles % NT == 0, (row_tiles, NT)
-    name = kernel_symbol("muse_spark_dattn", s=S, q=QL, n=NT, f=key.fault_site, t=int(key.trace))
+    name = kernel_symbol(
+        "muse_spark_dattn", s=S, q=QL, n=NT, f=key.fault_site, t=int(key.trace)
+    )
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = dattn_scratch_layout(S, QL)
@@ -735,7 +912,9 @@ def build_dattn(key: DAttnBuild):
         req_pool: Int64, rpi64: Int32, seq_lens: Int64, lens64: Int32, extra: Int32, window: Int32, part_in: Int32,
         scale_bits: Int32, scratch: Int64, epoch: Int64, layer: Int32,
     ):  # fmt: skip
-        with guard.scope(guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)):
+        with guard.scope(
+            guard.Guard(epoch, fault_site=fault_site or None, fault_after=fault_after)
+        ):
             lds = fx.SharedAllocator().allocate(Lds)
             args = {
                 "q": q, "o": o, "k_cache": k_cache, "v_cache": v_cache, "page_table": page_table,
@@ -743,7 +922,9 @@ def build_dattn(key: DAttnBuild):
                 "seq_lens": seq_lens, "lens64": lens64, "extra": extra, "window": window, "part_in": part_in,
                 "scale_bits": scale_bits,
             }  # fmt: skip
-            c = dattn_context(key, lds, args, scratch, step_tag(epoch, layer), layout, layer=layer)
+            c = dattn_context(
+                key, lds, args, scratch, step_tag(epoch, layer), layout, layer=layer
+            )
             run_dattn(c)
 
     @flyc.jit

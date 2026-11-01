@@ -93,7 +93,12 @@ SGLANG_READS = {
         '"moe_ep_size"',
     ),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
-    "srt/model_executor/forward_batch_info.py": ("contains_mm_inputs", "forward_mode", "is_decode", "out_cache_loc"),
+    "srt/model_executor/forward_batch_info.py": (
+        "contains_mm_inputs",
+        "forward_mode",
+        "is_decode",
+        "out_cache_loc",
+    ),
     "srt/models/muse_spark_omni.py": (
         "MuseSparkForConditionalGeneration",
         "forward(input_ids)",
@@ -159,11 +164,16 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     ]
     kinds = set(getattr(t, "mlp_layer_types", None) or ())
     if kinds != {"sparse"}:
-        reasons.append(f"mlp_layer_types {sorted(kinds)}; the kernels run routed experts in every layer")
+        reasons.append(
+            f"mlp_layer_types {sorted(kinds)}; the kernels run routed experts in every layer"
+        )
     kinds = set(getattr(t, "layer_types", None) or ())
     if not kinds <= {"sliding_attention", "full_attention"}:
         reasons.append(f"layer_types {sorted(kinds)}")
-    if cfg.speculative_algorithm is not None and cfg.speculative_num_draft_tokens != DRAFT_TOKENS:
+    if (
+        cfg.speculative_algorithm is not None
+        and cfg.speculative_num_draft_tokens != DRAFT_TOKENS
+    ):
         reasons.append(f"{cfg.speculative_num_draft_tokens} draft tokens; the widths are built for {DRAFT_TOKENS} a request")  # fmt: skip
     if not _has_flydsl():
         reasons.append("needs FlyDSL")
@@ -181,7 +191,9 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         return [f"{type(lm).__name__}; the kernels mirror the ROCm Muse Spark model"]
     reasons = []
     if lm._ffn_boundaries is None:
-        reasons.append("MUSE_FUSE_FFN_BOUNDARY=0; the launches hand on the fused FFN boundary")
+        reasons.append(
+            "MUSE_FUSE_FFN_BOUNDARY=0; the launches hand on the fused FFN boundary"
+        )
     if model.nvfp4_checkpoint:
         reasons.append("NVFP4 experts; the kernels read Quark MXFP4 or bf16 experts")
     p = get_parallel()
@@ -191,7 +203,9 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             f"the kernels shard attention over TP {TP} and experts over EP {TP}"
         )
     if len(lm.layers) != HF_CONFIG["num_hidden_layers"]:
-        reasons.append(f"{len(lm.layers)} layers, built for {HF_CONFIG['num_hidden_layers']}")
+        reasons.append(
+            f"{len(lm.layers)} layers, built for {HF_CONFIG['num_hidden_layers']}"
+        )
     for i, layer in enumerate(lm.layers):
         reasons += layer_reasons(layer, i)
     return reasons
@@ -205,7 +219,16 @@ class _Built:
         self.original = original  # the model class's own forward, for media batches
         self.check = os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1"
 
-    def forward(self, plan, input_ids, positions, forward_batch, input_embeds=None, *args, **kwargs):
+    def forward(
+        self,
+        plan,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        *args,
+        **kwargs,
+    ):
         """``MuseSparkForConditionalGeneration.forward`` for a routed step."""
         lm = self.lm
         if (
@@ -215,7 +238,9 @@ class _Built:
         ):
             # the omni prologue embeds the media, then re-enters this forward with
             # input_ids None and the embeddings
-            return self.original(input_ids, positions, forward_batch, input_embeds=input_embeds)
+            return self.original(
+                input_ids, positions, forward_batch, input_embeds=input_embeds
+            )
         if input_embeds is None:
             input_embeds = lm.get_input_embeddings()(input_ids)
         hidden, aux = self._backbone(plan, positions, forward_batch, input_embeds)
@@ -260,7 +285,11 @@ class _Built:
         the kernel), every row's cosine; rows below 0.99 are listed. Isolates K-attn from
         what follows it in the layer."""
         r = self.runner
-        if r.windows[i] != 0 or getattr(self, "_attn_checks", 0) >= 6 * 16 or int(forward_batch.seq_lens.max()) < 50000:
+        if (
+            r.windows[i] != 0
+            or getattr(self, "_attn_checks", 0) >= 6 * 16
+            or int(forward_batch.seq_lens.max()) < 50000
+        ):
             return
         self._attn_checks = getattr(self, "_attn_checks", 0) + 1
         from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, Q_K
@@ -278,7 +307,9 @@ class _Built:
             keys = int(lens[req]) + extra
             ctx = keys - q_len
             pages = table[req, : (keys + 15) // 16].long()
-            slots = (pages[:, None] * 16 + torch.arange(16, device=q.device)[None, :]).reshape(-1)[:keys]
+            slots = (
+                pages[:, None] * 16 + torch.arange(16, device=q.device)[None, :]
+            ).reshape(-1)[:keys]
             K, V = k[slots].float(), v[slots].float()  # [keys, KV heads, HEAD_DIM]
             kidx = torch.arange(keys, device=q.device)
             for qp in range(q_len):
@@ -287,10 +318,16 @@ class _Built:
                 for h in range(LOCAL_KV_HEADS):
                     qh = q[t].reshape(-1, HEAD_DIM)[h * GQA : (h + 1) * GQA]
                     sc = scale * (qh @ K[:, h].T)
-                    sc = torch.where(ok[None, :], sc, torch.full_like(sc, float("-inf")))
+                    sc = torch.where(
+                        ok[None, :], sc, torch.full_like(sc, float("-inf"))
+                    )
                     p = torch.softmax(sc, dim=-1).to(torch.bfloat16).float()
-                    ref[t, h * GQA * HEAD_DIM : (h + 1) * GQA * HEAD_DIM] = (p @ V[:, h]).reshape(-1)
-        cos = torch.nn.functional.cosine_similarity(o.reshape(rows, -1, HEAD_DIM), ref.reshape(rows, -1, HEAD_DIM), dim=-1)  # [rows, heads]
+                    ref[t, h * GQA * HEAD_DIM : (h + 1) * GQA * HEAD_DIM] = (
+                        p @ V[:, h]
+                    ).reshape(-1)
+        cos = torch.nn.functional.cosine_similarity(
+            o.reshape(rows, -1, HEAD_DIM), ref.reshape(rows, -1, HEAD_DIM), dim=-1
+        )  # [rows, heads]
         low = (cos < 0.99).nonzero().tolist()
         # SGLang's own attention on the same q and the step's K / V rows (from the cache, no write)
         nat = None
@@ -298,9 +335,25 @@ class _Built:
             slots_new = forward_batch.out_cache_loc[:rows].long()
             k_new = k[slots_new].to(torch.bfloat16).reshape(rows, -1)
             v_new = v[slots_new].to(torch.bfloat16).reshape(rows, -1)
-            nat_o = attn(q_i.to(torch.bfloat16), k_new, v_new, forward_batch, save_kv_cache=False).float().reshape(rows, -1)
-            c_nat = torch.nn.functional.cosine_similarity(nat_o.reshape(rows, -1, HEAD_DIM), ref.reshape(rows, -1, HEAD_DIM), dim=-1)
-            c_vs = torch.nn.functional.cosine_similarity(nat_o.reshape(rows, -1, HEAD_DIM), o.reshape(rows, -1, HEAD_DIM), dim=-1)
+            nat_o = (
+                attn(
+                    q_i.to(torch.bfloat16),
+                    k_new,
+                    v_new,
+                    forward_batch,
+                    save_kv_cache=False,
+                )
+                .float()
+                .reshape(rows, -1)
+            )
+            c_nat = torch.nn.functional.cosine_similarity(
+                nat_o.reshape(rows, -1, HEAD_DIM),
+                ref.reshape(rows, -1, HEAD_DIM),
+                dim=-1,
+            )
+            c_vs = torch.nn.functional.cosine_similarity(
+                nat_o.reshape(rows, -1, HEAD_DIM), o.reshape(rows, -1, HEAD_DIM), dim=-1
+            )
             nat = f"native vs exact min {c_nat.min().item():.5f} mean {c_nat.mean().item():.5f}; native vs ours min {c_vs.min().item():.5f}"
         except Exception as e:  # noqa: BLE001 - a diagnostic
             nat = f"native attention not run: {e!r}"[:200]
@@ -311,7 +364,9 @@ class _Built:
             self._attn_dumps = getattr(self, "_attn_dumps", 0) + 1
             keys = int(lens[0]) + extra
             pages = table[0, : (keys + 15) // 16].clone()
-            slots = (pages.long()[:, None] * 16 + torch.arange(16, device=q.device)[None, :]).reshape(-1)[:keys]
+            slots = (
+                pages.long()[:, None] * 16 + torch.arange(16, device=q.device)[None, :]
+            ).reshape(-1)[:keys]
             os.makedirs(dump_dir, exist_ok=True)
             torch.save(
                 {"layer": i, "rank": r.rank, "q": q_i.cpu(), "k": k[slots].cpu(), "v": v[slots].cpu(), "pages": pages.cpu(),
@@ -337,7 +392,9 @@ class _Built:
         k, v = r.pool.get_kv_buffer(self.model.layers[i].self_attn.attn.layer_id)
         return k[slots].float().clone(), v[slots].float().clone()
 
-    def _reference(self, i, positions, forward_batch, stream, attn_input, pre_norm_dtype):
+    def _reference(
+        self, i, positions, forward_batch, stream, attn_input, pre_norm_dtype
+    ):
         """Check mode: SGLang's layer ``i`` on copies of the launch's inputs, returning
         (stream, next attention input) as the launch does. It writes the same KV
         slots with the same values, which the launch then writes again."""
@@ -377,7 +434,9 @@ def _log_check(lid: int, live: torch.Tensor, got, ref) -> None:
         rel = ((o - r).abs().amax() / r.abs().amax().clamp_min(1e-30)).item()
         cos = torch.nn.functional.cosine_similarity(o, r, dim=-1)
         # the least row (one row's flipped expert shows as ~0.98), the mean, and the rows below 0.99
-        stats.append(f"{name} rel {rel:.5f} cosine {cos.min().item():.6f} mean {cos.mean().item():.6f} low {int((cos < 0.99).sum())}")
+        stats.append(
+            f"{name} rel {rel:.5f} cosine {cos.min().item():.6f} mean {cos.mean().item():.6f} low {int((cos < 0.99).sum())}"
+        )
     logger.info("monokernel check layer %d, %d rows: %s", lid, int(live.sum()), "; ".join(stats))  # fmt: skip
 
 
@@ -392,7 +451,9 @@ def _log_kv_check(lid: int, live: torch.Tensor, got, ref) -> None:
         o, r = o[live], r[live]
         same = (o == r).float().mean().item()
         diff = (o - r).abs().amax().item()
-        stats.append(f"{name} equal {same:.4f} maxdiff {diff:.3f} ref|max| {r.abs().amax().item():.3f}")
+        stats.append(
+            f"{name} equal {same:.4f} maxdiff {diff:.3f} ref|max| {r.abs().amax().item():.3f}"
+        )
     logger.info("monokernel kv check layer %d: %s", lid, "; ".join(stats))
 
 
@@ -405,7 +466,10 @@ def _build(model, hf_config, ctx) -> _Built:
     lm = model.model.language_model
     layers = list(lm.layers)
     next_norms = [layer.self_attn.pre_attn_norm for layer in layers[1:]] + [lm.norm]
-    views = [LayerViews.build(layer, i, next_norms[i], ctx.copies) for i, layer in enumerate(layers)]
+    views = [
+        LayerViews.build(layer, i, next_norms[i], ctx.copies)
+        for i, layer in enumerate(layers)
+    ]
     p = get_parallel()
     # the peer handshake is collective: every rank gets here (attach agreed first)
     runner = MuseMonoRunner(
@@ -419,7 +483,11 @@ def _build(model, hf_config, ctx) -> _Built:
     )
     runner.set_deadline(ctx.deadline_s)
     spec_config = get_spec()
-    q_len = int(spec_config.speculative_num_draft_tokens or 1) if spec_config.speculative_algorithm is not None else 1
+    q_len = (
+        int(spec_config.speculative_num_draft_tokens or 1)
+        if spec_config.speculative_algorithm is not None
+        else 1
+    )
     # every rank builds every width; FlyDSL's disk cache hands a rank the kernels
     # another rank built (a lock per kernel), so each rank starts at its own share
     widths = list(ctx.widths)

@@ -11,7 +11,17 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_muse_spark_dmlp import LAYER, _epoch  # noqa: E402
 
-STAMPS = ["entry", "norm done", "coef GEMV done", "coef reduced", "conv0 done", "gate/up GEMV done", "act done", "down GEMV done", "out done"]
+STAMPS = [
+    "entry",
+    "norm done",
+    "coef GEMV done",
+    "coef reduced",
+    "conv0 done",
+    "gate/up GEMV done",
+    "act done",
+    "down GEMV done",
+    "out done",
+]
 
 
 def main():
@@ -53,7 +63,11 @@ def main():
             epoch[0] += 1
             torch.cuda.synchronize()
         off, nbytes = layout["dm_trace"]
-        t = scratch[off : off + nbytes].view(torch.int64).reshape(-1)[: TRACE_LAYERS * BLOCKS * TRACE_SLOTS]
+        t = (
+            scratch[off : off + nbytes]
+            .view(torch.int64)
+            .reshape(-1)[: TRACE_LAYERS * BLOCKS * TRACE_SLOTS]
+        )
         t = t.reshape(TRACE_LAYERS, BLOCKS, TRACE_SLOTS)[LAYER % TRACE_LAYERS].cpu()
         used = [i for i in range(len(STAMPS)) if (t[:, i] != 0).any()]
         t0 = t[:, 0][t[:, 0] != 0].min().item()
@@ -61,7 +75,9 @@ def main():
         print(f"D-MLP S={rows}: launch span {us[:, used].max().item():7.1f} us")
         for i in used:
             v = us[:, i][t[:, i] != 0]
-            print(f"  {STAMPS[i]:>18s}: p50 {v.median().item():6.1f} p90 {v.quantile(0.9).item():6.1f} max {v.max().item():6.1f}")
+            print(
+                f"  {STAMPS[i]:>18s}: p50 {v.median().item():6.1f} p90 {v.quantile(0.9).item():6.1f} max {v.max().item():6.1f}"
+            )
     finally:
         peers.close()
 

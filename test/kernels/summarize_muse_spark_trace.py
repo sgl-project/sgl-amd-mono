@@ -34,7 +34,12 @@ def main():
                 continue
             base = a[:, 0][a[:, 0] != 0].min().item()
             kind = bool(snap["swa"][l])
-            parts = {"attn": a, "k2": clean(T["k2"][l]), "k3": clean(T["k3"][l]), "k1": clean(T["k1"][(l + 1) % TRACE_LAYERS])}
+            parts = {
+                "attn": a,
+                "k2": clean(T["k2"][l]),
+                "k3": clean(T["k3"][l]),
+                "k1": clean(T["k1"][(l + 1) % TRACE_LAYERS]),
+            }
             ok = True
             for stage, t in parts.items():
                 if t is None:
@@ -51,7 +56,9 @@ def main():
                     us = (v.double() - base) / 100.0
                     if us.max().item() > 2000:
                         continue
-                    acc.setdefault((kind, stage, i), []).append((us.median().item(), us.max().item()))
+                    acc.setdefault((kind, stage, i), []).append(
+                        (us.median().item(), us.max().item())
+                    )
             an = clean(T["attn"][l + 1])
             if an is not None:
                 d = (an[:, 0][an[:, 0] != 0].min().item() - base) / 100.0
@@ -62,7 +69,9 @@ def main():
         if not nxt[kind]:
             continue
         g = torch.tensor(nxt[kind])
-        print(f"== {label} layers: {len(nxt[kind])} launches; next launch entry p50 {g.median().item():.1f} mean {g.mean().item():.1f} us")
+        print(
+            f"== {label} layers: {len(nxt[kind])} launches; next launch entry p50 {g.median().item():.1f} mean {g.mean().item():.1f} us"
+        )
         for stage in ("attn", "k2", "k3", "k1"):
             cells = []
             for i, nm in enumerate(STAMPS[stage]):

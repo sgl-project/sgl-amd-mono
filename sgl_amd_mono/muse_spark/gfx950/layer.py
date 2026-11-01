@@ -13,6 +13,7 @@ from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import CM_DEV
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, sreg
+from sgl_amd_mono.muse_spark.gfx950 import compat
 from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
 from sgl_amd_mono.muse_spark.gfx950.device import global_atomic, step_tag
 from sgl_amd_mono.muse_spark.gfx950.layout import (
@@ -21,8 +22,6 @@ from sgl_amd_mono.muse_spark.gfx950.layout import (
     kattn_scratch_layout,
 )
 from sgl_amd_mono.muse_spark.gfx950.stages import attention, pre_attn
-
-from sgl_amd_mono.muse_spark.gfx950 import compat
 
 BRIDGE = compat.install()  # FlyDSL 0.3.2: the upstream helpers the image lacks
 SOURCES = kernel_sources(__name__)
@@ -41,7 +40,16 @@ class K1Build(msgspec.Struct, frozen=True):
     defer: bool = False  # a merged launch's K1 with the boundary's norms deferred (``stage_gemv_deferred``)
 
 
-def k1_context(key: K1Build, lds, args: dict, scratch, tag, layout: dict, merged: bool = False, layer=None) -> dict:
+def k1_context(
+    key: K1Build,
+    lds,
+    args: dict,
+    scratch,
+    tag,
+    layout: dict,
+    merged: bool = False,
+    layer=None,
+) -> dict:
     """K1's context: LDS views, the mailbox, the scratch regions and arguments.
     ``merged``: x comes from this launch's earlier stages (device-scope loads)."""
     s = key.tokens
@@ -57,7 +65,9 @@ def k1_context(key: K1Build, lds, args: dict, scratch, tag, layout: dict, merged
         "put": mb.put,
         "poll": mb.poll,
         "args": args,
-        "x_cm": CM_DEV if merged else 0,  # x from this launch: past the L2 (another XCD wrote it)
+        "x_cm": CM_DEV
+        if merged
+        else 0,  # x from this launch: past the L2 (another XCD wrote it)
         "defer": key.defer,
         "trace_on": key.trace,
         "layer": layer,
@@ -111,7 +121,9 @@ def build_k1(key: K1Build):
                 "k_out": k_out, "v_out": v_out, "g_out": g_out, "use_rope": use_rope,
                 "use_swa": use_swa, "slot64": slot64, "swa64": swa64,
             }  # fmt: skip
-            c = k1_context(key, lds, args, scratch, step_tag(epoch, layer), layout, layer=layer)
+            c = k1_context(
+                key, lds, args, scratch, step_tag(epoch, layer), layout, layer=layer
+            )
             pre_attn.run_k1(c, c["bid"])
 
     @flyc.jit
@@ -166,7 +178,9 @@ def _attn_views(lds):
     return lds.loop.peek(), lds.tree.peek()
 
 
-def kattn_context(key: KAttnBuild, lds, args: dict, scratch, tag, layout: dict, layer=None) -> dict:
+def kattn_context(
+    key: KAttnBuild, lds, args: dict, scratch, tag, layout: dict, layer=None
+) -> dict:
     """K-attn's context: LDS views, the mailbox, the scratch region and arguments."""
     tid = fx.thread_idx.x
     mb = Mailbox(tag)
@@ -186,7 +200,9 @@ def kattn_context(key: KAttnBuild, lds, args: dict, scratch, tag, layout: dict, 
         "layer": layer,
     }
     for region in ("attn_part", "attn_pflag", "attn_l2", "attn_l2flag", "attn_trace"):
-        c[region[5:]] = sreg(scratch, layout[region][0], region)  # "attn_part" -> c["part"]
+        c[region[5:]] = sreg(
+            scratch, layout[region][0], region
+        )  # "attn_part" -> c["part"]
     return c
 
 
@@ -197,7 +213,9 @@ def build_kattn(key: KAttnBuild):
     row_tiles = (attn_rows(QL) + 15) // 16
     NT = min(NT, row_tiles)
     assert row_tiles % NT == 0, (row_tiles, NT)
-    name = kernel_symbol("muse_spark_kattn", s=S, q=QL, n=NT, f=key.fault_site, t=int(key.trace))
+    name = kernel_symbol(
+        "muse_spark_kattn", s=S, q=QL, n=NT, f=key.fault_site, t=int(key.trace)
+    )
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
     layout = kattn_scratch_layout(S, QL)
@@ -207,7 +225,6 @@ def build_kattn(key: KAttnBuild):
     class Lds:
         loop: Loop  # type: ignore[valid-type]
         tree: Tree  # type: ignore[valid-type]
-
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kattn(
@@ -238,7 +255,9 @@ def build_kattn(key: KAttnBuild):
                 "lens64": lens64, "extra": extra, "window": window, "part_in": part_in,
                 "scale_bits": scale_bits,
             }  # fmt: skip
-            c = kattn_context(key, lds, args, scratch, step_tag(epoch, layer), layout, layer=layer)
+            c = kattn_context(
+                key, lds, args, scratch, step_tag(epoch, layer), layout, layer=layer
+            )
             attention.run_kattn(c)
 
     @flyc.jit
@@ -285,10 +304,16 @@ class LayerBuild(msgspec.Struct, frozen=True):
     trace: bool = False
     fp8_dense: bool = False  # the pooler and unpooler as packed FP8 copies
     tpx: bool = False  # TP experts (``K3Build.tpx``)
-    defer_k1: bool = False  # the next K1 folds the FFN boundary's norms itself (needs next_k1)
+    defer_k1: bool = (
+        False  # the next K1 folds the FFN boundary's norms itself (needs next_k1)
+    )
     xq_pre: bool = True  # K2's xn hands K3 the expert input as MXFP4 blocks (S <= 16; K3Build.xq_pre)
-    ug_dyn: bool = False  # K3's ug items from a launch-wide queue (with xq_pre; K3Build.ug_dyn)
-    pshard: bool = False  # the pooler sharded by rows over the ranks (K2Build.pshard; npes == 8)
+    ug_dyn: bool = (
+        False  # K3's ug items from a launch-wide queue (with xq_pre; K3Build.ug_dyn)
+    )
+    pshard: bool = (
+        False  # the pooler sharded by rows over the ranks (K2Build.pshard; npes == 8)
+    )
 
 
 def build_layer(key: LayerBuild):
@@ -309,10 +334,18 @@ def build_layer(key: LayerBuild):
     from sgl_amd_mono.muse_spark.gfx950.build_k2 import K2Build, k2_context
     from sgl_amd_mono.muse_spark.gfx950.build_k3 import K3Build, k3_context
     from sgl_amd_mono.muse_spark.gfx950.stages import ffn, post_attn
-    from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import k2_scratch_layout, sym_bytes
+    from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import (
+        k2_scratch_layout,
+        sym_bytes,
+    )
 
     S, QL, W, next_k1, last = key.tokens, key.q_len, key.npes, key.next_k1, key.last
-    assert 1 <= S <= MAX_TOKENS and S % QL == 0 and QL in (1, 8) and 1 <= W <= guard.FLAG_WORDS
+    assert (
+        1 <= S <= MAX_TOKENS
+        and S % QL == 0
+        and QL in (1, 8)
+        and 1 <= W <= guard.FLAG_WORDS
+    )
     name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16), u=int(key.ug_dyn and key.xq_pre and S == 16), ps=int(key.pshard))  # fmt: skip
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after, tr = key.fault_site, key.fault_after, key.trace
@@ -320,10 +353,18 @@ def build_layer(key: LayerBuild):
     k1_key = K1Build(S, fault_site, fault_after, tr, defer)
     ka_key = KAttnBuild(S, QL, fault_site=fault_site, fault_after=fault_after, trace=tr)
     xq = key.xq_pre and S <= 16
-    assert not key.pshard or (W == 8 and not key.fp8_dense), "the sharded pooler: TP 8, bf16"
-    k2_key = K2Build(S, W, fault_site, fault_after, tr, key.fp8_dense, defer, xq, key.pshard)
-    ugd = key.ug_dyn and xq and S >= 16  # (S = 8: neutral, 3.3 items a CTA; S = 16: -0.2 ms a step)
-    k3_key = K3Build(S, W, last, fault_site, fault_after, tr, key.fp8_dense, key.tpx, defer, xq, ugd)
+    assert not key.pshard or (W == 8 and not key.fp8_dense), (
+        "the sharded pooler: TP 8, bf16"
+    )
+    k2_key = K2Build(
+        S, W, fault_site, fault_after, tr, key.fp8_dense, defer, xq, key.pshard
+    )
+    ugd = (
+        key.ug_dyn and xq and S >= 16
+    )  # (S = 8: neutral, 3.3 items a CTA; S = 16: -0.2 ms a step)
+    k3_key = K3Build(
+        S, W, last, fault_site, fault_after, tr, key.fp8_dense, key.tpx, defer, xq, ugd
+    )
     k1_layout, ka_layout = k1_scratch_layout(), kattn_scratch_layout(S, QL)
     k2_layout, k3_layout = k2_scratch_layout(), ffn.k3_scratch_layout()
     sy = ffn.k3_sym_layout(W)
@@ -361,8 +402,14 @@ def build_layer(key: LayerBuild):
     ):  # fmt: skip
         with guard.scope(
             guard.Guard(
-                epoch, own=sym, peers=peers, rank=rank, npes=W, flags_offset=flags_offset,
-                fault_site=fault_site or None, fault_after=fault_after,
+                epoch,
+                own=sym,
+                peers=peers,
+                rank=rank,
+                npes=W,
+                flags_offset=flags_offset,
+                fault_site=fault_site or None,
+                fault_after=fault_after,
             )  # fmt: skip
         ):
             lds = fx.SharedAllocator().allocate(Lds)
@@ -373,7 +420,9 @@ def build_layer(key: LayerBuild):
                 # K3's ug queue starts at 0: CTA 0 zeroes it before its xn task (token 0),
                 # whose flag (after a release) every K3 CTA polls before its first ticket
                 if (bid == 0) & (fx.thread_idx.x == 0):
-                    global_atomic(scratch3 + fx.Int64(k3_layout["k3_ugq"][0]), 0, xchg=True)
+                    global_atomic(
+                        scratch3 + fx.Int64(k3_layout["k3_ugq"][0]), 0, xchg=True
+                    )
             # the stages' contexts share the layer's tag; the next K1 takes the next layer's
             a_args = {
                 "q": q, "o": o, "k_cache": k_cache, "v_cache": v_cache, "page_table": page_table,
@@ -391,15 +440,42 @@ def build_layer(key: LayerBuild):
                 "s13": s13, "w2": w2, "s2": s2, "pen_w": pen_w, "res": res, "pfw": pfw, "alpha": alpha2,
                 "beta": beta2, "npw": npw, "w_unpool": w_unpool, "attn_out": attn_out, "last": last_in,
             }  # fmt: skip
-            c2 = k2_context(k2_key, lds.k2.peek(), k2_args, scratch2, sym, peers, rank, tag, k2_layout, layer=layer)
+            c2 = k2_context(
+                k2_key,
+                lds.k2.peek(),
+                k2_args,
+                scratch2,
+                sym,
+                peers,
+                rank,
+                tag,
+                k2_layout,
+                layer=layer,
+            )
             k3_args["xinq"] = c2["xinq"]  # (read by K3 only with xq_pre)
             oflag, rflag, xinflag = c2["oflag"], c2["rflag"], c2["xinflag"]
-            ca = kattn_context(ka_key, lds, a_args, scratch_a, tag, ka_layout, layer=layer)
+            ca = kattn_context(
+                ka_key, lds, a_args, scratch_a, tag, ka_layout, layer=layer
+            )
             attention.run_kattn(ca, o_flag=oflag)
             gpu.barrier()  # this CTA is done with the attention's LDS
-            post_attn.run_k2(c2, route_flag=rflag, xin_flag=xinflag, o_flag=oflag, QL=QL)
+            post_attn.run_k2(
+                c2, route_flag=rflag, xin_flag=xinflag, o_flag=oflag, QL=QL
+            )
             gpu.barrier()
-            c3 = k3_context(k3_key, lds.k3.peek(), k3_args, scratch3, sym, peers, rank, tag, k3_layout, sy, layer=layer)
+            c3 = k3_context(
+                k3_key,
+                lds.k3.peek(),
+                k3_args,
+                scratch3,
+                sym,
+                peers,
+                rank,
+                tag,
+                k3_layout,
+                sy,
+                layer=layer,
+            )
             if const_expr(next_k1):
                 k1_args = {
                     "x": c2["c1"] if defer else attn_out, "w": w1, "pfw": pfw, "beta2": beta2, "npw": npw, "cos_sin": cos_sin, "positions": positions, "slots": slots,
@@ -407,15 +483,38 @@ def build_layer(key: LayerBuild):
                     "k_out": k_out, "v_out": v_out, "g_out": g, "use_rope": use_rope1,
                     "use_swa": use_swa1, "slot64": slot64, "swa64": swa64,
                 }  # fmt: skip
-                c1 = k1_context(k1_key, lds.k1.peek(), k1_args, scratch1, tag1, k1_layout, merged=True, layer=layer + 1)
+                c1 = k1_context(
+                    k1_key,
+                    lds.k1.peek(),
+                    k1_args,
+                    scratch1,
+                    tag1,
+                    k1_layout,
+                    merged=True,
+                    layer=layer + 1,
+                )
                 if const_expr(defer):
                     # the unpooled rows and the scalars are this layer's (K3's tag)
-                    c1.update(d_poll=c3["poll"], d_unp=c3["own_unp"], d_nscal=c3["nscal"])
-                ffn.run_k3(c3, route_flag=rflag, xin_flag=xinflag, x_flag=c1["xflag"], x_put=c1["put"], res_flag=(c2["resflag"], S * post_attn.a_parts(S)))
+                    c1.update(
+                        d_poll=c3["poll"], d_unp=c3["own_unp"], d_nscal=c3["nscal"]
+                    )
+                ffn.run_k3(
+                    c3,
+                    route_flag=rflag,
+                    xin_flag=xinflag,
+                    x_flag=c1["xflag"],
+                    x_put=c1["put"],
+                    res_flag=(c2["resflag"], S * post_attn.a_parts(S)),
+                )
                 gpu.barrier()
                 pre_attn.run_k1(c1, bid, x_flag=c1["xflag"])
             else:
-                ffn.run_k3(c3, route_flag=rflag, xin_flag=xinflag, res_flag=(c2["resflag"], S * post_attn.a_parts(S)))
+                ffn.run_k3(
+                    c3,
+                    route_flag=rflag,
+                    xin_flag=xinflag,
+                    res_flag=(c2["resflag"], S * post_attn.a_parts(S)),
+                )
 
     @flyc.jit
     def launch(

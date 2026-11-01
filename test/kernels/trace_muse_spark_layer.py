@@ -11,12 +11,52 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_muse_spark_layer import LAYER, LENS, Buffers, Layer, _attn_args, _epoch, _k1, _k1_next_args, _k2_args, _k3_args  # noqa: E402
+from test_muse_spark_layer import (  # noqa: E402
+    LAYER,
+    LENS,
+    Buffers,
+    Layer,
+    _attn_args,
+    _epoch,
+    _k1,
+    _k1_next_args,
+    _k2_args,
+    _k3_args,
+)
 
 K1_STAMPS = ["entry", "x ready", "gemv done", "head/gate done"]
-KA_STAMPS = ["entry", "attention tasks done", "merge done", "loop begins", "first chunk done", "loop done"]
-K2_STAMPS = ["entry", "og done", "o tasks done", "a_part done", "x arrived", "passes done", "pooled out", "end"]
-K3_STAMPS = ["entry", "flags", "plan", "ug done", "dn done", "fin done", "unpool done", "end", "unp flags", "unp dma", "unp mfma", "unp pushed"]
+KA_STAMPS = [
+    "entry",
+    "attention tasks done",
+    "merge done",
+    "loop begins",
+    "first chunk done",
+    "loop done",
+]
+K2_STAMPS = [
+    "entry",
+    "og done",
+    "o tasks done",
+    "a_part done",
+    "x arrived",
+    "passes done",
+    "pooled out",
+    "end",
+]
+K3_STAMPS = [
+    "entry",
+    "flags",
+    "plan",
+    "ug done",
+    "dn done",
+    "fin done",
+    "unpool done",
+    "end",
+    "unp flags",
+    "unp dma",
+    "unp mfma",
+    "unp pushed",
+]
 
 
 def _stamps(scratch, layout, region, blocks, slots, layer=None):
@@ -24,8 +64,14 @@ def _stamps(scratch, layout, region, blocks, slots, layer=None):
     from sgl_amd_mono.muse_spark.gfx950.layout import TRACE_LAYERS
 
     off, nbytes = layout[region]
-    t = scratch[off : off + nbytes].view(torch.int64).reshape(-1)[: TRACE_LAYERS * blocks * slots]
-    return t.reshape(TRACE_LAYERS, blocks, slots)[(LAYER if layer is None else layer) % TRACE_LAYERS].cpu()
+    t = (
+        scratch[off : off + nbytes]
+        .view(torch.int64)
+        .reshape(-1)[: TRACE_LAYERS * blocks * slots]
+    )
+    return t.reshape(TRACE_LAYERS, blocks, slots)[
+        (LAYER if layer is None else layer) % TRACE_LAYERS
+    ].cpu()
 
 
 def _report(name, t, names, classes=None):
@@ -33,7 +79,9 @@ def _report(name, t, names, classes=None):
     used = [i for i in range(len(names)) if (t[:, i] != 0).any()]
     t0 = t[:, 0][t[:, 0] != 0].min().item()
     us = (t.double() - t0) / 100.0  # 100 MHz -> us
-    print(f"== {name}: {len(used)} stamps, launch span {us[:, used].max().item():7.1f} us (first entry -> last stamp)")
+    print(
+        f"== {name}: {len(used)} stamps, launch span {us[:, used].max().item():7.1f} us (first entry -> last stamp)"
+    )
     groups = classes or [("all CTAs", torch.ones(t.shape[0], dtype=torch.bool))]
     for label, mask in groups:
         if not mask.any():
@@ -44,7 +92,9 @@ def _report(name, t, names, classes=None):
             v = v[t[mask, i] != 0]
             if v.numel() == 0:
                 continue
-            row.append(f"{names[i]} p50 {v.median().item():6.1f} p90 {v.quantile(0.9).item():6.1f} max {v.max().item():6.1f}")
+            row.append(
+                f"{names[i]} p50 {v.median().item():6.1f} p90 {v.quantile(0.9).item():6.1f} max {v.max().item():6.1f}"
+            )
         print(f"  [{label:>14s} n={int(mask.sum())}] " + " | ".join(row))
 
 
@@ -52,8 +102,19 @@ def main():
     from sgl_amd_mono.common.plan import BLOCKS
     from sgl_amd_mono.muse_spark.gfx950.build_k2 import K2Build, build_k2
     from sgl_amd_mono.muse_spark.gfx950.build_k3 import K3Build, build_k3
-    from sgl_amd_mono.muse_spark.gfx950.layer import K1Build, KAttnBuild, LayerBuild, build_k1, build_kattn, build_layer
-    from sgl_amd_mono.muse_spark.gfx950.layout import TRACE_SLOTS, k1_scratch_layout, kattn_scratch_layout
+    from sgl_amd_mono.muse_spark.gfx950.layer import (
+        K1Build,
+        KAttnBuild,
+        LayerBuild,
+        build_k1,
+        build_kattn,
+        build_layer,
+    )
+    from sgl_amd_mono.muse_spark.gfx950.layout import (
+        TRACE_SLOTS,
+        k1_scratch_layout,
+        kattn_scratch_layout,
+    )
     from sgl_amd_mono.muse_spark.gfx950.stages import ffn, post_attn
     from sgl_amd_mono.muse_spark.gfx950.stages.ffn import k3_bases
 
@@ -62,8 +123,12 @@ def main():
     if "--window" in sys.argv:
         window = int(sys.argv[sys.argv.index("--window") + 1])
         args = [a for a in args if a != str(window)] if False else args
-    merged = "--merged" in sys.argv  # the whole-layer launch (K1 first), stamps of every stage
-    graph = "--graph" in sys.argv  # the step captured in a graph and replayed: the launches' gaps as the server sees them
+    merged = (
+        "--merged" in sys.argv
+    )  # the whole-layer launch (K1 first), stamps of every stage
+    graph = (
+        "--graph" in sys.argv
+    )  # the step captured in a graph and replayed: the launches' gaps as the server sees them
     S = int(args[0]) if args else 8
     lens = [int(x) for x in args[1:]] if len(args) > 1 else LENS[: S // 8]
     ql = 8
@@ -76,10 +141,17 @@ def main():
     ka = build_kattn(KAttnBuild(tokens=S, q_len=ql, trace=True))
     k2 = build_k2(K2Build(tokens=S, npes=1, trace=True))
     k3 = build_k3(K3Build(tokens=S, npes=1, trace=True))
-    layer = build_layer(LayerBuild(tokens=S, q_len=ql, npes=1, next_k1=True, trace=True)) if merged else None
+    layer = (
+        build_layer(LayerBuild(tokens=S, q_len=ql, npes=1, next_k1=True, trace=True))
+        if merged
+        else None
+    )
     try:
+
         def step():
-            stream = torch.cuda.current_stream()  # the capture stream inside a graph capture
+            stream = (
+                torch.cuda.current_stream()
+            )  # the capture stream inside a graph capture
             _k1(k1, L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, stream)
             if merged:
                 layer(
@@ -105,7 +177,9 @@ def main():
             for _ in range(2):
                 g.replay()
             torch.cuda.synchronize()
-        for rep in range(0 if graph else 3):  # the third step's stamps are reported (warm caches, steady tags)
+        for rep in range(
+            0 if graph else 3
+        ):  # the third step's stamps are reported (warm caches, steady tags)
             B.res.copy_(L.res0)
             _k1(k1, L, B, L.x0, L.w_qkvg, L.k_cache, L.v_cache, epoch, LAYER, 0, stream)
             if merged:
@@ -121,14 +195,32 @@ def main():
                    B.peers.local, B.peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER, 0, stream=stream)  # fmt: skip
             epoch[0] += 1
             torch.cuda.synchronize()
-        print(f"S={S} lens={lens} window={window} merged={merged} graph={graph}; ids of token 0: {B.ids[0].tolist()}")
+        print(
+            f"S={S} lens={lens} window={window} merged={merged} graph={graph}; ids of token 0: {B.ids[0].tolist()}"
+        )
         cta = torch.arange(BLOCKS)
         # the launches on one clock: each launch's first entry and last stamp from K1's first entry
         tt = {
-            "K1": _stamps(B.scratch_k1, k1_scratch_layout(), "k1_trace", BLOCKS, TRACE_SLOTS),
-            "K-attn": _stamps(B.scratch_a, kattn_scratch_layout(S, ql), "attn_trace", BLOCKS, TRACE_SLOTS),
-            "K2": _stamps(B.scratch_k2, post_attn.k2_scratch_layout(), "k2_trace", BLOCKS, TRACE_SLOTS),
-            "K3": _stamps(B.scratch_k3, ffn.k3_scratch_layout(), "k3_trace", BLOCKS, TRACE_SLOTS),
+            "K1": _stamps(
+                B.scratch_k1, k1_scratch_layout(), "k1_trace", BLOCKS, TRACE_SLOTS
+            ),
+            "K-attn": _stamps(
+                B.scratch_a,
+                kattn_scratch_layout(S, ql),
+                "attn_trace",
+                BLOCKS,
+                TRACE_SLOTS,
+            ),
+            "K2": _stamps(
+                B.scratch_k2,
+                post_attn.k2_scratch_layout(),
+                "k2_trace",
+                BLOCKS,
+                TRACE_SLOTS,
+            ),
+            "K3": _stamps(
+                B.scratch_k3, ffn.k3_scratch_layout(), "k3_trace", BLOCKS, TRACE_SLOTS
+            ),
         }
         base = tt["K1"][:, 0][tt["K1"][:, 0] != 0].min().item()
         prev_end = None
