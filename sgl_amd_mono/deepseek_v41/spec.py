@@ -230,11 +230,14 @@ SGLANG_READS = {
         "get_attn_backend",
         "get_token_to_kv_pool",
     ),
-    "srt/configs/deepseek_v4.py": ("vision_n_layers", "image_token_id"),
     "srt/layers/engram.py": (
         "layer_hash_index",
         "forward(cp_all_tokens)",
+        "Engram.forward(input_ids)",
+        "image_token_id",
         "engram_gate",
+        "engram_gate(input_ids)",
+        "engram_gate(image_token_id)",
         "embed",
         "wkv",
         "q_weight",
@@ -986,10 +989,6 @@ class _Built:
             engram_rows = self._engram_rows(hash_ids)
         aux = None if m.dspark_layers_to_capture is None else []
         plan.state["dspark_aux"] = aux
-        # image rows bypass Engram on every step, as in SGLang: a graph cannot branch on mm inputs
-        image = None
-        if m.config.vision_n_layers > 0:
-            image = (input_ids == m.config.image_token_id)[:, None, None]
         pending, pre = (None, hc_broadcast(x, m.hc_mult), None, None), None
         plan.state["tok_par"] = self.runner.tok_par(x.shape[0])
         for i in range(m.start_layer, m.end_layer):
@@ -999,12 +998,17 @@ class _Built:
                 rows = engram_rows.get(engram.layer_hash_index)
                 if rows is None:
                     residual = engram(
-                        before, hash_ids[:, engram.layer_hash_index], forward_batch
+                        before,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        input_ids=input_ids,
                     )
                 else:  # Engram.forward on the staged rows
                     from sglang.srt.layers.engram import engram_gate
 
                     kv, _ = engram.wkv(rows.flatten(-2))
+                    # image rows keep their residual in the gate, as in SGLang
+                    image_ids = input_ids if engram.image_token_id is not None else None
                     residual = engram_gate(
                         before,
                         kv,
@@ -1012,9 +1016,9 @@ class _Built:
                         engram.k_weight,
                         engram.eps,
                         engram.clamp_value,
+                        input_ids=image_ids,
+                        image_token_id=engram.image_token_id,
                     )
-                if image is not None:
-                    residual = torch.where(image, before, residual)
                 pending = (None, residual, None, None)
             # an Engram layer reads the settled residual: no post owed into it
             defer = i + 1 < m.end_layer and m.layers[i + 1].engram is None
