@@ -18,8 +18,11 @@ path's is bf16. Per token::
          planes, the layer's fixed scale); index_k -> index cache (E4M3, unit scale)
 """
 
+from __future__ import annotations
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
@@ -38,61 +41,187 @@ from sgl_amd_mono.common.ops import (
     uniform,
     wave_max,
 )
+from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES
+from sgl_amd_mono.common.sync import Mailbox, sreg
 from sgl_amd_mono.minimax_m3.gfx950.config import (
-    BLOCKS,
     HEAD_DIM,
     HIDDEN,
-    LOCAL_Q_HEADS,
-    MAX_QKV_ROWS,
     MAX_TOKENS,
     PAGE16,
     ROTARY_DIM,
     SPARSE_BLOCK,
-    THREADS,
-    TP,
-    WAVES,
+    TOTAL_INDEX_HEADS,
+    Dims,
     IndexHeads,
-    qkv_rows,
 )
-from sgl_amd_mono.minimax_m3.gfx950.device import StepMailbox as Mailbox
 from sgl_amd_mono.minimax_m3.gfx950.device import (
     ar_pack_sumsq,
     readlane,
     release_stores,
     step_tag,
 )
-from sgl_amd_mono.minimax_m3.gfx950.index_score import emit_index_scores, step_rows
+from sgl_amd_mono.minimax_m3.gfx950.index_score import (
+    emit_index_scores,
+    step_rows,
+)
 from sgl_amd_mono.minimax_m3.gfx950.reduction import ar_block_sums
 
 FP8_MAX = 448.0
 ROWS_PER_TASK = 16
 K_CHUNKS = HIDDEN // 64  # 64-k chunks: one dwordx4 of weight per lane
 CHUNKS_PER_WAVE = K_CHUNKS // WAVES
-Q_OFF, K_OFF, V_OFF = 0, LOCAL_Q_HEADS * HEAD_DIM, (LOCAL_Q_HEADS + 1) * HEAD_DIM
-N_HEAD_TASKS = LOCAL_Q_HEADS + 4  # q heads, k, v, the rank's index_q, index_k
-IK_TASK = LOCAL_Q_HEADS + 3
 HEAD_ROW_GROUPS = HEAD_DIM // ROWS_PER_TASK  # GEMV tasks a head
 ELEMS = 4  # per lane in a head task: 32 lanes x 4 = 128, the aiter kernel's split
 PAGE_BYTES = PAGE16 * HEAD_DIM  # one page-16 of one kv head (fp8)
 # page-16 ids a cache block spans in a K or V plane
 BLOCK_PAGES = SPARSE_BLOCK // PAGE16
-# other index q heads' GEMV last, so a step without long requests keeps the one-head build's layout
-ONE_GEMV = qkv_rows(1) // ROWS_PER_TASK
-OTHER_GEMV = (TP - 1) * HEAD_ROW_GROUPS
-HT0 = ONE_GEMV
-NT0 = HT0 + N_HEAD_TASKS
-XT0 = NT0 + MAX_TOKENS
-assert XT0 + OTHER_GEMV <= BLOCKS
 assert MAX_TOKENS * 32 <= THREADS
 assert HIDDEN // 4 % THREADS == 0
 
 SCRATCH_QKV = 0  # (value, tag) pairs, one per qkv row
-SCRATCH_X8 = MAX_TOKENS * MAX_QKV_ROWS * 8  # S > 2: the norm tasks' x8 rows, words
-SCRATCH_X8S = SCRATCH_X8 + MAX_TOKENS * HIDDEN // 4 * 8  # and their scales
-# the head tasks' and the residual writers' done flags
-SCRATCH_HDONE = SCRATCH_X8S + MAX_TOKENS * 8
-SCRATCH_RDONE = SCRATCH_HDONE + MAX_TOKENS * N_HEAD_TASKS * 8
-SCRATCH_BYTES = SCRATCH_RDONE + MAX_TOKENS * 8
+
+
+class K1Layout(msgspec.Struct, frozen=True):
+    """K1's CTA layout and scratch regions for one rank's :class:`Dims`.
+
+    Split the same way as :mod:`config` and :mod:`layout`: what the execution
+    model fixes stays a module constant above, and everything whose extent
+    follows a rank's share of the heads hangs off here, built once per build.
+    The CTA-budget assertion that used to fire at import now fires in
+    ``__post_init__``, against that build's TP.
+    """
+
+    dims: Dims
+
+    def __post_init__(self):
+        assert self.xt0 + self.other_gemv <= BLOCKS
+
+    # --------------------------------------------- the fused projection's rows
+    # LOCAL_KV_HEADS k heads then LOCAL_KV_HEADS v heads. At TP4 LOCAL_KV_HEADS is
+    # 1, so these are the original `LOCAL_Q_HEADS * HEAD_DIM`, `+ 1`, `+ 4` and
+    # `+ 3`: TP4 is unchanged by construction.
+    @property
+    def q_off(self) -> int:
+        return 0
+
+    @property
+    def k_off(self) -> int:
+        return self.dims.local_q_heads * HEAD_DIM
+
+    @property
+    def v_off(self) -> int:
+        return (self.dims.local_q_heads + self.dims.local_kv_heads) * HEAD_DIM
+
+    # ------------------------------------------------------------- head tasks
+    # q heads, k, v, the rank's index_q, index_k -- one task a head, so a rank with
+    # several KV heads has a run of k tasks and a run of v tasks, not one of each.
+    @property
+    def n_head_tasks(self) -> int:
+        return self.dims.local_q_heads + 2 * self.dims.local_kv_heads + 2
+
+    @property
+    def k_task0(self) -> int:
+        return self.dims.local_q_heads
+
+    @property
+    def v_task0(self) -> int:
+        return self.dims.local_q_heads + self.dims.local_kv_heads
+
+    @property
+    def iq_task(self) -> int:
+        return self.dims.local_q_heads + 2 * self.dims.local_kv_heads
+
+    @property
+    def ik_task(self) -> int:
+        return self.dims.local_q_heads + 2 * self.dims.local_kv_heads + 1
+
+    # The cache is [page16][kv head][...], so stepping one page steps over every
+    # head and KV head h of page b starts at b * KV_PAGE_BYTES + h * PAGE_BYTES.
+    # At one head a rank these are the same number and the offset vanishes.
+    @property
+    def kv_page_bytes(self) -> int:
+        return self.dims.local_kv_heads * PAGE_BYTES
+
+    # ------------------------------------------------------------ CTA placing
+    # GEMV tasks, head tasks (every token of a head on one CTA) and the tokens' norm
+    # tasks each own a CTA, in this order; a head CTA's half waves hold the tokens.
+    # The rank's own rows (q | k | v | ONE index q | index k) are the first ONE_GEMV
+    # tasks in every mode, and the remaining index q heads' the OTHER_GEMV after the
+    # norm tasks.
+    #
+    # When those extra CTAs run differs by mode, and getting it wrong deadlocks:
+    #   * CP defers them to a step with a long request -- the only step that reads
+    #     the other heads -- so a short step keeps the one-head build's CTA layout.
+    #   * Own mode reads every one of the rank's heads in EVERY step (split pass h
+    #     selects with head h), so they always run. Gating them on long_step() there
+    #     leaves head 1's rows unwritten and every CTA spinning in index_q_row's
+    #     unbounded poll: measured as a TP2 hang holding both GPUs at 100%.
+    #
+    # Sequential task folding: a CTA runs TASKS_PER_CTA row groups in turn. At TP2
+    # a rank's projection is 4864 rows = 304 tasks, and 304 + 38 head + 16 norm +
+    # 24 other would need 382 CTAs against the 256 the kernel co-schedules, so the
+    # unfolded build fails this assert at import. Folding two tasks per CTA gives
+    # 152 + 38 + 16 + 24 = 230. TP4 folds by 1 and is unchanged (220).
+    @property
+    def tasks_per_cta(self) -> int:
+        return 2 if self.dims.tp == 2 else 1
+
+    @property
+    def one_gemv(self) -> int:
+        return self.dims.qkv_rows(1) // ROWS_PER_TASK
+
+    @property
+    def one_gemv_ctas(self) -> int:
+        return (self.one_gemv + self.tasks_per_cta - 1) // self.tasks_per_cta
+
+    # Budget the larger mode: CP projects TOTAL_INDEX_HEADS, own mode the rank's
+    # LOCAL_INDEX_HEADS, one of them already in ONE_GEMV. The kernel bounds the
+    # ACTIVE range by heads.count instead -- a CTA past the mode's head count would
+    # project a head the fused projection does not have. At TP4 this is the original
+    # (TP - 1) * HEAD_ROW_GROUPS, since TP there equals TOTAL_INDEX_HEADS.
+    @property
+    def other_heads(self) -> int:
+        return max(TOTAL_INDEX_HEADS, self.dims.local_index_heads) - 1
+
+    @property
+    def other_gemv(self) -> int:
+        return self.other_heads * HEAD_ROW_GROUPS
+
+    @property
+    def ht0(self) -> int:
+        return self.one_gemv_ctas
+
+    @property
+    def nt0(self) -> int:
+        return self.ht0 + self.n_head_tasks
+
+    @property
+    def xt0(self) -> int:
+        return self.nt0 + MAX_TOKENS
+
+    # --------------------------------------------------------------- scratch
+    @property
+    def scratch_x8(self) -> int:
+        """S > 2: the norm tasks' x8 rows, words."""
+        return MAX_TOKENS * self.dims.max_qkv_rows * 8
+
+    @property
+    def scratch_x8s(self) -> int:
+        """and their scales"""
+        return self.scratch_x8 + MAX_TOKENS * HIDDEN // 4 * 8
+
+    # fused layer kernel only: a head task's / the residual's done flags
+    @property
+    def scratch_hdone(self) -> int:
+        return self.scratch_x8s + MAX_TOKENS * 8
+
+    @property
+    def scratch_rdone(self) -> int:
+        return self.scratch_hdone + MAX_TOKENS * self.n_head_tasks * 8
+
+    @property
+    def scratch_bytes(self) -> int:
+        return self.scratch_rdone + MAX_TOKENS * 8
 
 
 def fp8_sat(x):
@@ -165,15 +294,27 @@ def head_norm_rope(e, lane, gw4, cs, sn, eps):
 @flyc.jit
 def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
-    x8s_mb, eps, tokens, heads, ptrs, signal, long_step=None,
+    x8s_mb, eps, tokens, heads, k1, ptrs, signal, long_step=None,
 ):  # fmt: skip
-    """K1's body: the GEMV tasks, the head tasks and, with S > 2, a norm task per token.
-
-    A GEMV task computes ROWS_PER_TASK rows of the ``heads`` projection: the rank's own
-    on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs XT0 .. in a step where
-    ``long_step()``. The head tasks run on CTAs HT0 .., a token per half wave; the norm
-    tasks, on CTAs NT0 .., feed the GEMV tasks. ``signal``: the head tasks' and the
-    residual writers' done flags."""
+    """K1's body: the GEMV tasks (ROWS_PER_TASK of the ``heads`` projection's rows
+    each: the rank's own on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs
+    XT0 .., in a step where ``long_step()``), the head tasks (CTAs HT0 .., a token
+    per half wave) and, with S > 2, one norm task per token (CTAs NT0 ..) feeding
+    the GEMV tasks. ``signal``: the head tasks' and the residual writers' done
+    flags. ``k1``: this build's :class:`K1Layout`."""
+    # This build's share of the heads and its CTA layout, which a build compiled
+    # for one TP read as module constants.
+    dims = k1.dims
+    LOCAL_Q_HEADS = dims.local_q_heads  # noqa: N806
+    LOCAL_KV_HEADS = dims.local_kv_heads  # noqa: N806
+    K_OFF, V_OFF = k1.k_off, k1.v_off  # noqa: N806
+    N_HEAD_TASKS = k1.n_head_tasks  # noqa: N806
+    K_TASK0, V_TASK0 = k1.k_task0, k1.v_task0  # noqa: N806
+    IQ_TASK, IK_TASK = k1.iq_task, k1.ik_task  # noqa: N806
+    KV_PAGE_BYTES = k1.kv_page_bytes  # noqa: N806
+    TASKS_PER_CTA = k1.tasks_per_cta  # noqa: N806
+    ONE_GEMV, ONE_GEMV_CTAS = k1.one_gemv, k1.one_gemv_ctas  # noqa: N806
+    HT0, NT0, XT0 = k1.ht0, k1.nt0, k1.xt0  # noqa: N806
     rows = heads.rows
     (
         ar,
@@ -319,52 +460,47 @@ def emit_pre_attn(
                 mb_put(x8s_mb, tk, x_scale)
 
     # ============================================ GEMV tasks (one per CTA)
-    # bid < ONE_GEMV: q | k | v, own index q, index k row groups (one-head build: rg = bid)
-    own_q = (LOCAL_Q_HEADS + 2) * HEAD_ROW_GROUPS
-    rg = (bid < own_q).select(
-        bid,
-        (bid < own_q + HEAD_ROW_GROUPS).select(
-            heads.iq_off // ROWS_PER_TASK + bid - own_q,
-            heads.ik_off // ROWS_PER_TASK + bid - own_q - HEAD_ROW_GROUPS,
-        ),
-    )
-    gemv = bid < ONE_GEMV
+    # CTA bid < ONE_GEMV: row group bid of q | k | v, then the own index q head's
+    # and index k's (the identity in the one-head build)
+    own_q = (LOCAL_Q_HEADS + 2 * LOCAL_KV_HEADS) * HEAD_ROW_GROUPS
+
+    def get_rg(task_id):
+        """Row group of task ``task_id``: q | k | v in order, then the rank's
+        own index q head's groups, then index k's."""
+        return (task_id < own_q).select(
+            task_id,
+            (task_id < own_q + HEAD_ROW_GROUPS).select(
+                heads.iq_off // ROWS_PER_TASK + task_id - own_q,
+                heads.ik_off // ROWS_PER_TASK + task_id - own_q - HEAD_ROW_GROUPS,
+            ),
+        )
+
+    is_primary_gemv = bid < ONE_GEMV_CTAS
+    is_other_gemv = False
+    other_rg = fx.Int32(0)
     if const_expr(heads.count > 1):
         xt = bid - XT0
-        if (xt >= 0) & (xt < OTHER_GEMV):
+        # this mode's head count, not the budgeted maximum
+        if (xt >= 0) & (xt < (heads.count - 1) * HEAD_ROW_GROUPS):
             other = xt // HEAD_ROW_GROUPS  # the other heads in head order, own skipped
             head = other + (other >= heads.own).select(1, 0)
-            rg = (LOCAL_Q_HEADS + 2 + head) * HEAD_ROW_GROUPS + xt % HEAD_ROW_GROUPS
-            gemv = long_step()
+            other_rg = (
+                LOCAL_Q_HEADS + 2 * LOCAL_KV_HEADS + head
+            ) * HEAD_ROW_GROUPS + xt % HEAD_ROW_GROUPS
+            # Own mode reads every head every step; only CP can defer these to
+            # the steps with a long request. See the CTA layout note above.
+            is_other_gemv = long_step() if heads.cp else True
+    gemv = is_primary_gemv | is_other_gemv
     if gemv:
         if const_expr(tokens <= 2):
             raw_g, raw_ar = load_norm_inputs(list(range(tokens)))
         # weight loads after the norm's: vmcnt waits in issue order; the sched_barrier pins that
         rocdl.sched_barrier(0)
         r_w = rsrc(w_qkv)
-        # 64-k chunk kc of row group rg is 1 KB at ((rg*K/32 + 2kc)*512); lane l
-        # holds row l%16, k = 64kc + 16(l/16) + [0, 16).
-        wts = []
-        for c in range_constexpr(CHUNKS_PER_WAVE):
-            kc = wave * CHUNKS_PER_WAVE + c
-            wts.append(
-                fx.Vector(
-                    bo.buffer_load(
-                        r_w,
-                        ((rg * (HIDDEN // 32) + kc * 2) * 512 + lane * 16) // 4,
-                        vec_width=4,
-                        dtype=T.i32,
-                    )
-                )
-            )
-        ws = fx.Float32(  # row tid % 16's scale, read below by tid < 16 * tokens
-            bo.buffer_load(
-                rsrc(s_qkv),
-                rg * ROWS_PER_TASK + tid % ROWS_PER_TASK,
-                vec_width=1,
-                dtype=T.f32,
-            )
-        )
+        # The weight and scale streams moved into run_gemv_row_group below, so
+        # that a folded CTA can issue them once per row group it takes. The
+        # norm's inputs are still loaded first, and sched_barrier still keeps
+        # the two streams from interleaving.
         if const_expr(tokens <= 2):
             x_scales = norm_quant(
                 list(range(tokens)), raw_g, raw_ar, lambda j: bid == j
@@ -395,41 +531,87 @@ def emit_pre_attn(
                         x8 + v * 4,
                     )
             gpu.barrier()
-        # B column l % 16 is token l % 16 (the last past it): one weight stream for any token count
-        col_tok = fx.min(lane % 16, tokens - 1)
-        c = fx.Vector.filled(4, 0.0, fx.Float32)
-        for cc in range_constexpr(CHUNKS_PER_WAVE):
-            kc = wave * CHUNKS_PER_WAVE + cc
-            xb = fx.ptr_load(
-                x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
-                result_type=fx.Vector.make_type(4, fx.Float32),
-            ).bitcast(fx.Int64)
-            wa = wts[cc].bitcast(fx.Int64)
-            for h in range_constexpr(2):
-                c = fx.Vector(
-                    rocdl.mfma_f32_16x16x32_fp8_fp8(
-                        T.vec(4, T.f32), [wa[h], xb[h], c, 0, 0, 0]
+
+        def run_gemv_row_group(rg):
+            """One row group: its weight and scale streams, the MFMA, and the
+            qkv rows it publishes. ``red`` is reused across a folded CTA's row
+            groups, so this both opens and closes on a barrier."""
+            # 64-k chunk kc of row group rg is 1 KB at ((rg*K/32 + 2kc)*512);
+            # lane l holds row l%16, k = 64kc + 16(l/16) + [0, 16).
+            wts = []
+            for c_i in range_constexpr(CHUNKS_PER_WAVE):
+                kc = wave * CHUNKS_PER_WAVE + c_i
+                wts.append(
+                    fx.Vector(
+                        bo.buffer_load(
+                            r_w,
+                            ((rg * (HIDDEN // 32) + kc * 2) * 512 + lane * 16) // 4,
+                            vec_width=4,
+                            dtype=T.i32,
+                        )
                     )
                 )
-        fx.ptr_store(c, red + (wave * 64 + lane) * 4)
-        gpu.barrier()
-        # sample column t of C: lanes t, 16 + t, 32 + t, 48 + t hold rows 4 (l/16) + e
-        if tid < ROWS_PER_TASK * tokens:
-            r = tid % ROWS_PER_TASK
-            tk = tid // ROWS_PER_TASK
-            tot_r = fx.Float32(0.0)
-            for w in range_constexpr(WAVES):
-                tot_r = tot_r + fx.ptr_load(
-                    red + ((w * 64 + 16 * (r // 4) + tk) * 4 + r % 4)
+            ws = fx.Float32(  # row tid % 16's scale, sampled by tid < 16 tokens
+                bo.buffer_load(
+                    rsrc(s_qkv),
+                    rg * ROWS_PER_TASK + tid % ROWS_PER_TASK,
+                    vec_width=1,
+                    dtype=T.f32,
                 )
-            x_scale = x_scales[0]
-            for k in range_constexpr(1, tokens):
-                x_scale = (tk == k).select(x_scales[k], x_scale)
-            mb_put(
-                qkv_mb,
-                tk * rows + rg * ROWS_PER_TASK + r,
-                bf16_round(tot_r * x_scale * ws),
             )
+            # 12 chunks per wave: two 16x16x32 FP8 MFMAs each (k halves of 8 bytes).
+            # B column l % 16 is token l % 16 (token 0 past the last): C column t is
+            # token t's rows, the weight stream is the same for any token count.
+            col_tok = fx.min(lane % 16, tokens - 1)
+            c = fx.Vector.filled(4, 0.0, fx.Float32)
+            for cc in range_constexpr(CHUNKS_PER_WAVE):
+                kc = wave * CHUNKS_PER_WAVE + cc
+                xb = fx.Vector(
+                    fx.ptr_load(
+                        x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
+                        result_type=fx.Vector.make_type(4, fx.Float32),
+                    )
+                ).bitcast(fx.Int64)
+                wa = wts[cc].bitcast(fx.Int64)
+                for h in range_constexpr(2):
+                    c = fx.Vector(
+                        rocdl.mfma_f32_16x16x32_fp8_fp8(
+                            T.vec(4, T.f32), [wa[h], xb[h], c, 0, 0, 0]
+                        )
+                    )
+            fx.ptr_store(c, red + (wave * 64 + lane) * 4)
+            gpu.barrier()
+            # sample column t of C: lanes t, 16 + t, 32 + t, 48 + t hold rows 4 (l/16) + e
+            if tid < ROWS_PER_TASK * tokens:
+                r = tid % ROWS_PER_TASK
+                tk = tid // ROWS_PER_TASK
+                tot_r = fx.Float32(0.0)
+                for w in range_constexpr(WAVES):
+                    tot_r = tot_r + fx.ptr_load(
+                        red + ((w * 64 + 16 * (r // 4) + tk) * 4 + r % 4)
+                    )
+                x_scale = x_scales[0]
+                for k in range_constexpr(1, tokens):
+                    x_scale = (tk == k).select(x_scales[k], x_scale)
+                mb_put(
+                    qkv_mb,
+                    tk * rows + rg * ROWS_PER_TASK + r,
+                    bf16_round(tot_r * x_scale * ws),
+                )
+            # `red` is about to be rewritten by this CTA's next row group
+            if const_expr(TASKS_PER_CTA > 1):
+                gpu.barrier()
+
+        if is_primary_gemv:
+            for step_i in range_constexpr(TASKS_PER_CTA):
+                task_id = bid * TASKS_PER_CTA + step_i
+                # the last folded CTA is short whenever TASKS_PER_CTA does not
+                # divide ONE_GEMV
+                if task_id < ONE_GEMV:
+                    run_gemv_row_group(get_rg(task_id))
+        if const_expr(heads.count > 1):
+            if is_other_gemv:
+                run_gemv_row_group(other_rg)
 
     # ======================================= head tasks: norm / rope / cache
     # one CTA per head, token k on the half wave of threads 32 k .. 32 k + 31
@@ -438,13 +620,25 @@ def emit_pre_attn(
         tk = tid // 32
         l32 = tid % 32
         is_q = ht < LOCAL_Q_HEADS
-        is_k = ht == LOCAL_Q_HEADS
-        is_v = ht == LOCAL_Q_HEADS + 1
-        is_iq = ht == LOCAL_Q_HEADS + 2
+        is_iq = ht == IQ_TASK
+        # ``ht`` comes from the block index, so it and everything below are
+        # uniform across the CTA. One KV head a rank keeps the original
+        # equality tests and constant offsets.
+        if const_expr(LOCAL_KV_HEADS == 1):
+            is_k = ht == K_TASK0
+            is_v = ht == V_TASK0
+            kv_head = 0
+            k_base, v_base = K_OFF, V_OFF
+        else:
+            is_k = (ht >= K_TASK0) & (ht < V_TASK0)
+            is_v = (ht >= V_TASK0) & (ht < IQ_TASK)
+            kv_head = is_k.select(ht - K_TASK0, ht - V_TASK0)
+            k_base = K_OFF + kv_head * HEAD_DIM
+            v_base = V_OFF + kv_head * HEAD_DIM
         base = tk * rows + is_q.select(
             ht * HEAD_DIM,
             is_k.select(
-                K_OFF, is_v.select(V_OFF, is_iq.select(heads.iq_off, heads.ik_off))
+                k_base, is_v.select(v_base, is_iq.select(heads.iq_off, heads.ik_off))
             ),
         )
         if tk < tokens:
@@ -476,7 +670,11 @@ def emit_pre_attn(
                         store(32 * h, *args)
 
             def page_rsrc(cache_ptr, first_lane):
-                return rsrc(cache_ptr + fx.Int64(readlane(b, first_lane)) * PAGE_BYTES)
+                off = fx.Int64(readlane(b, first_lane)) * KV_PAGE_BYTES
+                if const_expr(LOCAL_KV_HEADS > 1):
+                    # this task's KV head within the page (uniform over the CTA)
+                    off = off + fx.Int64(kv_head) * PAGE_BYTES
+                return rsrc(cache_ptr + off)
 
             def store_v(first_lane, vs):
                 r_v = page_rsrc(v_cache, first_lane)
@@ -552,25 +750,29 @@ K1_ARGS = (
 @flyc.jit
 def emit_k1(
     tid, bid, lane, wave, x8, red, qs, step, layer, eps, index_scale, tokens,
-    q_len, init_blocks, local_blocks, heads, ptrs, bt_width,
+    q_len, init_blocks, local_blocks, heads, k1, layout, ptrs, bt_width,
 ):  # fmt: skip
     """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores.
 
     ``x8``: tokens * HIDDEN / 4 words of LDS, ``red``: WAVES * 256 floats, ``qs``:
-    tokens * heads.count * HEAD_DIM / 2 floats. ``q_len``: tokens per request
-    (speculative verify rows). ``heads``: the fused projection's index q heads
-    (``IndexHeads``). The head tasks and residual writers publish done flags
-    (SCRATCH_HDONE / SCRATCH_RDONE) for K4."""
+    tokens * heads.count * HEAD_DIM / 2 floats. ``q_len``: tokens per request (speculative
+    verify rows). ``heads``: the index q heads of the fused projection
+    (``IndexHeads``). ``k1`` / ``layout``: this build's :class:`K1Layout` and
+    :class:`Layout`. The head tasks and residual writers publish done flags
+    (``K1Layout.scratch_hdone`` / ``scratch_rdone``) for K4."""
     (
         ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, positions,
         slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
         block_table, seq_lens, iscore, scratch,
     ) = ptrs  # fmt: skip
     mbox = Mailbox(tag=step_tag(step, layer))
-    qkv_mb = scratch + fx.Int64(SCRATCH_QKV)
-    x8_mb = scratch + fx.Int64(SCRATCH_X8)
-    x8s_mb = scratch + fx.Int64(SCRATCH_X8S)
-    # plain names: FlyDSL carries a local whose method a dynamic if / for calls as loop state
+    qkv_mb = sreg(scratch, SCRATCH_QKV, "qkv")
+    # the x8 rows are plain words read back through ``rsrc``, not a tagged
+    # hand-off: their flag is ``x8s_mb``'s pair, so this stays a raw address
+    x8_mb = scratch + fx.Int64(k1.scratch_x8)
+    x8s_mb = sreg(scratch, k1.scratch_x8s, "x8s")
+    # Plain names, not method calls: flydsl's AST rewriter carries every local whose
+    # method is called inside a dynamic if/for as loop state.
     mb_put = mbox.put
     mb_put_words = mbox.put_words
     mb_poll = mbox.poll
@@ -581,7 +783,11 @@ def emit_k1(
         with the index-q head's math, by this wave's lanes < 32."""
         d0 = lane * ELEMS
         gw4, cs, sn = head_rope_inputs(tk, g_iq, d0, cos_sin, positions)
-        base = tk * heads.rows + IndexHeads(heads.count, 0).iq_off + head * HEAD_DIM
+        base = (
+            tk * heads.rows
+            + IndexHeads(dims=heads.dims, count=heads.count, own=0, cp=heads.cp).iq_off
+            + head * HEAD_DIM
+        )
         got = mb_poll([(qkv_mb, base + d0, 2), (qkv_mb, base + d0 + 2, 2)])
         e = [got[h][j].bitcast(fx.Float32) for h in range(2) for j in range(2)]
         out = head_norm_rope(e, lane, gw4, cs, sn, eps)
@@ -628,21 +834,33 @@ def emit_k1(
 
     emit_pre_attn(
         tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
-        x8s_mb, eps, tokens, heads,
+        x8s_mb, eps, tokens, heads, k1,
         (
             ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, positions,
             slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
         ),
-        (scratch + fx.Int64(SCRATCH_HDONE), scratch + fx.Int64(SCRATCH_RDONE)),
+        (
+            sreg(scratch, k1.scratch_hdone, "hdone"),
+            sreg(scratch, k1.scratch_rdone, "rdone"),
+        ),
         long_step,
     )  # fmt: skip
-    # scorers: norm CTAs (done early) and idle CTAs first, then the GEMV CTAs, the head CTAs last
-    score_base = ONE_GEMV + N_HEAD_TASKS
-    hdone_mb = scratch + fx.Int64(SCRATCH_HDONE)
+    # the scorers: the idle CTAs first (the norm tasks' come first but finish
+    # early), then the GEMV CTAs, the head CTAs last
+    score_base = k1.one_gemv_ctas + k1.n_head_tasks
+    hdone_mb = sreg(scratch, k1.scratch_hdone, "hdone")
 
     def wait_new_keys():
         """Every token's index_k head task done, its key visible to this wave."""
-        mb_poll([(hdone_mb, fx.min(lane, tokens - 1) * N_HEAD_TASKS + IK_TASK, 1)])
+        mb_poll(
+            [
+                (
+                    hdone_mb,
+                    fx.min(lane, tokens - 1) * k1.n_head_tasks + k1.ik_task,
+                    1,
+                )
+            ]
+        )
         fx.memory_fence(
             syncscope=rocdl.SyncScope.Agent, ordering=fx.AtomicOrdering.Acquire
         )
@@ -651,5 +869,5 @@ def emit_k1(
         (bid + (BLOCKS - score_base)) % BLOCKS, lane, uniform(wave), red, mb_put, iscore,
         q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
         block_table, seq_lens, bt_width, wait_new_keys, make_index_q,
-        heads, q_frag_head, make_index_q_heads,
+        heads, layout, q_frag_head, make_index_q_heads,
     )  # fmt: skip

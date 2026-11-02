@@ -9,6 +9,8 @@ their forwards (``<model>/spec.py``, ``<model>/draft.py``) and its kernels per I
 entry point in ``pyproject.toml``), which registers each spec.
 """
 
+import inspect
+
 __version__ = "0.1.0.dev0"
 
 # the backend name every spec registers under
@@ -57,7 +59,26 @@ def register_specs() -> None:
     except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         from sglang.srt.monokernels.spec import register
 
+    # The pre-#45389 register() is keyword-only (backend, architecture, path) and
+    # has no model_type parameter at all -- passing it unconditionally raises
+    # TypeError on that older signature, which the module-path fallback above
+    # does not by itself protect against.
+    takes_model_type = "model_type" in inspect.signature(register).parameters
+
+    seen_architectures = set()
     for (architecture, model_type), path in SPECS.items():
-        register(
-            backend=BACKEND, architecture=architecture, path=path, model_type=model_type
-        )
+        if not takes_model_type:
+            # The old registry is a flat architecture -> path map with no
+            # model_type axis at all, so an architecture that needs model_type
+            # to disambiguate (DeepSeek-V4 vs V4.1 share one architecture
+            # string) can only keep one spec here -- the first one in SPECS
+            # wins; the rest are simply unavailable under old SGLang, same as
+            # they always were before this plugin grew model_type-scoped
+            # specs.
+            if architecture in seen_architectures:
+                continue
+            seen_architectures.add(architecture)
+        kwargs = dict(backend=BACKEND, architecture=architecture, path=path)
+        if takes_model_type:
+            kwargs["model_type"] = model_type
+        register(**kwargs)
