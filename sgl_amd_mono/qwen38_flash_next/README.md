@@ -17,6 +17,9 @@ interface is the one of RFC sgl-project/sglang#43949.
 GPU: gfx950 (MI355X), TP 1 only. Weights: the Quark checkpoint `amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8`
 (MXFP4 experts, W8A8 FP8 attention / GDN projections, FP8 PLE n-gram table).
 
+At TP2 the same spec routes to the decode path in `decode/` instead: plain decode of `amd/Qwen3.8-Flash-Next-Quark-MXFP4`
+(BF16 attention / GDN projections) on per-layer launches. This document covers the TP1 monokernel.
+
 | file | contents |
 | --- | --- |
 | `spec.py` | the target's `MonoSpec`, its refusal reasons and its forward (`_Built.forward`) |
@@ -29,6 +32,7 @@ GPU: gfx950 (MI355X), TP 1 only. Weights: the Quark checkpoint `amd/Qwen3.8-Flas
 | `gfx950/weights.py` | the layer views of SGLang's params and what the kernel assumes of them |
 | `gfx950/packing.py` | the bf16 tile packing and the pointer-table rows |
 | `gfx950/runner.py` | the buffers, pointer tables and launch sequence (`VerifyRunner`, `DraftRunner`) |
+| `decode/` | the TP2 decode path: refusals, build and forward (`spec.py`), check mode (`check.py`), launches (`gfx950/`) |
 
 ## 2. The target verify step
 

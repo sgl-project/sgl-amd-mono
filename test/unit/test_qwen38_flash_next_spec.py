@@ -475,9 +475,12 @@ def test_the_ple_layer_is_one_reason():
 
 
 def test_the_recipe_routes_verify_batches_of_one_to_eight():
-    # NEXTN, 3 steps: 4 verify rows a request, the 4- to 32-row launches
-    assert q38.SPEC.widths("gfx950") == tuple(range(4, 33, 4))
-    assert q38.SPEC.devices["gfx950"].tp_sizes == (1,)
+    # NEXTN, 3 steps: 4 verify rows a request, the 4- to 32-row launches (the
+    # spec's other widths are the TP2 decode path's, of one row a request)
+    widths = q38.SPEC.widths("gfx950")
+    assert tuple(w for w in widths if w % q38.TOKENS == 0) == tuple(range(4, 33, 4))
+    assert q38.WIDTHS == tuple(range(4, 33, 4))
+    assert q38.TP in q38.SPEC.devices["gfx950"].tp_sizes
     assert covered_capture_sizes(
         widths=q38.SPEC.widths("gfx950"), tokens_per_request=4, sizes=[1, 2, 4, 8]
     ) == list(range(1, 9))
@@ -494,8 +497,9 @@ def test_the_requirements_are_declared_sglang_reads():
         reads["srt/arg_groups/fields/*.py"]
     )
     assert set(q38.SPEC.requires.env) <= set(reads["srt/environ.py"])
+    assert set(q38.VERIFY_SERVER_ARGS) <= set(reads["srt/arg_groups/fields/*.py"])
     # NEXTN resolves to EAGLE; the kernel verifies 4 rows a request of one chain
-    args = q38.SPEC.requires.server_args
+    args = {**q38.SPEC.requires.server_args, **q38.VERIFY_SERVER_ARGS}
     assert args["speculative_algorithm"] == {"EAGLE"}
     assert args["speculative_num_draft_tokens"] == {q38.TOKENS}
     assert args["enable_linear_replayssm_spec"] == {False}
