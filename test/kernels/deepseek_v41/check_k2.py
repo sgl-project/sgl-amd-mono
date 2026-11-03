@@ -3,9 +3,14 @@
 XO against a torch attention, X8B and the pushed wo_b partial against wo_a / wo_b of K2's own
 XO / X8B, the output bit for bit against the FFN launch fed that partial; the index-source,
 window-only and token-parallel (this rank's rows) K2 bit for bit against the K2 of the same keys;
-then a graph replay."""
+then a graph replay. ``--unified``: every K2 also on SGLang's FP8 unified KV (two pools, the
+window's rows a ragged stream, the compressed rows past a base) holding the same keys, bit for bit
+against the paged K2, and in the replay; ``--bf16-ring``: the window-only K2 on the DSpark draft's
+bf16 unified ring holding the same keys (K2 quantizes each key's nope tiles as K1 would), bit for
+bit against the paged window-only K2."""
 
 import argparse
+import contextlib
 import os
 
 import torch
@@ -33,6 +38,10 @@ O_RANK = 1024
 SWA_BLOCK, COMP_BLOCK = 64, 128
 SWA_PAGES, COMP_PAGES = 48, 32
 POSITIONS = 4096
+# FP8 unified KV: a 512 B nope row (448 e4m3, the 7 codes twice, pad); window slot s at row s,
+# compressed slot c at row COMP_BASE + c (a layer's compressed region past the rings)
+UNI_ROW = 512
+COMP_BASE = SWA_PAGES * SWA_BLOCK + 37
 WIDTHS = SPEC.devices["gfx950"].widths
 
 
@@ -60,6 +69,35 @@ def make_cache(pages, block, g, dev):
     k_nope = nope.float() * torch.exp2(codes.float() - 127).repeat_interleave(64, -1)
     keys = torch.cat([k_nope, rope.float()], -1).reshape(pages * block, HEAD_DIM)
     return raw, keys
+
+
+def to_unified(raws, dev):
+    """The paged caches' records as SGLang's FP8 unified KV pools: (raw, block, first row)
+    each -> (nope uint8 [rows, 512], rope bf16 [rows, 64])."""
+    rows = max(r0 + raw.shape[0] * block for raw, block, r0 in raws)
+    nope = torch.zeros(rows, UNI_ROW, dtype=torch.uint8, device=dev)
+    rope = torch.zeros(rows, ROPE, dtype=torch.bfloat16, device=dev)
+    for raw, block, r0 in raws:
+        pages = raw.shape[0]
+        data = raw[:, : block * DATA].reshape(pages * block, DATA)
+        codes = raw[:, block * DATA : block * REC].reshape(pages * block, SCALE_BYTES)[
+            :, :7
+        ]
+        n = pages * block
+        nope[r0 : r0 + n, :NOPE] = data[:, :NOPE]
+        nope[r0 : r0 + n, NOPE : NOPE + 14] = codes.repeat_interleave(2, 1)
+        rope[r0 : r0 + n] = data[:, NOPE:].contiguous().view(torch.bfloat16)
+    return nope, rope
+
+
+def ragged(keys, dev):
+    """Unified KV's window keys: the window slots as one ragged stream (rows, indptr)."""
+    swa_idx, swa_lens, topk, topk_lens = keys
+    lens = swa_lens.cpu().tolist()
+    flat = [v for t, n in enumerate(lens) for v in swa_idx[t, :n].cpu().tolist()]
+    ptr = torch.tensor([0] + lens, dtype=torch.int32).cumsum(0).int()
+    rows = torch.tensor(flat or [0], dtype=torch.int32)
+    return rows.to(dev), ptr.to(dev), topk, topk_lens
 
 
 def key_lists(M, g, dev, pad_rows=()):
@@ -194,6 +232,10 @@ def main():
     ap.add_argument("--widths", default="", help="comma-separated widths to run")
     # K2 reads wo_b in aiter's (16, 16) preshuffle; the references keep row-major
     ap.add_argument("--shuffled", action="store_true")
+    # also every K2 on SGLang's FP8 unified KV holding the same keys, bit for bit
+    ap.add_argument("--unified", action="store_true")
+    # also the window-only K2 on the draft's bf16 ring of the same keys, bit for bit
+    ap.add_argument("--bf16-ring", action="store_true")
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
@@ -224,6 +266,36 @@ def main():
     gc = torch.Generator(device=dev).manual_seed(5)
     swa_raw, swa_keys = make_cache(SWA_PAGES, SWA_BLOCK, gc, dev)
     comp_raw, comp_keys = make_cache(COMP_PAGES, COMP_BLOCK, gc, dev)
+    ring = None
+    if args.bf16_ring:  # window slot s at row s: its dequantized key, exact in bf16
+        ring = swa_keys.bfloat16().contiguous().view(torch.uint8)
+    uni = None
+    if args.unified:
+        uni = to_unified(
+            [(swa_raw, SWA_BLOCK, 0), (comp_raw, COMP_BLOCK, COMP_BASE)], dev
+        )
+
+    @contextlib.contextmanager
+    def on(kv):
+        """The runner on KV layout ``kv`` (its kernels keyed by it), then paged."""
+        runner.kv = kv
+        try:
+            yield
+        finally:
+            runner.kv = "paged"
+
+    def k2(unified, *a, comp=True, **kw):
+        """runner.k2 on the paged caches, or on the unified pools holding the same keys."""
+        if not unified:
+            caches = (swa_raw, SWA_BLOCK, comp_raw if comp else None, COMP_BLOCK)
+            return runner.k2(aw, mw, *a[:2], *caches, *a[2:], **kw)
+        if kw.get("index"):
+            kw["keys"] = ragged(kw["keys"], dev)
+        kw |= dict(kv_rope=uni[1], comp_base=COMP_BASE)
+        caches = (uni[0], 1, uni[0] if comp else None, 1)
+        with on("fp8"):
+            return runner.k2(aw, mw, *a[:2], *caches, *a[2:], **kw)
+
     gr = torch.Generator(device=dev).manual_seed(77 + rank)
     o_rows = d.groups * O_RANK
 
@@ -254,7 +326,7 @@ def main():
     )
     aw.check(d)
 
-    fails, steps = [], []
+    fails, steps, uni_steps = [], [], set()
     widths = tuple(int(w) for w in args.widths.split(",")) if args.widths else WIDTHS
     for M in widths:
         # alike on every rank: the step's metadata
@@ -348,6 +420,32 @@ def main():
             pair.append(runner.k2(aw, mw, M, pos, swa_raw, SWA_BLOCK, comp, COMP_BLOCK))
         torch.cuda.synchronize()
         checks["window only"] = all(torch.equal(a, b) for a, b in zip(*pair))
+        if args.bf16_ring:
+            runner.kt[: M * (WINDOW + TOPK)] = kt0.reshape(-1)
+            runner.klen[: 2 * M] = klen0
+            with on("bf16"):
+                bo = runner.k2(aw, mw, M, pos, ring, 1, None, 1)
+            torch.cuda.synchronize()
+            checks["bf16 ring"] = all(torch.equal(a, b) for a, b in zip(bo, pair[0]))
+        if args.unified:
+            # the same keys from the unified pools: every K2 above, bit for bit
+            uo = []
+            for index in (False, True):
+                runner.kt[: M * (WINDOW + TOPK)] = kt.reshape(-1)
+                runner.klen[: 2 * M] = klen
+                extra = dict(slot=slot, keys=keys, index=True) if index else {}
+                uo.append(k2(True, M, pos, **extra))
+            runner.kt[: M * (WINDOW + TOPK)] = kt0.reshape(-1)
+            runner.klen[: 2 * M] = klen0
+            uo.append(k2(True, M, pos, comp=False))
+            torch.cuda.synchronize()
+            checks["unified"] = all(torch.equal(a, b) for a, b in zip(uo[0], outs))
+            checks["unified index source"] = all(
+                torch.equal(a, b) for a, b in zip(uo[1], outs)
+            )
+            checks["unified window only"] = all(
+                torch.equal(a, b) for a, b in zip(uo[2], pair[0])
+            )
         if token_par(M, tp):
             # token parallel: this rank's rows of every output, bit for bit
             n = M // tp
@@ -356,14 +454,15 @@ def main():
                 runner.kt[: M * (WINDOW + TOPK)] = kt.reshape(-1)
                 runner.klen[: 2 * M] = klen
                 extra = dict(slot=slot, keys=keys, index=True) if index else {}
-                tpo = runner.k2(
-                    aw, mw, M, pos, swa_raw, SWA_BLOCK, comp_raw, COMP_BLOCK,
-                    tok_par=True, **extra,
-                )  # fmt: skip
-                torch.cuda.synchronize()
-                checks[f"token parallel{' index' if index else ''}"] = all(
-                    torch.equal(a[mine], b[mine]) for a, b in zip(tpo, outs)
-                )
+                for unified in (False, True) if args.unified else (False,):
+                    runner.kt[: M * (WINDOW + TOPK)] = kt.reshape(-1)
+                    runner.klen[: 2 * M] = klen
+                    tpo = k2(unified, M, pos, tok_par=True, **extra)
+                    torch.cuda.synchronize()
+                    name = "unified " if unified else ""
+                    checks[f"{name}token parallel{' index' if index else ''}"] = all(
+                        torch.equal(a[mine], b[mine]) for a, b in zip(tpo, outs)
+                    )
         ref0 = out.clone()
         dist.broadcast(ref0, 0)
         checks["ranks agree"] = torch.equal(ref0, out)
@@ -401,10 +500,21 @@ def main():
             steps.append(
                 (M, pos, kt, klen, q, res, post, comb, pre, True, runner._outs(M, res))
             )
+        if args.unified:  # the unified pools' K2 and index-source K2 in the replay too
+            for st in steps[-3:] if token_par(M, tp) else steps[-2:]:
+                if not st[9]:
+                    uni_steps.add(len(steps))
+                    steps.append(st[:-1] + (runner._outs(M, res),))
+
+    # the unified index-source steps' ragged streams, built once (not under capture)
+    streams = {i: ragged(steps[i][2][1], dev) for i in uni_steps if steps[i][3] is None}
 
     # the hand-offs under replay: every width's K2 in one graph, bit for bit against eager
     def run_all():
-        for M, pos, kt, klen, q, res, post, comb, pre, tok_par, outs in steps:
+        for i, (M, pos, kt, klen, q, res, post, comb, pre, tok_par, outs) in enumerate(
+            steps
+        ):
+            unified = i in uni_steps
             runner.q[:M].copy_(q)
             runner.res_mid[:M].copy_(res)
             runner.post_a[:M].copy_(post)
@@ -412,6 +522,14 @@ def main():
             runner.pre_a[:M].copy_(pre)
             if klen is None:  # an index source's K2: it builds the table
                 slot, keys = kt
+                if unified:  # its stream built before the capture
+                    with on("fp8"):
+                        runner.k2(
+                            aw, mw, M, pos, uni[0], 1, uni[0], 1, outs=outs, slot=slot,
+                            keys=streams[i], index=True, kv_rope=uni[1],
+                            comp_base=COMP_BASE,
+                        )  # fmt: skip
+                    continue
                 runner.k2(
                     aw, mw, M, pos, swa_raw, SWA_BLOCK, comp_raw, COMP_BLOCK,
                     outs=outs, slot=slot, keys=keys, index=True,
@@ -419,10 +537,7 @@ def main():
                 continue
             runner.kt[: M * (WINDOW + TOPK)].copy_(kt.reshape(-1))
             runner.klen[: 2 * M].copy_(klen)
-            runner.k2(
-                aw, mw, M, pos, swa_raw, SWA_BLOCK, comp_raw, COMP_BLOCK, outs=outs,
-                tok_par=tok_par,
-            )  # fmt: skip
+            k2(unified, M, pos, outs=outs, tok_par=tok_par)
 
     # token-parallel steps write only their rows; a sentinel elsewhere, as NaN never compares equal
     sentinel = -3.25

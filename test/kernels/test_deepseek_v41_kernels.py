@@ -2,7 +2,8 @@
 
 Runs each ``deepseek_v41/check_*.py`` (K1, K2, and the FFN launch on the target's and the DSpark
 draft's routes) under torchrun at TP2 and TP4: every output within the spec's bound, then a
-bitwise graph replay across widths with every rank agreeing."""
+bitwise graph replay across widths with every rank agreeing; K1 and K2 also on SGLang's FP8
+unified KV and the DSpark draft's bf16 unified ring."""
 
 import subprocess
 import sys
@@ -57,6 +58,18 @@ class TestMonoDeepseekV41Kernels(CustomTestCase):
 
     def test_k2_preshuffled(self):
         self._check("check_k2", "--replays", "100", "--shuffled")
+
+    def test_k1_unified_kv(self):
+        # SGLang's FP8 unified KV rows, against its own writer of that layout
+        self._check("check_k1", "--trials", "2", "--unified")
+
+    def test_k1_draft_bf16_ring(self):
+        # the DSpark draft's bf16 unified ring, against SGLang's draft writer
+        self._check("check_k1", "--trials", "2", "--bf16-ring")
+
+    def test_k2_unified_kv(self):
+        # every K2 on the unified pools (and the draft's bf16 ring) holding the paged keys
+        self._check("check_k2", "--replays", "100", "--unified", "--bf16-ring")
 
 
 if __name__ == "__main__":

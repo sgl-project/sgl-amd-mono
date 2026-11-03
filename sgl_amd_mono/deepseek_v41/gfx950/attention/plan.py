@@ -26,6 +26,15 @@ WOA_ROWS = 32  # a wo_a task's rows: one MX group of its output
 
 # KV record (V4 fp8_ds_mla): 576 B rows (448 e4m3, 64 bf16), then 8 B of scales a token
 DATA = 576
+# SGLang's FP8 unified KV (SGLANG_DSV4_UNIFIED_KV_FP8): a row's nope in one pool, 512 B
+# (448 e4m3, each of the 7 E8M0 scales twice, pad), its rope in another, 64 bf16
+UNI_ROW = 512
+UNI_ROPE = ROPE * 2
+# its bf16 variant (the DSpark draft's ring): one pool, a row 512 bf16 (448 nope, 64 rope)
+UNI_BF16_ROW = HEAD_DIM * 2
+# the KV cache K1 writes and K2 reads: SGLang's paged records (DATA), its FP8 unified KV
+# (UNI_ROW) or that KV's bf16 ring (UNI_BF16_ROW)
+KV_LAYOUTS = ("paged", "fp8", "bf16")
 
 PAIR = 8  # a mailbox (value, tag) pair
 KEYS = TOPK + WINDOW  # a token's attention keys at most
