@@ -48,6 +48,9 @@ __all__ = [
 HC = 4
 # below this many rows an ug task takes one FP4 group (``route_at``)
 FINE_UG_ROWS = 7
+# TP8 holds 9 FP4 groups of an expert: two a task leave 5 parts, ~240 tasks at 8 rows
+# for 238 CTAs, and the CTAs with two run a second 328 KB round
+FINE_UG_ROWS_TP8 = 9
 RECORD = DATA + 8  # a token's KV record: 576 B of data, then 8 B of scales
 _LOG2E = 1.4426950408889634
 # a wait's deadline until the framework sets one from its watchdog timeout
@@ -388,7 +391,8 @@ class DSV41MonoRunner:
         end closer together (ROCm/ATOM's fine ug); the draft fixes its own."""
         ug = self.ug_groups
         if ug is None:
-            ug = 1 if tokens < FINE_UG_ROWS else 2
+            fine = FINE_UG_ROWS_TP8 if self.tp >= 8 else FINE_UG_ROWS
+            ug = 1 if tokens < fine else 2
         return {**self.route, "ug_groups": ug}
 
     def timeline(self, tokens: int) -> torch.Tensor:
@@ -615,7 +619,7 @@ class DSV41MonoRunner:
         keys: tuple,  # int32 [>= M, ...]: window slots, window lengths, top-k slots, top-k lengths
         index: bool = False,
         tok_par: bool = False,
-        aux: torch.Tensor | None = None,  # [>= M, 5120] bf16: DSpark's capture
+        aux: torch.Tensor | None = None,  # [>= M, 5120] bf16, any row stride: a capture
     ):
         """Run K1: the pending post, this layer's attention seam and the attention front.
 
@@ -641,9 +645,16 @@ class DSV41MonoRunner:
                 "post": (post, HC, f32),
                 "comb": (comb, HC * HC, f32),
             }
-        if aux is not None:
-            want["aux"] = (aux, HIDDEN, bf)
         check_rows("K1", M, self.device, want)
+        if aux is not None and not (
+            aux.dtype == bf
+            and aux.shape[0] >= M
+            and aux.shape[-1] == HIDDEN
+            and aux.stride(-1) == 1
+            and aux.stride(0) % 8 == 0
+            and aux.device == self.device
+        ):
+            raise RuntimeError(f"K1 aux: {tuple(aux.shape)} {aux.stride()} {aux.dtype}")
         if not fold:  # unread: the seam takes the residual as it is
             x = post = comb = residual
         for name, t, dtypes in (
@@ -690,6 +701,7 @@ class DSV41MonoRunner:
             w.norm.data_ptr(),
             self.res_mid.data_ptr(),
             0 if aux is None else aux.data_ptr(),
+            HIDDEN if aux is None else aux.stride(0),
             self.post_a.data_ptr(),
             self.comb_a.data_ptr(),
             self.pre_a.data_ptr(),

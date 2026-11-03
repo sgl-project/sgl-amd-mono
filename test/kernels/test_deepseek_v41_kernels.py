@@ -1,8 +1,8 @@
 """The DeepSeek-V4.1 gfx950 monokernels against SGLang's ops (RFC #43949).
 
-Runs each ``deepseek_v41/check_*.py`` (K1, K2, and the FFN launch on the target's and the DSpark
-draft's routes) under torchrun at TP2 and TP4: every output within the spec's bound, then a
-bitwise graph replay across widths with every rank agreeing."""
+Each ``deepseek_v41/check_*.py`` (K1, K2, the FFN launch on both routes, the sampled Markov block)
+under torchrun at TP2, TP4 and, with 8 GPUs, TP8: outputs within the spec's bound, bitwise graph
+replays with every rank agreeing; and ``check_glue.py`` (the step glue) on one GPU."""
 
 import subprocess
 import sys
@@ -27,7 +27,8 @@ CHECKS = Path(__file__).with_name("deepseek_v41")
 @unittest.skipIf(_gfx950_gpus() < 4, "needs 4 gfx950 GPUs")
 class TestMonoDeepseekV41Kernels(CustomTestCase):
     def _check(self, module: str, *args: str) -> None:
-        for tp in (2, 4):
+        # TP8 pads its 8 heads to a 16-head tile and runs the shared down at K 288
+        for tp in (2, 4, 8) if _gfx950_gpus() >= 8 else (2, 4):
             cmd = [
                 sys.executable,
                 "-m",
@@ -57,6 +58,13 @@ class TestMonoDeepseekV41Kernels(CustomTestCase):
 
     def test_k2_preshuffled(self):
         self._check("check_k2", "--replays", "100", "--shuffled")
+
+    def test_sampled_markov_block(self):
+        self._check("check_markov", "--replays", "20")
+
+    def test_step_glue(self):
+        cmd = [sys.executable, str(CHECKS / "check_glue.py"), "--trials", "8"]
+        self.assertEqual(subprocess.run(cmd, timeout=1800).returncode, 0, "check_glue")
 
 
 if __name__ == "__main__":
