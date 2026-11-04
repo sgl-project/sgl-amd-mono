@@ -122,7 +122,7 @@ UP_ROWS = {
     384: "96:128:2:4:8",
 }
 SDOWN_ROWS = {288: "96:128:2:4:1", 384: "192:64:4:2:1"}
-NARROW = 8  # rows up to this stay on SGLang's path (the wide launch starts at 2 requests above 8 rows)
+NARROW = 8  # rows up to this run Kimi-K3's launches (the wide launch starts at 2 requests above 8 rows)
 
 
 def enabled() -> bool:
