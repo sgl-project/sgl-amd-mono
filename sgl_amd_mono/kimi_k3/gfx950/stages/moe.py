@@ -1863,6 +1863,9 @@ def build(key: MoeBuild):
             "xp": key.xp,
             "guint": key.guint,
             "lazy_inter": True,
+            # the shared stages' timeline points (the route's, the router's)
+            "tl_on": key.timeline,
+            "tls": lds.tls.ptr,
             "args": {
                 "x": x,
                 "w_gate": w_gate,

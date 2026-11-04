@@ -133,6 +133,9 @@ SGLANG_READS = {
         "out_cache_loc",
         "req_pool_indices",
         "capture_hidden_mode",
+    ),
+    # ForwardMode and CaptureHiddenMode, in forward_batch_info.py before forward_mode.py
+    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
         "need_capture",
     ),
     "srt/model_executor/forward_context.py": (

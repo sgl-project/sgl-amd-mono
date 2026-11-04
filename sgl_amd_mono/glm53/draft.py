@@ -104,11 +104,14 @@ SGLANG_READS = {
         "forward_mode",
         "batch_size",
         "input_ids",
-        "is_draft_extend_v2",
-        "is_decode",
         "reuse_dsa_topk_indices",
         "out_cache_loc",
         "sampling_info",
+    ),
+    # ForwardMode and CaptureHiddenMode, in forward_batch_info.py before forward_mode.py
+    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
+        "is_draft_extend_v2",
+        "is_decode",
     ),
     "srt/sampling/sampling_batch_info.py": ("is_all_greedy",),
     "srt/speculative/*.py": (

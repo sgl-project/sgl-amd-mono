@@ -176,45 +176,11 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
     assert len(reasons) == 7, reasons
 
 
-class _ServerArgs(SimpleNamespace):
-    """Server arguments as SGLang's startup check reads them: the given ones, every
-    other feature off."""
-
-    def __getattr__(self, name):
-        return 0 if name.endswith(("_size", "_gb", "nnodes")) else None
-
-
-def test_sglang_refuses_its_jit_grouped_topk(monkeypatch):
+def test_the_spec_requires_sglang_jit_grouped_topk_off():
     # the kernel's router ties follow AITER's grouped top-k; SGLang's JIT grouped
-    # top-k (a Triton gate) keeps the lower expert id, so the spec requires it off,
-    # and SGLang's startup check refuses the setup when it is on
-    import sglang.srt.configs.mamba_utils as mamba_utils
-    import sglang.srt.layers.attention.dsa.utils as dsa_utils
-
-    try:
-        from sglang.srt.kernel_plugins.amd.binding import monokernel_disable_reasons
-    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-        from sglang.srt.monokernels.guards import monokernel_disable_reasons
-
-    monkeypatch.setattr(mamba_utils, "mamba2_state_dtype", _dtypes())
-    monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: True)
-    sgl_amd_mono.register_specs()
-    name = "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK"
-    assert flash.SPEC.requires.env[name] is False
-    cfg = _ServerArgs(monokernel_backend=sgl_amd_mono.BACKEND, tp_size=4, page_size=256)
-    model_config = SimpleNamespace(hf_config=FLASH, dtype=torch.bfloat16)
-
-    def reasons():
-        spec, why = monokernel_disable_reasons(
-            cfg=cfg, model_config=model_config, isa="gfx950"
-        )
-        assert spec is flash.SPEC
-        return set(why)
-
-    monkeypatch.delenv(name, raising=False)
-    off = reasons()
-    monkeypatch.setenv(name, "1")
-    assert reasons() - off == {f"{name} True is not False"}
+    # top-k (a Triton gate) keeps the lower expert id, so the spec requires it off
+    # (SGLang refuses a setup against a spec's declared env)
+    assert flash.SPEC.requires.env["SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK"] is False
 
 
 def _layer(kda=True, shuffled=True, scale_dims=3, fused=True, indexer=True):

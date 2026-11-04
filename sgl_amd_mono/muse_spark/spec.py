@@ -96,8 +96,11 @@ SGLANG_READS = {
     "srt/model_executor/forward_batch_info.py": (
         "contains_mm_inputs",
         "forward_mode",
-        "is_decode",
         "out_cache_loc",
+    ),
+    # ForwardMode and CaptureHiddenMode, in forward_batch_info.py before forward_mode.py
+    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
+        "is_decode",
     ),
     "srt/models/muse_spark_omni.py": (
         "MuseSparkForConditionalGeneration",

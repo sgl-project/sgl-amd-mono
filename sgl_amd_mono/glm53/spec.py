@@ -115,6 +115,9 @@ SGLANG_READS = {
         "out_cache_loc",
         "seq_lens",
         "forward_mode",
+    ),
+    # ForwardMode and CaptureHiddenMode, in forward_batch_info.py before forward_mode.py
+    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
         "is_idle",
     ),
     "srt/model_executor/forward_context.py": (
