@@ -49,15 +49,9 @@ from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
 logger = logging.getLogger(__name__)
 
-# K1 reads each layer's initial recurrent state from the committed pool, so the
-# step stages no copy of it into the speculative scratch (54 MB of fp32 states
-# a step at Kimi-K3's 69 KDA layers: ~120 us of gather and index_put on MI350X).
-# SGLANG_AMD_MONO_K3_K1_INIT_COMMITTED=0 restores the staging copy.
-INIT_COMMITTED = os.environ.get("SGLANG_AMD_MONO_K3_K1_INIT_COMMITTED", "1") == "1"
-# The conv window's staging (prepare) and hand-back (finish) as one Triton launch
-# each, instead of ~13 small torch kernels a step (~125 us on MI350X). Same values:
-# copies only. SGLANG_AMD_MONO_K3_K1_CONV_TRITON=0 (and check mode) keep torch's.
-CONV_TRITON = os.environ.get("SGLANG_AMD_MONO_K3_K1_CONV_TRITON", "1") == "1"
+# The conv window's staging (prepare) and hand-back (finish) run as one Triton
+# launch each, instead of ~13 small torch kernels a step. Same values: copies
+# only; check mode keeps torch's.
 _CONV_BLOCK = 512
 
 
@@ -100,7 +94,7 @@ def _hand_back(
 
 
 def _conv_triton() -> bool:
-    return CONV_TRITON and os.environ.get("SGLANG_AMD_MONO_CHECK") != "1"
+    return os.environ.get("SGLANG_AMD_MONO_CHECK") != "1"
 
 
 # Said once a process. This catches a launch that is built but never reached.
@@ -266,8 +260,9 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
             lower_bound=float(attn.attn.lower_bound),
             write_idx=(layer.prev_valid_blocks if layer.is_block_write_layer else -1),
             ring=_ring_mode(),
-            # the ring reads the committed state itself
-            init_committed=INIT_COMMITTED and not _ring_mode(),
+            # K1 reads the initial state from the committed pool, so the step
+            # stages no copy of it (the ring reads the committed state itself)
+            init_committed=not _ring_mode(),
         ),
         module=layer,
         # The same cast SGLang's own fused KDA decode makes once at load

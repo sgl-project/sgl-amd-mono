@@ -30,8 +30,9 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
 )
 from sgl_amd_mono.common.sync import sreg
+from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
+from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k31.gfx950 import chain as post
-from sgl_amd_mono.kimi_k31.gfx950 import kda_defs as k1
 from sgl_amd_mono.kimi_k31.gfx950 import pre_attn as pre
 from sgl_amd_mono.kimi_k31.gfx950.stages import coll
 from sgl_amd_mono.kimi_k31.gfx950.stages import kda_wide as kdaw
@@ -44,7 +45,6 @@ from sgl_amd_mono.kimi_k31.gfx950.stages.gemm_coll import (
 )
 from sgl_amd_mono.kimi_k31.gfx950.stages.tile import atomic_lin, bf16_emit
 from sgl_amd_mono.kimi_k31.gfx950.stages.tile_mma import DEPTH, RW, mma_tile
-from sgl_amd_mono.kimi_k31.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k31.plan import Plan
 
 SOURCES = kernel_sources(__name__)

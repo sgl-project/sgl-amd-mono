@@ -48,7 +48,7 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
 )
 from sgl_amd_mono.common.sync import sreg
-from sgl_amd_mono.kimi_k31.gfx950 import kda_defs as k1
+from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
 from sgl_amd_mono.kimi_k31.gfx950.stages import coll
 from sgl_amd_mono.kimi_k31.gfx950.stages import kda_wide as kdaw
 from sgl_amd_mono.kimi_k31.gfx950.stages.attnres import attnres_row, red_words, scalars

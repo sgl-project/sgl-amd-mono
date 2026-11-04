@@ -133,7 +133,7 @@ def run(args, spec, mode, rank, dev, cpu):
         args.write,
     )
     sl = H // TP
-    from sgl_amd_mono.kimi_k31.gfx950 import kda_defs as k1
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
 
     L = args.kda
     state_len = L + k1.CONV_W - 1 if L else 0

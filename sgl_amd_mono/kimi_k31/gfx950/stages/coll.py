@@ -48,7 +48,7 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, preg, shift
-from sgl_amd_mono.kimi_k31.gfx950.tag import step_tag
+from sgl_amd_mono.kimi_k3.gfx950.tag import step_tag
 
 SOURCES = kernel_sources(__name__)
 

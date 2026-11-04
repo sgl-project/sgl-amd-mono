@@ -35,6 +35,7 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
 )
 from sgl_amd_mono.common.sync import sreg
+from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k31.gfx950.stages import coll
 from sgl_amd_mono.kimi_k31.gfx950.stages.attnres import attnres_row, red_words, scalars
 from sgl_amd_mono.kimi_k31.gfx950.stages.gemm_coll import (
@@ -44,7 +45,6 @@ from sgl_amd_mono.kimi_k31.gfx950.stages.gemm_coll import (
 )
 from sgl_amd_mono.kimi_k31.gfx950.stages.tile import atomic_lin, bf16_emit, f32_emit
 from sgl_amd_mono.kimi_k31.gfx950.stages.tile_mma import DEPTH, RW, mma_tile
-from sgl_amd_mono.kimi_k31.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k31.plan import Plan
 
 SOURCES = kernel_sources(__name__)

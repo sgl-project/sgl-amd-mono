@@ -96,7 +96,7 @@ def timeline(pl, scratch, m, rank):
 def run(args, m, rank, dev, cpu):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
-    from sgl_amd_mono.kimi_k31.gfx950 import kda_defs as k1
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
     from sgl_amd_mono.kimi_k31.gfx950 import layer as lay
     from sgl_amd_mono.kimi_k31.gfx950 import pre_attn as pa
     from sgl_amd_mono.kimi_k31.gfx950.chain import Gemm

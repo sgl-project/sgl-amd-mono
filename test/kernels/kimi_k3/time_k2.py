@@ -41,13 +41,6 @@ def main():
         help="1: an all-reduce right before K2 in its graph, so ranks start together",
     )
     ap.add_argument(
-        "--route", type=int, default=2, help="K2Build.route (2: the candidate rank)"
-    )
-    ap.add_argument(
-        "--latq-push", type=int, default=1, help="K2Build.latq_push (serving's default)"
-    )
-    ap.add_argument("--rtab", type=int, default=2, help="K2Build.rtab")
-    ap.add_argument(
         "--opt",
         type=int,
         default=-1,
@@ -100,9 +93,6 @@ def main():
             guint=False,
             fold=bool(args.fold),
             tl=tl,
-            route=args.route,
-            latq_push=bool(args.latq_push),
-            rtab=args.rtab,
             opt=k2.K2_OPT if args.opt < 0 else args.opt,
         )
 

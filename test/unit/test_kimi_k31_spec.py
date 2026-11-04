@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The Kimi-K3.1 spec routes steps of up to 8 rows to Kimi-K3's launches and the
-verify steps above them to the wide launch."""
-
-from types import SimpleNamespace
+"""The Kimi-K3.1 spec routes one request's verify steps to Kimi-K3's launches and
+wider ones to the wide launch."""
 
 import sgl_amd_mono
 from sgl_amd_mono.kimi_k3 import MAX_ROWS
@@ -26,21 +24,18 @@ def test_the_narrow_and_wide_widths_meet_without_a_gap():
     assert all(w > wide.NARROW for w in widths[MAX_ROWS:])
 
 
-def test_the_wide_launch_names_its_server_args():
-    def cfg(**kw):
-        return SimpleNamespace(
-            **{
-                "speculative_algorithm": "DFLASH",
-                "speculative_num_draft_tokens": 6,
-                "enable_linear_replayssm_spec": True,
-                **kw,
-            }
-        )
+def test_every_wide_width_has_a_bucket_at_each_draft_length():
+    # the binding serves a width at every L it is a multiple of: an 8-token width
+    # that reads as more 6-token requests than the largest bucket holds raised at
+    # the launch
+    top = max(wide.REQ_BUCKETS)
+    for w in wide.wide_widths():
+        for L in wide.SUPPORTED_L:
+            if w % L == 0:
+                assert w // L <= top, (w, L)
 
-    assert k31._wide_config_disable_reasons(cfg()) == []
-    (why,) = k31._wide_config_disable_reasons(cfg(enable_linear_replayssm_spec=False))
-    assert (
-        "--enable-linear-replayssm-spec" in why and "SGLANG_AMD_MONO_K31_WIDE=0" in why
-    )
-    decode = cfg(speculative_algorithm=None, speculative_num_draft_tokens=None)
-    assert len(k31._wide_config_disable_reasons(decode)) == 2
+
+def test_the_launches_name_their_server_args():
+    server_args = k31.SPEC.requires.server_args
+    assert server_args["enable_linear_replayssm_spec"] == frozenset({True})
+    assert server_args["speculative_algorithm"] == frozenset({"DSPARK", "DFLASH"})

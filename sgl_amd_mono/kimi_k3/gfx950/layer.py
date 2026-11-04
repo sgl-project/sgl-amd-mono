@@ -112,19 +112,9 @@ class K2Build(msgspec.Struct, frozen=True):
     reduce: bool = True  # the final reduce here (else the next layer's K1)
     reset: bool = False  # a block-write layer: the prefix restarts at the o_proj output
     # the reduce writes out + the updated prefix (the layer's residual stream), and
-    # the seam reads the incoming prefix from ``prefix_in``: no copy in, no add out
-    fold: bool = False
-    # the route's top-16: 1 max-extraction (GLM-5.3-Flash's), 0 the radix select;
-    # the same picks, order and weights bit for bit
-    route: int = 1
-    # the route table: 1 the flag array's block scan, 2 a bitmask's wave scan
-    # (the same tables bit for bit, two fewer CTA barriers)
-    rtab: int = 1
-    # the shared expert's down on the idle CTAs before the route (else after down)
-    sdown_early: bool = False
-    # the latent quantized to MXFP4 by its producers (32-row groups, K quarters)
-    # and pushed to every rank, instead of every CTA quantizing the bf16 latent
-    latq_push: bool = False
+    # the seam reads the incoming prefix from ``prefix_in``: no copy in, no add out.
+    # False (the kernel checks): out is the MoE output alone
+    fold: bool = True
     timeline: bool = False
     # fault injection (tests only): the wait to stall and how many launches
     # to let through first. Compile-time, so a serving build pays nothing.
@@ -319,10 +309,6 @@ def build(key: K2Build):
         f"k3_mono_k2_s{s}_nb{key.nblocks}_x{int(key.reset)}_r{int(key.reduce)}"
         f"_t{int(key.timeline)}"
         + ("_f1" if key.fold else "")
-        + ("" if key.route == 1 else f"_rt{key.route}")
-        + ("" if key.rtab == 1 else f"_tb{key.rtab}")
-        + ("" if key.sdown_early else "_sl")
-        + ("_lq" if key.latq_push else "")
         + (f"_o{key.opt}" if key.opt else "")
     )
 
@@ -413,8 +399,10 @@ def build(key: K2Build):
                 "delta": True,
                 "reset": key.reset,
                 "fold": key.fold,
-                "route_v": key.route,
-                "latq_push": key.latq_push,
+                # the top-16 by candidate rank; the latent quantized to MXFP4 by
+                # its producers and pushed to every rank
+                "route_v": 2,
+                "latq_push": True,
                 "gate_local": False,
                 "debug": False,
                 "eps": key.eps,
@@ -532,12 +520,8 @@ def build(key: K2Build):
             if is_l:
                 stage_oproj(c, bid - O0)
                 stamp(on, tls, tid, 1)
-                if const_expr(key.latq_push):
-                    lops = k2b.early_loads(c, 3, lb // k2b.LQ_PARTS, lb % k2b.LQ_PARTS)
-                    k2b.early_compute(c, 3, lb // k2b.LQ_PARTS, lb % k2b.LQ_PARTS, lops)
-                else:
-                    lops = k2b.early_loads(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS)
-                    k2b.early_compute(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS, lops)
+                lops = k2b.early_loads(c, 3, lb // k2b.LQ_PARTS, lb % k2b.LQ_PARTS)
+                k2b.early_compute(c, 3, lb // k2b.LQ_PARTS, lb % k2b.LQ_PARTS, lops)
             if (bid >= O0) & ~is_r & ~is_l:
                 stage_oproj(c, bid - O0)
                 stamp(on, tls, tid, 1)
@@ -568,16 +552,12 @@ def build(key: K2Build):
                     k2b.stage_h(c, bid - H0)
             if bid >= NA:
                 stamp(on, tls, tid, 2)
-            if const_expr(key.sdown_early):
-                k2b.run_sdown_early(c, bid, w_sd, NA)
             # ---- the routed experts
             # the latent (ready ~10 us before the route) quantized first
             k2b.load_latq(c)
             stamp(on, tls, tid, 12)
-            if const_expr(key.rtab == 2):
-                nu = k2b.load_route2(c)
-            else:
-                nu = k2b.load_route(c)
+            # the route table from a bitmask's wave scan
+            nu = k2b.load_route2(c)
             stamp(on, tls, tid, 11)
             total = nu * k2b.UG_GROUPS
             last = total - 1
@@ -598,13 +578,12 @@ def build(key: K2Build):
                 stamp(on, tls, tid, 15)
                 k2b.stage_down(c, bid, nu, dops)
                 stamp(on, tls, tid, 16)
-            if const_expr(not key.sdown_early):
-                if const_expr(key.opt & OPT_SDOWN_FIRST):
-                    k2b.run_sdown_first(c, bid, w_sd)
-                    k2b.run_sdown_rest(c, bid, w_sd)
-                else:
-                    k2b.run_sdown_rest(c, bid, w_sd)
-                    k2b.run_sdown(c, bid, w_sd)
+            if const_expr(key.opt & OPT_SDOWN_FIRST):
+                k2b.run_sdown_first(c, bid, w_sd)
+                k2b.run_sdown_rest(c, bid, w_sd)
+            else:
+                k2b.run_sdown_rest(c, bid, w_sd)
+                k2b.run_sdown(c, bid, w_sd)
             stamp(on, tls, tid, 4)
             if (bid >= k2b.LN0) & (bid < k2b.LN0 + k2b.LN_TASKS):
                 k2b.stage_lnorm(c, bid - k2b.LN0)

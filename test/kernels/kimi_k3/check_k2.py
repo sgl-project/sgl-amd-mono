@@ -102,10 +102,6 @@ def run(
     guint,
     fold=False,
     tl=None,
-    route=1,
-    sdown_early=False,
-    latq_push=False,
-    rtab=1,
     opt=0,
 ):
     """One layer launch -> (out, the updated prefix, the build key the caller
@@ -118,10 +114,6 @@ def run(
         reset=reset,
         guint=guint,
         fold=fold,
-        route=route,
-        rtab=rtab,
-        sdown_early=sdown_early,
-        latq_push=latq_push,
         opt=opt,
         timeline=tl is not None,
     )
@@ -265,88 +257,10 @@ def main():
             )
         fails += [f"{tag}/{n}" for n, v in ok.items() if not v]
 
-    # The max-extraction route (the default) against the radix select: the same
-    # picks, order and weights, so the whole launch's output bit for bit.
-    for tag, reset in (("accumulate", False), ("reset", True)):
-        outs = {}
-        for route in (0, 1, 2):
-            epoch[0].add_(1)
-            o, p, _ = run(
-                k2, w, scratch, reset=reset, peers=peers, epoch=epoch,
-                rank=rank, layer=1, guint=False, route=route,
-            )  # fmt: skip
-            torch.cuda.synchronize()
-            outs[route] = (o.clone(), p.clone())
-        for route, what in ((1, "max-extraction"), (2, "candidate rank")):
-            same = torch.equal(outs[0][0], outs[route][0]) and torch.equal(
-                outs[0][1], outs[route][1]
-            )
-            if rank == 0:
-                print(f"route/{tag}: {what} == radix bit for bit: {same}", flush=True)
-            if not same:
-                fails.append(f"route{route}/{tag}")
-
-    # The route table from a bitmask (rtab 2) against the flag array's scan: the
-    # same tables, so the output bit for bit (route 2, latq_push as served).
-    outs = {}
-    for rtab in (1, 2):
-        epoch[0].add_(1)
-        o, p, _ = run(
-            k2, w, scratch, reset=False, peers=peers, epoch=epoch, rank=rank,
-            layer=1, guint=False, route=2, latq_push=True, rtab=rtab,
-        )  # fmt: skip
-        torch.cuda.synchronize()
-        outs[rtab] = (o.clone(), p.clone())
-    same = torch.equal(outs[1][0], outs[2][0]) and torch.equal(outs[1][1], outs[2][1])
-    if rank == 0:
-        print(f"rtab: bitmask == block scan bit for bit: {same}", flush=True)
-    if not same:
-        fails.append("rtab")
-
-    # The shared down before the route (the default) against after the MoE's down:
-    # the same tasks on other CTAs, so the output bit for bit.
-    outs = {}
-    for early in (False, True):
-        epoch[0].add_(1)
-        o, p, _ = run(
-            k2, w, scratch, reset=False, peers=peers, epoch=epoch,
-            rank=rank, layer=1, guint=False, sdown_early=early,
-        )  # fmt: skip
-        torch.cuda.synchronize()
-        outs[early] = o.clone()
-    same = torch.equal(outs[False], outs[True])
-    if rank == 0:
-        print(f"sdown/early == late bit for bit: {same}", flush=True)
-    if not same:
-        fails.append("sdown/early")
-
-    # The latent quantized by its producers (latq_push): K quarters instead of
-    # halves, so not bit for bit the per-CTA quantization; against the reference.
-    for tag, reset in (("accumulate", False), ("reset", True)):
-        epoch[0].add_(1)
-        o, p, key = run(
-            k2, w, scratch, reset=reset, peers=peers, epoch=epoch,
-            rank=rank, layer=1, guint=False, latq_push=True,
-        )  # fmt: skip
-        torch.cuda.synchronize()
-        off, nbytes = k2.scratch_layout(key)["xrow"]
-        xrow = scratch[off : off + nbytes].view(BF).view(ROWS, HIDDEN).clone()
-        ref_moe = moe_reference(xrow, w, rank)
-        ok = cos(o, ref_moe) > NUMERICS.bound("k2.out.cosine") and rel(
-            o, ref_moe
-        ) < NUMERICS.bound("k2.out.rel")
-        if rank == 0:
-            print(
-                f"latq_push/{tag}: out cos {cos(o, ref_moe):.6f} rel {rel(o, ref_moe):.4g}",
-                flush=True,
-            )
-        if not ok:
-            fails.append(f"latq_push/{tag}")
-
     # The OPT_* bits, each alone and all together, against opt=0 on the served
     # form: bit for bit. A sentinel word is pushed again only two launches
     # later, so consecutive launches take layers of alternating parity.
-    served = dict(fold=True, route=2, rtab=2, latq_push=True, guint=False)
+    served = dict(fold=True, guint=False)
     bits = [
         k2.OPT_SENT, k2.OPT_PRELOAD, k2.OPT_TAG_X, k2.OPT_SENT_LATR,
         k2.OPT_SENT_FINAL, k2.OPT_SDOWN_FIRST, k2.OPT_RLOG_PARTS, k2.OPT_BATCH,

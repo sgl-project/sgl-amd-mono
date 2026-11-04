@@ -36,7 +36,7 @@ from sgl_amd_mono.common.ops import (
     write_lane_i32,
 )
 from sgl_amd_mono.common.plan import THREADS
-from sgl_amd_mono.kimi_k31.gfx950.kda_defs import ld_f32
+from sgl_amd_mono.kimi_k3.gfx950.attention.kda import ld_f32
 from sgl_amd_mono.kimi_k31.gfx950.stages import coll
 
 TP = 8

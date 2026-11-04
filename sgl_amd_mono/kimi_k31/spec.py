@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi-K3.1 on gfx950: the monokernel spec (RFC #43949).
 
-A routed step of up to 8 rows (a decode step, or a verify step of one request)
-runs Kimi-K3's launches: K1 on the KDA layers, the MLA projection front on the
-DSA layers and the layer launch (o_proj to the MoE output) on every MoE layer.
-A speculative verify step (DSpark or DFLASH) of R >= 2 requests x L draft tokens
-(L = 6 or 8) above 8 rows runs ``wide.Wide.backbone``: one persistent launch a
-KDA layer, SGLang's routed experts between launches, and SGLang's own path for
-layer 0, the DSA layers and each run's exit. ``SGLANG_AMD_MONO_K31_WIDE=0``
-leaves those steps on SGLang's path.
+A routed step is a speculative verify step (DSpark or DFLASH) of L draft tokens a
+request (L = 6 or 8). One request's step runs Kimi-K3's launches: K1 on the KDA
+layers, the MLA projection front on the DSA layers and the layer launch (o_proj to
+the MoE output) on every MoE layer. A step of R >= 2 requests runs
+``wide.Wide.backbone``: one persistent launch a KDA layer, SGLang's routed experts
+between launches, and SGLang's own path for layer 0, the DSA layers and each run's
+exit.
 
-The DSA layers keep SGLang's attention up to o_proj, so the indexer, the sparse
-MLA and the decode context parallel (DCP) combine stay on SGLang's path. Under
-DCP the attention hands o_proj the same TP-local 12-head core as without it.
+The DSA layers keep SGLang's attention up to o_proj, so the indexer, the sparse MLA
+and the decode context parallel (DCP) combine stay on SGLang's path. Under DCP the
+attention hands o_proj the same TP-local 12-head core as without it.
 """
 
 from __future__ import annotations
@@ -54,28 +53,6 @@ NUMERICS = Numerics(
 )
 
 
-def _wide_config_disable_reasons(cfg) -> list[str]:
-    reasons = []
-    if getattr(cfg, "speculative_algorithm", None) not in ("DSPARK", "DFLASH"):
-        reasons.append(
-            "the wide launch serves DSpark and DFLASH verify steps; set "
-            "SGLANG_AMD_MONO_K31_WIDE=0 to serve decode on the Kimi-K3 launches"
-        )
-    tokens = getattr(cfg, "speculative_num_draft_tokens", None)
-    if tokens not in wide.SUPPORTED_L:
-        reasons.append(
-            f"--speculative-num-draft-tokens {tokens} is not one of "
-            f"{list(wide.SUPPORTED_L)} (the wide launch; SGLANG_AMD_MONO_K31_WIDE=0 "
-            "serves up to 8 rows only)"
-        )
-    if not getattr(cfg, "enable_linear_replayssm_spec", False):
-        reasons.append(
-            "the wide launch reads and writes the ReplaySSM ring: pass "
-            "--enable-linear-replayssm-spec, or set SGLANG_AMD_MONO_K31_WIDE=0"
-        )
-    return reasons
-
-
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     reasons = k3._config_disable_reasons(cfg, hf_config)
     if not getattr(k3._text_config(hf_config), "dsa_config", None):
@@ -88,8 +65,11 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     ):
         # CONTEXT_PARALLEL is accepted for DCP; attention CP reshapes the decode rows
         reasons.append("attention context parallel is on; only --dcp-size is accepted")
-    if wide.enabled():
-        reasons += _wide_config_disable_reasons(cfg)
+    tokens = getattr(cfg, "speculative_num_draft_tokens", None)
+    if tokens not in wide.SUPPORTED_L:
+        reasons.append(
+            f"--speculative-num-draft-tokens {tokens} is not one of {list(wide.SUPPORTED_L)}"
+        )
     return reasons
 
 
@@ -97,8 +77,6 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     """Kimi-K3's per-layer checks, and what the wide launch reads on top: every
     KDA layer's merged in_proj."""
     reasons = k3._model_disable_reasons(model, hf_config, copies)
-    if not wide.enabled():
-        return reasons
     layers = k3._backbone(model).layers
     covered = [i for i, layer in enumerate(layers) if wide._is_covered(layer)]
     if not covered:
@@ -179,29 +157,26 @@ def _build(model, hf_config, ctx):
     return _Built(narrow, w)
 
 
-def _devices():
-    devices = dict(k3.SPEC.devices)
-    if wide.enabled():
-        limits = devices["gfx950"]
-        devices["gfx950"] = msgspec.structs.replace(
-            limits, widths=tuple(limits.widths) + wide.wide_widths()
-        )
-    return devices
-
-
 SPEC = msgspec.structs.replace(
     k3.SPEC,
     name="kimi_k31_hip",
-    devices=_devices(),
+    devices={
+        "gfx950": msgspec.structs.replace(
+            k3.SPEC.devices["gfx950"],
+            widths=k3.SPEC.devices["gfx950"].widths + wide.wide_widths(),
+        )
+    },
     # DCP (CONTEXT_PARALLEL) shards the DSA layers' KV, which run on SGLang's path
     features=k3.SPEC.features | {Feature.CONTEXT_PARALLEL},
     requires=msgspec.structs.replace(
         k3.SPEC.requires,
         attention_backends=frozenset({"dsa"}),
-        # DSpark's and DFLASH's target steps are uniform verify steps of L rows a request
         server_args={
             **k3.SPEC.requires.server_args,
-            "speculative_algorithm": frozenset({None, "DSPARK", "DFLASH"}),
+            # DSpark's and DFLASH's target steps are uniform verify steps of L rows a request
+            "speculative_algorithm": frozenset({"DSPARK", "DFLASH"}),
+            # K1 and the wide KDA stage read and write the ReplaySSM ring
+            "enable_linear_replayssm_spec": frozenset({True}),
         },
         hf_config={"model_type": "kimi_k31"},
     ),

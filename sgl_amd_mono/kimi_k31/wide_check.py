@@ -264,7 +264,7 @@ class WideCheck:
 
     def _state(self, rows):
         """The step's KDA state, as K1's prepare reads it, for every request."""
-        from sgl_amd_mono.kimi_k31.gfx950 import kda_defs as k1
+        from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
 
         backend = self._backend()
         pool = backend.req_to_token_pool

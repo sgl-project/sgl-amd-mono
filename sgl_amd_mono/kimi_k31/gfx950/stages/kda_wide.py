@@ -34,22 +34,26 @@ from sgl_amd_mono.common.ops import (
     uniform,
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, first_task
-from sgl_amd_mono.kimi_k31.gfx950.kda_defs import (
+from sgl_amd_mono.kimi_k3.gfx950.attention.kda import (
     BETA_0,
     CONV_W,
     FA_0,
     G2_0,
-    HD,
-    LOG2E,
-    NH,
     NPROJ,
-    PROJ,
-    bf16r,
-    f32_of,
     ld_bf,
     ld_f32,
     sigmoid,
 )
+from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HD, LOG2E, NH, PROJ
+
+
+def bf16r(v):
+    return fx.Float32(fx.Float32(v).to(fx.BFloat16))
+
+
+def f32_of(w):
+    return w.bitcast(fx.Float32)
+
 
 KPT = 16  # K columns a thread holds in the recurrence (4, 8 or 16)
 

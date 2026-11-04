@@ -9,8 +9,6 @@ own slot distinguishes it from the step's other launches.
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 from sgl_amd_mono.common import guard
@@ -36,19 +34,12 @@ class K3MonoRunner:
         # The launches run one after another, so one buffer the widest of them
         # fits, then K2's tagged x rows.
         self.scratch_bytes = (layer.scratch_alloc_bytes() + 255) // 256 * 256
-        self._scratch = None
-        if os.environ.get("SGLANG_AMD_MONO_K3_UNCACHED_SCRATCH", "1") == "1":
-            # The hand-off mailboxes uncached, as GLM-5.3-Flash's: a consumer
-            # reads a line at its home memory, not through the producer XCD's
-            # L2. A one-rank peer buffer, never freed while the process lives
-            # (see PeerBuffer); =0 for the cached form.
-            self._scratch = PeerBuffer(self.scratch_bytes, group, rank, 1, device)
-            self.scratch = self._scratch.bytes
-            self.scratch.zero_()
-        else:
-            self.scratch = torch.zeros(
-                self.scratch_bytes, dtype=torch.uint8, device=device
-            )
+        # The hand-off mailboxes uncached, as GLM-5.3-Flash's: a consumer reads a
+        # line at its home memory, not through the producer XCD's L2. A one-rank
+        # peer buffer, never freed while the process lives (see PeerBuffer).
+        self._scratch = PeerBuffer(self.scratch_bytes, group, rank, 1, device)
+        self.scratch = self._scratch.bytes
+        self.scratch.zero_()
         # [the step epoch, the guard block (deadline, error words)]
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # The MoE launch's task queue. The layer launch takes none -- its ABI

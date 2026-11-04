@@ -78,21 +78,6 @@ from sgl_amd_mono.kimi_k3 import (
 logger = logging.getLogger(__name__)
 
 TP_SIZE = 8
-# K2 takes the residual stream where it lies and writes the layer's stream itself
-# (out + the updated prefix): no copy before the launch, no add after it.
-# SGLANG_AMD_MONO_K3_FOLD=0 restores the copy-and-add form, for A/B.
-FOLD = os.environ.get("SGLANG_AMD_MONO_K3_FOLD", "1") == "1"
-# The route's top-16: 1 max-extraction, 0 the radix select, 2 the candidate rank
-# (identical results; 2, the default, is the fastest).
-ROUTE = int(os.environ.get("SGLANG_AMD_MONO_K3_ROUTE", "2"))
-# The route table: 1 the flag array's block scan, 2 a bitmask's wave scan (identical;
-# 2, the default, is the fastest).
-RTAB = int(os.environ.get("SGLANG_AMD_MONO_K3_RTAB", "2"))
-# The shared expert's down before the route on idle CTAs: off by default, it delays
-# ug's start on those CTAs more than it shortens the tail.
-SDOWN_EARLY = os.environ.get("SGLANG_AMD_MONO_K3_SDOWN_EARLY", "0") == "1"
-# The latent quantized once by its producers and pushed as MXFP4 (1 = on).
-LATQ_PUSH = os.environ.get("SGLANG_AMD_MONO_K3_LATQ_PUSH", "1") == "1"
 # K2's OPT_* bits (gfx950/layer.py: sentinel all-reduces, preloads, tagged x rows,
 # router partials, batched polls), each bit for bit the launch without it; unset
 # is layer.K2_OPT, all of them.
@@ -101,8 +86,6 @@ K2_OPT = os.environ.get("SGLANG_AMD_MONO_K3_K2_OPT")
 # AttnRes, fused_qkv_a, the q / kv norms, q_b, g_proj and the indexer's wk,
 # weights_proj and wq_b, handed to SGLang's MLA forward and indexer.
 MLA_PRE = os.environ.get("SGLANG_AMD_MONO_K3_MLA_PRE", "1") == "1"
-# the MLA front also runs q_nope @ w_kc (stage 3): SGLang takes q_nope_out from _mono_pre
-MLA_QN = os.environ.get("SGLANG_AMD_MONO_K3_MLA_QN", "1") == "1"
 # SGLANG_AMD_MONO_K3_K1=0 builds no K1: every KDA layer keeps SGLang's attention.
 K1 = os.environ.get("SGLANG_AMD_MONO_K3_K1", "1") == "1"
 
@@ -506,11 +489,6 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
             out_eps=layer.post_attention_layernorm.variance_epsilon,
             ln_eps=moe.routed_expert_norm.variance_epsilon,
             reset=layer.is_block_write_layer,
-            fold=FOLD,
-            route=ROUTE,
-            rtab=RTAB,
-            sdown_early=SDOWN_EARLY,
-            latq_push=LATQ_PUSH,
             opt=k2.K2_OPT if K2_OPT is None else int(K2_OPT),
             guint=_gu_interleaved(moe),
             fault_site=runner.fault_site,
@@ -567,8 +545,7 @@ def _mla_build(layer, rows: int):
     # the absorb's weight as SGLang's bf16 bmm multiplies it: w_kc itself, unscaled
     wkc, wsc = getattr(attn, "w_kc", None), getattr(attn, "w_scale", None)
     qn = (
-        MLA_QN
-        and isinstance(wkc, torch.Tensor)
+        isinstance(wkc, torch.Tensor)
         and wkc.dtype == torch.bfloat16
         and tuple(wkc.shape) == (mp.NHQ, mp.QN, mp.KV)
         and isinstance(wsc, (int, float))
@@ -680,19 +657,10 @@ def _launch(runner, packed: _Layer, attn_res, core, forward_batch):
     _check(packed, core, prefix_sum, attn_res, rows)
     prefix = runner.prefix[:rows]
     out = torch.empty_like(prefix)
-    if packed.key.fold:
-        # The kernel reads the stream from prefix_sum (lent out read-only),
-        # updates its own prefix and writes out + prefix itself.
-        _k2_launch(
-            runner, packed, core, prefix, attn_res.block_residual, out, prefix_sum
-        )
-        return out
-    if prefix_sum is not None:
-        # Not ``prefix = prefix_sum``: that tensor is the residual stream's,
-        # lent out read-only, and the kernel updates its prefix in place.
-        prefix.copy_(prefix_sum)
-    _k2_launch(runner, packed, core, prefix, attn_res.block_residual, out)
-    return out + prefix
+    # The kernel reads the stream from prefix_sum (lent out read-only), updates its
+    # own prefix and writes out + prefix itself.
+    _k2_launch(runner, packed, core, prefix, attn_res.block_residual, out, prefix_sum)
+    return out
 
 
 def _check(packed: _Layer, core, prefix_sum, attn_res, rows: int) -> None:

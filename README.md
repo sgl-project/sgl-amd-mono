@@ -19,7 +19,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | All 45 layers (one launch each; layer 0 from the tokens, with the embedding) and the final norm, LM head and logits (one launch), in decode steps of up to 8 rows (4 at TP2) |
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows |
 | Kimi-K3 | MI350X, MI355X (gfx950) | 8 | Every MoE layer in decode and DSpark verify steps of up to 8 rows |
-| Kimi-K3.1 | MI350X, MI355X (gfx950) | 8 | Kimi-K3's launches on every MoE layer in decode and verify steps of up to 8 rows (the MLA layers' projection front too, without DCP), and one launch a KDA layer in DSpark and DFLASH verify steps of 2 to 48 requests |
+| Kimi-K3.1 | MI350X, MI355X (gfx950) | 8 | Kimi-K3's launches on every MoE layer in DSpark and DFLASH verify steps of one request (the MLA layers' projection front too, without DCP), and one launch a KDA layer in verify steps of 2 to 48 requests |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
 | Qwen3.8-Flash-Next (MXFP4) | MI355X (gfx950) | 1 | The whole model (48 layers in 13 launches) in NEXTN verify steps of up to 8 requests x 4 tokens; the MTP draft's draft extend (up to 8 x 4 rows) and draft decode steps (up to 8 x 1) are routed to its launch |
@@ -113,7 +113,7 @@ SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 python -m sglang.launch_server \
   --enable-amd-monokernel
 ```
 
-Kimi-K3.1, with DFLASH (the wide launch reads the ReplaySSM ring; `SGLANG_AMD_MONO_K31_WIDE=0` serves steps of up to 8 rows only, without it):
+Kimi-K3.1, with DFLASH (the launches read and write the ReplaySSM ring):
 
 ```bash
 SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 AITER_FLYDSL_FORCE=1 AITER_SITUV2_A8W4=1 \

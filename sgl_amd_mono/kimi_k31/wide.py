@@ -125,11 +125,6 @@ SDOWN_ROWS = {288: "96:128:2:4:1", 384: "192:64:4:2:1"}
 NARROW = 8  # rows up to this run Kimi-K3's launches (the wide launch starts at 2 requests above 8 rows)
 
 
-def enabled() -> bool:
-    """On unless ``SGLANG_AMD_MONO_K31_WIDE=0`` (``--enable-amd-monokernel`` opts in)."""
-    return os.environ.get("SGLANG_AMD_MONO_K31_WIDE", "1") != "0"
-
-
 def tokens() -> int:
     """Rows a request takes in this server's verify steps (DSpark / DFLASH draft tokens)."""
     from sglang.srt.runtime_context import get_spec
@@ -171,14 +166,18 @@ def wide_widths(max_reqs: int = 48) -> tuple:
     rs = req_buckets()
     lo = max((x for x in REQ_BUCKETS if x < rs[0]), default=1)
     top = min(max_reqs, rs[-1])
+    widths = {
+        L * r
+        for L in SUPPORTED_L
+        for r in range(max(2, lo + 1), top + 1)
+        if L * r > NARROW
+    }
+    # the binding serves a width at every L it is a multiple of: drop one another L
+    # reads as more requests than the largest bucket holds (8-token 312 .. 384 rows
+    # would be 52 .. 64 requests at 6 tokens)
     return tuple(
         sorted(
-            {
-                L * r
-                for L in SUPPORTED_L
-                for r in range(max(2, lo + 1), top + 1)
-                if L * r > NARROW
-            }
+            w for w in widths if all(w // L <= top for L in SUPPORTED_L if w % L == 0)
         )
     )
 
@@ -430,7 +429,7 @@ class Wide:
         def z(*shape, dt=bf):
             return torch.zeros(*shape, dtype=dt, device=dev)
 
-        from sgl_amd_mono.kimi_k31.gfx950 import kda_defs as k1
+        from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
 
         # the routed latent and shared partials of a ping share one buffer: the column exit
         # reduces the pair in one collective, as SGLang's fused front does
@@ -547,7 +546,7 @@ class Wide:
         import time
 
         L = self.L
-        from sgl_amd_mono.kimi_k31.gfx950 import kda_defs as k1
+        from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
         from sgl_amd_mono.kimi_k31.gfx950 import pre_attn as pa
 
         t0 = time.time()

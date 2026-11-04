@@ -619,52 +619,15 @@ ROUTE_SLOTS = 16  # a lane's 14 candidates (896 / 64) padded to the network's wi
 ROUTE_NET = _batcher(ROUTE_SLOTS)
 
 
-def _route_extract(lane, keys, sigs):
-    """The top-16 by max-extraction (GLM-5.3-Flash's routing): each lane sorts its
-    candidates (key descending, the lower expert first on a tie), then 16 rounds of
-    a wave max on the heads -- the key, then the lowest expert holding it -- pop the
-    winner's head. Pick k lands in lane k already ranked, which is what the radix
-    select's ranking produced: the same picks, order and sigmoids, bit for bit.
-    Returns (expert, pre-bias sigmoid bits) of pick ``lane`` (lanes < TOPK)."""
-    per = len(keys)
-    ks = list(keys) + [fx.Uint32(0)] * (ROUTE_SLOTS - per)
-    ids = [fx.Int32(lane + 64 * i) for i in range(per)] + [fx.Int32(1023)] * (
-        ROUTE_SLOTS - per
-    )
-    sg = [v.bitcast(fx.Int32) for v in sigs] + [fx.Int32(0)] * (ROUTE_SLOTS - per)
-    for a, b in ROUTE_NET:
-        first = (ks[a] > ks[b]) | ((ks[a] == ks[b]) & (ids[a] < ids[b]))
-        ka, kb, ia, ib, sa, sb = ks[a], ks[b], ids[a], ids[b], sg[a], sg[b]
-        ks[a], ks[b] = first.select(ka, kb), first.select(kb, ka)
-        ids[a], ids[b] = first.select(ia, ib), first.select(ib, ia)
-        sg[a], sg[b] = first.select(sa, sb), first.select(sb, sa)
-    ks = [fx.Int32(k) for k in ks] + [fx.Int32(0)]
-    ids = ids + [fx.Int32(1023)]
-    sg = sg + [fx.Int32(0)]
-    ev, sv = fx.Int32(0), fx.Int32(0)
-    for k in range_constexpr(TOPK):
-        m = wave_umax(ks[0])
-        expert = fx.Int32(1023) - wave_umax(
-            (ks[0] == m).select(fx.Int32(1023) - ids[0], fx.Int32(0))
-        )
-        # the winner's sigmoid, read before its lane pops its head
-        sig = read_lane_i32(sg[0], expert % 64)
-        hit = (ks[0] == m) & (ids[0] == expert)
-        ks = [hit.select(ks[i + 1], ks[i]) for i in range(ROUTE_SLOTS)] + [ks[-1]]
-        ids = [hit.select(ids[i + 1], ids[i]) for i in range(ROUTE_SLOTS)] + [ids[-1]]
-        sg = [hit.select(sg[i + 1], sg[i]) for i in range(ROUTE_SLOTS)] + [sg[-1]]
-        ev = write_lane_i32(expert, k, ev)
-        sv = write_lane_i32(sig, k, sv)
-    return ev, sv
-
-
 def _route_extract2(lane, keys, sigs, lds):
-    """``_route_extract`` with less per-lane work (the same picks, order and
-    sigmoids, bit for bit): the lane sort runs on one packed (key, 15 - slot)
-    u64 a candidate, a pick finds its lane by a ballot of the max key (the
-    lowest expert among equal keys by a second max only when keys tie), the
-    lanes' slot lists shift as one packed u64 of nibbles, and the sigmoids wait
-    in ``lds`` (an f32 an expert) for the picks' lanes to read once."""
+    """The top-16 by max-extraction, ``_route_rank``'s fallback: each lane sorts
+    its candidates as packed (key, 15 - slot) u64s, then 16 rounds of a wave max
+    on the heads pop the winner's head. A pick finds its lane by a ballot of the
+    max key (the lowest expert among equal keys by a second max only when keys
+    tie), the lanes' slot lists shift as one packed u64 of nibbles, and the
+    sigmoids wait in ``lds`` (an f32 an expert) for the picks' lanes to read once.
+    Pick k lands in lane k already ranked: the radix select's picks, order and
+    sigmoids, bit for bit."""
     per = len(keys)
     for i in range_constexpr(per):
         fx.ptr_store(sigs[i], lds + (lane + 64 * i))
@@ -710,8 +673,8 @@ CAND0 = E  # route 2: the candidates' u64s after the experts' sigmoids in ``lds`
 
 @flyc.jit
 def _route_rank(lane, keys, sigs, lds):
-    """The top-16 with no serial pick rounds (``route`` 2): the same picks,
-    order and sigmoids as ``_route_extract``, bit for bit. T is the least of
+    """The top-16 with no serial pick rounds: the same picks, order and
+    sigmoids as the radix select, bit for bit. T is the least of
     the 16-lane rows' 4th largest lane maxima (a bitonic sort a row, DPP
     only): 16 keys are >= T, so the top-16 are among the candidates, the keys
     >= T. The candidates go to ``lds`` as distinct u64s, (key << 32) | (1023 -
@@ -798,10 +761,12 @@ def _okey(v):
 @flyc.jit
 def stage_route(c, t):
     """Token t (wave 0): 896 logits, 14 a lane (expert lane + 64 i) -> sigmoid
-    (v_rcp) + bias -> the top-16 by a radix select (the 16th largest key by a
-    32-step bit search of ballot counts; equal keys: the lower experts) -> the
-    16 ranked by score, descending (aiter's slot order) -> the pre-bias
-    sigmoids renormalized in that order (IEEE 1 / sum)."""
+    (v_rcp) + bias -> the top-16 (equal keys: the lower experts) ranked by
+    score, descending (aiter's slot order) -> the pre-bias sigmoids renormalized
+    in that order (IEEE 1 / sum). ``route_v`` 2 (the layer launch) ranks the
+    candidates (``_route_rank``); 0 (the MoE launch) runs the radix select (the
+    16th largest key by a 32-step bit search of ballot counts), the same picks
+    bit for bit."""
     lane, wave, red = c["lane"], c["wave"], c["red"]
     a = c["args"]
     # read before the traced branch (a dict lookup inside it is carried state)
@@ -849,11 +814,8 @@ def stage_route(c, t):
             keys.append(_okey((sc == sc).select(sc, fx.Float32(-3.0e38))))
             sigs.append((sg == sg).select(sg, fx.Float32(0.0)))
         stamp(c["tl_on"], c["tls"], c["tid"], 17)  # keys (sigmoid + bias)
-        if const_expr(route_v >= 1):
-            if const_expr(route_v == 2):
-                ev, sv = _route_rank(lane, keys, sigs, red)
-            else:
-                ev, sv = _route_extract(lane, keys, sigs)
+        if const_expr(route_v == 2):
+            ev, sv = _route_rank(lane, keys, sigs, red)
             stamp(c["tl_on"], c["tls"], c["tid"], 19)  # selected and ranked
             total = fx.Float32(0.0)
             for j in range_constexpr(TOPK):
@@ -1538,20 +1500,6 @@ def run_sdown_first(c, bid, w_sd):
         stage_sdown(c, j0, ops0)
         if k0 + nsd < UP_TASKS:
             stage_sdown(c, j1, ops1)
-
-
-@flyc.jit
-def run_sdown_early(c, bid, w_sd, r0):
-    """All 448 shared-down tasks on the CTAs from ``r0`` (past AttnRes's), between
-    their early work and the route: h is ready by then and these CTAs would only
-    wait, so the shared expert leaves the tail (up and the final reduce wait on
-    it there). This rank's up columns first: up waits on them."""
-    if bid >= r0:
-        load_h(c)
-        lo = c["rank"] * UP_TASKS
-        for k in range(bid - r0, SD_TASKS, BLOCKS - r0):
-            j = (k + lo) % SD_TASKS
-            stage_sdown(c, j, gemv.loads(c["lane"], c["wave"], w_sd, j * ROWS, SI))
 
 
 @flyc.jit
