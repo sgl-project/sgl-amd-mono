@@ -1694,7 +1694,8 @@ def stage_reduce(c, j):
     s, tid = c["S"], c["tid"]
     # read before the traced branch: a dict lookup inside it becomes carried state
     fold = c.get("fold", False)
-    prefix = c["args"]["prefix"]
+    # the MoE launch has no prefix: only the layer launch's fold reads it
+    prefix = c["args"]["prefix"] if fold else None
     if tid < s * 64:
         if const_expr(sent_final):
             # consecutive threads read consecutive words
