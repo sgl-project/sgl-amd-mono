@@ -112,6 +112,8 @@ SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 python -m sglang.launch_server \
   --enable-amd-monokernel
 ```
 
+The KDA launch reads and writes SGLang's SSM state in place, in whichever dtype `--mamba-ssm-dtype` gives it: `float32` (the default) or `bfloat16`.
+
 MiniMax-M3.1-Flash, with DSpark:
 
 ```bash

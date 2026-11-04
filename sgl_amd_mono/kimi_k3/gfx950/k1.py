@@ -31,6 +31,14 @@ indexes the recurrent state with, and that number is a row of SGLang's scratch,
 not of this buffer. The buffer is expanded to a zero slot stride so every such
 number folds onto its single row. That is what makes one request work and what
 makes two impossible, so ``covered()`` refuses a batch above one.
+
+**Under --enable-linear-replayssm-spec there is no state a token.** SGLang
+allocates no ``intermediate_ssm``. Verify leaves the committed state as it is
+and writes each token's raw inputs to the request's ReplaySSM ring, and the
+commit replays the accepted ones into the state. K1 then takes the ring build
+(``KdaPreBuild.ring``). It reads the committed state in place, so nothing is
+staged, and it writes the ring at the request's state slot. The conv side is
+the same in both forms.
 """
 
 from __future__ import annotations
@@ -79,8 +87,19 @@ SGLANG_READS = {
         "mamba2_layer_cache",
         "intermediate_ssm",
         "intermediate_conv_window",
+        # the ReplaySSM spec rings, which replace intermediate_ssm
+        "replayssm_rawv",
+        "replayssm_rawk",
+        "replayssm_g",
+        "replayssm_beta",
     ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
+    # whether the KDA state is kept as the ReplaySSM ring, which picks K1's build
+    "srt/runtime_context.py": ("get_exec",),
+    "srt/arg_groups/fields/exec_.py": ("enable_linear_replayssm_spec",),
+    # the SSM state dtype the pool is allocated in, which picks K1's build
+    "srt/configs/kimi_linear.py": ("mamba2_cache_params",),
+    "srt/configs/mamba_utils.py": ("dtype", "temporal"),
     # the kernel writes the bank row; this is the count that goes with it
     "srt/layers/attn_residual.py": ("_count_write", "num_valid_blocks"),
     # this layer's weights, read in place at launch
@@ -135,10 +154,31 @@ def _is_kda_layer(layer) -> bool:
     return hasattr(layer.self_attn, "qkv_conv1d")
 
 
-def _unsupported_reasons(layer) -> list[str]:
+def ssm_dtype(hf_config) -> torch.dtype:
+    """The dtype SGLang allocates the KDA state pools in: --mamba-ssm-dtype,
+    else the model config, else fp32. K1 reads and writes that pool in place,
+    so its build follows it."""
+    t = getattr(hf_config, "text_config", None) or hf_config
+    return t.mamba2_cache_params.dtype.temporal
+
+
+def replayssm_spec() -> bool:
+    """Whether SGLang keeps the KDA verify state as the ReplaySSM ring
+    (--enable-linear-replayssm-spec), which K1 needs its ring build for."""
+    from sglang.srt.runtime_context import get_exec
+
+    return bool(get_exec().mamba.enable_linear_replayssm_spec)
+
+
+def _unsupported_reasons(layer, state_dtype: torch.dtype) -> list[str]:
     """Why K1 cannot take this layer, fail-loud at build rather than per step."""
     attn = layer.self_attn
     reasons = []
+    if state_dtype not in (torch.float32, torch.bfloat16):
+        reasons.append(
+            f"the SSM state is {state_dtype}; K1 has builds for float32 and "
+            "bfloat16 (--mamba-ssm-dtype)"
+        )
     # w_in is the merged [q,k,v,g | f_a | b | pad] buffer. Without the merge
     # there is no single tensor in K1's in-projection layout, and the pieces
     # carry their own quantization scales that a row-cat would drop.
@@ -165,15 +205,19 @@ def _unsupported_reasons(layer) -> list[str]:
     return reasons
 
 
-def build(layer, i: int, rows: int) -> Optional[K1Layer]:
+def build(
+    layer, i: int, rows: int, state_dtype: torch.dtype, ring: bool = False
+) -> Optional[K1Layer]:
     """This layer's K1 build key at one launch width, or None when K1 does not
     take it. The weights are read in place; the conv row is filled in by
-    ``build_batch``, which allocates every layer's in one buffer."""
+    ``build_batch``, which allocates every layer's in one buffer.
+    ``state_dtype`` is the SSM pool's (``ssm_dtype``), ``ring`` whether the
+    pool keeps the ReplaySSM ring (``replayssm_spec``)."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
     if not _is_kda_layer(layer):
         return None  # a full-attention layer, not a refusal
-    reasons = _unsupported_reasons(layer)
+    reasons = _unsupported_reasons(layer, state_dtype)
     if reasons:
         # Said once: a KDA layer K1 could not take is a configuration fact the
         # log has to carry, or K1 reads as built and unhelpful.
@@ -193,6 +237,8 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
             onorm_eps=float(attn.o_norm.eps),
             lower_bound=float(attn.attn.lower_bound),
             write_idx=(layer.prev_valid_blocks if layer.is_block_write_layer else -1),
+            state_bf16=state_dtype == torch.bfloat16,
+            ring=ring,
         ),
         module=layer,
         # The same cast SGLang's own fused KDA decode makes once at load
@@ -276,6 +322,19 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
     rows, device = packed.key.qlen, runner.device
+    ring = None
+    if packed.key.ring:
+        # one slot of rings, as long as the step: slot 0 is what st_idx names
+        shape = (1, kda.NH, rows, kda.HD)
+        ring = tuple(
+            torch.zeros(s, dtype=d, device=device)
+            for s, d in (
+                (shape, torch.bfloat16),
+                (shape, torch.bfloat16),
+                (shape, torch.float32),
+                (shape[:3], torch.float32),
+            )
+        )
     kda.kda_pre(
         packed.key,
         prefix=prefix,
@@ -283,7 +342,12 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
         blocks=blocks,
         **_weight_args(packed),
         rstate=torch.zeros(
-            rows, kda.NH, kda.HD, kda.HD, dtype=torch.float32, device=device
+            rows,
+            kda.NH,
+            kda.HD,
+            kda.HD,
+            dtype=kda.state_dtype(packed.key),
+            device=device,
         ),
         st_idx=torch.arange(rows, dtype=torch.int32, device=device).view(1, rows),
         num_acc=torch.ones(1, dtype=torch.int32, device=device),
@@ -291,6 +355,7 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
         scratch=runner.scratch,
         epoch=runner.epoch,
         layer=packed.i,
+        ring=ring,
     )
 
 
@@ -323,7 +388,17 @@ def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
     cache = pool.mamba_pool.mamba_cache  # every field [num_layers, ...]
     inter_ssm = getattr(cache, "intermediate_ssm", None)
     windows = getattr(cache, "intermediate_conv_window", None)
-    if inter_ssm is None or not windows:
+    rings = tuple(
+        getattr(cache, name, None)
+        for name in (
+            "replayssm_rawv",
+            "replayssm_rawk",
+            "replayssm_g",
+            "replayssm_beta",
+        )
+    )
+    ring = rings[0] is not None
+    if not windows or (inter_ssm is None and not ring):
         return None
     if batch.idx is None:
         # First call, which is an eager warmup forward: the pool indices and
@@ -349,6 +424,8 @@ def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
         "committed_ssm": cache.temporal,
         "inter_ssm": inter_ssm,
         "inter_window": windows[0],
+        "ring": ring,
+        "rings": rings if ring else None,
         "slots": slots,
         "rows": rows,
         "num_draft": spec_info.draft_token_num,
@@ -369,7 +446,12 @@ def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
             1, qlen
         )
         batch.ones = torch.ones(1, dtype=torch.int32, device=slots.device)
-    st["st_idx"] = (row * qlen).view(1, 1) + batch.ramp
+    if ring:
+        # The committed state's slot, which is also the request's ring: the
+        # ring build reads st_idx[req, 0] for both and stores no state a token.
+        st["st_idx"] = slot.view(1, 1) + 0 * batch.ramp
+    else:
+        st["st_idx"] = (row * qlen).view(1, 1) + batch.ramp
     st["st_idx_i32"] = st["st_idx"].to(torch.int32)
     st["num_acc"] = batch.ones
     win = batch.conv.shape[-1] - qlen
@@ -384,9 +466,10 @@ def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
     # intermediate_ssm scratch. SGLang's own fused-accept staging makes the
     # same copy. It writes a production buffer, so only the layers that launch
     # may make it. The step that built the hand-off mask names those layers.
-    # Until then every layer stages its own in launch().
-    st["staged"] = batch.where_key is not None
-    if st["staged"]:
+    # Until then every layer stages its own in launch(). The ring build reads
+    # the committed state in place and has nothing to stage.
+    st["staged"] = ring or batch.where_key is not None
+    if st["staged"] and not ring:
         taken = batch.idx if batch.where is None else batch.idx[batch.where]
         st["inter_ssm"][taken, row, 0] = st["committed_ssm"][taken, slot]
     return st
@@ -398,14 +481,21 @@ def _step_shapes_ok(batch: K1Batch, st: dict) -> bool:
 
     qlen = st["num_draft"]
     key = batch.layers[0].key
+    want = kda.state_dtype(key)
     checks = [
         (st["rows"].numel() >= 1 and st["slots"].numel() >= 1, "the step has no state"),
         (0 < qlen <= MAX_ROWS, f"{qlen} drafted tokens is not 1 .. {MAX_ROWS}"),
         (qlen == key.qlen, f"{qlen} drafted tokens, built for {key.qlen}"),
         (
-            st["inter_ssm"].dtype == torch.float32 and st["inter_ssm"].shape[2] == qlen,
-            f"intermediate_ssm is {st['inter_ssm'].dtype} "
-            f"{tuple(st['inter_ssm'].shape)}",
+            st["ring"] == key.ring,
+            "the KDA state is kept as "
+            + ("the ReplaySSM ring" if st["ring"] else "a state a token")
+            + ", K1 was built for the other (--enable-linear-replayssm-spec)",
+        ),
+        (
+            st["committed_ssm"].dtype == want,
+            f"the SSM state is {st['committed_ssm'].dtype}; K1 was built for "
+            f"{want} (--mamba-ssm-dtype)",
         ),
         (
             st["committed_conv"].shape[-1] == 3 * kda.PROJ
@@ -413,11 +503,61 @@ def _step_shapes_ok(batch: K1Batch, st: dict) -> bool:
             f"the committed conv state is {tuple(st['committed_conv'].shape)}",
         ),
     ]
+    if st["ring"]:
+        checks += _ring_checks(st["rings"], st["committed_ssm"], qlen)
+    else:
+        checks += [
+            (
+                st["inter_ssm"].dtype == want,
+                f"intermediate_ssm is {st['inter_ssm'].dtype}; K1 was built for "
+                f"{want} (--mamba-ssm-dtype)",
+            ),
+            (
+                st["inter_ssm"].shape[2] == qlen,
+                f"intermediate_ssm is {tuple(st['inter_ssm'].shape)}",
+            ),
+        ]
     for ok, reason in checks:
         if not ok:
             _say(f"declined: {reason}")
             return False
     return True
+
+
+def _ring_checks(rings, committed_ssm, qlen: int) -> list:
+    """The ReplaySSM rings as the ring build writes them: [layers, slots, 12,
+    ring_len, ...], a slot's rows dense, one slot a state slot, and long enough
+    for the step. The kernel derives their strides from that shape."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+
+    rawv, rawk, g, beta = rings
+    if any(t is None for t in rings):
+        return [(False, "the ReplaySSM rings are not all allocated")]
+    n, slots = committed_ssm.shape[:2]
+    ring_len = rawv.shape[3] if rawv.dim() == 5 else 0
+    head = (n, slots, kda.NH, ring_len)
+    return [
+        (ring_len >= qlen, f"the ReplaySSM ring holds {ring_len} of {qlen} tokens"),
+        (
+            tuple(rawv.shape) == (*head, kda.HD)
+            and tuple(rawk.shape) == (*head, kda.HD)
+            and tuple(g.shape) == (*head, kda.HD)
+            and tuple(beta.shape) == head,
+            f"the ReplaySSM rings are v {tuple(rawv.shape)}, k {tuple(rawk.shape)}, "
+            f"g {tuple(g.shape)}, beta {tuple(beta.shape)}; K1 writes "
+            f"{(*head, kda.HD)} and {head}",
+        ),
+        (
+            rawv.dtype == rawk.dtype == torch.bfloat16
+            and g.dtype == beta.dtype == torch.float32,
+            f"the ReplaySSM rings are v {rawv.dtype}, k {rawk.dtype}, g {g.dtype}, "
+            f"beta {beta.dtype}; K1 writes bf16 v and k, fp32 g and beta",
+        ),
+        (
+            all(t[0].is_contiguous() for t in rings),
+            "a layer's ReplaySSM ring is not dense",
+        ),
+    ]
 
 
 def finish(batch: Optional[K1Batch], st: Optional[dict], engaged: list) -> None:
@@ -549,17 +689,23 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tensor:
 
     qlen = packed.key.qlen
     device = prefix.device
-    # prepare() filled the conv window for every layer, and the SSM scratch
-    # for the layers that launch once it knew which those are. Until then this
-    # layer stages its own, which is the same copy over one layer.
-    inter = state["inter_ssm"]
-    rstate = inter[packed.mamba_idx].reshape(-1, *inter.shape[3:])
-    if not state["staged"]:
-        rstate.index_copy_(
-            0,
-            state["st_idx"][:, 0],
-            state["committed_ssm"][packed.mamba_idx].index_select(0, state["slot"]),
-        )
+    ring = None
+    if packed.key.ring:
+        # the committed state, read in place, and this layer's rings
+        rstate = state["committed_ssm"][packed.mamba_idx]
+        ring = tuple(t[packed.mamba_idx] for t in state["rings"])
+    else:
+        # prepare() filled the conv window for every layer, and the SSM scratch
+        # for the layers that launch once it knew which those are. Until then
+        # this layer stages its own, which is the same copy over one layer.
+        inter = state["inter_ssm"]
+        rstate = inter[packed.mamba_idx].reshape(-1, *inter.shape[3:])
+        if not state["staged"]:
+            rstate.index_copy_(
+                0,
+                state["st_idx"][:, 0],
+                state["committed_ssm"][packed.mamba_idx].index_select(0, state["slot"]),
+            )
 
     core = torch.empty(qlen, kda.PROJ, dtype=torch.bfloat16, device=device)
     kda.kda_pre(
@@ -579,6 +725,7 @@ def launch(runner, packed: K1Layer, prefix, attn_res, state) -> torch.Tensor:
         # one address. These two differ by slot, so the host-bumped epoch
         # still carries the step. See gfx950/tag.py.
         layer=packed.i,
+        ring=ring,
     )
     # The hand-off to the conv window is finish()'s, once for every layer that engaged.
     if packed.key.write_idx >= 0:

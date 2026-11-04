@@ -11,12 +11,17 @@ MODEL = os.environ.get("KIMI_K3_MODEL_PATH", "moonshotai/Kimi-K3")
 DRAFT = os.environ.get(
     "KIMI_K3_DSPARK_MODEL_PATH", "moonshotai/RadixArk-Kimi-K3-DSpark"
 )
+# K1 has a build for either SSM state dtype; this picks the one served.
+SSM_DTYPE = os.environ.get("KIMI_K3_MAMBA_SSM_DTYPE", "float32")
+# aiter's SiTU MoE mode: a8w4 or a16w4 lay the experts out gate / up
+# interleaved, a4w4 separated. The launch reads either layout.
+SITU = os.environ.get("KIMI_K3_SITU", "a8w4")
 ENV = {
     "SGLANG_USE_AITER": "1",
     "SGLANG_AITER_K3_OPT": "1",
     "AITER_FLYDSL_FORCE": "1",
-    # the MXFP4 experts in aiter's gate / up interleaved layout
-    "AITER_SITUV2_A8W4": "1",
+    "AITER_SITUV2_A8W4": "1" if SITU == "a8w4" else "0",
+    "AITER_SITUV2_A4W4": "1" if SITU == "a4w4" else "0",
     # the aiter backend derates mem-fraction past a 8192 context; opt out so
     # --mem-fraction-static means what it says
     "SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION": "1",
@@ -45,6 +50,8 @@ ARGS = [
     "128",
     "--mamba-full-memory-ratio",
     "0.9",
+    "--mamba-ssm-dtype",
+    SSM_DTYPE,
     "--speculative-algorithm",
     "DSPARK",
     "--speculative-draft-model-path",

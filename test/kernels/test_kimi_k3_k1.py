@@ -19,6 +19,9 @@ What is checked, and why each:
   ``buffer_load`` is OOB-clamped: reading past the buffer returns a clamped
   address rather than faulting, so a window that is one entry short loses
   precision silently.
+* the **ring build** (--enable-linear-replayssm-spec): the same output as the
+  snapshot build, the ReplaySSM ring entries SGLang's commit replays, and a fold
+  of them in torch that gives the snapshot build's state.
 
 Run directly with ``python test/kernels/test_kimi_k3_k1.py``.
 """
@@ -37,6 +40,12 @@ QLEN = 8
 NVB = 3
 MAX_BLOCKS = 8
 EPS = 1e-5
+# SGLang's default --linear-replayssm-cache-len, at least 2x the drafted tokens
+RING_LEN = 16
+# what a ring entry the launch does not write keeps
+RING_FILL = 3.0
+# a ring build's request: not 0, so a wrong slot pitch shows
+RING_SLOT = 3
 
 
 def _randn(gen, *shape, scale=1.0, dtype=BF):
@@ -65,6 +74,40 @@ def _seam_reference(prefix, blocks, nvb, ares_nw, ares_qk, in_nw, eps, out_eps):
     return _rms(mixed, in_nw, out_eps).to(BF)
 
 
+def _conv_reference(case):
+    """The conv of the carried window and this step's tokens, then its silu:
+    q, k and v, each [L, NH, HD], k and q before their l2norm."""
+    kda = case.kda
+    L, hd, nh, proj_w = case.L, kda.HD, kda.NH, kda.PROJ
+    win = kda.CONV_W - 1
+    acc_idx = case.num_acc - 1
+    slot_c = int(case.st_idx[0, 0])
+    proj = case.proj_dbg.float()
+    xv = proj[:, : 3 * proj_w].t()  # [3 * PROJ, L]
+    window = case.conv_state_in[slot_c][:, acc_idx : acc_idx + win].float()
+    seq = torch.cat([window, xv], dim=1)
+    cw = case.conv_w.float()
+    conv = torch.stack(
+        [sum(cw[:, q] * seq[:, j + q] for q in range(kda.CONV_W)) for j in range(L)],
+        dim=1,
+    )
+    conv = (conv * torch.sigmoid(conv)).t()  # [L, 3 * PROJ]
+    return [conv[:, i * proj_w : (i + 1) * proj_w].reshape(L, nh, hd) for i in range(3)]
+
+
+def _gates_reference(case, h):
+    """Head h's beta [L] and log-domain gate [L, HD], per-K."""
+    kda = case.kda
+    hd = kda.HD
+    proj = case.proj_dbg.float()
+    fa = proj[:, kda.FA_0 : kda.FA_0 + hd]  # [L, HD]
+    beta = torch.sigmoid(proj[:, kda.BETA_0 + h])
+    g1 = fa.to(BF).float() @ case.w_fb[h * hd : (h + 1) * hd].float().t()
+    g = g1 + case.dt_bias[h * hd : (h + 1) * hd].float()
+    gate = -5.0 * torch.sigmoid(torch.exp(case.a_log[h].float()) * g)
+    return beta, gate
+
+
 def _kda_reference(case):
     """core_out in torch, from the kernel's own in-projection.
 
@@ -79,25 +122,10 @@ def _kda_reference(case):
     """
     kda = case.kda
     L, hd, nh, proj_w = case.L, kda.HD, kda.NH, kda.PROJ
-    win = kda.CONV_W - 1
     acc_idx = case.num_acc - 1
-    slot_c = int(case.st_idx[0, 0])
     slot0 = int(case.st_idx[0, acc_idx])
     proj = case.proj_dbg.float()
-
-    # --- conv: the carried window then this step's tokens, then silu
-    xv = proj[:, : 3 * proj_w].t()  # [3 * PROJ, L]
-    window = case.conv_state_in[slot_c][:, acc_idx : acc_idx + win].float()
-    seq = torch.cat([window, xv], dim=1)
-    cw = case.conv_w.float()
-    conv = torch.stack(
-        [sum(cw[:, q] * seq[:, j + q] for q in range(kda.CONV_W)) for j in range(L)],
-        dim=1,
-    )
-    conv = (conv * torch.sigmoid(conv)).t()  # [L, 3 * PROJ]
-    q_all, k_all, v_all = (
-        conv[:, i * proj_w : (i + 1) * proj_w].reshape(L, nh, hd) for i in range(3)
-    )
+    q_all, k_all, v_all = _conv_reference(case)
 
     def l2(x, scale):
         return x * torch.rsqrt(x.pow(2).sum(-1, keepdim=True) + 1e-6) * scale
@@ -105,13 +133,9 @@ def _kda_reference(case):
     q_all = l2(q_all, hd**-0.5)
     k_all = l2(k_all, 1.0)
 
-    fa = proj[:, kda.FA_0 : kda.FA_0 + hd]  # [L, HD]
     out = torch.empty(case.S, proj_w, dtype=torch.float32, device=proj.device)
     for h in range(nh):
-        beta = torch.sigmoid(proj[:, kda.BETA_0 + h])  # [L]
-        g1 = fa.to(BF).float() @ case.w_fb[h * hd : (h + 1) * hd].float().t()
-        g = g1 + case.dt_bias[h * hd : (h + 1) * hd].float()
-        gate = -5.0 * torch.sigmoid(torch.exp(case.a_log[h].float()) * g)
+        beta, gate = _gates_reference(case, h)
         decay = torch.exp(gate)  # [L, HD], per-K
 
         state = case.rstate_in[slot0, h].float().clone()  # [V, K]
@@ -128,10 +152,37 @@ def _kda_reference(case):
     return out.to(BF)
 
 
+def _fold(case, n):
+    """SGLang's ReplaySSM commit in torch: the ring's first n entries replayed
+    into the committed state, as ``kda_replayssm_exact_fold_kernel`` does it
+    (division-form l2norm of k, per-K decay, then the delta rule). [NH, V, K]."""
+    slot = int(case.st_idx[0, 0])
+    v_ring, k_ring, g_ring, b_ring = (t[slot].float() for t in case.ring)
+    state = case.rstate_in[slot].float().clone()
+    for t in range(n):
+        k = k_ring[:, t]  # [NH, K]
+        k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+        state = state * torch.exp(g_ring[:, t]).unsqueeze(1)
+        v = (v_ring[:, t] - (state * k.unsqueeze(1)).sum(-1)) * b_ring[:, t, None]
+        state = state + v.unsqueeze(-1) * k.unsqueeze(1)
+    return state
+
+
 class K1Case:
     """One synthetic K1 launch: its inputs, and the tensors it wrote."""
 
-    def __init__(self, device, *, num_acc, state_len=None, write_idx=-1):
+    def __init__(
+        self,
+        device,
+        *,
+        num_acc,
+        state_len=None,
+        write_idx=-1,
+        state_dtype=torch.float32,
+        ring_slot=None,
+    ):
+        """``ring_slot`` makes it a ring build's launch, whose request has that
+        state slot, with the state and conv window slot 0 has otherwise."""
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
         self.kda = kda
@@ -143,6 +194,7 @@ class K1Case:
         self.state_len = state_len or (self.L + kda.CONV_W - 1)
         self.num_acc = num_acc
         self.write_idx = write_idx
+        self.state_dtype = state_dtype
 
         g = torch.Generator(device=device).manual_seed(5)
         s, h, dim = self.S, kda.HIDDEN, 3 * kda.PROJ
@@ -170,10 +222,28 @@ class K1Case:
         # prefix of the full one and every later draw is unchanged.
         full = _randn(g, nslots, dim, self.L + kda.CONV_W - 1, scale=0.5)
         self.conv_state = full[:, :, : self.state_len].contiguous()
-        self.conv_state_in = self.conv_state.clone()
         self.rstate = _randn(
-            g, nslots, kda.NH, kda.HD, kda.HD, scale=0.05, dtype=torch.float32
+            g, nslots, kda.NH, kda.HD, kda.HD, scale=0.05, dtype=state_dtype
         )
+        self.ring = None
+        if ring_slot is not None:
+            # The ring build reads st_idx[req, 0] for the state slot and the
+            # ring, so every token names the request's slot.
+            self.st_idx = torch.full_like(self.st_idx, ring_slot)
+            self.rstate[ring_slot] = self.rstate[0]
+            self.conv_state[ring_slot] = self.conv_state[0]
+            shape = (nslots, kda.NH, RING_LEN, kda.HD)
+            self.ring = tuple(
+                torch.full(s, RING_FILL, dtype=d, device=device)
+                for s, d in (
+                    (shape, BF),
+                    (shape, BF),
+                    (shape, torch.float32),
+                    (shape[:3], torch.float32),
+                )
+            )
+            self.ring_in = tuple(t.clone() for t in self.ring)
+        self.conv_state_in = self.conv_state.clone()
         self.rstate_in = self.rstate.clone()
 
         self.core_out = torch.zeros(self.S, kda.PROJ, dtype=BF, device=device)
@@ -193,6 +263,8 @@ class K1Case:
             onorm_eps=EPS,
             debug=True,
             write_idx=self.write_idx,
+            state_bf16=self.state_dtype == BF,
+            ring=self.ring is not None,
         )
         scratch = torch.zeros(
             kda.scratch_bytes(key), dtype=torch.uint8, device=self.device
@@ -220,6 +292,7 @@ class K1Case:
             scratch=scratch,
             layer=1,
             epoch=epoch,
+            ring=self.ring,
             x_dbg=self.x_dbg,
             proj_dbg=self.proj_dbg,
         )
@@ -495,6 +568,133 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
             f"short state_len {short.state_len}: carry entry {win - 1} differs "
             f"(read index {acc_idx + win} does not exist), launch succeeded"
         )
+
+    def test_bf16_state_is_the_fp32_state_rounded(self):
+        """--mamba-ssm-dtype bfloat16 changes how the state is stored, not how
+        it is computed.
+
+        The recurrence runs in fp32 registers in both builds. Started from the
+        same values, a bf16 build therefore computes the same core_out, bit for
+        bit, and stores each token's state as the fp32 build's rounded to bf16.
+        """
+        fp32 = K1Case(self.device, num_acc=QLEN)
+        bf16 = K1Case(self.device, num_acc=QLEN, state_dtype=BF)
+        fp32.rstate = bf16.rstate.float()
+        fp32.rstate_in = fp32.rstate.clone()
+        fp32.run()
+        bf16.run()
+        self.assertTrue(
+            torch.equal(bf16.core_out, fp32.core_out),
+            "the state dtype changed core_out, not only the stored state",
+        )
+        slots = fp32.st_idx[0].long()
+        torch.testing.assert_close(
+            bf16.rstate[slots].float(),
+            fp32.rstate[slots].to(BF).float(),
+            rtol=2**-7,
+            atol=0.0,
+            msg="the bf16 state is not the fp32 state rounded once",
+        )
+        cos = _cos(bf16.core_out, _kda_reference(bf16))
+        print(f"bf16 state: core_out equal to fp32's, cos vs torch {cos:.6f}")
+        self.assertGreater(cos, COS_MIN, "the bf16 build differs from torch")
+
+    def test_ring_build_computes_the_snapshot_builds_output(self):
+        """--enable-linear-replayssm-spec changes what a launch stores, not what
+        it computes. From the same state and conv window, the ring build's
+        core_out and conv state are the snapshot build's, bit for bit, and it
+        leaves the recurrent state as it was."""
+        snapshot = K1Case(self.device, num_acc=1).run()
+        ring = K1Case(self.device, num_acc=1, ring_slot=RING_SLOT).run()
+        self.assertTrue(
+            torch.equal(ring.core_out, snapshot.core_out),
+            "the ring build computed another core_out",
+        )
+        self.assertTrue(
+            torch.equal(ring.conv_state[RING_SLOT], snapshot.conv_state[0]),
+            "the ring build wrote another conv state",
+        )
+        self.assertTrue(
+            torch.equal(ring.rstate, ring.rstate_in),
+            "the ring build wrote the recurrent state",
+        )
+        cos = _cos(ring.core_out, _kda_reference(ring))
+        print(f"ring build: core_out equal to the snapshot build's, cos {cos:.6f}")
+        self.assertGreater(cos, COS_MIN, "the ring build differs from torch")
+
+    def test_ring_holds_each_tokens_raw_inputs(self):
+        """Entries 0 .. L - 1 of the request's ring hold what SGLang's verify
+        stores and its commit replays: the conv's v and k (k before its l2norm)
+        in bf16, the log-domain gate and beta in fp32."""
+        case = K1Case(self.device, num_acc=1, ring_slot=RING_SLOT).run()
+        v_ring, k_ring, g_ring, b_ring = (t[RING_SLOT, :, : case.L] for t in case.ring)
+        _, k_all, v_all = _conv_reference(case)
+        for name, got, want in (("v", v_ring, v_all), ("k", k_ring, k_all)):
+            torch.testing.assert_close(
+                got.float(),
+                want.transpose(0, 1).to(BF).float(),
+                rtol=2**-7,
+                atol=1e-6,
+                msg=f"the {name} ring is not the conv's {name} rounded to bf16",
+            )
+        gates = [_gates_reference(case, h) for h in range(case.kda.NH)]
+        torch.testing.assert_close(
+            b_ring,
+            torch.stack([beta for beta, _ in gates]),
+            rtol=1e-4,
+            atol=1e-6,
+            msg="the beta ring is not sigmoid(b)",
+        )
+        cos = _cos(g_ring, torch.stack([gate for _, gate in gates]))
+        print(f"ring: v and k within a bf16 ulp, beta matches, gate cos {cos:.8f}")
+        self.assertGreater(cos, 0.99999, "the gate ring differs from torch")
+
+    def test_folding_the_ring_replays_the_snapshot_states(self):
+        """SGLang's commit folds the accepted entries into the state. For every
+        acceptance count n, folding the ring build's first n entries gives the
+        state the snapshot build stores for token n - 1, so a ReplaySSM server
+        commits the state K1 computed with."""
+        snapshot = K1Case(self.device, num_acc=1).run()
+        ring = K1Case(self.device, num_acc=1, ring_slot=RING_SLOT).run()
+        for n in range(1, ring.L + 1):
+            got = _fold(ring, n)
+            want = snapshot.rstate[int(snapshot.st_idx[0, n - 1])].float()
+            cos = _cos(got, want)
+            rel = float((got - want).norm() / want.norm())
+            with self.subTest(n=n):
+                self.assertGreater(cos, 1.0 - 1e-5, f"n={n}: cos {cos:.8f}")
+                self.assertLess(rel, 1e-3, f"n={n}: rel {rel:.3g}")
+        print(f"folded ring: the snapshot build's state for n = 1 .. {ring.L}")
+
+    def test_ring_writes_only_the_steps_entries(self):
+        """The launch writes entries 0 .. L - 1 of its request's ring and no
+        other: SGLang sizes the ring past the step, and the other slots are
+        other requests'. A negative slot writes no entry at all."""
+        case = K1Case(self.device, num_acc=1, ring_slot=RING_SLOT).run()
+        names = ("v", "k", "g", "beta")
+        for name, got, before in zip(names, case.ring, case.ring_in):
+            step = torch.zeros(got.shape[:3], dtype=torch.bool, device=got.device)
+            step[RING_SLOT, :, : case.L] = True
+            changed = got[step] != before[step]
+            if changed.dim() > 1:
+                changed = changed.any(-1)
+            with self.subTest(ring=name):
+                self.assertTrue(
+                    torch.equal(got[~step], before[~step]),
+                    f"the {name} ring was written outside the step's entries",
+                )
+                self.assertTrue(
+                    bool(changed.all()), f"an entry of the {name} ring went unwritten"
+                )
+        neg = K1Case(self.device, num_acc=1, ring_slot=RING_SLOT)
+        neg.st_idx = torch.full_like(neg.st_idx, -1)
+        neg.run()
+        for name, got, before in zip(names, neg.ring, neg.ring_in):
+            with self.subTest(ring=name, slot=-1):
+                self.assertTrue(
+                    torch.equal(got, before), f"a negative slot wrote the {name} ring"
+                )
+        print("ring: the step's entries only, and none for a negative slot")
 
     def test_block_write_layer_snapshots_the_prefix(self):
         """write_idx >= 0 stores the updated prefix into that bank row.

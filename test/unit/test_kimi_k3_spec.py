@@ -99,10 +99,95 @@ def test_a_block_size_past_the_launch_is_refused():
 
 
 def test_the_bounds_name_the_launches_and_their_outputs():
-    for name in ("k2.prefix.cosine", "k2.x.cosine", "k2.out.cosine", "moe.out.cosine"):
+    for name in (
+        "k2.prefix.cosine",
+        "k2.x.cosine",
+        "k2.out.cosine",
+        "moe.out.cosine",
+        "k1.ssm.cosine",
+        "k1.ssm_bf16.cosine",
+        "k1.ring_v.cosine",
+        "k1.ring_k.cosine",
+        "k1.ring_g.cosine",
+        "k1.ring_beta.cosine",
+    ):
         assert 0.0 < k3.SPEC.numerics.bound(name) <= 1.0
     with pytest.raises(KeyError):
         k3.SPEC.numerics.bound("k2.nothing.cosine")
+
+
+def test_k1_builds_for_the_ssm_pools_dtype():
+    """K1 reads and writes SGLang's SSM pool in place, so its build has to take
+    the dtype the pool was allocated in: bf16 or fp32, and nothing else."""
+    import torch
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+
+    for dtype in (torch.float32, torch.bfloat16):
+        params = SimpleNamespace(dtype=SimpleNamespace(temporal=dtype))
+        text = SimpleNamespace(mamba2_cache_params=params)
+        assert k1.ssm_dtype(SimpleNamespace(text_config=text)) is dtype
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(
+            use_full_rank_gate=True,
+            _qkvgbfa_layer=object(),
+            qkv_conv1d=SimpleNamespace(weight=torch.zeros(4, 1, 4)),
+        )
+    )
+    assert k1._unsupported_reasons(layer, torch.float32) == []
+    assert k1._unsupported_reasons(layer, torch.bfloat16) == []
+    reasons = k1._unsupported_reasons(layer, torch.float16)
+    assert any("--mamba-ssm-dtype" in r for r in reasons), reasons
+
+
+def test_k1_takes_the_replayssm_ring_only_in_its_ring_build():
+    """Under --enable-linear-replayssm-spec the pool has the ReplaySSM rings and
+    no intermediate_ssm. The ring build takes a step only with rings of the
+    layout it writes and long enough for the step; the snapshot build never."""
+    pytest.importorskip("flydsl")
+    pytest.importorskip("aiter")
+    import torch
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+
+    qlen, layers, slots = 6, 2, 3
+
+    def batch(ring):
+        key = kda.KdaPreBuild(
+            tokens=qlen,
+            qlen=qlen,
+            nblocks=1,
+            delta=False,
+            state_len=qlen + kda.CONV_W - 1,
+            ring=ring,
+        )
+        return SimpleNamespace(layers=[SimpleNamespace(key=key)])
+
+    def step(ring_len=16, g_dtype=torch.float32):
+        head = (layers, slots, kda.NH, ring_len)
+        return {
+            "rows": torch.zeros(1, dtype=torch.long),
+            "slots": torch.zeros(1, dtype=torch.int32),
+            "num_draft": qlen,
+            "ring": True,
+            "inter_ssm": None,
+            "rings": (
+                torch.empty(*head, kda.HD, dtype=torch.bfloat16),
+                torch.empty(*head, kda.HD, dtype=torch.bfloat16),
+                torch.empty(*head, kda.HD, dtype=g_dtype),
+                torch.empty(*head, dtype=torch.float32),
+            ),
+            "committed_ssm": torch.empty(layers, slots, kda.NH, kda.HD, kda.HD),
+            "committed_conv": torch.empty(
+                layers, slots, kda.CONV_W - 1, 3 * kda.PROJ, dtype=torch.bfloat16
+            ),
+        }
+
+    assert k1._step_shapes_ok(batch(True), step())
+    assert not k1._step_shapes_ok(batch(False), step())
+    assert not k1._step_shapes_ok(batch(True), step(ring_len=qlen - 1))
+    assert not k1._step_shapes_ok(batch(True), step(g_dtype=torch.bfloat16))
 
 
 def test_the_build_needs_a_real_model():
@@ -172,6 +257,28 @@ def test_an_mla_layer_without_the_output_gate_is_refused(monkeypatch):
     # so it cannot carry this: for MLA the split rides on the gate's wrapper.
     reasons = _reasons(monkeypatch, _fake_layer(gate=False))
     assert any("output gate" in r for r in reasons), reasons
+
+
+def test_a4w4_experts_are_the_plain_layout(monkeypatch):
+    # Under AITER_SITUV2_A4W4, Mxfp4MoEMethod shuffles with shuffle_weight /
+    # shuffle_scale, not the a16w4 pair the launch reads with guint=False. The
+    # bytes agree for Kimi-K3's TP8 shapes; this fails if aiter changes either.
+    pytest.importorskip("aiter.ops.shuffle")
+    import torch
+
+    from sgl_amd_mono.kimi_k3.gfx950.stages.moe import LAT, RI
+
+    monkeypatch.setenv("AITER_SITUV2_A8W4", "0")
+    monkeypatch.setenv("AITER_SITUV2_A4W4", "1")
+    layer = _fake_layer()
+    layer.mlp.experts = SimpleNamespace(
+        w13_weight=torch.zeros(1, 2 * RI, LAT // 2, dtype=torch.uint8),
+        w2_weight=torch.zeros(1, LAT, RI // 2, dtype=torch.uint8),
+    )
+    layer.mlp.experts.w13_weight.is_shuffled = True
+    layer.mlp.experts.w2_weight.is_shuffled = True
+    assert k3._a4w4_layout_is_plain(layer.mlp.experts)
+    assert _reasons(monkeypatch, layer) == []
 
 
 def test_the_guard_flags_sit_past_every_width(monkeypatch):

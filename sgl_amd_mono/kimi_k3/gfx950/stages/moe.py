@@ -165,8 +165,9 @@ class MoeBuild(msgspec.Struct, frozen=True):
     # 5 lnorm, 6 up)
     stop: int = 99
     # w13's AITER layout: False is gate/up separated (``gate_up=False``, what
-    # the kernel was written for), True is gate/up interleaved, which is what
-    # SGLang's Mxfp4MoEMethod produces for Kimi-K3 under AITER_SITUV2_A8W4.
+    # the kernel was written for, and byte for byte what SGLang's
+    # Mxfp4MoEMethod produces under AITER_SITUV2_A4W4), True is gate/up
+    # interleaved, which is what it produces under AITER_SITUV2_A8W4.
     # Only the 16-row block index differs, so it costs one remap in ug_loads.
     guint: bool = False
 

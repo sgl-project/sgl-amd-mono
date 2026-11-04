@@ -2,8 +2,10 @@
 """SGLANG_AMD_MONO_CHECK=1 (eager only): every layer K1 takes also runs on
 SGLang's own attention, on the caches as they were, and the launch is checked
 against it: the attention output, the bank row it contributes, the recurrent
-state it leaves, and the conv window it hands back. Each is scored against its
-``spec.NUMERICS`` bound. Every check is logged; a miss is logged as a violation.
+state it leaves (under --enable-linear-replayssm-spec, the ReplaySSM ring
+entries it writes instead), and the conv window it hands back. Each is scored
+against its ``spec.NUMERICS`` bound. Every check is logged; a miss is logged as
+a violation.
 
 The launch reads every tensor as a raw address, so a wrong value is not a
 crash. It is carried into the next step and into the draft's input, and the
@@ -52,10 +54,17 @@ def _kda_slices(built, packed):
     st = built._k1_state
     mi = packed.k1.mamba_idx
     row = st["row"]
-    pairs = [
-        ("ssm", st.get("inter_ssm"), (mi, row)),
-        ("window", st.get("inter_window"), (mi, row)),
-    ]
+    pairs = [("window", st.get("inter_window"), (mi, row))]
+    if st["ring"]:
+        # Under ReplaySSM the state is left as it is and the step's tokens go
+        # to entries 0 .. L - 1 of the request's ring, at its state slot.
+        entries = (mi, st["slot"], slice(None), slice(None, st["num_draft"]))
+        names = ("ring_v", "ring_k", "ring_g", "ring_beta")
+        pairs += [(n, t, entries) for n, t in zip(names, st["rings"])]
+    else:
+        # A bf16 state is scored against its own bound: it rounds once a store.
+        ssm = "ssm_bf16" if packed.k1.key.state_bf16 else "ssm"
+        pairs.append((ssm, st.get("inter_ssm"), (mi, row)))
     return [(n, t, idx) for n, t, idx in pairs if t is not None]
 
 
@@ -170,8 +179,9 @@ def _profile_lines(name: str, got: torch.Tensor, want: torch.Tensor) -> list:
     """
     if got.dim() < 2 or got.shape != want.shape:
         return []
-    # [1, tokens, ...] for a pool slice, [tokens, ...] for core and bank
-    tok = 1 if got.dim() >= 4 else 0
+    # [1, tokens, ...] for a pool slice, [1, heads, tokens, ...] for a ring
+    # slice, [tokens, ...] for core and bank
+    tok = 2 if name.startswith("ring") else 1 if got.dim() >= 4 else 0
     lines = [f"k1.{name} by_token got {_profile(got, tok)} want {_profile(want, tok)}"]
     if name == "window":
         lines.append(

@@ -26,6 +26,12 @@ behind every earlier load):
 Rounding follows the original path where it is elementwise (the AttnRes prefix
 add, every bf16 hand-off between the original kernels); split-K reductions
 differ only in their order.
+
+A ``ring`` build is the --enable-linear-replayssm-spec form. SGLang then keeps
+no state a token: the step starts from the committed state, which it leaves
+untouched, and each token's raw inputs go to the request's ReplaySSM ring --
+the conv's v and k (k before its l2norm), the log-domain gate and beta, at
+entries 0 .. L - 1. SGLang's commit replays the accepted ones into the state.
 """
 
 from dataclasses import dataclass
@@ -72,8 +78,10 @@ from sgl_amd_mono.kimi_k3.gfx950.stages.dims import (
     ROWS,
 )
 from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
+    bf4_words,
     bf16r,
     f32_of,
+    ld_bf4,
     stage_gate,
     stage_mix,
     stage_slice,
@@ -125,6 +133,11 @@ class KdaPreBuild:
     debug: bool = False
     timeline: bool = False
     write_idx: int = -1  # a block-write layer's block: the updated prefix stored there
+    # the recurrent state's dtype in memory, which is --mamba-ssm-dtype's: bf16
+    # or fp32. The recurrence runs in fp32 registers either way.
+    state_bf16: bool = False
+    # ReplaySSM spec (see the module docstring): read the state, write the ring
+    ring: bool = False
     kda0: int = 0  # the first KDA task's CTA
     xp: int = 0  # experiment switch (timing only)
 
@@ -150,6 +163,11 @@ def scratch_layout(key: KdaPreBuild) -> dict:
 
 def scratch_bytes(key: KdaPreBuild) -> int:
     return max(o + n for o, n in scratch_layout(key).values())
+
+
+def state_dtype(key: KdaPreBuild) -> torch.dtype:
+    """The dtype of the ``rstate`` a build reads and writes."""
+    return torch.bfloat16 if key.state_bf16 else torch.float32
 
 
 def ld_bf(ptr, i, cm=0):
@@ -269,9 +287,16 @@ def kda_stage(c, req, h, ch):
     k["acc_idx"] = uniform(ld_i32(a["num_acc"], req)) - 1
     k["slot_c"] = uniform(ld_i32(a["st_idx"], req * a["st_stride"]))
     k["slot0"] = uniform(ld_i32(a["st_idx"], req * a["st_stride"] + k["acc_idx"]))
-    k["slots"] = [
-        uniform(ld_i32(a["st_idx"], req * a["st_stride"] + j)) for j in range(L)
-    ]
+    if const_expr(c["ring"]):
+        # the request's first ring entry of head h: the rings are
+        # [slots, NH, ring_len, ...], a slot's rows dense
+        k["ring_row"] = (fx.Int64(fx.max(k["slot0"], 0)) * NH + fx.Int64(h)) * fx.Int64(
+            a["ring_len"]
+        )
+    else:
+        k["slots"] = [
+            uniform(ld_i32(a["st_idx"], req * a["st_stride"] + j)) for j in range(L)
+        ]
     # conv: thread < 48 owns channel (part, d)
     ct = fx.min(tid, 3 * VCH - 1)
     part = ct // VCH
@@ -292,10 +317,15 @@ def kda_stage(c, req, h, ch):
     vr = ch * VCH + tid // 32
     k0 = (tid % 32) * 4
     k["head_off"] = (h * HD + vr) * HD + k0
-    base0 = a["rstate"] + fx.Int64(fx.max(k["slot0"], 0)) * fx.Int64(a["rs_seq"]) * 4
-    k["st"] = fx.Vector(
-        bo.buffer_load(rsrc(base0), k["head_off"], vec_width=4, dtype=T.f32)
-    )
+    row0 = fx.Int64(fx.max(k["slot0"], 0)) * fx.Int64(a["rs_seq"])
+    if const_expr(c["state_bf16"]):
+        k["st"] = ld_bf4(a["rstate"] + row0 * 2, k["head_off"])
+    else:
+        k["st"] = fx.Vector(
+            bo.buffer_load(
+                rsrc(a["rstate"] + row0 * 4), k["head_off"], vec_width=4, dtype=T.f32
+            )
+        )
     # f_b: wave w's rows 16 w .. of head h, a lane 64 B of its row
     fr = h * HD + wave * 16 + lane % 16
     fb = (fr * HD + (lane // 16) * 32) // 2
@@ -340,6 +370,12 @@ def kda_conv(c, k, req, h, ch):
                 )
         stamp(c["on"], c["tls"], tid, 14)
         seq = k["win"] + xv
+        if const_expr(c["ring"]):
+            # one resource a ring: k and v threads share wave 0, and a resource
+            # built on a per-thread choice would not be wave-uniform
+            live = k["slot0"] >= 0
+            ring_k = rsrc(a["ring_k"] + k["ring_row"] * (HD * 2))
+            ring_v = rsrc(a["ring_v"] + k["ring_row"] * (HD * 2))
         for j in range_constexpr(L):
             acc = fx.Float32(0.0)
             for q in range_constexpr(CONV_W):
@@ -356,15 +392,25 @@ def kda_conv(c, k, req, h, ch):
                 )
             if k["part"] == 2:
                 fx.ptr_store(o, c["vloc"] + (j * VCH + tid % VCH))
+            if const_expr(c["ring"]):
+                at = j * HD + ch * VCH + tid % VCH
+                if (k["part"] == 1) & live:
+                    bo.buffer_store(o.to(fx.BFloat16), ring_k, at)
+                if (k["part"] == 2) & live:
+                    bo.buffer_store(o.to(fx.BFloat16), ring_v, at)
     gpu.barrier()
 
 
 @flyc.jit
-def kda_gates(c, k, req, h):
+def kda_gates(c, k, req, h, ch):
     """f_a, beta and the head's q / k (one poll batch a thread); g1 = f_b f_a by
     MFMA (a wave 16 rows) -> lower-bound gate -> decay in LDS; q / k l2-normed
-    (q scaled)."""
+    (q scaled). Every chunk's task computes the whole head's gate and beta, so
+    a ring build stores them from chunk 0's."""
     L, tid, lane, wave = c["L"], c["tid"], c["lane"], c["wave"]
+    a = c["args"]
+    if const_expr(c["ring"]):
+        ring_owner = (ch == 0) & (k["slot0"] >= 0)
     n_fa = L * HD
     n = n_fa + L * 2 * HD
     per = (n + THREADS - 1) // THREADS
@@ -389,7 +435,11 @@ def kda_gates(c, k, req, h):
             fx.ptr_store(f32_of(got_qk[i][0]), c["qkl"] + (e - n_fa))
     if tid < L:
         b = c["poll"]([(c["proj"], (req * L + tid) * NPROJ + BETA_0 + h, 1)])[0][0]
-        fx.ptr_store(sigmoid(f32_of(b)), c["beta"] + tid)
+        beta = sigmoid(f32_of(b))
+        fx.ptr_store(beta, c["beta"] + tid)
+        if const_expr(c["ring"]):
+            if ring_owner:
+                bo.buffer_store(beta, rsrc(a["ring_b"] + k["ring_row"] * 4), tid)
     gpu.barrier()
     # g1 rows 16 wave .. x tokens: A = f_b rows (staged), B = f_a [token][K]
     t = fx.min(lane % 16, L - 1)
@@ -399,12 +449,17 @@ def kda_gates(c, k, req, h):
         xs = [fx.ptr_load(c["fa"] + (t * HD + kb + e)) for e in range(8)]
         xb = fx.Vector.from_elements(xs, fx.Float32).to(fx.BFloat16)
         acc = mfma_bf16(k["fb"][q].bitcast(fx.BFloat16), xb, acc)
+    if const_expr(c["ring"]):
+        ring_g = rsrc(a["ring_g"] + k["ring_row"] * (HD * 4))
     for i in range_constexpr(4):
         kk = wave * 16 + 4 * (lane // 16) + i
         g = bf16r(acc[i]) + k["dtb"][i]
         gate = fx.Float32(c["lb"]) * sigmoid(k["aa"] * g)
         if lane % 16 < L:
             fx.ptr_store(hw_exp2(gate * fx.Float32(LOG2E)), c["decay"] + (t * HD + kk))
+            if const_expr(c["ring"]):
+                if ring_owner:
+                    bo.buffer_store(gate, ring_g, t * HD + kk)
     # l2norm: q / k row r (2 L rows of 128) on wave r % 8
     for rr in range_constexpr((2 * L + WAVES - 1) // WAVES):
         row = fx.min(wave + WAVES * rr, 2 * L - 1)
@@ -442,12 +497,19 @@ def kda_recur(c, k, req, h, ch):
         o = stv[0] * qv[0] + stv[1] * qv[1] + stv[2] * qv[2] + stv[3] * qv[3]
         o = bf16r(butterfly(o, (16, 8, 4, 2, 1)))
         o = live0.select(o, fx.Float32(0.0))
-        slot = k["slots"][j]
-        if (slot >= 0) & live0:
-            dst = rsrc(a["rstate"] + fx.Int64(slot) * fx.Int64(a["rs_seq"]) * 4)
-            bo.buffer_store(
-                fx.Vector.from_elements(stv, fx.Float32), dst, k["head_off"]
-            )
+        # a ring build stores no state: SGLang's commit folds the ring into it
+        if const_expr(not c["ring"]):
+            slot = k["slots"][j]
+            if (slot >= 0) & live0:
+                row = fx.Int64(slot) * fx.Int64(a["rs_seq"])
+                if const_expr(c["state_bf16"]):
+                    dst = rsrc(a["rstate"] + row * 2)
+                    bo.buffer_store(bf4_words(stv), dst, k["head_off"] // 2)
+                else:
+                    dst = rsrc(a["rstate"] + row * 4)
+                    bo.buffer_store(
+                        fx.Vector.from_elements(stv, fx.Float32), dst, k["head_off"]
+                    )
         if lane % 32 == 0:
             fx.ptr_store(o, c["ol"] + (j * VCH + v))
     gpu.barrier()
@@ -499,7 +561,7 @@ def kda_tasks(c, on, tls):
         stamp(on, tls, tid, 7)
         kda_conv(c, k, req, h, ch)
         stamp(on, tls, tid, 8)
-        kda_gates(c, k, req, h)
+        kda_gates(c, k, req, h, ch)
         stamp(on, tls, tid, 9)
         kda_recur(c, k, req, h, ch)
         stamp(on, tls, tid, 10)
@@ -552,6 +614,7 @@ def build(key: KdaPreBuild):
     keyed = key_tuple(key, SOURCES)
     name = (
         f"k3_mono_kda_pre_s{s}_l{L}_nb{key.nblocks}_d{int(key.delta)}"
+        f"_st{16 if key.state_bf16 else 32}_r{int(key.ring)}"
         f"_g{int(key.debug)}_t{int(key.timeline)}"
     )
 
@@ -580,6 +643,11 @@ def build(key: KdaPreBuild):
         st_idx: Int64,
         st_stride: Int32,
         num_acc: Int64,
+        ring_v: Int64,
+        ring_k: Int64,
+        ring_g: Int64,
+        ring_b: Int64,
+        ring_len: Int32,
         core_out: Int64,
         x_dbg: Int64,
         proj_dbg: Int64,
@@ -607,6 +675,8 @@ def build(key: KdaPreBuild):
             "lane": tid % 64,
             "wave": tid // 64,
             "delta": key.delta,
+            "state_bf16": key.state_bf16,
+            "ring": key.ring,
             "debug": key.debug,
             "eps": key.eps,
             "out_eps": key.out_eps,
@@ -652,6 +722,11 @@ def build(key: KdaPreBuild):
                 "st_idx": st_idx,
                 "st_stride": st_stride,
                 "num_acc": num_acc,
+                "ring_v": ring_v,
+                "ring_k": ring_k,
+                "ring_g": ring_g,
+                "ring_b": ring_b,
+                "ring_len": ring_len,
                 "core_out": core_out,
                 "x_dbg": x_dbg,
                 "proj_dbg": proj_dbg,
@@ -712,6 +787,11 @@ def build(key: KdaPreBuild):
         st_idx: Int64,
         st_stride: Int32,
         num_acc: Int64,
+        ring_v: Int64,
+        ring_k: Int64,
+        ring_g: Int64,
+        ring_b: Int64,
+        ring_len: Int32,
         core_out: Int64,
         x_dbg: Int64,
         proj_dbg: Int64,
@@ -746,6 +826,11 @@ def build(key: KdaPreBuild):
             st_idx,
             st_stride,
             num_acc,
+            ring_v,
+            ring_k,
+            ring_g,
+            ring_b,
+            ring_len,
             core_out,
             x_dbg,
             proj_dbg,
@@ -786,21 +871,45 @@ def kda_pre(
     scratch,
     layer,
     epoch,
+    ring=None,
     x_dbg=None,
     proj_dbg=None,
     tl=None,
 ):
     """Host launcher. ``conv_state`` [slots, dim, state_len] or a transposed view
     of [slots, state_len, dim] (strides read); ``rstate`` [slots, 12, 128, 128]
-    fp32; ``st_idx`` [R, >= L] int32; ``scratch`` zeroed before the step's first
-    layer (tags are a layer's); ``epoch`` a device int32 bumped once a step and
-    ``layer`` this launch's slot below ``TAG_SLOTS``."""
+    in ``state_dtype(key)``; ``st_idx`` [R, >= L] int32; ``scratch`` zeroed
+    before the step's first layer (tags are a layer's); ``epoch`` a device int32
+    bumped once a step and ``layer`` this launch's slot below ``TAG_SLOTS``.
+
+    ``ring``, for a ring build only: one layer's ReplaySSM rings ``(v, k, g,
+    beta)``, dense, [slots, 12, ring_len, 128] bf16 for v and k, the same in
+    fp32 for g, and [slots, 12, ring_len] fp32 for beta. ``rstate`` is then
+    the committed state, read only, and a request's slot is ``st_idx[req, 0]``
+    for both."""
     assert w_in.shape == (NPROJ, HIDDEN) and w_in.is_contiguous()
-    assert rstate.dtype == torch.float32 and rstate[0].numel() == NH * HD * HD
+    assert rstate.dtype == state_dtype(key), (rstate.dtype, key.state_bf16)
+    assert rstate[0].numel() == NH * HD * HD
     assert rstate[0].is_contiguous(), (
         "a slot's state must be dense; slots may be strided"
     )
     assert conv_state.dtype == torch.bfloat16
+    assert key.ring == (ring is not None), "a ring build takes the rings, others none"
+    ring_len = 0
+    if ring is not None:
+        ring_v, ring_k, ring_g, ring_b = ring
+        slots, ring_len = ring_v.shape[0], ring_v.shape[2]
+        assert ring_len >= key.qlen, (ring_len, key.qlen)
+        for t, dtype, shape in (
+            (ring_v, torch.bfloat16, (slots, NH, ring_len, HD)),
+            (ring_k, torch.bfloat16, (slots, NH, ring_len, HD)),
+            (ring_g, torch.float32, (slots, NH, ring_len, HD)),
+            (ring_b, torch.float32, (slots, NH, ring_len)),
+        ):
+            assert t.dtype == dtype and tuple(t.shape) == shape, (t.dtype, t.shape)
+            assert t.is_contiguous(), (
+                "the kernel derives a ring's strides from its shape"
+            )
     f = build(key)
     f(
         prefix.data_ptr(),
@@ -826,6 +935,8 @@ def kda_pre(
         st_idx.data_ptr(),
         st_idx.stride(0),
         num_acc.data_ptr(),
+        *(ptr(t) for t in (ring or (None,) * 4)),
+        ring_len,
         core_out.data_ptr(),
         ptr(x_dbg),
         ptr(proj_dbg),

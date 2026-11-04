@@ -158,9 +158,6 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """What ``SPEC.requires`` cannot state: the shapes, which live on the text
     config and so are out of ``requires.hf_config``'s reach; aiter's own flags;
     and FlyDSL."""
-    from sglang.srt.layers.quantization.mxfp4 import (
-        _aiter_situ_uses_gu_interleaved_weights,
-    )
     from sglang.srt.utils.common import get_bool_env_var
 
     t = _text_config(hf_config)
@@ -188,11 +185,6 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
                 f"attn_res_block_size {block} gives layer {last} {blocks} "
                 f"attention-residual blocks, the launch is built for {MAX_BLOCKS}"
             )
-    if not _aiter_situ_uses_gu_interleaved_weights():
-        reasons.append(
-            "needs the MXFP4 experts in aiter's gate / up interleaved layout; "
-            "set AITER_SITUV2_A8W4=1 or leave AITER_SITUV2_A4W4 unset"
-        )
     if not get_bool_env_var("SGLANG_AITER_K3_OPT"):
         reasons.append("needs SGLANG_AITER_K3_OPT=1")
     if importlib.util.find_spec("flydsl") is None:
@@ -200,10 +192,56 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     return reasons
 
 
+def _a4w4_layout_is_plain(experts) -> bool:
+    """Whether the A4W4 branch of ``Mxfp4MoEMethod`` laid these experts out in
+    the launch's plain layout (``guint=False``).
+
+    That branch shuffles with ``shuffle_weight`` / ``shuffle_scale``, the launch
+    reads ``shuffle_weight_a16w4`` / ``shuffle_scale_a16w4`` with ``gate_up=False``.
+    They are different permutations that give the same bytes for these shapes,
+    which is aiter's code and not a contract, so it is checked on one expert of
+    the loaded shapes rather than assumed.
+    """
+    from aiter.ops.shuffle import (
+        shuffle_scale,
+        shuffle_scale_a16w4,
+        shuffle_weight,
+        shuffle_weight_a16w4,
+    )
+
+    gen = torch.Generator().manual_seed(0)
+
+    def u8(*shape):
+        return torch.randint(0, 256, shape, generator=gen, dtype=torch.uint8)
+
+    for weight, gate_up in ((experts.w13_weight, True), (experts.w2_weight, False)):
+        n, k = weight.shape[1], weight.view(torch.uint8).shape[2] * 2
+        w, s = u8(1, n, k // 2), u8(n, k // 32)
+        try:
+            a4w4_w = shuffle_weight(w, is_guinterleave=False, gate_up=gate_up)
+            a4w4_s = shuffle_scale(
+                s, experts_cnt=1, is_guinterleave=False, gate_up=gate_up
+            )
+            plain_w = shuffle_weight_a16w4(w, 16, False)
+            plain_s = shuffle_scale_a16w4(s, 1, False)
+        except (AssertionError, RuntimeError, ValueError):
+            return False  # a shape one of the shuffles does not tile
+        if not (
+            torch.equal(a4w4_w.view(torch.uint8), plain_w.view(torch.uint8))
+            and a4w4_s.shape == plain_s.shape
+            and torch.equal(a4w4_s.view(torch.uint8), plain_s.view(torch.uint8))
+        ):
+            return False
+    return True
+
+
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     """Every per-layer check the config cannot answer. The kernels read each
     weight as a raw address, so a wrong dtype, shape or layout is read as if it
     were the expected one."""
+    from sglang.srt.layers.quantization.mxfp4 import (
+        _aiter_situ_uses_gu_interleaved_weights,
+    )
     from sglang.srt.utils.common import require_mlp_sync
 
     hidden = HF_CONFIG["hidden_size"]
@@ -269,6 +307,16 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         reasons += [f"layer {i}: {why}" for ok, why in checks if not ok]
         if reasons and i > covered[0]:
             break  # one layer's reasons say it for all
+    experts = getattr(layers[covered[0]].mlp, "experts", None) if covered else None
+    if (
+        experts is not None
+        and not _aiter_situ_uses_gu_interleaved_weights()
+        and not _a4w4_layout_is_plain(experts)
+    ):
+        reasons.append(
+            "the MXFP4 experts are not in the plain A16W4 layout the launch reads "
+            "with gate / up separated; set AITER_SITUV2_A8W4=1"
+        )
     return reasons
 
 
@@ -285,10 +333,12 @@ def _build(model, hf_config, ctx):
     # the peer handshake is collective: every rank reaches it here
     runner = K3MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
     runner.set_deadline(ctx.deadline_s)
+    state_dtype = k1_mod.ssm_dtype(hf_config)
+    ring = k1_mod.replayssm_spec()
     layers, batches = {}, {}
     for rows in ctx.widths:
         for i in _covered_layers(hf_config):
-            packed = _weights(backbone.layers[i], i, rows, runner)
+            packed = _weights(backbone.layers[i], i, rows, runner, state_dtype, ring)
             layers.setdefault(rows, {})[i] = packed
         # FlyDSL compiles a launcher on its first call, and the first real call
         # is inside a CUDA graph capture, where compiling aborts the process.
@@ -386,6 +436,24 @@ NUMERICS = Numerics(
         # The recurrent state staged for the step's verify rows.
         "k1.ssm.cosine": 1.0 - 1e-6,
         "k1.ssm.rel": 0.001,
+        # The same under --mamba-ssm-dtype bfloat16, where both sides round the
+        # fp32 state to bf16 once a store. Not measured yet: provisional, at
+        # k1.core's bf16-rounding bounds.
+        "k1.ssm_bf16.cosine": 0.99999,
+        "k1.ssm_bf16.rel": 0.004,
+        # Under --enable-linear-replayssm-spec, the ReplaySSM ring in place of
+        # the state: the conv's v and k, the gate and beta of each token, which
+        # SGLang's commit folds into the state. Elementwise on both sides but
+        # for the gate's f_b GEMM, which sums in another order. Not measured
+        # yet: provisional, at k1.core's bf16-rounding bounds.
+        "k1.ring_v.cosine": 0.99999,
+        "k1.ring_v.rel": 0.004,
+        "k1.ring_k.cosine": 0.99999,
+        "k1.ring_k.rel": 0.004,
+        "k1.ring_g.cosine": 0.99999,
+        "k1.ring_g.rel": 0.004,
+        "k1.ring_beta.cosine": 0.99999,
+        "k1.ring_beta.rel": 0.004,
         # The conv window handed back to SGLang's speculative state, which the
         # accept-time commit reads. Nothing in the serving path reports a wrong
         # one: it shows up as a lower acceptance length and a GSM8K score a few
@@ -447,7 +515,7 @@ def _k2_blocks(layer) -> int:
     return layer.prev_valid_blocks + int(layer.is_block_write_layer)
 
 
-def _weights(layer, i: int, rows: int, runner) -> _Layer:
+def _weights(layer, i: int, rows: int, runner, state_dtype, ring) -> _Layer:
     """This layer's build key at one launch width. The weights themselves are
     read in place at launch, so nothing is packed or copied here."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
@@ -455,7 +523,7 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
 
     moe = layer.mlp
     return _Layer(
-        k1=k1_mod.build(layer, i, rows),
+        k1=k1_mod.build(layer, i, rows, state_dtype, ring),
         i=i,
         key=K2Build(
             tokens=rows,
