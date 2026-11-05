@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import os
+from functools import partial
 from pathlib import Path
 from typing import Optional, Union
 
@@ -159,21 +160,12 @@ IDX_BT_GROUP = INDEX_BLOCK_POOLS * KPOOL // PAGE_TOKENS
 
 
 def compile_only(launch) -> None:
-    """Compile a launch for this process without running it (FlyDSL's compile-only
-    mode, for the one call); the first real call then only loads the code."""
-    from flydsl.utils.env import CompileEnvManager
+    """Build the launcher without dispatching its kernels."""
+    # AITER probes the GPU when imported; test/unit imports this module on CPU
+    from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled
 
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    var = CompileEnvManager.options["compile_only"].env_var
-    old = os.environ.get(var)
-    os.environ[var] = "1"
-    try:
-        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
-    finally:
-        if old is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = old
+    _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
 
 def ensure_writable_flydsl_cache() -> None:
@@ -192,6 +184,8 @@ class FlashRuntime:
     is the step epoch (``advance_step``)."""
 
     def __init__(self, key, rank: int, group, device: torch.device):
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
         from sgl_amd_mono.common import guard
         from sgl_amd_mono.common.peer import PeerBuffer
 
@@ -200,9 +194,13 @@ class FlashRuntime:
         ensure_writable_flydsl_cache()
         self.key, self.width, self.rank = key, key.rows, rank
         self.launch, self.sc, self.sy = build_flash_kernel(key)
+        self.dispatch = partial(_run_compiled, self.launch)
         self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
         self.peer.bytes.zero_()
-        self.scratch = torch.zeros(self.sc["_bytes"], dtype=torch.uint8, device=device)
+        # the hand-off mailboxes, uncached as the peer buffer is: a line is read at its
+        # home memory, not through the producer's L2
+        self._scratch = PeerBuffer(self.sc["_bytes"], group, rank, 1, device)
+        self.scratch = self._scratch.bytes
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # the tail's gathered logits; a layer's two output sets, by layer parity: a
         # layer never writes what it reads
@@ -244,6 +242,8 @@ class FlashRuntime:
         self.epoch[:1].add_(1)
 
     def close(self) -> None:
+        self.scratch = None
+        self._scratch.close()
         self.peer.close()
 
 
@@ -474,7 +474,7 @@ class FlashLayerOp:
                 *map(p, (w.w_r, w.bias, w.w_ug, w.s_ug, w.w_dn, w.s_dn)),
                 *map(p, (w.w_sh_ug, w.s_sh_ug, w.w_sh_dn, w.s_sh_dn)),
             ]
-        rt.launch(
+        rt.dispatch(
             p(x),
             p(residual),
             p(post),
@@ -496,7 +496,7 @@ class FlashLayerOp:
             p(rt.epoch),
             rt.rank,
             self.layer,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return x_out, res_out, post_out, comb_out
 
@@ -522,7 +522,7 @@ class FlashHeadOp:
         _check("post", post, (S, HC_MULT, 1), torch.float32)
         _check("comb", comb, (S, HC_MULT, HC_MULT), torch.float32)
         p = lambda t: t.data_ptr()  # noqa: E731
-        rt.launch(
+        rt.dispatch(
             p(x),
             p(residual),
             p(post),
@@ -545,6 +545,6 @@ class FlashHeadOp:
             p(rt.epoch),
             rt.rank,
             self.layer,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         return rt.logits

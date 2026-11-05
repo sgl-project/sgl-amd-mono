@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MiniMax-M3 FFN launch: one persistent kernel from the unreduced ``o_proj``
-partial to the reduced MoE output (``MiniMaxM3DecoderLayer.forward`` after its
-attention).
+"""MiniMax-M3 FFN launch: one persistent kernel from the attention output to the
+reduced MoE output (``MiniMaxM3DecoderLayer.forward`` after its attention, o_proj
+included).
 
 ``BLOCKS`` x ``THREADS``, S rows, one launch per sparse layer and rank:
 
-    push    (192 x 32 columns): the partial's bf16 pairs to every rank
+    push    (128 x 48 columns): o_proj as SGLang runs it (per-token FP8 rows x
+            its rowwise-FP8 weight), the partial's bf16 triples to every rank
     reduce  (192): the ranks' pairs in rank order, f32 -> bf16; + residual
             in f32 -> residual out (bf16), the f32 sum, its sum of squares
     norm    (S): Gemma RMSNorm of the f32 sum -> X (bf16)
@@ -28,6 +29,7 @@ from enum import Enum
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
@@ -36,6 +38,7 @@ from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import EPOCH_MARKS, epoch_end
 from sgl_amd_mono.common.ops import (
+    CM_NT,
     CM_SYS,
     ballot,
     bf2_f32,
@@ -43,12 +46,14 @@ from sgl_amd_mono.common.ops import (
     bf16_round,
     butterfly,
     clock,
+    fp8_pack4,
     hw_exp2,
     hw_rcp,
     lanes_below,
     peer_bases,
     popcount,
     rsrc,
+    uniform,
 )
 from sgl_amd_mono.common.plan import (
     BLOCKS,
@@ -94,6 +99,14 @@ FINAL_TASKS = HIDDEN // COLS  # 192
 # the attention seam's pairs carry three bf16 under a 16-bit tag
 TRIPLES = HIDDEN // 3  # 2048 a row
 TASK_TRIPLES = 16  # triples of a push / reduce task (CTAs 0 .. 127)
+ATTN_K = 2048  # a TP4 rank's o_proj input: 16 heads of 128
+OP_TILES = 3 * TASK_TRIPLES // 16  # o_proj's 16-row tiles of a push task
+INV_FP8_MAX = 1.0 / 448.0  # AITER's per-token FP8 scale: amax / 448 as one f32 multiply
+# the push stage's LDS pool words: row amax, the task's partial, the waves' MFMA tiles
+OP_AMAX = 0
+OP_PART = OP_AMAX + MAX_TOKENS
+OP_RED = OP_PART + MAX_TOKENS * 3 * TASK_TRIPLES
+OP_WORDS = OP_RED + WAVES * OP_TILES * 256
 SEAM_TASKS = TRIPLES // TASK_TRIPLES  # 128 (a token's SSQ parts)
 ROUTER_PARTS = 16
 ROUTER_K = HIDDEN // ROUTER_PARTS
@@ -101,6 +114,9 @@ ROUTER_TASKS = EXPERTS // 16 * ROUTER_PARTS
 
 UP_TILES = INTER // 16  # 48 gate/up tile pairs an expert
 DOWN_TASKS = HIDDEN // 16  # 384
+XN_LDS_TOKENS = 8  # steps of up to this many rows keep XN in LDS (16 would not fit)
+XN_ROW = HIDDEN // 2 + 4  # dwords of a token's XN in LDS, 16 bytes off the banks
+XMID_ROW = INTER // 2 + 4  # dwords of a pick's MID in LDS, likewise
 K1_STEPS = HIDDEN // 128
 K2_STEPS = INTER // 128
 UP_WAVE_STEPS = K1_STEPS // WAVES
@@ -139,8 +155,27 @@ class FfnBuild:
     fault_after: int = 0
 
 
+def oproj_split(s: int) -> tuple[int, int]:
+    """Waves and 64-wide K steps a wave of SGLang's o_proj GEMM on ``s`` rows
+    (``smallm_fp8_gemm`` at (N, K) = (HIDDEN, ATTN_K)), so that the partial is its
+    own to the bit."""
+    return (8, 4) if s <= 8 else (4, 8)
+
+
 def slots(s: int) -> int:
     return 1 + TOPK * s
+
+
+def picks(s: int) -> int:
+    """MID columns at most: a token's routed picks (t * 4 + k), then its shared one."""
+    return (TOPK + 1) * s
+
+
+def pool_words(s: int) -> int:
+    """The LDS pool: the push stage's o_proj, XN for the up stage (up to
+    ``XN_LDS_TOKENS`` tokens), then every pick's MID for the down stage."""
+    xn = s * XN_ROW if s <= XN_LDS_TOKENS else 0
+    return max(OP_WORDS, xn, picks(s) * XMID_ROW)
 
 
 def peer_half_bytes(tp: int) -> int:
@@ -163,6 +198,7 @@ def scratch_layout(s: int) -> dict[str, tuple[int, int]]:
         [
             ("ssq", s * SEAM_TASKS),
             ("xrdy", s),
+            ("rstd", s),
             ("logit", s * EXPERTS * ROUTER_PARTS),
             ("route", s * 2 * TOPK),
             ("upf", slots(s) * UP_TILES),
@@ -281,15 +317,151 @@ def block_sum(c, v, slot):
 # ---------------------------------------------------------------- seam
 @flyc.jit
 def stage_push(c, task):
-    """Triples 16 task ..: this rank's partial as triple pairs to every rank's
-    ATTN."""
+    """Triples 16 task ..: this rank's o_proj partial (``oproj``) as triple pairs
+    to every rank's ATTN."""
     s, tid = c["S"], c["tid"]
+    oproj(c, task)
     if tid < s * TASK_TRIPLES:
         t = tid // TASK_TRIPLES
-        tr = task * TASK_TRIPLES + tid % TASK_TRIPLES
-        bits = triple_bits(c["args"]["part"], t, tr)
+        q = tid % TASK_TRIPLES
+        tr = task * TASK_TRIPLES + q
+        at = c["fpool"] + (OP_PART + t * 3 * TASK_TRIPLES + 3 * q)
+        bits = fx.Int64(0)
+        for k in range_constexpr(3):
+            hi = fx.Int64((fx.ptr_load(at + k).bitcast(fx.Int32) >> 16) & 0xFFFF)
+            bits = bits | (hi << (16 * k))
         for p in range_constexpr(c["tp"]):
             c["mb"].put_triple(c["peer"][p], attn_pair(c, c["rank"], t, tr), bits)
+
+
+@flyc.jit
+def oproj(c, task):
+    """The rank's o_proj partial of every row at the task's 48 columns -> LDS
+    ``OP_PART`` (bf16 values as f32), as SGLang computes it from the attention
+    rows: AITER's per-token FP8 quant (scale amax / 448, its v_rcp_f32 inverse,
+    clamped, RNE) and ``smallm_fp8_gemm`` on the rowwise-FP8 weight, with its waves,
+    K steps, accumulator chains and wave order (``oproj_split``)."""
+    s, tid, lane, wave, a = c["S"], c["tid"], c["lane"], c["wave"], c["args"]
+    k = ATTN_K
+    vw, steps = oproj_split(s)
+    chains = 2  # smallm's accumulator chains: step pair p on chain p % 2
+    row, kc = lane % 16, (lane // 16) * 16
+    k0 = wave * steps * 64
+    nb = task * OP_TILES
+    pool, fpool = c["pool"], c["fpool"]
+    # waves past the GEMM's run on zero-sized buffers: their tiles are never summed
+    live = fx.Int64(uniform((wave < vw).select(fx.Int32(-1), fx.Int32(0))))
+    rx = rsrc(a["attn"], fx.Int64(s * k * 2) & live)
+    rw = rsrc(a["wo"], live)
+
+    # the lane's 16 weight bytes of each tile and step (AITER's (16, 16) shuffle:
+    # row l % 16, K bytes 16 (l / 16) .. of each 64-wide step), then its 16 bf16 of
+    # row ``row`` at the same K (rows past s read 0)
+    wvs = [
+        [
+            fx.Vector(
+                bo.buffer_load(
+                    rw,
+                    ((nb + tt) * 16 * k + k0 * 16 + lane * 16 + i * 1024) // 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_NT,
+                )
+            )
+            for i in range(steps)
+        ]
+        for tt in range(OP_TILES)
+    ]
+    xvs = [
+        [
+            fx.Vector(
+                bo.buffer_load(
+                    rx,
+                    (row * k + k0 + i * 64 + kc) // 2 + 4 * h,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+            )
+            for h in range(2)
+        ]
+        for i in range(steps)
+    ]
+    if tid < 16:
+        fx.ptr_store(fx.Int32(0), pool + (OP_AMAX + tid))
+    gpu.barrier()
+    # every row's amax over K, as a nonnegative f32's bits
+    mx = fx.Int32(0)
+    for i in range_constexpr(steps):
+        for h in range_constexpr(2):
+            for d in range_constexpr(4):
+                word = fx.Int32(xvs[i][h][d])
+                mx = fx.max(mx, (word << 16) & 0x7FFF0000)
+                mx = fx.max(mx, word & 0x7FFF0000)
+    mx = butterfly(mx, (16, 32), fx.max)
+    if lane < 16:
+        fx.llvm.atomic_max(pool + (OP_AMAX + row), mx, syncscope="workgroup")
+    gpu.barrier()
+    scale = fx.ptr_load(pool + (OP_AMAX + row)).bitcast(fx.Float32) * fx.Float32(
+        INV_FP8_MAX
+    )
+    inv = hw_rcp(scale)
+    accs = [
+        [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(chains)]
+        for _ in range(OP_TILES)
+    ]
+    xq = []
+    for i in range_constexpr(steps):
+        vals = []
+        for h in range_constexpr(2):
+            for d in range_constexpr(4):
+                word = fx.Int32(xvs[i][h][d])
+                for half in range_constexpr(2):
+                    bits = (word << 16) if half == 0 else (word & -65536)
+                    v = bits.bitcast(fx.Float32) * inv
+                    vals.append(
+                        fx.min(fx.max(v, fx.Float32(-448.0)), fx.Float32(448.0))
+                    )
+        xq.append([fp8_pack4(*vals[4 * j : 4 * j + 4]) for j in range(4)])
+    # a 16x16x128 MFMA takes two steps
+    for p in range_constexpr(steps // 2):
+        x8 = fx.Vector.from_elements(xq[2 * p] + xq[2 * p + 1], fx.Int32)
+        for tt in range_constexpr(OP_TILES):
+            w8 = fx.Vector.from_elements(
+                [wvs[tt][2 * p + i][e] for i in range(2) for e in range(4)], fx.Int32
+            )
+            accs[tt][p % chains] = fx.Vector(
+                rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    T.vec(4, T.f32),
+                    [x8, w8, accs[tt][p % chains], 0, 0, 0, 127, 0, 127],
+                )
+            )
+    for tt in range_constexpr(OP_TILES):
+        acc = accs[tt][0]
+        for ch in range_constexpr(1, chains):
+            acc = acc + accs[tt][ch]
+        for r in range_constexpr(4):
+            fx.ptr_store(
+                acc[r], fpool + (OP_RED + (wave * OP_TILES + tt) * 256 + r * 64 + lane)
+            )
+    gpu.barrier()
+    # MFMA C: element tt 256 + r 64 + l is row 4 (l / 16) + r, column 16 tt + l % 16
+    for e0 in range_constexpr(0, OP_TILES * 256, THREADS):
+        e = tid + e0
+        m = (e % 64) // 16 * 4 + e % 256 // 64
+        n = e // 256 * 16 + e % 16
+        if (e < OP_TILES * 256) & (m < s):
+            v = fx.Float32(0.0)
+            for w in range_constexpr(vw):
+                v = v + fx.ptr_load(fpool + (OP_RED + w * OP_TILES * 256 + e))
+            amax = fx.ptr_load(pool + (OP_AMAX + m)).bitcast(fx.Float32)
+            ws = fx.Float32(
+                bo.buffer_load(rsrc(a["wos"]), nb * 16 + n, vec_width=1, dtype=T.f32)
+            )
+            sc = (amax * fx.Float32(INV_FP8_MAX)) * ws
+            fx.ptr_store(
+                bf16_round(v * sc), fpool + (OP_PART + m * 3 * TASK_TRIPLES + n)
+            )
+    gpu.barrier()
 
 
 @flyc.jit
@@ -327,7 +499,7 @@ def stage_reduce(c, task):
 @flyc.jit
 def stage_norm(c, t):
     """Token t's Gemma RMSNorm of SRES -> XN, then XRDY."""
-    tid, a = c["tid"], c["args"]
+    tid = c["tid"]
     part = fx.Float32(0.0)
     if tid < SEAM_TASKS:
         got = c["mb"].poll([(c["ssq"], t * SEAM_TASKS + tid, 1)])
@@ -336,32 +508,76 @@ def stage_norm(c, t):
     cta_sync()
     var = block_sum(c, part, 0) / fx.Float32(HIDDEN)
     rstd = fx.Float32(1.0) / fx.Float32(fmath.sqrt(var + fx.Float32(EPS)))
+    # released after the SSQ acquires: the router reads SRES on it, not on XRDY
+    if tid == 0:
+        c["mb"].publish(c["rstd"], t, rstd)
     per = HIDDEN // THREADS  # 12
     for q in range_constexpr(per // 2):
         col = (q * THREADS + tid) * 2
-        sv = load_dev(c["sres"].value, t * HIDDEN + col, 2)
-        ww = fx.Int32(
-            bo.buffer_load(rsrc(a["norm_w"]), col // 2, vec_width=1, dtype=T.i32)
-        )
-        wl, wh = bf2_f32(ww)
-        ol = fx.Int32(sv[0]).bitcast(fx.Float32) * rstd * (fx.Float32(1.0) + wl)
-        oh = fx.Int32(sv[1]).bitcast(fx.Float32) * rstd * (fx.Float32(1.0) + wh)
         store_dev(
-            c["xn"].value,
-            t * (HIDDEN // 2) + col // 2,
-            [bf16_pair(ol, oh).bitcast(fx.Int32)],
+            c["xn"].value, t * (HIDDEN // 2) + col // 2, xn_words(c, t, col, rstd, 2)
         )
     flag_after_stores(c, c["xrdy"], t, tid == 0)
 
 
+def xn_words(c, t, col, rstd, n):
+    """XN[t][col .. col + n) from SRES: bf16 pairs of the Gemma RMSNorm, one word
+    a pair."""
+    sv = load_dev(c["sres"].value, t * HIDDEN + col, n)
+    words = []
+    for h in range_constexpr(n // 2):
+        ww = fx.Int32(
+            bo.buffer_load(
+                rsrc(c["args"]["norm_w"]), col // 2 + h, vec_width=1, dtype=T.i32
+            )
+        )
+        wl, wh = bf2_f32(ww)
+        ol = fx.Int32(sv[2 * h]).bitcast(fx.Float32) * rstd * (fx.Float32(1.0) + wl)
+        oh = fx.Int32(sv[2 * h + 1]).bitcast(fx.Float32) * rstd * (fx.Float32(1.0) + wh)
+        words.append(bf16_pair(ol, oh).bitcast(fx.Int32))
+    return words
+
+
 @flyc.jit
 def await_x(c, tokens_n):
-    """XRDY of the first ``tokens_n`` tokens (thread t polls token t)."""
+    """XRDY of the first ``tokens_n`` tokens (thread t polls token t); up to
+    ``XN_LDS_TOKENS`` tokens, then their XN -> LDS (``xn_operands``)."""
     tid = c["tid"]
     if tid < tokens_n:
         c["mb"].poll([(c["xrdy"], tid, 1)])
         c["mb"].acquire(Space.SCRATCH)
     cta_sync()
+    if const_expr(c["xn_lds"] is not None):
+        row = HIDDEN // 8
+        chunks = tokens_n * row
+        n = -(-chunks // THREADS)
+        for b in range_constexpr(0, n, 6):
+            words, ats = [], []
+            for i in range_constexpr(b, min(b + 6, n)):
+                v = fx.min(tid + THREADS * i, chunks - 1)
+                t, q = v // row, v % row
+                words.append(load_dev(c["xn"].value, t * (HIDDEN // 2) + q * 4, 4))
+                ats.append(t * XN_ROW + q * 4)
+            for i in range_constexpr(len(words)):
+                fx.ptr_store(words[i], c["xn_lds"] + ats[i])
+        gpu.barrier()
+
+
+def xn_operands(c, tok, st0):
+    """The lane's B operands of up steps st0 .. (``x_operands`` of XN), from
+    LDS when XN is there: a unit's global X loads would take most of the
+    CTA's vector memory issue."""
+    if const_expr(c["xn_lds"] is None):
+        return x_operands(c, c["xn"].value, tok, HIDDEN // 2, st0, UP_WAVE_STEPS)
+    v4 = fx.Vector.make_type(4, fx.Int32)
+    at = tok * XN_ROW + (c["lane"] // 16) * 16
+    return [
+        [
+            fx.ptr_load(c["xn_lds"] + (at + (st0 + i) * 64 + d * 4), result_type=v4)
+            for d in range(4)
+        ]
+        for i in range(UP_WAVE_STEPS)
+    ]
 
 
 # ---------------------------------------------------------------- router
@@ -407,12 +623,12 @@ def stage_router(c, task):
         )
         for ch in range(chunks)
     ]
-    await_x(c, s)
     tok = fx.min(lane % 16, s - 1)
-    xv = [
-        load_dev(c["xn"].value, (tok * HIDDEN + k0 + 16 * ch) // 2, 2)
-        for ch in range(chunks)
-    ]
+    # the norm's scale, published before XN: the router normalizes its own columns
+    got = c["mb"].poll([(c["rstd"], tok, 1)])
+    c["mb"].acquire(Space.SCRATCH)
+    rstd = got[0][0].bitcast(fx.Float32)
+    xv = [xn_words(c, tok, k0 + 16 * ch, rstd, 4) for ch in range(chunks)]
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for ch in range_constexpr(chunks):
         for h in range_constexpr(2):
@@ -428,7 +644,6 @@ def stage_router(c, task):
         tot = fx.Float32(0.0)
         for w in range_constexpr(WAVES):
             tot = tot + fx.ptr_load(red + (w * 64 * 4 + at))
-        # released: a routed up CTA reads XN through logit -> route -> table
         c["mb"].publish(
             c["logit"], (t * EXPERTS + tile * 16 + r) * ROUTER_PARTS + part, tot
         )
@@ -649,21 +864,25 @@ def x_operands(c, base, row, k_dwords, st0, steps):
 
 
 @flyc.jit
-def stage_up(c, u, j, weights=None, shared=False):
+def stage_up(c, u, j, weights, shared=False, nxt=None):
     """Slot u's tile pair j: gate rows 16 j .., up rows 768 + 16 j .. of its
     expert over this wave's K steps; waves summed in order; SwiGLU-OAI ->
-    bf16 ``MID[u][column][16 j ..]``, then UPF. ``shared``: the MXFP8 shared
-    expert's ``weights``."""
+    bf16 ``MID[u][column][16 j ..]``, then UPF. ``weights``: the pair's
+    ``up_weights`` (``shared``: the MXFP8 shared expert's). ``nxt``: the
+    routed unit after it; returns that unit's ``unit_weights``, issued past
+    this pair's X reads (loads return in order: from global memory, the GEMV
+    still waits on X only)."""
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     e = tab_ld(c, T_SLOT_E + u)
     cnt = slot_count(c, u)
     st0 = wave * UP_WAVE_STEPS
     rgs = [e * (2 * UP_TILES) + j, e * (2 * UP_TILES) + UP_TILES + j]
-    if const_expr(weights is None):
-        weights = up_weights(c, rgs, st0)
     wvs, svs = weights
     tok = tab_ld(c, T_SLOT_TOK + u * 16 + slot_col(c, cnt))
-    xs = x_operands(c, c["xn"].value, tok, HIDDEN // 2, st0, UP_WAVE_STEPS)
+    xs = xn_operands(c, tok, st0)
+    ahead = None
+    if const_expr(nxt is not None):
+        ahead = unit_weights(c, nxt)
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
     for i in range_constexpr(UP_WAVE_STEPS):
         for h in range_constexpr(2):
@@ -689,9 +908,24 @@ def stage_up(c, u, j, weights=None, shared=False):
             v = _swiglu(g, up).to(fx.BFloat16)
             store16(c["mid"].value, (u * 16 + col) * INTER + j * 16 + r, v, "agent")
     flag_after_stores(c, c["upf"], u * UP_TILES + j, tid == 0)
+    return ahead
 
 
-def up_weights(c, rgs, st0, shared=False):
+def unit_weights(c, unit):
+    """Routed up unit ``unit``'s weights for this wave (``up_weights``); past
+    the last unit, zero-sized reads."""
+    total = (n_slots(c) - 1) * UP_TILES
+    live = unit < total
+    unit = fx.min(unit, total - 1)
+    u, j = 1 + unit // UP_TILES, unit % UP_TILES
+    e = tab_ld(c, T_SLOT_E + u)
+    rgs = [e * (2 * UP_TILES) + j, e * (2 * UP_TILES) + UP_TILES + j]
+    # a descriptor's size must be uniform: the unit is the CTA's
+    nbytes = fx.Int64(uniform(live.select(fx.Int32(-1), fx.Int32(0))))
+    return up_weights(c, rgs, c["wave"] * UP_WAVE_STEPS, nbytes=nbytes)
+
+
+def up_weights(c, rgs, st0, shared=False, nbytes=None):
     a = c["args"]
     if const_expr(shared):
         wvs = [
@@ -701,8 +935,14 @@ def up_weights(c, rgs, st0, shared=False):
             a16w8.scale_loads(a["s13s"], rg, HIDDEN, st0, UP_WAVE_STEPS) for rg in rgs
         ]
         return wvs, svs
-    wvs = [weight_loads(a["w13"], rg, HIDDEN, st0, UP_WAVE_STEPS) for rg in rgs]
-    svs = [scale_loads(a["s13"], rg, HIDDEN, st0, UP_WAVE_STEPS) for rg in rgs]
+    wvs = [
+        weight_loads(a["w13"], rg, HIDDEN, st0, UP_WAVE_STEPS, nbytes=nbytes)
+        for rg in rgs
+    ]
+    svs = [
+        scale_loads(a["s13"], rg, HIDDEN, st0, UP_WAVE_STEPS, nbytes=nbytes)
+        for rg in rgs
+    ]
     return wvs, svs
 
 
@@ -722,24 +962,64 @@ def down_slot(c, u, tasks, shared=False):
     cnt = slot_count(c, u)
     c["mb"].poll([(c["upf"], u * UP_TILES + fx.min(lane, UP_TILES - 1), 1)])
     c["mb"].acquire(Space.SCRATCH)
+    k = (u - wave) // WAVES
     # a lane's MID loads span tiles other lanes polled
-    wave_sync(c["tab"] + (T_WAVE + wave), 64 * ((u - wave) // WAVES + 1))
+    wave_sync(c["tab"] + (T_WAVE + wave), 64 * (2 * k + 1))
+    stage_slot_mid(c, u, cnt)
+    # and its B reads span chunks other lanes stored
+    wave_sync(c["tab"] + (T_WAVE + wave), 64 * (2 * k + 2))
     col = slot_col(c, cnt)
-    xs = x_operands(c, c["mid"].value, u * 16 + col, INTER // 2, 0, K2_STEPS)
     pick = tab_ld(c, T_SLOT_PICK + u * 16 + col)
-    for ti in range_constexpr(len(tasks)):
-        acc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for i in range_constexpr(K2_STEPS):
+    v4 = fx.Vector.make_type(4, fx.Int32)
+    at = fx.max(fx.min(pick, picks(c["S"]) - 1), 0) * XMID_ROW + (lane // 16) * 16
+    accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in tasks]
+    for i in range_constexpr(K2_STEPS):
+        # a step's B at a time, each task's MFMA chain in its order
+        xs = [
+            fx.ptr_load(c["xmid"] + (at + i * 64 + d * 4), result_type=v4)
+            for d in range(4)
+        ]
+        for ti in range_constexpr(len(tasks)):
             if const_expr(shared):
-                acc = a16w8.step_mfma(acc, wvs[ti][i], svs[ti][i], xs[i])
+                accs[ti] = a16w8.step_mfma(accs[ti], wvs[ti][i], svs[ti][i], xs)
             else:
-                acc = step_mfma(acc, wvs[ti][i], scale_f32(svs[ti], rgs[ti], i), xs[i])
+                sc = scale_f32(svs[ti], rgs[ti], i)
+                accs[ti] = step_mfma(accs[ti], wvs[ti][i], sc, xs)
+    for ti in range_constexpr(len(tasks)):
+        acc = accs[ti]
         if lane % 16 < cnt:
             for q in range_constexpr(4):
                 fx.ptr_store(
                     acc[q],
                     c["contrib"] + ((ti * 80 + pick) * 16 + 4 * (lane // 16) + q),
                 )
+
+
+@flyc.jit
+def stage_slot_mid(c, u, cnt):
+    """Slot u's ``cnt`` MID columns -> LDS ``XMID[pick]``, a 16-byte chunk a
+    lane a load, every load out before a store: each lane loading its own B
+    would repeat the last column's ``16 - cnt`` times."""
+    s, lane = c["S"], c["lane"]
+    row = INTER // 8
+    n = cnt * row
+    iters = -(-s * row // 64)
+    # six loads out at a time: the slot's down weights hold most registers
+    for b in range_constexpr(0, iters, 6):
+        words = []
+        for i in range_constexpr(b, min(b + 6, iters)):
+            w = fx.Vector(_llvm.mlir_undef(T.vec(4, T.i32)))
+            if i * 64 < n:
+                v = fx.min(lane + 64 * i, n - 1)
+                at = (u * 16 + v // row) * (INTER // 2) + v % row * 4
+                w = load_dev(c["mid"].value, at, 4)
+            words.append(w)
+        for i in range_constexpr(b, min(b + 6, iters)):
+            if i * 64 < n:
+                v = fx.min(lane + 64 * i, n - 1)
+                pick = tab_ld(c, T_SLOT_PICK + u * 16 + v // row)
+                at = pick * XMID_ROW + v % row * 4
+                fx.ptr_store(words[i - b], c["xmid"] + at)
 
 
 @flyc.jit
@@ -848,10 +1128,17 @@ def run_ffn(c, bid):
         stage_up(c, 0, sh, weights, shared=True)
     stamp(c, 6)
     load_table(c)
-    stamp(c, 7)
     total = (n_slots(c) - 1) * UP_TILES
-    for unit in range(first_task(bid, ROUTED0), total, BLOCKS):
-        stage_up(c, 1 + unit // UP_TILES, unit % UP_TILES)
+    first = first_task(bid, ROUTED0)
+    weights = unit_weights(c, first)
+    # the router no longer orders XN before the table; a shared CTA has it in LDS
+    if sh >= UP_TILES:
+        await_x(c, s)
+    stamp(c, 7)
+    for unit in range(first, total, BLOCKS):
+        weights = stage_up(
+            c, 1 + unit // UP_TILES, unit % UP_TILES, weights, nxt=unit + BLOCKS
+        )
     stamp(c, 8)
     if bid < DOWN_TASKS - BLOCKS:
         stage_down(c, [bid, bid + BLOCKS])
@@ -888,10 +1175,13 @@ def build_ffn(key: FfnBuild):
         red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
         tab: fx.Array[fx.Int32, T_WORDS, 16]
         contrib: fx.Array[fx.Float32, 2 * 80 * 16, 16]
+        # XN while the up stage reads it (``XN_LDS_TOKENS``), then the down
+        # stage's MID columns (``stage_slot_mid``)
+        pool: fx.Array[fx.Int32, pool_words(s), 16]
 
     @flyc.kernel(name=kernel_name(key), known_block_size=[THREADS, 1, 1])
     def kffn(
-        part: Int64,
+        attn: Int64,
         res_in: Int64,
         res_out: Int64,
         out: Int64,
@@ -907,6 +1197,8 @@ def build_ffn(key: FfnBuild):
         s13s: Int64,
         w2s: Int64,
         s2s: Int64,
+        wo: Int64,
+        wos: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -950,11 +1242,15 @@ def build_ffn(key: FfnBuild):
                     "red": lds.red.ptr,
                     "tab": lds.tab.ptr,
                     "contrib": lds.contrib.ptr,
+                    "xn_lds": lds.pool.ptr if s <= XN_LDS_TOKENS else None,
+                    "xmid": lds.pool.ptr,
+                    "pool": lds.pool.ptr,
+                    "fpool": fx.recast_iter(fx.Float32, lds.pool.ptr),
                     "own": preg(sym + par, 0, "peer"),
                     "half_words": half // 8,
                     "peer": [preg(b + par, 0, "peer") for b in raw],
                     "args": {
-                        "part": part,
+                        "attn": attn,
                         "res_in": res_in,
                         "res_out": res_out,
                         "out": out,
@@ -970,6 +1266,8 @@ def build_ffn(key: FfnBuild):
                         "s13s": s13s,
                         "w2s": w2s,
                         "s2s": s2s,
+                        "wo": wo,
+                        "wos": wos,
                     },
                 }
                 for region, (off, _) in layout.items():
@@ -981,7 +1279,7 @@ def build_ffn(key: FfnBuild):
 
     @flyc.jit
     def launch(
-        part: Int64,
+        attn: Int64,
         res_in: Int64,
         res_out: Int64,
         out: Int64,
@@ -997,6 +1295,8 @@ def build_ffn(key: FfnBuild):
         s13s: Int64,
         w2s: Int64,
         s2s: Int64,
+        wo: Int64,
+        wos: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -1007,7 +1307,7 @@ def build_ffn(key: FfnBuild):
     ):
         _ = keyed
         kffn(
-            part,
+            attn,
             res_in,
             res_out,
             out,
@@ -1023,6 +1323,8 @@ def build_ffn(key: FfnBuild):
             s13s,
             w2s,
             s2s,
+            wo,
+            wos,
             scratch,
             sym,
             peers,

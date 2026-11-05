@@ -8,7 +8,8 @@ finish with no error word set and the same output (the TP sums run in rank order
 ``--compare-shuffled``: a sparse-attention or dense launch on AITER-shuffled FP8
 weights equals the row-major one bitwise; ``--check-routing``: the top-8 equals
 SGLang's on keys that tie in bf16; ``--check-keys``: rows past 2048 tokens attend to
-the selected pools and then their tail, as SGLang's kpool top-k selects;
+the selected pools (the 512 best of a torch scoring) and then their tail, as SGLang's
+kpool top-k selects;
 ``--check-dense``: the dense MLP's output against an f32 MLP on the launch's own FFN
 input; ``--check-embed``: the launch from the tokens equals the dense launch on the
 gathered embedding rows, and writes the spec's step tables (``--step-rows``: the
@@ -668,7 +669,8 @@ def check_keys(args, rank, tp, group, device) -> bool:
     """Sparse-attention launches on rows past 2048 tokens. A scored row (more than 512
     complete pools) attends to the selected pools' 2048 tokens and then its tail (up to
     2051 keys), as SGLang's kpool top-k appends it: its selection holds 512 whole
-    distinct complete pools, then the tail tokens in order. Perturbing the MLA rows of
+    distinct complete pools, the 512 best of a torch scoring of the launch's index
+    query, then the tail tokens in order. Perturbing the MLA rows of
     the tokens a 2048-key selection gives up for the tail (its last selected pool's last
     positions) changes the row's output (negative control: a 2048-key selection never
     reads them); perturbing an unselected pool changes nothing. A row of 2051 tokens
@@ -680,7 +682,8 @@ def check_keys(args, rank, tp, group, device) -> bool:
     from sgl_amd_mono.glm53_flash.gfx950.layout import SEL_STRIDE
     from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
 
-    rows = len(KEY_LENS)
+    key_lens = [int(v) for v in args.lens.split(",")] if args.lens else list(KEY_LENS)
+    rows = len(key_lens)
     key = FlashBuild(
         rows=rows,
         tp=tp,
@@ -696,7 +699,7 @@ def check_keys(args, rank, tp, group, device) -> bool:
         rt, ffn_weights(rank, tp, device), 0, dsa=dsa_weights(rank, tp, device)
     )
     x, res, post, comb = layer_inputs(rows, device)
-    caches, table, pt = dsa_caches(rows, device, list(KEY_LENS))
+    caches, table, pt = dsa_caches(rows, device, key_lens)
 
     def run(kv):
         c = replace(
@@ -709,13 +712,17 @@ def check_keys(args, rank, tp, group, device) -> bool:
         out = op.launch(x, res, post, comb, caches=c, rows=table, page_table=pt)
         rt.advance_step()
         torch.cuda.synchronize()
-        sel = rt.scratch[rt.sc["tok_sel"] :].view(torch.int32)[: rows * SEL_STRIDE]
-        return out[1].clone(), sel.view(rows, SEL_STRIDE).clone()
+        sel = rt.scratch[rt.sc["tok_sel"] :].view(torch.int32)[: 2 * rows * SEL_STRIDE]
+        return out[1].clone(), sel.view(rows, SEL_STRIDE, 2).clone(), c.idx_cache
 
-    base, sel = run(caches.kv_cache.clone())
+    base, sel, idx = run(caches.kv_cache.clone())
+    pool_scores = index_scores(rt, rows, idx, pt)
+    # (token, launch tag) pairs; kv_ready holds this launch's tag
+    tags = rt.scratch[rt.sc["kv_ready"] :].view(torch.int32)[1 : 2 * rows : 2].clone()
+    sel, sel_tags = sel[..., 0], sel[..., 1]
     g = _gen(30, device)
     ok = True
-    for r, n in enumerate(KEY_LENS):
+    for r, n in enumerate(key_lens):
         bound, tail = n // KPOOL, n % KPOOL
         if bound <= TOPK_POOLS:
             victims, spare = [0], None
@@ -731,13 +738,17 @@ def check_keys(args, rank, tp, group, device) -> bool:
             tail_ok = sel[r, TOPK_TOKENS : TOPK_TOKENS + tail].tolist() == [
                 bound * KPOOL + i for i in range(tail)
             ]
+            tagged = bool((sel_tags[r, : TOPK_TOKENS + tail] == tags[r]).all())
+            missed, worse = off_top_pools(pool_scores(r, bound), ids)
+            top = missed == worse == 0
             print(
                 f"rank {rank} row {r} ({n} tokens): 512 whole distinct pools "
-                f"{whole and distinct}, tail {tail_ok}",
+                f"{whole and distinct}, tail {tail_ok}, tagged {tagged}, the torch "
+                f"top-512 {top} ({missed} better pools missed, {worse} worse picked)",
                 flush=True,
             )
-            ok = ok and whole and distinct and tail_ok
-            victims = picked[TOPK_TOKENS - tail : TOPK_TOKENS].tolist()
+            ok = ok and whole and distinct and tail_ok and tagged and top
+            victims = picked[TOPK_TOKENS - max(tail, 1) : TOPK_TOKENS].tolist()
             unpicked = sorted(set(range(bound)) - set(ids.tolist()))
             spare = unpicked[0] * KPOOL
         kv = caches.kv_cache.clone()
@@ -766,6 +777,52 @@ def check_keys(args, rank, tp, group, device) -> bool:
             ok = ok and still
     rt.close()
     return ok
+
+
+def index_scores(rt, rows, idx, pt):
+    """``scores(r, bound)``: f64 index scores of row r's complete pools from the
+    launch's FP8 query and head weights and the index cache it read, as the kernel
+    defines them: scale(pool) * sum_h w_h * relu(q_h . k_pool)."""
+    from sgl_amd_mono.glm53_flash.gfx950.config import INDEX_DIM, INDEX_HEADS, KPOOL
+
+    def words(name, n):
+        return rt.scratch[rt.sc[name] :].view(torch.int32)[: 2 * n].view(n, 2)[:, 0]
+
+    f8 = torch.float8_e4m3fn
+    QW = INDEX_HEADS * INDEX_DIM // 4
+    q = words("iq8", rows * QW).contiguous().view(torch.uint8).view(f8)
+    q = q.double().view(rows, INDEX_HEADS, INDEX_DIM)
+    w = words("iqw", rows * INDEX_HEADS).contiguous().view(torch.float32).double()
+    w = w.view(rows, INDEX_HEADS)
+    device = idx.device
+    off = torch.arange(64, device=device)[:, None]
+    d = torch.arange(INDEX_DIM, device=device)[None, :]
+    perm = ((off // 16) * 2048 + (d // 16) * 256 + (off % 16) * 16 + d % 16).reshape(-1)
+    keys = idx[:, perm].view(f8).view(-1, 64, INDEX_DIM)
+    scale = idx[:, 64 * INDEX_DIM :].contiguous().view(torch.float32)
+
+    def scores(r, bound):
+        p = torch.arange(bound, device=device)
+        page = pt[r, p * KPOOL // 64].long() // 4
+        k = keys[page, p % 64].double()
+        s = (k @ q[r].T).clamp_min(0) @ w[r]
+        return s * scale[page, p % 64].double()
+
+    return scores
+
+
+def off_top_pools(ref, ids):
+    """(pools above the 512th best of ``ref`` that ``ids`` misses, picked pools below
+    it): a pool within the f32 rounding of the 512th best counts either way."""
+    from sgl_amd_mono.glm53_flash.gfx950.config import TOPK_POOLS
+
+    kth = ref.topk(TOPK_POOLS).values[-1]
+    tol = 1e-5 * ref.abs().max()
+    picked = torch.zeros_like(ref, dtype=torch.bool)
+    picked[ids] = True
+    missed = int((~picked & (ref > kth + tol)).sum())
+    worse = int((picked & (ref < kth - tol)).sum())
+    return missed, worse
 
 
 KINDS = ("ffn", "kda", "dsa", "dense", "embed", "head")
@@ -1117,6 +1174,7 @@ def writes_only_its_rows(extra: dict, before: dict) -> bool:
 
 
 def main() -> int:
+    global MAX_LEN
     from sgl_amd_mono.common import guard
 
     ap = argparse.ArgumentParser()
@@ -1124,7 +1182,10 @@ def main() -> int:
     ap.add_argument("--rows", type=int, default=4)
     ap.add_argument("--deadline", type=float, default=10.0)
     ap.add_argument("--launches", type=int, default=3)
-    ap.add_argument("--max-pools", type=int, default=MAX_LEN // 4)
+    ap.add_argument(
+        "--max-len", type=int, default=MAX_LEN, help="a row's tokens at most"
+    )
+    ap.add_argument("--max-pools", type=int, default=0, help="default: --max-len / 4")
     ap.add_argument("--lens", type=str, default="", help="comma-separated row lengths")
     ap.add_argument("--compare-shuffled", action="store_true")
     ap.add_argument("--check-routing", action="store_true")
@@ -1140,6 +1201,8 @@ def main() -> int:
         "--writes", action="store_true", help="check the rows a launch writes"
     )
     args = ap.parse_args()
+    MAX_LEN = args.max_len
+    args.max_pools = args.max_pools or MAX_LEN // 4
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", torch.cuda.current_device())

@@ -23,15 +23,16 @@ STEP = 128  # K a lane group covers in one 16-byte weight load
 STEP_DWORDS = 256  # a 16-row group's dwords per step
 
 
-def weight_loads(w, row_group, k, st0, steps, cm=CM_NT):
+def weight_loads(w, row_group, k, st0, steps, cm=CM_NT, nbytes=None):
     """Lane's 16-byte weight words of 16-row group ``row_group`` (counted over
-    the flattened ``[E N]`` rows) for steps ``st0 ..``; loads only."""
+    the flattened ``[E N]`` rows) for steps ``st0 ..``; loads only. ``nbytes``:
+    the buffer's size (0: zeros, nothing read)."""
     lane = fx.thread_idx.x % 64
     base = row_group * (2 * k) + lane * 4
     return [
         fx.Vector(
             bo.buffer_load(
-                rsrc(w),
+                rsrc(w, nbytes),
                 base + (st0 + i) * STEP_DWORDS,
                 vec_width=4,
                 dtype=T.i32,
@@ -42,7 +43,7 @@ def weight_loads(w, row_group, k, st0, steps, cm=CM_NT):
     ]
 
 
-def scale_loads(ws, row_group, k, st0, steps, cm=CM_NT):
+def scale_loads(ws, row_group, k, st0, steps, cm=CM_NT, nbytes=None):
     """Lane's scale dwords for steps ``st0 .. st0 + steps`` (st0, steps even)."""
     lane = fx.thread_idx.x % 64
     c8 = k // 256
@@ -50,7 +51,7 @@ def scale_loads(ws, row_group, k, st0, steps, cm=CM_NT):
     return [
         fx.Int32(
             bo.buffer_load(
-                rsrc(ws),
+                rsrc(ws, nbytes),
                 base + (st0 // 2 + i) * 64,
                 vec_width=1,
                 dtype=T.i32,

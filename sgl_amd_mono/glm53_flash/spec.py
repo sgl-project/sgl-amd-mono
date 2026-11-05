@@ -76,6 +76,7 @@ SGLANG_READS = {
         "enable_linear_replayssm",
         "enable_hisparse",
         "expert_distribution_recorder_mode",
+        "watchdog_timeout",
     ),
     "srt/configs/glm5_next.py": (
         "num_hidden_layers",
@@ -102,6 +103,7 @@ SGLANG_READS = {
         "_track_mamba_state_decode(ssm_states)",
         "_track_mamba_state_decode(cache_indices)",
         "_track_mamba_state_decode(layer_id)",
+        "state_layer_cache",
     ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
@@ -121,7 +123,6 @@ SGLANG_READS = {
         "final_logit_softcapping",
     ),
     "srt/mem_cache/memory_pool.py": (
-        "mamba2_layer_cache",
         "conv",
         "temporal",
         "get_key_buffer",
@@ -132,11 +133,13 @@ SGLANG_READS = {
         "out_cache_loc",
         "req_pool_indices",
         "capture_hidden_mode",
+    ),
+    # ForwardMode and CaptureHiddenMode, in forward_batch_info.py before forward_mode.py
+    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
         "need_capture",
     ),
     "srt/model_executor/forward_context.py": (
         "get_attn_backend",
-        "get_req_to_token_pool",
         "get_token_to_kv_pool",
     ),
     "srt/models/deepseek_v2.py": ("indexer",),
@@ -165,6 +168,7 @@ SGLANG_READS = {
         "copies",
     ),
     "srt/runtime_context.py": (
+        "get_device",
         "get_parallel",
         "process_model_config",
         '"tp_rank"',
@@ -523,7 +527,7 @@ class _Built:
             hidden = self.model.embed_tokens(input_ids[:S]) if L.i == 0 else streams
             ref = check.reference(L, positions, hidden, forward_batch, S, idx[:S])
         if L.kda:
-            self._bind_kda(L)
+            self._bind_kda(L, backend.linear_attn_backend)
             out = op.launch(*ins, state=L.state, state_idx=idx, step=step)
             backend.linear_attn_backend._track_mamba_state_decode(
                 forward_batch, L.state.conv_state, L.state.rec_state, slots, L.i
@@ -540,14 +544,12 @@ class _Built:
         return _Owed(*out)
 
     @staticmethod
-    def _bind_kda(L: _Layer) -> None:
-        from sglang.srt.model_executor.forward_context import get_req_to_token_pool
-
+    def _bind_kda(L: _Layer, kda) -> None:
         from sgl_amd_mono.glm53_flash.gfx950.runner import (
             FlashKdaState,
         )
 
-        cache = get_req_to_token_pool().mamba2_layer_cache(L.i)
+        cache = kda.state_layer_cache(L.i)
         conv, rec = cache.conv[0], cache.temporal
         if L.state is not None and (
             L.state.conv_state.data_ptr() == conv.data_ptr()
@@ -632,6 +634,15 @@ class _Built:
         L.caches = FlashDsaCaches(
             kv_cache=kv, idx_cache=idx, tail_k=tail_k, tail_g=tail_g
         )
+
+
+def _deadline(key, deadline_s: float, longest_s: int) -> float:
+    """A step's first launch waits up to half the watchdog, at most ``longest_s``."""
+    from sglang.srt.runtime_context import get_device
+
+    if not key.tokens:
+        return deadline_s
+    return min(max(deadline_s, 0.5 * get_device().watchdog_timeout), longest_s)
 
 
 def _build(model, hf_config, ctx) -> _Built:
@@ -725,7 +736,10 @@ def _build(model, hf_config, ctx) -> _Built:
 
     def runtime(key):
         rt = FlashRuntime(key, rank, p.tp_group.cpu_group, device)
-        rt.set_deadline(ctx.deadline_s)
+        # at most the guard's longest deadline, in whole seconds
+        rt.set_deadline(
+            _deadline(key, ctx.deadline_s, guard.MAX_DEADLINE_TICKS // guard.CLOCK_HZ)
+        )
         return rt
 
     # each runtime's peer handshake is collective: every rank builds them in one order

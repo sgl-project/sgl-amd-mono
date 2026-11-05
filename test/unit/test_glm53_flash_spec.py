@@ -4,6 +4,7 @@ cap, the tail's logits in place of the logits processor's, its registry entry, i
 config and model refusal reasons, and the dense, embedding and LM-head views. SGLang
 checks its declared requirements, the same way for every spec."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -122,24 +123,6 @@ def test_the_logits_processor_returns_the_tail_s_logits_on_a_routed_step():
     assert torch.equal(lp._get_logits(h, None, None), torch.arange(6.0).view(3, 2))
 
 
-def test_the_spec_needs_aiters_grouped_topk(monkeypatch):
-    # the kernel's router ties follow AITER's grouped top-k; SGLang's JIT grouped
-    # top-k (a Triton gate) keeps the lower expert id, so the spec requires it off.
-    # SGLang refuses a spec whose required env value differs from envs' value.
-    from sglang.srt.environ import envs
-
-    def unmet():
-        req = flash.SPEC.requires.env
-        return [name for name, want in req.items() if getattr(envs, name).get() != want]
-
-    name = "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK"
-    assert flash.SPEC.requires.env[name] is False
-    monkeypatch.delenv(name, raising=False)
-    assert unmet() == []
-    monkeypatch.setenv(name, "1")
-    assert unmet() == [name]
-
-
 def _cfg(**kw):
     return SimpleNamespace(**{"page_size": 256, **kw})
 
@@ -191,6 +174,13 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
     ):
         assert want in joined, joined
     assert len(reasons) == 7, reasons
+
+
+def test_the_spec_requires_sglang_jit_grouped_topk_off():
+    # the kernel's router ties follow AITER's grouped top-k; SGLang's JIT grouped
+    # top-k (a Triton gate) keeps the lower expert id, so the spec requires it off
+    # (SGLang refuses a setup against a spec's declared env)
+    assert flash.SPEC.requires.env["SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK"] is False
 
 
 def _layer(kda=True, shuffled=True, scale_dims=3, fused=True, indexer=True):
@@ -432,6 +422,36 @@ def test_the_check_rejects_an_output_it_does_not_list():
 
     with pytest.raises(ValueError, match="dense.mlp_out.rel"):
         check._report("layer 1", {"dense.mlp_out.rel": 0.0})
+
+
+def test_a_step_s_first_launch_waits_up_to_half_the_watchdog(monkeypatch):
+    import sglang.srt.runtime_context as runtime_context
+
+    try:
+        from sglang.srt.kernel_plugins.amd.binding import deadline_s
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.monokernels.guards import deadline_s
+
+    first, other = SimpleNamespace(tokens=True), SimpleNamespace(tokens=False)
+    longest = 5497  # the guard's longest deadline, in whole seconds
+    # SGLang's default watchdog, the serving test's and the fault test's; a watchdog
+    # past twice the longest deadline, and none
+    cases = (
+        (300, 150.0),
+        (600, 300.0),
+        (20, 10.0),
+        (11100, longest),
+        (math.inf, longest),
+    )
+    for watchdog, entry in cases:
+        monkeypatch.setattr(
+            runtime_context,
+            "get_device",
+            lambda w=watchdog: SimpleNamespace(watchdog_timeout=w),
+        )
+        deadline = deadline_s(watchdog)
+        assert flash._deadline(first, deadline, longest) == entry
+        assert flash._deadline(other, deadline, longest) == deadline
 
 
 class _Op:

@@ -38,10 +38,11 @@ import flydsl.expr as fx
 import msgspec
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, T
+from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol, spin_until
@@ -107,6 +108,8 @@ from .config import (
 )
 from .layout import (
     BASE_SPLITS,
+    BOX_LINE,
+    BOX_WORDS,
     DSA_TAB,
     DUG_TILE,
     FGB_TILE,
@@ -136,6 +139,7 @@ from .layout import (
     UK_TILE,
     UV_TILE,
     XQ_GROUPS,
+    box_lines,
     dn_tile,
     down_prefetch_batch,
     down_x_words,
@@ -338,6 +342,9 @@ def build_flash_kernel(key: FlashBuild):
     SHARED = SHARED_EXPERT
     G = BLOCKS
     SC, SY = layout(S, W, expert_inter, kda, dsa, max_pools, dense, head, tokens)
+    # producers of each box: the gates' rows and the kda heads
+    BOXES = {"box_a_in": S, "box_a": S, "box_o_in": S * H}
+    assert not kda or (S * H % BOX_WORDS == 0 and box_lines(S * H) <= WAVES)
     DN_TILE = dn_tile(S)
     N_DN_TILES = HIDDEN // DN_TILE
     # a routed up/gate task: 32 intermediate values (one MXFP8 block of mid), its gate
@@ -528,6 +535,12 @@ def build_flash_kernel(key: FlashBuild):
                 fx.BFloat16(bo.buffer_load(r, i, vec_width=1, dtype=T.bf16))
             )
 
+        def ld_bf16s(r, elem, n):
+            """bf16 elements elem .. elem + n - 1 (n of 4 or 8, elem a multiple of n)
+            of a plain tensor -> n f32, in one load."""
+            w = fx.Vector(bo.buffer_load(r, elem // 2, vec_width=n // 2, dtype=T.i32))
+            return [v for e in range(n // 2) for v in bf2_f32(w[e])]
+
         def ld_pair(r, elem):
             """bf16 elements elem, elem + 1 (elem even) of a plain tensor -> 2 f32."""
             return bf2_f32(
@@ -663,6 +676,78 @@ def build_flash_kernel(key: FlashBuild):
 
         def get(base_addr, i):
             return poll([(base_addr, i, 1)])[0][0]
+
+        # ---- boxes: a consumer CTA polls its own lines, a word a producer
+        def sloads(loads):
+            """Scalar glc loads of [(wave-uniform address, n words)], n of 1, 2, 4, 8
+            or 16, issued together. They count in lgkmcnt, so they do not wait
+            behind the CU's vector loads."""
+            types = [T.i32 if n == 1 else T.vec(n, T.i32) for _, n in loads]
+            k = len(loads)
+            asm = "\n".join(
+                ["s_nop 4"]
+                + [
+                    f"s_load_dword{'' if n == 1 else f'x{n}'} ${i}, ${k + i}, 0x0 glc"
+                    for i, (_, n) in enumerate(loads)
+                ]
+                + ["s_waitcnt lgkmcnt(0)"]
+            )
+            res = llvm.inline_asm(
+                types[0] if k == 1 else llvm.StructType.get_literal(types),
+                [as_ir_value(fx.Int64(a)) for a, _ in loads],
+                asm,
+                ",".join(["=&s"] * k + ["s"] * k),
+                has_side_effects=True,
+            )
+            words = []
+            for i, (_, n) in enumerate(loads):
+                v = res if k == 1 else llvm.extractvalue(types[i], res, [i])
+                words += (
+                    [fx.Int32(v)] if n == 1 else [fx.Vector(v)[e] for e in range(n)]
+                )
+            return words
+
+        def box_line(box, slot, line):
+            return mb(box) + fx.Int64((slot * box_lines(BOXES[box]) + line) * BOX_LINE)
+
+        def signal(box, p):
+            """Producer ``p``'s tag into its word of every CTA's line of ``box``; the
+            calling wave stores them, a lane a CTA."""
+            r = _rsrc(mb(box))
+            for i in range_constexpr(G // 64):
+                c = lane + 64 * i
+                line = c * box_lines(BOXES[box]) + p // BOX_WORDS
+                bo.buffer_store(
+                    tag,
+                    r,
+                    line * (BOX_LINE // 4) + p % BOX_WORDS,
+                    cache_modifier=CM_DEV,
+                )
+
+        def await_box(box, words):
+            """Wait (guarded) until this CTA's ``words`` = [(line, first word, count)]
+            of ``box`` all hold the launch's tag: one scalar load a line."""
+            loads = []
+            for line, w0, cnt in words:
+                n = 1 << (cnt - 1).bit_length()
+                assert n <= BOX_WORDS
+                loads.append((box_line(box, bid, line) + fx.Int64(w0 * 4), n, cnt))
+
+            def load_all():
+                return fx.Vector.from_elements(
+                    sloads([(a, n) for a, n, _ in loads]), fx.Int32
+                )
+
+            def pending(v):
+                acc, e = fx.Int32(0), 0
+                for _, n, cnt in loads:
+                    for q in range_constexpr(cnt):
+                        acc = acc | (v[e + q] ^ tag)
+                    e += n
+                return acc != 0
+
+            with guard.scope(launch_guard):
+                spin_until(load_all, pending)
 
         def getf_many(specs):
             """[(base, i)] single pairs -> list of f32."""
@@ -1373,11 +1458,15 @@ def build_flash_kernel(key: FlashBuild):
         # misc words of the mix scales (3) and biases (N_MIX), past the mix sums
         SCW = 32
         HBW = SCW + 4
+        # a row's mix partials (every tile's), staged in LDS words 0 .. PM_WORDS
+        PM_WORDS = N_ROW_TILES * PMIX
+        PM_LOADS = PM_WORDS // 2
+        assert PM_WORDS % 2 == 0 and PM_WORDS + HBW + N_MIX <= X_WORDS
 
         def gate_early():
             """The attention gate's constants, loaded at launch start: this thread's norm
             weights, a mix scale and a mix bias (clamped thread indices)."""
-            gam = [ld_bf16(_rsrc(g_in), tid * CPT + q) for q in range(CPT)]
+            gam = ld_bf16s(_rsrc(g_in), tid * CPT, CPT)
             sc = ld_f32(_rsrc(hc_a_scale), fx.min(tid, 2))
             bs = ld_f32(_rsrc(hc_a_base), fx.min(tid, N_MIX - 1))
             return gam, sc, bs
@@ -1399,7 +1488,7 @@ def build_flash_kernel(key: FlashBuild):
                 if tid < N_MIX:
                     lds_st(sums, HBW + tid, bs)
             else:
-                gam = [ld_bf16(r_g, tid * CPT + q) for q in range(CPT)]
+                gam = ld_bf16s(r_g, tid * CPT, CPT)
                 if tid < 3:
                     lds_st(sums, SCW + tid, ld_f32(r_scale, tid))
                 if tid < N_MIX:
@@ -1417,18 +1506,22 @@ def build_flash_kernel(key: FlashBuild):
                     for q in range(CPT // 4)
                 ]
             )
+            # every tile's mix partials of the row -> LDS words 0 .., two pairs a load
+            pm = [
+                fx.min(tid + i * THREADS, PM_LOADS - 1)
+                for i in range(-(-PM_LOADS // THREADS))
+            ]
+            got_pm = poll([(pmix, s * N_ROW_TILES * PMIX + 2 * q, 2) for q in pm])
+            for i, q in enumerate(pm):
+                for e in range_constexpr(2):
+                    lds_st(xs, 2 * q + e, got_pm[i][e].bitcast(fx.Float32))
+            gpu.barrier()
             if tid < PMIX * NP:
                 k = tid // NP
                 part = tid % NP
-                vals = getf_many(
-                    [
-                        (pmix, (s * N_ROW_TILES + part * TPP + q) * PMIX + k)
-                        for q in range(TPP)
-                    ]
-                )
-                tot = vals[0]
+                tot = lds_ld(xs, part * TPP * PMIX + k)
                 for q in range_constexpr(1, TPP):
-                    tot = tot + vals[q]
+                    tot = tot + lds_ld(xs, (part * TPP + q) * PMIX + k)
                 lds_st(red, k * NP + part, tot)
             gpu.barrier()
             if tid < PMIX:
@@ -1471,15 +1564,26 @@ def build_flash_kernel(key: FlashBuild):
                 li, rstd, gam, rinv = gate_row(
                     stage, "aseam" if attn else "seam", s, attn, misc, early
                 )
-                for q in range_constexpr(CPT // 2):
-                    put(
-                        a_out,
-                        (s * HIDDEN + tid * CPT + 2 * q) // 2,
-                        bf16_pair(
-                            li[2 * q] * rstd * gam[2 * q],
-                            li[2 * q + 1] * rstd * gam[2 * q + 1],
-                        ),
+                pairs = [
+                    bf16_pair(
+                        li[2 * q] * rstd * gam[2 * q],
+                        li[2 * q + 1] * rstd * gam[2 * q + 1],
                     )
+                    for q in range(CPT // 2)
+                ]
+                if const_expr(attn):
+                    # plain words, released by their drain before the box word
+                    bo.buffer_store(
+                        fx.Vector.from_elements(
+                            [p.bitcast(fx.Int32) for p in pairs], fx.Int32
+                        ),
+                        _rsrc(a_out),
+                        (s * HIDDEN + tid * CPT) // 2,
+                        cache_modifier=CM_DEV,
+                    )
+                else:
+                    for q in range_constexpr(CPT // 2):
+                        put(a_out, (s * HIDDEN + tid * CPT + 2 * q) // 2, pairs[q])
                 if const_expr(not attn and not dense):
                     # the row's MXFP8 blocks for the experts: a 32-value block is 4
                     # threads' values (as rounded to bf16 in the row)
@@ -1499,10 +1603,12 @@ def build_flash_kernel(key: FlashBuild):
                         )
                     if tid % (32 // CPT) == 0:
                         put(mb("xqs"), s * XQ_GROUPS + tid // (32 // CPT), exponent)
-                # the row's ready flag, after every thread's stores of it
+                # the row's word in every CTA's box, after every thread's stores of it
+                if const_expr(attn):
+                    rocdl.s_waitcnt(vmcnt=0)
                 gpu.barrier()
-                if tid == 0:
-                    put(mb("a_in_rdy" if attn else "a_rdy"), s, fx.Int32(1))
+                if _uniform(wave) == 0:
+                    signal("box_a_in" if attn else "box_a", s)
                 if wave == 0:
                     # lane l of each 16-lane row holds comb[l // 4][l % 4]: a row is a
                     # quad, a column one lane of each quad; sums keep the serial order
@@ -1607,13 +1713,37 @@ def build_flash_kernel(key: FlashBuild):
                     for j in range_constexpr(2):
                         lds_st(xs, q * 2 + j, v[j].bitcast(fx.Float32))
 
-        def wait_ready(rdy, rows):
-            """One lane polls the ready flags of ``rows`` (a broadcast row's flag is
-            set after its stores), so the payload's own poll is read once; the
-            barrier holds the other waves."""
-            if wave == 0:
-                if lane == 0:
-                    poll([(rdy, r, 1) for r in rows])
+        def stage_plain(base, K):
+            """``stage_rows`` for a mailbox of plain words (packed bf16 pairs) its box
+            releases: one read, 16 bytes a load."""
+            nl = S * K // 8 // THREADS
+            assert nl * THREADS * 8 == S * K
+            r = _rsrc(base)
+            for g0 in range_constexpr(0, nl, STAGE_GROUP):
+                group = range(g0, min(g0 + STAGE_GROUP, nl))
+                got = [
+                    fx.Vector(
+                        bo.buffer_load(
+                            r,
+                            (tid + i * THREADS) * 4,
+                            vec_width=4,
+                            dtype=T.i32,
+                            cache_modifier=CM_DEV,
+                        )
+                    )
+                    for i in group
+                ]
+                for k, i in enumerate(group):
+                    fx.ptr_store(
+                        got[k].bitcast(fx.Float32), xs + (tid + i * THREADS) * 4
+                    )
+
+        def wait_ready(box, row=None):
+            """Wave 0 waits for every row's word (or row ``row``'s) in this CTA's
+            line of ``box`` (a broadcast row's word is set after its stores), so the
+            payload's own poll is read once; the barrier holds the other waves."""
+            if _uniform(wave) == 0:
+                await_box(box, [(0, 0, S)] if row is None else [(0, row, 1)])
             gpu.barrier()
 
         # ===================== 3. merged q | k | v | beta | f_a | g_a projection
@@ -1658,8 +1788,8 @@ def build_flash_kernel(key: FlashBuild):
                 row0 = row0_of(t)
                 # the CTA's first task stages every row; a later task reuses them
                 if const_expr(k == 0):
-                    wait_ready(mb("a_in_rdy"), range(S))
-                    stage_rows(mb("a_in"), HIDDEN)
+                    wait_ready("box_a_in")
+                    stage_plain(mb("a_in"), HIDDEN)
                     gpu.barrier()
                 acc = run_units(lambda c: unit_of(row0, c), IN_CPW, IN_AHEAD, pre)
                 nxt = (
@@ -1724,10 +1854,14 @@ def build_flash_kernel(key: FlashBuild):
         # One task a (row, head). A row whose state index is not positive (padding)
         # writes no state and outputs zeros.
         QO, KO, VO, G1O, G2O, OO, DO = 0, KD, 2 * KD, 3 * KD, 4 * KD, 5 * KD, 6 * KD
-        # at 8 rows the new states are stored after the output, the conv inputs
-        # kept in LDS words XO .. until then
-        STATES_LAST = S > 4
-        XO = 7 * KD
+        # at 2 rows (TP4 and TP8: slower at TP2) a kda CTA runs its o_proj task right
+        # after the head's output, then stores the new states; at 8 rows the states also
+        # follow the output. The conv inputs wait in LDS words XO .. (with o_proj, past
+        # its staged rows)
+        OPROJ_IN_KDA = S <= 2 and W > 2
+        STATES_LAST = OPROJ_IN_KDA or S > 4
+        XO = X_WORDS - 3 * KD if OPROJ_IN_KDA else 7 * KD
+        assert not OPROJ_IN_KDA or XO >= max(7 * KD, S * P // 2)
 
         def conv_at(ch, j):
             """Element of channel ``ch``, tap ``j`` in a conv state slot, laid out
@@ -1736,7 +1870,9 @@ def build_flash_kernel(key: FlashBuild):
                 return ch * (CONV_TAPS - 1) + j
             return j * (3 * P) + ch
 
-        def run_kda():
+        def run_kda(then):
+            """``then``: the CTA's o_proj task, run between the head's output and its
+            state write-back with ``OPROJ_IN_KDA``."""
             r_cw = _rsrc(conv_w)
             r_alog = _rsrc(a_log)
             r_dtb = _rsrc(dt_bias)
@@ -1874,7 +2010,11 @@ def build_flash_kernel(key: FlashBuild):
                     y0 = o0 * rstd * won[0] * sigmoid(lds_ld(xs, G2O + e0))
                     y1 = o1 * rstd * won[1] * sigmoid(lds_ld(xs, G2O + e0 + 1))
                     put(mb("o_in"), (s * P + h * KD + e0) // 2, bf16_pair(y0, y1))
+                    # the head's word in every o_proj CTA's box, after its stores
+                    signal("box_o_in", t)
                 gpu.barrier()
+                if const_expr(OPROJ_IN_KDA):
+                    then()
                 if const_expr(STATES_LAST):
                     if valid:
                         store_rec()
@@ -1892,11 +2032,15 @@ def build_flash_kernel(key: FlashBuild):
         # One task a 16-row tile of the row-major [HIDDEN, K] weight; the FFN seam
         # sums the TP partials as it does vLLM's. ``unit_of(row0, chunk)`` issues
         # one K chunk (``cpw`` a wave, prefetched ``ahead`` at a time) of the weight.
-        def run_oproj(unit_of, K, cpw, ahead):
+        def run_oproj(unit_of, K, cpw, ahead, done=None):
+            """``done``: the CTA ran its task already (inside its kda task)."""
             attn_base = fx.Int64(SY["attn"]) + fx.Int64(peer_slot) * fx.Int64(
                 SY["_part_stride"]
             )
-            for t in range(start("oproj"), HIDDEN // O_TILE, G):
+            t0 = start("oproj")
+            if const_expr(done is not None):
+                t0 = done.select(fx.Int32(HIDDEN // O_TILE), t0)
+            for t in range(t0, HIDDEN // O_TILE, G):
                 t = fx.Int32(t)
                 row0 = t * O_TILE
 
@@ -1905,15 +2049,10 @@ def build_flash_kernel(key: FlashBuild):
 
                 pre = [u_o(c) for c in range(ahead)]
                 if const_expr(kda):
-                    # wave 0 waits for one pair in every 32 (a kda task writes whole
-                    # 64-pair heads), then every thread reads the payload
-                    if wave == 0:
-                        poll(
-                            [
-                                (mb("o_in"), (lane + 64 * i) * 32, 1)
-                                for i in range(S * K // 64 // 64)
-                            ]
-                        )
+                    # wave w waits for line w of the CTA's box (16 kda heads' words),
+                    # then every thread reads the payload
+                    if _uniform(wave) < box_lines(BOXES["box_o_in"]):
+                        await_box("box_o_in", [(_uniform(wave), 0, BOX_WORDS)])
                     gpu.barrier()
                 stage_rows(mb("o_in"), K)
                 gpu.barrier()
@@ -2109,8 +2248,8 @@ def build_flash_kernel(key: FlashBuild):
                     )
 
                 pre = [u8(c) for c in range(4)]
-                wait_ready(mb("a_in_rdy"), range(S))
-                stage_rows(mb("a_in"), HIDDEN)
+                wait_ready("box_a_in")
+                stage_plain(mb("a_in"), HIDDEN)
                 gpu.barrier()
                 acc = run_units(u8, QKV_CPW, 4, pre)
 
@@ -2144,8 +2283,8 @@ def build_flash_kernel(key: FlashBuild):
                     )
 
                 pre = [ub(c) for c in range(4)]
-                wait_ready(mb("a_in_rdy"), range(S))
-                stage_rows(mb("a_in"), HIDDEN)
+                wait_ready("box_a_in")
+                stage_plain(mb("a_in"), HIDDEN)
                 gpu.barrier()
                 acc = run_units(ub, IDX_CPW, 4, pre)
 
@@ -2173,7 +2312,7 @@ def build_flash_kernel(key: FlashBuild):
                 s = fx.Int32(t)
                 live = tid < NQ4
                 e0 = fx.min(tid, NQ4 - 1) * 4
-                gam = [ld_bf16(r_gqa, e0 + j) for j in range(4)]
+                gam = ld_bf16s(r_gqa, e0, 4)
                 v2 = get2_many(
                     [(mb("qa"), s * Q_LORA + e0), (mb("qa"), s * Q_LORA + e0 + 2)]
                 )
@@ -2613,8 +2752,19 @@ def build_flash_kernel(key: FlashBuild):
                 val = parts[0]
                 for e in range_constexpr(1, 4):
                     val = (e_w == e).select(parts[e], val)
-                if (e_w < 4) & (pw < n_pools):
-                    put(mb("iscores"), s * MAXP + pw, val * ksc)
+                # every lane stores, the others past num_records (dropped): FlyDSL's
+                # lowering merges a divergent store here with the first tile's, and
+                # the tile loop's MFMAs then run with the storing lanes off and
+                # overwrite their index (https://github.com/ROCm/FlyDSL/issues/1358)
+                keep = (e_w < 4) & (pw < n_pools)
+                bo.buffer_store(
+                    fx.Vector.from_elements(
+                        [(val * ksc).bitcast(fx.Int32), tag], fx.Int32
+                    ),
+                    _rsrc(mb("iscores"), S * MAXP * 8),
+                    keep.select(s * MAXP + pw, fx.Int32(S * MAXP)) * 2,
+                    cache_modifier=CM_DEV,
+                )
 
             for s in range_constexpr(S):
                 pos = row_word(s, ROW_POS)
@@ -2672,7 +2822,6 @@ def build_flash_kernel(key: FlashBuild):
         def dsa_iselect(tv, t32):
             hist = fx.recast_iter(fx.Int32, xs)
             r_scores = _rsrc(mb("iscores"))
-            r_sel = _rsrc(mb("tok_sel"))
 
             def radix_key(bits):
                 return (bits >= 0).select(bits ^ fx.Int32(-(2**31)), ~bits)
@@ -2856,23 +3005,21 @@ def build_flash_kernel(key: FlashBuild):
                                 )
 
                     def publish_all():
-                        """red[0 .. 512) holds the pools; write the row's tokens."""
+                        """red[0 .. 512) holds the pools; write the row's tokens, tagged."""
                         gpu.barrier()
                         for b in range_constexpr(TOPK_TOKENS // THREADS):
                             j = tid + b * THREADS
                             pool = lds_ld(red, j // KPOOL).bitcast(fx.Int32)
-                            bo.buffer_store(
-                                pool * KPOOL + j % KPOOL,
-                                r_sel,
+                            put(
+                                mb("tok_sel"),
                                 s * SEL_STRIDE + j,
-                                cache_modifier=CM_DEV,
+                                pool * KPOOL + j % KPOOL,
                             )
                         if tid < (pos + 1) - bound * KPOOL:
-                            bo.buffer_store(
-                                bound * KPOOL + tid,
-                                r_sel,
+                            put(
+                                mb("tok_sel"),
                                 s * SEL_STRIDE + TOPK_TOKENS + tid,
-                                cache_modifier=CM_DEV,
+                                bound * KPOOL + tid,
                             )
 
                     def candidates(level, prefix, remain, n_cand):
@@ -3099,12 +3246,6 @@ def build_flash_kernel(key: FlashBuild):
                             candidates(8, p24, r24, c24)
                         if c24 > SEL_CAP:
                             full_radix()
-                    # the tokens are device-scope stores: their completion releases
-                    # them
-                    rocdl.s_waitcnt(vmcnt=0)
-                    gpu.barrier()
-                    if tid == 0:
-                        put(mb("tok_ready"), s, fx.Int32(1))
 
         # ================= sparse MLA split: 64 selected keys x HT heads a task
         # Scored rows attend to the tokens the index selected plus their tail, other
@@ -3158,29 +3299,22 @@ def build_flash_kernel(key: FlashBuild):
                         )
 
                     kidx = t * SPLIT_KEYS + lane
-                    # A task that reads the selection waits for it: one lane polls the
-                    # selection's and the cache's flags; its divergent poll reconverges
-                    # before wave 0's acquire, and the barrier below orders the other
-                    # waves' loads after it. Any other task knows its tokens and
-                    # gathers them at once; of those only the row's own token (its
-                    # last key) is written by this launch's cache task, and it is read
-                    # again once kv_ready is in.
+                    # A task that reads the selection waits for it: wave 0 polls its 64
+                    # tagged tokens and the cache's flag together, then acquires; the
+                    # barrier below orders the other waves' loads after it. Any other task
+                    # knows its tokens and gathers them at once; of those only the row's
+                    # own token (its last key) is written by this launch's cache task, and
+                    # it is read again once kv_ready is in.
                     if picked_keys:
                         if wave == 0:
-                            if lane == 0:
-                                poll([(mb("tok_ready"), s, 1), (mb("kv_ready"), s, 1)])
+                            picked = poll(
+                                [
+                                    (mb("tok_sel"), s * SEL_STRIDE + kidx, 1),
+                                    (mb("kv_ready"), s, 1),
+                                ]
+                            )[0][0]
                             fx.memory_fence(
                                 ordering=fx.AtomicOrdering.Acquire, syncscope="agent"
-                            )
-                        if wave == 0:
-                            picked = fx.Int32(
-                                bo.buffer_load(
-                                    _rsrc(mb("tok_sel")),
-                                    s * SEL_STRIDE + kidx,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                    cache_modifier=CM_DEV,
-                                )
                             )
                             resolve((kidx < nk).select(picked, fx.Int32(0)))
                     else:
@@ -3597,7 +3731,7 @@ def build_flash_kernel(key: FlashBuild):
                         tile_task(k + 1, tile + G, nxt)
 
             pre = ahead(t0)
-            gam = [ld_bf16(r_g, tid * CPT + q) for q in range(CPT)]
+            gam = ld_bf16s(r_g, tid * CPT, CPT)
             # the rows' rstd: wave s sums row s's tile sums (lanes l, l + 64), then the
             # wave in a fixed order
             if wave < S:
@@ -3672,15 +3806,22 @@ def build_flash_kernel(key: FlashBuild):
             run_gate("agate", "attn", early_gate)
             run_inproj()
             run_fgb()
-            run_kda()
-            run_oproj(
-                lambda row0, kc: unit_rm(
-                    r_wo_kda, row0, kc, P, HIDDEN, n_sel() * (P // 2) + kc * 32
-                ),
-                P,
-                O_CPW,
-                min(4, O_CPW),
-            )
+
+            def kda_oproj(done=None):
+                run_oproj(
+                    lambda row0, kc: unit_rm(
+                        r_wo_kda, row0, kc, P, HIDDEN, n_sel() * (P // 2) + kc * 32
+                    ),
+                    P,
+                    O_CPW,
+                    min(4, O_CPW),
+                    done,
+                )
+
+            # a CTA with a kda task (at most one) runs its o_proj task inside it
+            assert S * H <= G
+            run_kda(kda_oproj)
+            kda_oproj(start("kda") < S * H if OPROJ_IN_KDA else None)
             run_seam("seam", "ffn_own")
         elif const_expr(dsa):
             run_dsa()
@@ -3728,7 +3869,7 @@ def build_flash_kernel(key: FlashBuild):
                     )
 
                 pre = [u_gu(c) for c in range(DUG_AHEAD)]
-                wait_ready(mb("a_rdy"), range(S))
+                wait_ready("box_a")
                 stage_rows(mb("a"), HIDDEN)
                 gpu.barrier()
                 acc = run_units(u_gu, DUG_CPW, DUG_AHEAD, pre)
@@ -3823,7 +3964,7 @@ def build_flash_kernel(key: FlashBuild):
             # the gate's
             if const_expr(ROUTER_OWN_ROW):
                 li, rstd, gam, _ = gate_row(
-                    "router", "seam", router_sample, False, xs + HIDDEN // 2
+                    "router", "seam", router_sample, False, xs + PM_WORDS
                 )
                 for q in range_constexpr(CPT // 2):
                     lds_st(
@@ -3835,7 +3976,7 @@ def build_flash_kernel(key: FlashBuild):
                         ),
                     )
             else:
-                wait_ready(mb("a_rdy"), [router_sample])
+                wait_ready("box_a", router_sample)
                 nq = HIDDEN // 4
                 vals = poll(
                     [
@@ -3943,7 +4084,7 @@ def build_flash_kernel(key: FlashBuild):
         # task (and no shared task) stages them behind its routed up/gate task's first
         # weight batch instead
         def stage_all_xq():
-            wait_ready(mb("a_rdy"), range(S))
+            wait_ready("box_a")
             stage_xq(list(range(S)))
 
         if const_expr(ROUTER_OWN_ROW):

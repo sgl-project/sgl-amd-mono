@@ -14,6 +14,7 @@ import torch
 from sgl_amd_mono.common import guard
 
 from .ffn import (
+    ATTN_K,
     BLOCKS,
     EPOCH_WORDS,
     HIDDEN,
@@ -92,9 +93,9 @@ class FfnRunner:
         self.epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
 
-    def _args(self, s, part, res_in, res_out, out, slots, w, mode):
+    def _args(self, s, attn, res_in, res_out, out, slots, w, mode):
         return (
-            part.data_ptr(),
+            attn.data_ptr(),
             res_in.data_ptr(),
             res_out.data_ptr(),
             out.data_ptr(),
@@ -110,6 +111,8 @@ class FfnRunner:
             w.s13s.data_ptr(),
             w.w2s.data_ptr(),
             w.s2s.data_ptr(),
+            w.wo.data_ptr(),
+            w.wos.data_ptr(),
             self.scratch[s].data_ptr(),
             self.sym,
             self.peers.data_ptr(),
@@ -141,24 +144,25 @@ class FfnRunner:
 
     def __call__(
         self,
-        part: torch.Tensor,
+        attn: torch.Tensor,
         residual: torch.Tensor,
         weights,
         slots: torch.Tensor,
     ):
-        """``part``: this rank's unreduced o_proj output; ``slots``: the step's
-        int64 slot mapping. A row with a negative slot (padding) still runs the
-        seam (its residual output is unspecified) but joins no expert and its
+        """``attn``: this rank's attention output, o_proj's input; ``slots``: the
+        step's int64 slot mapping. A row with a negative slot (padding) still runs
+        the seam (its residual output is unspecified) but joins no expert and its
         MoE output is zero. Returns the reduced MoE output and the residual after
         attention."""
-        s = part.shape[0]
-        assert part.is_contiguous() and residual.is_contiguous()
+        s = attn.shape[0]
+        assert attn.dtype == torch.bfloat16 and tuple(attn.shape) == (s, ATTN_K)
+        assert attn.is_contiguous() and residual.is_contiguous()
         assert (
             slots.dtype == torch.int64 and slots.is_contiguous() and slots.numel() >= s
         )
-        out = torch.empty_like(part)
+        out = torch.empty_like(residual)
         res_out = torch.empty_like(residual)
-        args = self._args(s, part, residual, res_out, out, slots, weights, 1)
+        args = self._args(s, attn, residual, res_out, out, slots, weights, 1)
         self._compiled[s](*args)
         return out, res_out
 

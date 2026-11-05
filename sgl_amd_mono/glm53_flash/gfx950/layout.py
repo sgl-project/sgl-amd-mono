@@ -121,6 +121,16 @@ STEP_COUNTS = frozenset(
     name for name in STEP_TAB if name.endswith(("_words", "_lo", "_hi", "_rows"))
 )
 
+# a box: each consumer CTA's own 128-byte lines, a word a producer in a line's first
+# 16 words (one s_load_dwordx16)
+BOX_LINE = 128
+BOX_WORDS = 16
+
+
+def box_lines(producers: int) -> int:
+    return -(-producers // BOX_WORDS)
+
+
 N_ROW_TILES = HIDDEN // ROW_TILE
 # mix projection outputs (pre, post, comb) plus one sum of squares a tile
 N_MIX = HC_MULT * (2 + HC_MULT)
@@ -209,7 +219,7 @@ def layout(
             ("rnew_a", samples * HC_MULT * HIDDEN // 2 * pair_bytes),
             ("pmix_a", samples * N_ROW_TILES * PMIX * pair_bytes),
             ("a_in", samples * HIDDEN // 2 * pair_bytes),
-            ("a_in_rdy", samples * pair_bytes),
+            ("box_a_in", BLOCKS * box_lines(samples) * BOX_LINE),
             ("mix_a", samples * HC_MULT * (1 + HC_MULT) * pair_bytes),
         ]
     if kda:
@@ -217,6 +227,7 @@ def layout(
             ("proj", samples * shard.kda_in_rows * pair_bytes),
             ("gates", samples * 2 * shard.kda_proj * pair_bytes),
             ("o_in", samples * shard.kda_proj // 2 * pair_bytes),
+            ("box_o_in", BLOCKS * box_lines(samples * shard.kda_heads) * BOX_LINE),
         ]
     if dsa:
         H = shard.mla_heads
@@ -234,8 +245,7 @@ def layout(
             ("q_lat", samples * H * KV_LORA // 2 * pair_bytes),
             ("kv_ready", samples * pair_bytes),
             ("iscores", samples * max(max_pools, 1) * pair_bytes),
-            ("tok_sel", samples * SEL_STRIDE * 4),
-            ("tok_ready", samples * pair_bytes),
+            ("tok_sel", samples * SEL_STRIDE * pair_bytes),
             ("sp_acc", samples * N_SPLIT * H * KV_LORA // 2 * pair_bytes),
             ("sp_m", samples * N_SPLIT * H * pair_bytes),
             ("sp_l", samples * N_SPLIT * H * pair_bytes),
@@ -245,7 +255,7 @@ def layout(
         ("rnew", samples * HC_MULT * HIDDEN // 2 * pair_bytes),
         ("pmix", samples * N_ROW_TILES * PMIX * pair_bytes),
         ("a", samples * HIDDEN // 2 * pair_bytes),
-        ("a_rdy", samples * pair_bytes),
+        ("box_a", BLOCKS * box_lines(samples) * BOX_LINE),
     ]
     if dense:
         # the dense MLP's mid (bf16 pairs)

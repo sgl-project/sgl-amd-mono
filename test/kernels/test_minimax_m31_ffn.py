@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The M3.1 FFN launch against native ops on one GPU (TP=1 build): the seam residual,
-Gemma post-attention norm, FP32 router, top-4, the routed A16W4 experts against AITER on
+"""The M3.1 FFN launch against native ops on one GPU (TP=1 build): o_proj (AITER's
+per-token FP8 quant, SGLang's rowwise-FP8 weight), the seam residual, Gemma
+post-attention norm, FP32 router, top-4, the routed A16W4 experts against AITER on
 SGLang's post-load MXFP4 layout (AITER (16, 16) shuffle, shuffled E8M0 group-32 scales,
 separated gate / up), and the MXFP8 shared expert against torch. Adapted from vLLM's
 tests/models/minimax_m3/amd_specialized_decode/test_ops.py (Apache-2.0)."""
@@ -68,7 +69,7 @@ def weights():
     down, down_scale = mxfp8(H, INTER)
     w13s, s13s = a16w8.layout(gate_up, gate_up_scale)
     w2s, s2s = a16w8.layout(down, down_scale)
-    return SimpleNamespace(
+    w = SimpleNamespace(
         w13=w13,
         w2=w2,
         s13=s13,
@@ -87,6 +88,12 @@ def weights():
         router=torch.randn(ffn.EXPERTS, H, device=dev, generator=g).mul(0.02),
         router_bias=torch.randn(ffn.EXPERTS, device=dev, generator=g).mul(0.01),
     )
+    # o_proj as SGLang keeps it for decode on gfx950: rowwise FP8, (16, 16) shuffled
+    dense = torch.randn(H, ffn.ATTN_K, device=dev, generator=g).mul(0.02)
+    w.wos = dense.abs().amax(1, keepdim=True).clamp(min=1e-12) / 448.0
+    w.oproj = (dense / w.wos).clamp(-448, 448).to(torch.float8_e4m3fn)
+    w.wo = shuffle_weight(w.oproj, (16, 16))
+    return w
 
 
 def _native_experts(x, w, ids, wts):
@@ -121,6 +128,14 @@ def _native_shared(x, w):
     return mid.float() @ values(w.down, w.down_scale).T
 
 
+def _native_oproj(attn, w):
+    """AITER's per-token FP8 quant, then the rowwise-FP8 GEMM in f32."""
+    import aiter
+
+    q, xs = aiter.per_token_quant_hip(attn, quant_dtype=aiter.dtypes.fp8)
+    return ((q.float() @ w.oproj.float().T) * xs * w.wos.T).bfloat16()
+
+
 def _native_norm(part, residual, weight):
     total = part.float() + residual.float()
     var = total.pow(2).mean(-1, keepdim=True)
@@ -145,6 +160,14 @@ def _pairs(region, n):
     return region[: n * 8].view(torch.int32).view(n, 2)[:, 0].contiguous()
 
 
+def _pushed(runner, s):
+    """The launch's o_proj partial, from the triples it pushed (the first launch's
+    parity half, this rank's rows)."""
+    triples = runner.peer_bufs[0][: s * ffn.TRIPLES * 8].view(torch.int64)
+    bits = torch.stack([(triples >> (16 * k)) & 0xFFFF for k in range(3)], -1)
+    return bits.to(torch.int16).view(torch.bfloat16).view(s, H)
+
+
 def _runner(weights, s):
     dev = torch.device("cuda")
     buf = torch.zeros(ffn.peer_bytes(1), dtype=torch.uint8, device=dev)
@@ -157,11 +180,11 @@ def _runner(weights, s):
 
 def _run(weights, s, seed=1):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    part = torch.randn(s, H, device="cuda", generator=g).bfloat16()
+    attn = torch.randn(s, ffn.ATTN_K, device="cuda", generator=g).mul(3).bfloat16()
     residual = torch.randn(s, H, device="cuda", generator=g).mul(4).bfloat16()
     runner = _runner(weights, s)
     slots = torch.arange(s, dtype=torch.int64, device="cuda")
-    out, res_out = runner(part, residual, weights, slots)
+    out, res_out = runner(attn, residual, weights, slots)
     torch.cuda.synchronize()
     err = runner.epoch[list(guard.ERROR_WORDS)].tolist()
     assert not any(err), err
@@ -170,7 +193,8 @@ def _run(weights, s, seed=1):
     parts = parts.view(torch.float32).view(s, ffn.EXPERTS, ffn.ROUTER_PARTS)
     route = _pairs(runner.region(s, "route"), s * 2 * ffn.TOPK).view(s, 2 * ffn.TOPK)
     return SimpleNamespace(
-        part=part,
+        attn=attn,
+        part=_pushed(runner, s),
         residual=residual,
         out=out,
         res_out=res_out,
@@ -184,6 +208,8 @@ def _run(weights, s, seed=1):
 @pytest.mark.parametrize("s", [1, 3, 8, 16])
 def test_ffn_stages_match_native(weights, s):
     r = _run(weights, s)
+    cos, rel = _metrics(r.part, _native_oproj(r.attn, weights))
+    assert cos > 0.99999 and rel < 2e-3, (cos, rel)
     want_x, want_res = _native_norm(r.part, r.residual, weights.post_norm)
     torch.testing.assert_close(r.res_out, want_res, rtol=0, atol=0)
     cos, rel = _metrics(r.x, want_x)
@@ -211,6 +237,21 @@ def test_ffn_stages_match_native(weights, s):
     assert cos > 0.9999 and rel < 1e-2, (cos, rel)
 
 
+@pytest.mark.parametrize("s", [8, 16])
+def test_o_proj_is_sglangs_to_the_bit(weights, s):
+    """The launch's o_proj partial is SGLang's (AITER's per-token FP8 quant, then
+    ``smallm_fp8_gemm``) bit for bit, in both of that GEMM's wave splits."""
+    import aiter
+
+    smallm = pytest.importorskip("sglang.kernels.ops.gemm.smallm_fp8_gfx950")
+    if not smallm.smallm_fp8_gemm_enabled():
+        pytest.skip("smallm_fp8_gemm is off")
+    r = _run(weights, s)
+    q, xs = aiter.per_token_quant_hip(r.attn, quant_dtype=aiter.dtypes.fp8)
+    want = smallm.smallm_fp8_gemm(q, weights.wo, xs, weights.wos, torch.bfloat16)
+    assert torch.equal(r.part, want)
+
+
 _STALLED_LAUNCH = """
 import torch
 import test_minimax_m31_ffn as t
@@ -224,8 +265,9 @@ peers = torch.tensor([buf.data_ptr()], dtype=torch.int64, device=dev)
 runner = FfnRunner(1, 0, buf.data_ptr(), peers, dev, (1,), drop_mark=5)
 runner.set_deadline(0.2)
 runner.warm(w)
-part = torch.randn(1, ffn.HIDDEN, device=dev).bfloat16()
-runner(part, part.clone(), w, torch.zeros(1, dtype=torch.int64, device=dev))
+attn = torch.randn(1, ffn.ATTN_K, device=dev).bfloat16()
+res = torch.randn(1, ffn.HIDDEN, device=dev).bfloat16()
+runner(attn, res, w, torch.zeros(1, dtype=torch.int64, device=dev))
 torch.cuda.synchronize()
 print("LAUNCH_RETURNED", flush=True)
 """
@@ -261,17 +303,17 @@ def test_a_tag_cycle_ends_with_its_receive_half_cleared(weights):
     (a stale pair there could otherwise carry the next cycle's tags)."""
     s = 16
     g = torch.Generator(device="cuda").manual_seed(3)
-    part = torch.randn(s, H, device="cuda", generator=g).bfloat16()
+    attn = torch.randn(s, ffn.ATTN_K, device="cuda", generator=g).bfloat16()
     residual = torch.randn(s, H, device="cuda", generator=g).mul(4).bfloat16()
     slots = torch.arange(s, dtype=torch.int64, device="cuda")
-    want, want_res = _runner(weights, s)(part, residual, weights, slots)
+    want, want_res = _runner(weights, s)(attn, residual, weights, slots)
 
     runner = _runner(weights, s)
     half = ffn.peer_half_bytes(1)
     last = 2 * (ffn.TAG16_CYCLE - 1)  # parity 0's last launch of the first cycle
     runner.epoch[0] = last
     for ep in range(last, last + 4):
-        out, res_out = runner(part, residual, weights, slots)
+        out, res_out = runner(attn, residual, weights, slots)
         torch.cuda.synchronize()
         assert torch.equal(out, want) and torch.equal(res_out, want_res), ep
         if ep < last + 2:  # a cycle's end: the parity's half was cleared

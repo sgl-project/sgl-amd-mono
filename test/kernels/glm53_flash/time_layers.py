@@ -210,6 +210,7 @@ def main() -> int:
     ap.add_argument("--max-pools", type=int, default=262144, help="1M-token context")
     ap.add_argument("--row-major", action="store_true", help="row-major FP8 weights")
     args = ap.parse_args()
+    cl.MAX_LEN = max(cl.MAX_LEN, (args.pos + 256) // 256 * 256)
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", torch.cuda.current_device())
