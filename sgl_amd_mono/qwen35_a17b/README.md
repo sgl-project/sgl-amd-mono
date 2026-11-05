@@ -2,7 +2,8 @@
 
 This document explains the monokernel in `sgl_amd_mono/qwen35_a17b/`: what a decode step and an MTP target-verify
 step launch, stage by stage, and how they plug into SGLang. File and symbol names refer to this repository; the
-SGLang interface is the monokernel API v1 (`sglang/srt/monokernels/`).
+SGLang interface is the one of RFC sgl-project/sglang#43949 (`sglang/kernels/plugin_kernels/amd/`,
+`sglang/srt/monokernels/` before sgl-project/sglang#45389).
 
 ## 1. Scope
 

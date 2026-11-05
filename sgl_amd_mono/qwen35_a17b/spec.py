@@ -8,14 +8,20 @@ under ``qwen35_a17b/mxfp4``.
 
 from __future__ import annotations
 
-from sglang.srt.monokernels.spec import MonoSpec, Requirements
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import MonoSpec, Requirements
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import MonoSpec, Requirements
 
 from sgl_amd_mono.qwen35_a17b.config import is_block_fp8, quant_of
 from sgl_amd_mono.qwen35_a17b.fp8 import spec as fp8
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/monokernels/spec.py": ("MonoSpec", "Requirements"),
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
+        "MonoSpec",
+        "Requirements",
+    ),
 }
 
 
