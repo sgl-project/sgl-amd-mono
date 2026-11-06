@@ -33,6 +33,9 @@ SGLANG_READS = {
         "select_verify_intermediate_state_indices",
     ),
     "srt/layers/attn_residual.py": ("AttnResidual",),
+    # the layer's place in the state pool
+    "srt/layers/attention/hybrid_linear_attn_backend.py": ("state_layer",),
+    "srt/mem_cache/kv/router.py": ("view_layer_id",),
 }
 
 TP, H, NF, E = 8, 7168, 2096, 896
@@ -270,7 +273,7 @@ class WideCheck:
         pool = backend.req_to_token_pool
         meta = backend.forward_metadata
         cache = pool.mamba_pool.mamba_cache
-        idx = pool.mamba2_layer_index(self.layer.self_attn.attn.layer_id)
+        idx = backend.state_layer(self.layer.self_attn.attn.layer_id).view_layer_id
         return dict(cache=cache, idx=idx, meta=meta, k1=k1)
 
     def _run(self, mid, bank):

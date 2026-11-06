@@ -87,6 +87,9 @@ SGLANG_READS = {
     ),
     "srt/distributed/parallel_state.py": ("get_tp_group",),
     "srt/utils/common.py": ("BumpAllocator",),
+    # the layer's place in the state pool
+    "srt/layers/attention/hybrid_linear_attn_backend.py": ("state_layer",),
+    "srt/mem_cache/kv/router.py": ("view_layer_id",),
 }
 
 TP, H, SL, E, NF, LAT = 8, 7168, 896, 896, 2096, 3584
@@ -888,7 +891,9 @@ class Wide:
         if not self.kda_ready:
             self.kda_ready = True
             for pk in self.layers.values():
-                pk.mamba_idx = pool.mamba2_layer_index(pk.layer.self_attn.attn.layer_id)
+                pk.mamba_idx = backend.state_layer(
+                    pk.layer.self_attn.attn.layer_id
+                ).view_layer_id
         slots = meta.mamba_cache_indices[:R]
         vrows = select_verify_intermediate_state_indices(
             backend.verify_intermediate_state_indices,

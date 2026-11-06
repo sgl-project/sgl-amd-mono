@@ -118,6 +118,8 @@ SGLANG_READS = {
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
         "linear_attn_backend",
         "req_to_token_pool",
+        # the layer's place in the state pool (KVLayer.view_layer_id)
+        "state_layer",
         "forward_metadata",
     ),
     "srt/layers/attention/linear/kda_backend.py": (
@@ -152,6 +154,7 @@ SGLANG_READS = {
         "self_attention_res_norm",
         "self_attention_res_proj",
     ),
+    "srt/mem_cache/kv/router.py": ("view_layer_id",),
 }
 
 
@@ -447,7 +450,9 @@ def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
         # the tensor that gathers them, once. A capture would otherwise take
         # the host-to-device copy of this constant with it.
         for k in batch.layers:
-            k.mamba_idx = pool.mamba2_layer_index(k.module.self_attn.attn.layer_id)
+            k.mamba_idx = backend.state_layer(
+                k.module.self_attn.attn.layer_id
+            ).view_layer_id
         batch.idx = torch.tensor(
             [k.mamba_idx for k in batch.layers],
             dtype=torch.int64,
