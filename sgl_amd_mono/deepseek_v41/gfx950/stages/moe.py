@@ -1357,6 +1357,11 @@ def moe_context(s, rs, lds, mb, bases, layout, scratch, args, rank, sym):
     return c
 
 
+def ug_free(key, rs) -> int:
+    """The CTAs a one-tile step's ug tasks are spread over (``MoeBuild.ug_all``)."""
+    return BLOCKS if key.ug_all else BLOCKS - rs.shared_units
+
+
 @flyc.jit
 def run_moe(c, key, bid, before_ug=None):
     """The MoE stages, in order (``before_ug``: work for this CTA once its shared
@@ -1412,9 +1417,10 @@ def run_moe(c, key, bid, before_ug=None):
         while task < ug_total:
             task = stage_ug_tile(c, task, ug_total)
     else:
-        # one token tile: every task placed; shared-unit CTAs reach ug late, so take none (``ug0``)
+        # one token tile: every task placed; shared-unit CTAs reach ug late, so without
+        # ``ug_all`` they take none (``ug0``)
         loaded = fx.Int32(0)
-        free = BLOCKS - c["rs"].shared_units
+        free = ug_free(key, c["rs"])
         at = first_task(bid, c["rs"].ug0)
         for task in range(at, (at < free).select(fx.Int32(ug_tasks), at), free):
             if loaded == 0:
