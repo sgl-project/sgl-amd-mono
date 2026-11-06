@@ -35,9 +35,10 @@ SGLANG_READS = {
     # the new dev_amd moved KimiK3MoE's ROCm paths into kimi_k3_amd
     "srt/models/kimi_k3_amd/moe.py": (
         "_vector_aligned",
-        "_COLUMN_TAIL_MAX_TOKENS",
         "_forward_shared_casting_routed",
     ),
+    # the row cap of SGLang's column tail, which _column_exit must not exceed
+    "srt/environ.py": ("envs", "SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS"),
     "srt/layers/attn_residual_hip.py": ("gather_covers",),
     "srt/layers/attention/linear/utils.py": (
         "select_verify_intermediate_state_indices",
@@ -700,20 +701,21 @@ class Wide:
         return x, prefix
 
     def _column_exit(self, moe, b, rows, bufs, ping):
-        """A run's exit as SGLang's column tail (<= 64 rows): one all-reduce of the
+        """A run's exit as SGLang's column tail (up to its row cap): one all-reduce of the
         [latent | shared] pair, this rank's stream columns (its prefix columns added
         there), and the stream's all-gather that also stages the next layer's attention
         read. None, before anything runs, when SGLang's kernels do not take the batch."""
         import sglang.kernels.ops.attention.k3_attn_res_read_hip as hip
-        import sglang.srt.models.kimi_k3_amd.moe as k3_amd_moe
         from sglang.srt.distributed import tensor_model_parallel_all_reduce
+        from sglang.srt.environ import envs
         from sglang.srt.layers.attn_residual_hip import gather_covers
 
         read = moe.next_attn_read
         if (
             not self.column_exit
             or read is None
-            or rows > k3_amd_moe._COLUMN_TAIL_MAX_TOKENS
+            # _column_tail_and_next_read's own cap: past it, it would decline after the all-reduce
+            or rows > envs.SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS.get()
             or not moe._fused_latent_tail_eligible
         ):
             return None
