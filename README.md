@@ -22,6 +22,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | Kimi-K3.1 | MI350X, MI355X (gfx950) | 8 | Kimi-K3's launches on every MoE layer in DSpark and DFLASH verify steps of one request (the MLA layers' projection front too, without DCP), and one launch a KDA layer in verify steps of 2 to 48 requests |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
+| Qwen3.5-397B-A17B-FP8 | MI355X (gfx950) | 4, 8 (MTP verify: 4) | Decode steps of up to 8 rows, and EAGLE/MTP target-verify steps of up to 8 requests x 4 draft tokens: every layer's norms, FP8 quants and dense projections, and the 45 GDN layers' conv and gated delta (two launches a GDN layer in decode, three in verify). Attention, the MoE and the MTP draft run SGLang's kernels. See [its README](sgl_amd_mono/qwen35_a17b/README.md) |
 | Qwen3.8-Flash-Next (MXFP4) | MI355X (gfx950) | 1 | The whole model (48 layers in 13 launches) in NEXTN verify steps of up to 8 requests x 4 tokens; the MTP draft's draft extend (up to 8 x 4 rows) and draft decode steps (up to 8 x 1) are routed to its launch |
 
 ### Design
@@ -164,6 +165,41 @@ For MoRI PD, enable monokernels only on the decode server
 DeepSeek-V4-Pro, TP2 or TP4 for DeepSeek-V4.1-Flash. Leave the flag off on prefill;
 both peers must use the same KV layout.
 
+Qwen3.5-397B-A17B-FP8 (128x128 block FP8), with decode graphs at the kernels'
+widths (the flags of `test/e2e/qwen35_a17b_fp8_server.py`):
+
+```bash
+SGLANG_USE_AITER=1 AITER_BF16_FP8_MOE_BOUND=0 python -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --tp 4 \
+  --attention-backend aiter \
+  --moe-runner-backend aiter \
+  --cuda-graph-config '{"decode":{"backend":"full","max_bs":8,"bs":[1,2,3,4,5,6,7,8]}}' \
+  --monokernel-backend amd
+```
+
+The same model with MTP (EAGLE, 3 steps, top-k 1, 4 draft tokens), where the
+monokernel serves the target-verify steps (the flags of
+`test/e2e/qwen35_a17b_fp8_mtp_server.py`, which follow the InferenceX MI355X
+FP8 MTP recipe):
+
+```bash
+SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_BF16_FP8_MOE_BOUND=0 \
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --tp 4 \
+  --attention-backend aiter \
+  --enable-aiter-allreduce-fusion \
+  --page-size 16 \
+  --max-running-requests 8 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --cuda-graph-config '{"decode":{"backend":"full","max_bs":8,"bs":[1,2,3,4,5,6,7,8]}}' \
+  --monokernel-backend amd
+```
+
 Qwen3.8-Flash-Next, with its MTP head (one MI355X; the server flags of `test/e2e/qwen38_flash_next_server.py`, which also caps running requests at 16 to step past 8):
 
 ```bash
@@ -226,6 +262,15 @@ sgl-amd-mono/
 │   │   ├── a16w4.py     # routed experts' MXFP4 GEMV steps
 │   │   ├── a16w8.py     # the shared expert's MXFP8 GEMV steps
 │   │   └── runner.py    # launch runner
+│   ├── qwen35_a17b/
+│   │   ├── README.md    # the decode and target-verify steps, stage by stage
+│   │   ├── spec.py      # family spec: block-FP8 now, MXFP4 when that path moves here
+│   │   ├── config.py    # shared checkpoint checks
+│   │   ├── layout.py    # model facts shared by every precision
+│   │   └── fp8/
+│   │       ├── spec.py  # block-FP8 spec and forward, TP4 and TP8
+│   │       ├── check.py # SGLANG_AMD_MONO_CHECK: each launch against SGLang's own layer
+│   │       └── gfx950/  # kernels (verify.py: the MTP verify GDN chain) and the step barriers
 │   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4; spec and kernels land in its PR
 │   └── qwen38_flash_next/
 │       ├── README.md    # how the kernel works, stage by stage
@@ -243,12 +288,14 @@ sgl-amd-mono/
 
 ```bash
 pytest test/unit                                                # CPU only
-pytest test/kernels test/e2e -k "not glm53 and not minimax_m3 and not qwen38_flash_next"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k "not glm53 and not minimax_m3 and not qwen38_flash_next and not qwen35_a17b_fp8"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
 pytest test/kernels -k "deepseek_v4 and not deepseek_v41"      # one MI355X: every DeepSeek-V4-Pro launch compiles
 pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k "minimax_m3 and not minimax_m31"  # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
 pytest test/kernels test/e2e -k minimax_m31                     # 4 x MI350X, MINIMAX_M31_FLASH_MODEL_PATH set
+pytest test/kernels -k qwen35_a17b_fp8                          # 1 x MI355X, no model needed: the verify GEMV and GDN chain
+pytest test/e2e -k qwen35_a17b_fp8                              # MI355X, QWEN35_FP8_MODEL_PATH set; QWEN35_FP8_TP=4 (default) or 8 for decode, MTP at TP4
 pytest test/kernels test/e2e -k qwen38_flash_next               # 1 x MI355X, QWEN38_FLASH_NEXT_MODEL_PATH set (the kernel test needs no checkpoint)
 pytest test/kernels test/e2e -k kimi_k3                         # 8 x MI350X or MI355X, KIMI_K3_MODEL_PATH and KIMI_K3_DSPARK_MODEL_PATH set
 ```
