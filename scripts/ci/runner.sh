@@ -23,7 +23,7 @@
 set -euo pipefail
 # The login node's own disk: a shared home may be slow to write, and a runner
 # writes its checkouts and tools under its directory.
-ROOT="${MONO_RUNNER_ROOT:-/var/tmp/sgl-amd-mono-runner-$(id -un)}"
+ROOT="${MONO_RUNNER_ROOT:-/var/tmp/sgl-amd-mono-runner}"
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT=sgl-amd-mono-runner
 LABELS=sgl-amd-mono-mi355x
@@ -34,7 +34,7 @@ NODES=(crsuse2-m2m-v3-060 crsuse2-m2m-v3-123)
 # Cluster settings (see slurm_launch.sh); the environment at install overrides each
 # one, and a later install without it writes these defaults again.
 : "${SLURM_PARTITION:=amd-aifw-sglang-ci}"
-: "${CI_NODE_SCRATCH:=/mnt/m2m_nobackup/sgl-amd-mono-ci-$(id -un)}"
+: "${CI_NODE_SCRATCH:=/mnt/m2m_nobackup/sgl-amd-mono-ci}"
 : "${CI_MODEL_ROOT:=/shared_nfs/huggingface_models}"
 
 write_env() {
