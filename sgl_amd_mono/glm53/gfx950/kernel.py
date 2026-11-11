@@ -1187,6 +1187,25 @@ def build_glm5_monokernel(
                 ]
             return ("mxfp4", (raw, scales), coef, b_word + (lane // 16) * 4)
 
+        def mfma_f8f8(wv, bw, c):
+            """``c`` plus an f8f8 unit's FP8 x FP8 MFMA (E8M0 scales = 1)."""
+            a = fx.Vector.from_elements(
+                [wv[h][e] for h in range(2) for e in range(4)], fx.Int32
+            )
+            bv = [
+                fx.ptr_load(xs + (bw + h * 16), result_type=v4f).bitcast(fx.Int32)
+                for h in range(2)
+            ]
+            b = fx.Vector.from_elements(
+                [bv[h][e] for h in range(2) for e in range(4)], fx.Int32
+            )
+            one = fx.Int32(127)
+            return fx.Vector(
+                rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    T.vec(4, T.f32), [a, b, c, 0, 0, 0, one, 0, one]
+                )
+            )
+
         def unit_mxfp4_bf16(w_rsrc, s_rsrc, rg, kc, K, b_word, coef, ln=None):
             fmt, weights, factor, _ = unit_mxfp4(
                 w_rsrc, s_rsrc, rg, kc, K, b_word, coef, ln
@@ -1307,25 +1326,8 @@ def build_glm5_monokernel(
                         c = fx.Vector(
                             rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c])
                         )
-                if const_expr(fmt == "f8f8"):  # one FP8 x FP8 MFMA (E8M0 scales = 1)
-                    a = fx.Vector.from_elements(
-                        [wv[h][e] for h in range(2) for e in range(4)], fx.Int32
-                    )
-                    bv = [
-                        fx.ptr_load(xs + (bw + h * 16), result_type=v4f).bitcast(
-                            fx.Int32
-                        )
-                        for h in range(2)
-                    ]
-                    b = fx.Vector.from_elements(
-                        [bv[h][e] for h in range(2) for e in range(4)], fx.Int32
-                    )
-                    one = fx.Int32(127)
-                    c = fx.Vector(
-                        rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                            T.vec(4, T.f32), [a, b, c, 0, 0, 0, one, 0, one]
-                        )
-                    )
+                if const_expr(fmt == "f8f8"):
+                    c = mfma_f8f8(wv, bw, c)
                 if const_expr(fmt == "native_mxfp4"):
                     raw, weight_scale, activation_scale_word = wv
                     activation_scale = lds_ld(misc, activation_scale_word).bitcast(
@@ -6700,35 +6702,7 @@ def build_glm5_monokernel(
             def dd_products(units):
                 """MFMA each unit; store a used column's products (its 4 rows)."""
                 for (fmt, wv, coef, bw), live, sl, h in units:
-                    a = fx.Vector.from_elements(
-                        [wv[hh][ee] for hh in range(2) for ee in range(4)], fx.Int32
-                    )
-                    bv = [
-                        fx.ptr_load(xs + (bw + hh * 16), result_type=v4f).bitcast(
-                            fx.Int32
-                        )
-                        for hh in range(2)
-                    ]
-                    b = fx.Vector.from_elements(
-                        [bv[hh][ee] for hh in range(2) for ee in range(4)], fx.Int32
-                    )
-                    one = fx.Int32(127)
-                    c = fx.Vector(
-                        rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                            T.vec(4, T.f32),
-                            [
-                                a,
-                                b,
-                                fx.Vector.filled(4, 0.0, fx.Float32),
-                                0,
-                                0,
-                                0,
-                                one,
-                                0,
-                                one,
-                            ],
-                        )
-                    )
+                    c = mfma_f8f8(wv, bw, fx.Vector.filled(4, 0.0, fx.Float32))
                     k = coef()
                     if live & (sl >= 0) & (lane % 16 < S):
                         fx.ptr_store(
