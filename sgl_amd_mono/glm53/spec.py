@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from typing import Optional
 
 import msgspec
 import torch
@@ -61,14 +62,22 @@ from sgl_amd_mono.glm53 import HF_CONFIG
 # one-row launch never completes on gfx950)
 WIDTHS = (2, 4, 8)
 ROWS = tuple(range(1, max(WIDTHS) + 1))
-TP_SIZES = (4, 8)
+TP_SIZES = (2, 4, 8)
+# the launch widths at a TP size, if not WIDTHS: at TP2 (32 heads, 1024 expert rows a
+# rank) an 8-row MoE's mids and down products outgrow the LDS, and the indexer launch
+# below 4 rows faults, so its steps of 1 to 4 rows run at width 4
+TP_WIDTHS = {2: (4,)}
+
+
+def tp_widths(tp: int) -> tuple:
+    return TP_WIDTHS.get(tp, WIDTHS)
 # SGLang's DSA cache on ROCm: 64-token pages
 PAGE_SIZE = 64
 TOPK = 2048
 
 
-def _width(rows: int) -> int:
-    return next(w for w in WIDTHS if w >= rows)
+def _width(rows: int, widths: tuple = WIDTHS) -> int:
+    return next(w for w in widths if w >= rows)
 
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -236,6 +245,38 @@ def _deadline(key, deadline_s: float, longest_s: int) -> float:
     return min(max(deadline_s, 0.5 * get_device().watchdog_timeout), longest_s)
 
 
+def _quant_reason(quant: dict) -> Optional[str]:
+    """Why the checkpoint's quantization is not one the kernels run, or None: the FP8
+    block-128 checkpoint, or the MXFP4 one (static FP4 weights, dynamic FP4
+    activations, an E8M0 a 32 values). Each layer's tensors are checked as loaded."""
+    method = quant.get("quant_method")
+    if method == "fp8" and list(quant.get("weight_block_size") or ()) == [128, 128]:
+        return None
+    if method == "quark":
+        g = quant.get("global_quant_config") or {}
+
+        def mx(spec: dict, dynamic: bool) -> bool:
+            return (
+                spec.get("dtype") == "fp4"
+                and spec.get("qscheme") == "per_group"
+                and spec.get("group_size") == 32
+                and spec.get("scale_format", "e8m0") == "e8m0"
+                and bool(spec.get("is_dynamic")) == dynamic
+            )
+
+        if mx(g.get("weight") or {}, False) and mx(g.get("input_tensors") or {}, True):
+            return None
+        return (
+            "needs the MXFP4 checkpoint (E2M1 a 32 with an E8M0, dynamic "
+            f"MXFP4 activations), got weight {g.get('weight')!r} input "
+            f"{g.get('input_tensors')!r}"
+        )
+    return (
+        "needs the FP8 block-128 or the MXFP4 checkpoint, got "
+        f"{method!r} {quant.get('weight_block_size')!r}"
+    )
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     reasons = [
         f"needs GLM-5.3's {key} = {want!r}, got {getattr(hf_config, key, None)!r}"
@@ -261,14 +302,9 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         or cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
     ):
         reasons.append("MTP verifies one draft chain: topk 1, draft tokens = steps + 1")
-    quant = getattr(hf_config, "quantization_config", None) or {}
-    if quant.get("quant_method") != "fp8" or list(
-        quant.get("weight_block_size") or ()
-    ) != [128, 128]:
-        reasons.append(
-            "needs the FP8 block-128 checkpoint, got "
-            f"{quant.get('quant_method')!r} {quant.get('weight_block_size')!r}"
-        )
+    why = _quant_reason(getattr(hf_config, "quantization_config", None) or {})
+    if why is not None:
+        reasons.append(why)
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -378,6 +414,9 @@ class _Built:
         # per width, the guard blocks of its runtimes: a step advances them at once
         self.epochs = epochs
         self.max_position = context_len - 1
+        # the launch widths built, and the rows a step runs on them at most
+        self.widths = tuple(sorted({w for w, _ in runtimes}))
+        self.max_rows = self.widths[-1]
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         self.cos, self.sin = cos, sin
         self.steps, self.ids = {}, {}
@@ -420,7 +459,7 @@ class _Built:
     ):
         """``DeepseekV2ForCausalLM.forward`` for a routed decode or verify step."""
         lm = self.lm
-        if input_embeds is not None:
+        if input_embeds is not None or plan.key.rows > self.max_rows:
             return type(lm).forward(
                 lm, input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
@@ -446,7 +485,7 @@ class _Built:
 
         start(forward_batch)
         S = plan.key.rows
-        W = _width(S)
+        W = _width(S, self.widths)
         step = self._step(plan, input_ids, positions, forward_batch, S, W)
         h = self.ids[W]
         for i in sorted(self._layers):
@@ -466,7 +505,7 @@ class _Built:
         """The previous launch's output (layer 0: the token ids) in; the launch's
         output out."""
         S = plan.key.rows
-        W = _width(S)
+        W = _width(S, self.widths)
         self._bind(L, kv_dtype=L.ops[W].rt.kv_dtype)
         checking = self.check_layers and not torch.cuda.is_current_stream_capturing()
         if checking:
@@ -484,7 +523,8 @@ class _Built:
             check.compare(
                 L, ref, out[:S], positions, forward_batch, S, step=step, scores=scores
             )
-            if L.w.dense:
+            # the FP8 dense MLP's own parts (the layer is compared whole for MXFP4)
+            if L.w.dense and not L.w.mxfp4:
                 check.dense(L, L.ops[W], ref, out[:S], S)
         return out
 
@@ -598,6 +638,10 @@ def _build(model, hf_config, ctx) -> _Built:
     if len(shuffled) != 1:
         raise ValueError("GLM-5.3 monokernel: the layers' FP8 layouts differ")
     fp8_shuffled = shuffled.pop()
+    mxfp4 = {L.w.mxfp4 for L in layers.values()}
+    if len(mxfp4) != 1:
+        raise ValueError("GLM-5.3 monokernel: the layers' MLPs differ in FP8 / MXFP4")
+    mxfp4 = mxfp4.pop()
     dense = {L.w.dense for L in layers.values() if L.w.dense}
     if len(dense) > 1 or not layers[0].w.dense or layers[0].w.index is None:
         raise ValueError(
@@ -631,7 +675,14 @@ def _build(model, hf_config, ctx) -> _Built:
     # the keys an indexer row scores at most: the served context's, in whole tasks
     tasks = -(-context_len // INDEX_KEYS_PER_TASK)
     max_seq = tasks * INDEX_KEYS_PER_TASK
-    widths = sorted({_width(r) for r in ctx.widths})
+    allowed = tp_widths(p.tp_size)
+    cap = max(allowed)
+    widths = sorted({_width(r, allowed) for r in ctx.widths if r <= cap})
+    if not widths:
+        raise ValueError(
+            f"GLM-5.3 monokernel: TP{p.tp_size} runs at most {cap} rows on the "
+            f"kernels, and this server's decode graphs route {sorted(ctx.widths)}"
+        )
     runtimes, heads = {}, {}
     epochs = {w: Glm53Epochs(len(kinds) + 1, device) for w in widths}
 
@@ -663,6 +714,7 @@ def _build(model, hf_config, ctx) -> _Built:
                 dense=layers[ids[0]].w.dense,
                 tokens=kind == "embed",
                 vocab_rows=vocab_rows if kind == "embed" else 0,
+                mxfp4=mxfp4,
             )
             rt = runtime(key)
             runtimes[w, kind] = rt

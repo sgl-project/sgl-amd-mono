@@ -102,7 +102,8 @@ class Draft:
         self.cos, self.sin = C.rope(max(live) + W + 1, device)
         self.st, self.topk0 = C.make_step(positions, requests, pages, device)
         self.eh, (self.w_eh, self.emb) = eh_weights(rank, tp, device)
-        w = C.layer_weights(78, rank, tp, device, kind)
+        mxfp4 = getattr(args, "mxfp4", False)
+        w = C.layer_weights(78, rank, tp, device, kind, mxfp4)
 
         def build(**kw):
             key = Glm53Build(
@@ -113,6 +114,7 @@ class Draft:
                 index_max_seq=C.MAX_SEQ if index else 0,
                 fp8_shuffled=True,
                 kv_fp8=args.kv == "fp8",
+                mxfp4=mxfp4 and not kw.get("head", False),
                 **kw,
             )
             rt = Glm53Runtime(key, rank, group, device)
@@ -378,6 +380,7 @@ def main() -> int:
     ap.add_argument("--only", default="tables,entry,replay")
     ap.add_argument("--replays", type=int, default=20)
     ap.add_argument("--deadline", type=float, default=10.0)
+    ap.add_argument("--mxfp4", action="store_true", help="MXFP4 MLPs")
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
