@@ -60,6 +60,21 @@ INDEX_KEYS_PER_TASK = 64
 # a row's top-k runs on up to this many slices (CTAs), with staging room for this many
 # candidates of the threshold's prefix
 INDEX_SEL_SLICES = 64
+# a selecting thread's keys a round of the paged top-k
+INDEX_SEL_ITEMS = 8
+
+
+def paged_select_lds(index_max_seq: int, block_size: int, threads: int) -> tuple:
+    """The paged top-k selection's X-region words (a CTA selects one row's slice):
+    the slice's radix keys (whole chunks of threads x INDEX_SEL_ITEMS), its block
+    ids, its bins and the digit found, the row's bins, then its keys above the
+    threshold's prefix. Returns (SLICE_KEYS, SBINS, STOT, SALIST); the selection
+    needs SALIST + topk words."""
+    chunk = threads * INDEX_SEL_ITEMS
+    slice_keys = -(-(-(-index_max_seq // INDEX_SEL_SLICES)) // chunk) * chunk
+    sbins = slice_keys + slice_keys // block_size + 2
+    stot = sbins + 72
+    return slice_keys, sbins, stot, stot + 64
 INDEX_CAND_STAGE_CAP = 16384
 # radix digits of the sliced top-k; a row has a slice per this many keys (rounded up),
 # at most INDEX_SEL_SLICES

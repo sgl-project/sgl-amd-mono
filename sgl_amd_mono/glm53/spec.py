@@ -62,14 +62,22 @@ from sgl_amd_mono.glm53 import HF_CONFIG
 # one-row launch never completes on gfx950)
 WIDTHS = (2, 4, 8)
 ROWS = tuple(range(1, max(WIDTHS) + 1))
-TP_SIZES = (4, 8)
+TP_SIZES = (2, 4, 8)
+# the launch widths at a TP size, if not WIDTHS: at TP2 (32 heads, 1024 expert rows a
+# rank) an 8-row MoE's mids and down products outgrow the LDS, and the indexer launch
+# below 4 rows faults, so its steps of 1 to 4 rows run at width 4
+TP_WIDTHS = {2: (4,)}
+
+
+def tp_widths(tp: int) -> tuple:
+    return TP_WIDTHS.get(tp, WIDTHS)
 # SGLang's DSA cache on ROCm: 64-token pages
 PAGE_SIZE = 64
 TOPK = 2048
 
 
-def _width(rows: int) -> int:
-    return next(w for w in WIDTHS if w >= rows)
+def _width(rows: int, widths: tuple = WIDTHS) -> int:
+    return next(w for w in widths if w >= rows)
 
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -406,6 +414,9 @@ class _Built:
         # per width, the guard blocks of its runtimes: a step advances them at once
         self.epochs = epochs
         self.max_position = context_len - 1
+        # the launch widths built, and the rows a step runs on them at most
+        self.widths = tuple(sorted({w for w, _ in runtimes}))
+        self.max_rows = self.widths[-1]
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         self.cos, self.sin = cos, sin
         self.steps, self.ids = {}, {}
@@ -448,7 +459,7 @@ class _Built:
     ):
         """``DeepseekV2ForCausalLM.forward`` for a routed decode or verify step."""
         lm = self.lm
-        if input_embeds is not None:
+        if input_embeds is not None or plan.key.rows > self.max_rows:
             return type(lm).forward(
                 lm, input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
@@ -474,7 +485,7 @@ class _Built:
 
         start(forward_batch)
         S = plan.key.rows
-        W = _width(S)
+        W = _width(S, self.widths)
         step = self._step(plan, input_ids, positions, forward_batch, S, W)
         h = self.ids[W]
         for i in sorted(self._layers):
@@ -494,7 +505,7 @@ class _Built:
         """The previous launch's output (layer 0: the token ids) in; the launch's
         output out."""
         S = plan.key.rows
-        W = _width(S)
+        W = _width(S, self.widths)
         self._bind(L, kv_dtype=L.ops[W].rt.kv_dtype)
         checking = self.check_layers and not torch.cuda.is_current_stream_capturing()
         if checking:
@@ -664,7 +675,14 @@ def _build(model, hf_config, ctx) -> _Built:
     # the keys an indexer row scores at most: the served context's, in whole tasks
     tasks = -(-context_len // INDEX_KEYS_PER_TASK)
     max_seq = tasks * INDEX_KEYS_PER_TASK
-    widths = sorted({_width(r) for r in ctx.widths})
+    allowed = tp_widths(p.tp_size)
+    cap = max(allowed)
+    widths = sorted({_width(r, allowed) for r in ctx.widths if r <= cap})
+    if not widths:
+        raise ValueError(
+            f"GLM-5.3 monokernel: TP{p.tp_size} runs at most {cap} rows on the "
+            f"kernels, and this server's decode graphs route {sorted(ctx.widths)}"
+        )
     runtimes, heads = {}, {}
     epochs = {w: Glm53Epochs(len(kinds) + 1, device) for w in widths}
 

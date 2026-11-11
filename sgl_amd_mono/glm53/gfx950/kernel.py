@@ -120,6 +120,8 @@ from .config import (
 )
 from .layout import (
     BLOCKS,
+    INDEX_SEL_ITEMS,
+    paged_select_lds,
     DCP_SUMMARY_PAIRS,
     EH_ARGS,
     FRONT_K_BIG,
@@ -380,7 +382,10 @@ def build_glm5_monokernel(
     N_SPLIT = topk // SPLIT_KEYS
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
     N_QB = QB_ROWS // Q_B_TILE
-    assert not with_indexer or (INDEX_Q_ROWS // INDEX_TILE == G and N_QB in (G // 2, G))
+    # q_b tiles: half the grid (TP8), the grid (TP4) or two rounds of it (TP2)
+    assert not with_indexer or (
+        INDEX_Q_ROWS // INDEX_TILE == G and N_QB in (G // 2, G, 2 * G)
+    )
     QB_PER_HEAD = (NOPE_DIM + PE_DIM) // Q_B_TILE
     N_UK = H * KV_LORA // UK_TILE
     UK_PER_HEAD = KV_LORA // UK_TILE
@@ -421,6 +426,11 @@ def build_glm5_monokernel(
         S * HIDDEN // 4,
         SPLIT_X_WORDS,
         0 if index_paged else index_max_seq,
+        # the paged top-k selection's keys, bins and list (with 32 heads a rank the
+        # attention's tiles no longer cover it)
+        paged_select_lds(index_max_seq, index_block_size, THREADS)[3] + topk
+        if index_paged
+        else 0,
         down_x_words(S, expert_inter, expert_mxfp4, native_fp4_mfma),
         # the tail's normed rows, or one half of the NextN entry's, every row at once
         S * HIDDEN // 2 if tail or eh_entry else 0,
@@ -444,7 +454,7 @@ def build_glm5_monokernel(
     assert S == 1 or JOB_SLOT_OFF + MOE_GROUPS * S <= X_WORDS
     # Paged top-k: a 4096-bin histogram, then (key, position) candidates of
     # the threshold bin, both in the X region of the selecting CTA.
-    SEL_ITEMS = 8
+    SEL_ITEMS = INDEX_SEL_ITEMS
     SEL_CHUNK = THREADS * SEL_ITEMS
     SEL_BINS = 4096
     SEL_CAP = (X_WORDS - SEL_BINS) // 2
@@ -3009,7 +3019,7 @@ def build_glm5_monokernel(
             # concurrently, the q_norm CTAs theirs right after q_norm (ahead of the
             # row's index key and KV rows). They reload q_a, but remove one full GEMV
             # from the q_b CTAs' serialized critical path.
-            N_INDEX_Q_EXTRA = INDEX_Q_ROWS // INDEX_TILE - N_QB
+            N_INDEX_Q_EXTRA = max(INDEX_Q_ROWS // INDEX_TILE - N_QB, 0)
             IQ_NKC = Q_LORA // 64
             IQ_UNITS = IQ_NKC // (2 * WAVES)
             r_wiq, r_siq = _rsrc(index_arg(3)), _rsrc(index_arg(4))
@@ -3383,8 +3393,9 @@ def build_glm5_monokernel(
         if const_expr(with_indexer):
             r_wiq, r_siq = _rsrc(index_arg(3)), _rsrc(index_arg(4))
 
-        for t in range(start("q_b"), N_QB, G):
-            t = fx.Int32(t)
+        def qb_task(t, fuse):
+            """q_b tile t; ``fuse``: index-query tile t too, on the same staged
+            q_lora rows (the indexer launch's tiles 0 .. G - 1)."""
             stamp("q_b", t, 0)
 
             def u_qb(c):
@@ -3403,7 +3414,7 @@ def build_glm5_monokernel(
                 )
 
             pre = [u_qb(c) for c in range(QB_UNITS)]
-            if const_expr(with_indexer):
+            if const_expr(fuse):
                 # this CTA's index-query tile reuses the normalized q_lora tile: its
                 # weights are issued before the wait too
                 iq_t = t
@@ -3419,7 +3430,7 @@ def build_glm5_monokernel(
                 stage_x_pairs("q_an", S * Q_LORA, lambda k: k)
             stamp("q_b", t, 2)
             gpu.barrier()
-            if const_expr(with_indexer):
+            if const_expr(fuse):
                 # This CTA's index-query row tile first, on the normalized q_lora tile
                 # (the index chain waits on it, split on the selection after it).
                 # Complementary CTAs compute the remaining half below.
@@ -3478,6 +3489,17 @@ def build_glm5_monokernel(
                         [x0 * c - x1 * sn, x0 * sn + x1 * c],
                     )
             stamp("q_b", t, 4)
+
+        if const_expr(with_indexer and N_QB > G):
+            # 32 heads a rank (TP2): two q_b rounds a CTA. Every CTA has a first-round
+            # tile (t < G <= N_QB) and fuses that index-query tile; the second round is
+            # q_b alone (there are G index-query tiles)
+            qb_task(fx.Int32(start("q_b")), True)
+            for t in range(start("q_b") + G, N_QB, G):
+                qb_task(fx.Int32(t), False)
+        else:
+            for t in range(start("q_b"), N_QB, G):
+                qb_task(fx.Int32(t), with_indexer)
 
         if const_expr(with_indexer and N_INDEX_Q_EXTRA == 0):
             index_qh_tasks()
@@ -4325,20 +4347,16 @@ def build_glm5_monokernel(
             # radix select's: keys above the threshold's 12-bit (24-, 32-bit) prefix in
             # position order, then the prefix's keys above the threshold, then its ties.
             # the keys a slice holds at most, as radix keys in LDS, in chunks of SEL_CHUNK
-            SLICE_KEYS = (
-                ((index_max_seq + SEL_SLICES - 1) // SEL_SLICES + SEL_CHUNK - 1)
-                // SEL_CHUNK
-                * SEL_CHUNK
+            SLICE_KEYS, SBINS, STOT, SALIST = paged_select_lds(
+                index_max_seq, index_block_size, THREADS
             )
+            assert SEL_CHUNK == THREADS * INDEX_SEL_ITEMS
             DIGITS = ((26, 6), (20, 6), (14, 6), (8, 6), (2, 6), (0, 2))
             assert len(DIGITS) == INDEX_SEL_DIGITS
             HIST_PAIRS = 32  # a slice's 64 counts, two 16-bit counts a pair
             # LDS words: the slice's keys, its block ids, its bins (and the digit
             # found), the row's bins
             SBT = SLICE_KEYS
-            SBINS = SBT + SLICE_KEYS // index_block_size + 2
-            STOT = SBINS + 72
-            SALIST = STOT + 64  # the slice's keys above the threshold's prefix
             assert SALIST + topk <= X_WORDS and SEL_SLICES * HIST_PAIRS <= 4 * THREADS
             assert SLICE_KEYS < 1 << 16
             skeys = fx.recast_iter(fx.Int32, xs)

@@ -308,7 +308,7 @@ GLM53 = SimpleNamespace(index_topk=TOPK, index_share_for_mtp_iteration=True)
             "a seed of 2049 keys",
         ),
         (SPEC_ARGS, GLM53, _nextn_model(fused=False), 8, "fused DSA indexer"),
-        (SPEC_ARGS, GLM53, _nextn_model(), 2, "TP2"),
+        (SPEC_ARGS, GLM53, _nextn_model(), 1, "TP1"),
         (SPEC_ARGS, GLM53, _nextn_model(eh=_ReplicatedLinear()), 8, "eh_proj is a"),
     ],
     ids=["served", "token map", "no index share", "seed width", "indexer", "tp", "eh"],
