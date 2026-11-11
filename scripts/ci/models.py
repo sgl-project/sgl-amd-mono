@@ -30,6 +30,7 @@ CHECKPOINTS = [
         "deepseek-ai/DeepSeek-V4-Pro",
         "deepseek-ai/DeepSeek-V4-Pro-DSpark",
         "zai-org/GLM-5.3",
+        "amd/GLM-5.3-Quark-MXFP4-AttnFP8",
         "amd/GLM-5.3-Flash-Quark-MXFP4",
         "moonshotai/Kimi-K3",
         "RadixArk/Kimi-K3-DSpark",
@@ -183,6 +184,23 @@ MODELS = {
         "e2e_tests": ["test/e2e/test_glm53_server.py"],
         "microbench": [
             "torchrun --nproc-per-node 8 test/kernels/glm53/time_layers.py --kind model --rows 2,4,8"
+        ],
+        "evals": TEXT_EVALS,
+        # decode steps of up to 8 rows
+        "concurrency": [1, 2, 4, 8, 16],
+        "gate_concurrency": [1, 8],
+    },
+    "glm53_mxfp4": {
+        "name": "GLM-5.3 (MXFP4)",
+        "packages": ["glm53"],
+        "tp": 8,
+        "paths": {"GLM_53_MODEL_PATH": f"{HF}/amd/GLM-5.3-Quark-MXFP4-AttnFP8"},
+        "recipe": ("glm53_server", "ARGS"),
+        # test_glm53_kernels.py, its MXFP4 cases included, runs under glm53
+        "kernel_tests": [],
+        "e2e_tests": ["test/e2e/test_glm53_server.py"],
+        "microbench": [
+            "torchrun --nproc-per-node 8 test/kernels/glm53/time_layers.py --kind model --rows 2,4,8 --mxfp4"
         ],
         "evals": TEXT_EVALS,
         # decode steps of up to 8 rows

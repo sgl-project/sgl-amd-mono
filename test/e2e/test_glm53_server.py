@@ -17,6 +17,7 @@ import time
 import unittest
 from types import SimpleNamespace
 
+import pytest
 import requests
 import torch
 from glm53_server import ARGS, ENV, MODEL, MTP
@@ -30,16 +31,22 @@ from sglang.test.test_utils import (
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
+from transformers import AutoConfig
 
 from sgl_amd_mono import BACKEND
 from sgl_amd_mono.glm53.gfx950 import layout
 
 LAUNCH_TIMEOUT = 3600
+# the MXFP4 checkpoint (amd/GLM-5.3-Quark-MXFP4-AttnFP8), not the FP8 one
+_quant = AutoConfig.from_pretrained(MODEL, trust_remote_code=True).quantization_config
+MXFP4 = _quant.get("quant_method") == "quark"
 # The normal path scores about 0.97 on GSM8K (thinking on); the bound is for gross
 # failures
 GSM8K_BOUND = 0.90
-# Decode against prefill, one batch of prompts at a time (every decode step covered)
-KL_BOUND = 0.06
+# Decode against prefill, one batch of prompts at a time (every decode step covered).
+# On the MXFP4 checkpoint SGLang's own decode against its prefill (monokernels off)
+# reaches 0.060 (0.009 on the FP8 one): twice that
+KL_BOUND = 0.12 if MXFP4 else 0.06
 # MTP (3 draft tokens) accepts about 3.3 tokens a step on this GSM8K run at TP8;
 # the bound is for gross failures
 MTP_ACCEPT_BOUND = 2.5
@@ -127,6 +134,12 @@ class TestMonokernelMtp(CustomTestCase):
         cls.out.close()
         cls.err.close()
 
+    # On the MXFP4 checkpoint the dense MLPs' down_proj in SGLang's verify steps of 4
+    # and 8 requests (AITER's Triton gemm_afp4wfp4 at M = 16, 32) returns NaN rows,
+    # monokernels off alike, until the CI image has ROCm/aiter#7910
+    @pytest.mark.xfail(
+        MXFP4, reason="https://github.com/ROCm/aiter/pull/7910", strict=False
+    )
     def test_gsm8k_and_accept_length_past_the_largest_width(self):
         # 12 requests at a time: verify steps of 1 and 2 requests run the kernels,
         # wider ones the normal path. A verify row that attends the wrong keys of
