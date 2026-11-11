@@ -340,6 +340,7 @@ class _Weights(msgspec.Struct, frozen=True):
 
     shuffled: bool
     index: object = None
+    mxfp4: bool = False
 
 
 class _Runtime:
