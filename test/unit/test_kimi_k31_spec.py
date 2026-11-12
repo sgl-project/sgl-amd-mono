@@ -39,3 +39,4 @@ def test_the_launches_name_their_server_args():
     server_args = k31.SPEC.requires.server_args
     assert server_args["enable_linear_replayssm_spec"] == frozenset({True})
     assert server_args["speculative_algorithm"] == frozenset({"DSPARK", "DFLASH"})
+    assert server_args["mamba_ssm_dtype"] == frozenset({None, "float32"})
