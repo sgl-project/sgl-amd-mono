@@ -1,10 +1,10 @@
 """Qwen3.8 MoE with --monokernel-backend amd on MI355X, TP8, across the switch
 points: decode steps of 1 to 8 rows run K2, wider ones the normal path, and
 requests join and leave a running batch that steps past 8 rows and back (a short
-GSM8K run, for gross failures); the tokens of covered steps scored again by the
-normal prefill path (KL consistency); each covered layer against SGLang's layer
-(check mode); and a fault on one rank that stops the server before any token of
-the failed step is sent."""
+GSM8K run, for gross failures); NEXTN verify steps of up to 8 rows run K2; the
+tokens of covered steps scored again by the normal prefill path (KL consistency);
+each covered layer against SGLang's layer (check mode); and a fault on one rank
+that stops the server before any token of the failed step is sent."""
 
 import os
 import re
@@ -15,7 +15,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
-from qwen38_a95b_mxfp4_server import ARGS, ENV, MODEL
+from qwen38_a95b_mxfp4_server import ARGS, ENV, MODEL, NEXTN
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
 )
@@ -95,6 +95,23 @@ class TestMonokernelDecode(CustomTestCase):
                 max_new_tokens=512,
                 trust_remote_code=True,
             )
+
+
+class TestMonokernelVerify(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.process = _launch(extra_args=[*NEXTN, "--watchdog-timeout", "600"])
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process)
+
+    def test_gsm8k_past_the_largest_width(self):
+        # 4 requests at a time: verify steps of 4 to 16 rows, K2 up to 8
+        metrics = _gsm8k(4)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], GSM8K_BOUND)
 
 
 class TestMonokernelCheck(CustomTestCase):

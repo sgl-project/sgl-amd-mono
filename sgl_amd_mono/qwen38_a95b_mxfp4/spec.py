@@ -8,7 +8,8 @@ post-attention norm, the router, the shared and routed MXFP4 experts and the MoE
 TP reduce. It writes the layer output and the residual.
 
 In front of K2, each layer runs SGLang's input norm and its attention or GDN up to
-the projection's input. SGLang's embedding, final norm and logits processor run
+the projection's input. A target-verify step (speculative decoding) runs the same
+way on its draft tokens. SGLang's embedding, final norm and logits processor run
 around the layers.
 
 The kernels read SGLang's weights in place at each launch. The spec refuses the
@@ -31,6 +32,7 @@ import torch
 try:
     from sglang.kernels.plugin_kernels.amd.spec import (
         DeviceLimits,
+        Feature,
         MonoSpec,
         Numerics,
         NumericsKind,
@@ -39,6 +41,7 @@ try:
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels.spec import (
         DeviceLimits,
+        Feature,
         MonoSpec,
         Numerics,
         NumericsKind,
@@ -50,7 +53,7 @@ from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layout as L
 
 logger = logging.getLogger(__name__)
 
-# a launch takes 1 to MAX_TOKENS rows: decode requests
+# a launch takes 1 to MAX_TOKENS rows: decode requests, or verify tokens
 WIDTHS = tuple(range(1, L.MAX_TOKENS + 1))
 # the mailbox tags K2 writes: TAG_SLOTS // 2 + i, as in sgl-project/sglang#43516
 # (its K1 has i)
@@ -69,7 +72,13 @@ PENDING_MXFP4 = (
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
-    "srt/arg_groups/fields/*.py": ("enforce_shared_experts_fusion",),
+    "srt/arg_groups/fields/*.py": (
+        "enforce_shared_experts_fusion",
+        "speculative_algorithm",
+        "speculative_eagle_topk",
+        "speculative_num_steps",
+        "speculative_num_draft_tokens",
+    ),
     "srt/layers/layernorm.py": ("variance_epsilon",),
     "srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py": (
         "is_shuffled",
@@ -115,6 +124,7 @@ SGLANG_READS = {
     ),
     "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "DeviceLimits",
+        "Feature",
         "MonoSpec",
         "Numerics",
         "NumericsKind",
@@ -169,6 +179,16 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         reasons.append(f"{layers} layers: the mailbox tags hold {MAX_LAYERS}")
     if cfg.enforce_shared_experts_fusion:
         reasons.append(PENDING_FSE)
+    if cfg.speculative_algorithm is not None:
+        topk = cfg.speculative_eagle_topk or 1
+        tokens, steps = cfg.speculative_num_draft_tokens, cfg.speculative_num_steps
+        if topk != 1 or tokens != (steps or 0) + 1:
+            reasons.append(
+                "the verify step takes one draft chain: needs "
+                "--speculative-eagle-topk 1 and --speculative-num-draft-tokens = "
+                f"--speculative-num-steps + 1, got topk {topk}, {tokens} tokens, "
+                f"{steps} steps"
+            )
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -489,7 +509,7 @@ SPEC = MonoSpec(
             widths=WIDTHS, tp_sizes=(L.TP,), resident_blocks=L.BLOCKS
         )
     },
-    features=frozenset(),
+    features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"aiter"}),

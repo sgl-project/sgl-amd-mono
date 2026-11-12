@@ -6,18 +6,18 @@ come from sgl-project/sglang#43516, which adapts them from vllm-project/vllm#608
 
 ## 1. Scope
 
-This document uses two terms. The width of a decode step is its number of rows, one row for each request. GDN is
-Gated DeltaNet, the linear attention of Qwen3.8.
+This document uses two terms. The width of a step is its number of rows. A decode step has one row for each request. A
+NEXTN verify step has one row for each token that it scores. GDN is Gated DeltaNet, the linear attention of Qwen3.8.
 
-| | decode in `spec.py` |
+| | the target model in `spec.py` |
 | --- | --- |
 | model class | `Qwen3_5MoeForCausalLM` |
 | checkpoint | `amd/Qwen3.8-2.4T-A95B-Quark-MXFP4`, with MXFP4 routed experts, a bf16 shared expert and bf16 GDN projections |
 | GPU and TP | gfx950 on MI355X, TP 8 |
-| SGLang step | decode, with no speculative decoding |
+| SGLang steps | decode and NEXTN verify |
 | widths | 1 to 8, from `layout.MAX_TOKENS` |
 | launches per step | 92 on each rank, one K2 launch for each decoder layer |
-| other steps | SGLang's forward runs prefill, extend and the decode steps wider than 8 |
+| other steps | SGLang's forward runs prefill, extend, the steps wider than 8 and the MTP draft model |
 
 | file | contents |
 | --- | --- |
@@ -33,10 +33,10 @@ Gated DeltaNet, the linear attention of Qwen3.8.
 | `test/unit/test_qwen38_a95b_mxfp4_spec.py` | CPU tests of the registry entry, the widths, the config and model refusals, and the rows that check mode compares |
 | `test/kernels/test_qwen38_a95b_mxfp4_kernels.py` | the MXFP4 layout on the host, K2 on 8 GPUs with `qwen38_a95b_mxfp4/check_k2.py`, and the port test `check_port.py` |
 | `test/kernels/qwen38_a95b_mxfp4/inputs.py` | random TP8 shards in SGLang's layouts, the inputs of the kernel checks |
-| `test/e2e/qwen38_a95b_mxfp4_server.py` | the server flags and the environment of the serving test |
-| `test/e2e/test_qwen38_a95b_mxfp4_server.py` | the serving test at TP8 |
+| `test/e2e/qwen38_a95b_mxfp4_server.py` | the server flags, the NEXTN flags in `NEXTN`, and the environment of the serving tests |
+| `test/e2e/test_qwen38_a95b_mxfp4_server.py` | the serving tests at TP8, with `TestMonokernelVerify` for NEXTN |
 
-## 2. The decode step
+## 2. The decode and verify steps
 
 Each decoder layer has an attention block and a sparse MoE. The attention block is full attention or GDN. In a decode
 step, `_Built.forward` runs each layer in two parts:
@@ -46,6 +46,11 @@ step, `_Built.forward` runs each layer in two parts:
 2. One K2 launch on each rank runs the rest of the layer. It writes the layer output and the residual.
 
 SGLang runs the embedding before the first layer. It runs the final norm and the logits processor after the last layer.
+
+With NEXTN, SGLang runs the MTP layer of Qwen3.8 as a draft model. The target model then runs verify steps instead of
+decode steps. A verify step scores the last accepted token and the draft tokens of each request. `_Built.forward` runs
+it as a decode step, with one row for each token. The K2 kernels do not change. With 3 draft steps, a request has 4
+rows, so K2 serves the verify steps of 1 and 2 requests.
 
 A K2 launch is one grid of 256 CTAs with 512 threads each. Each CTA runs on its own CU, and all CTAs stay resident
 until the launch ends. The table gives the stages of one launch in order.
@@ -89,16 +94,19 @@ K2 makes no weight copies. Each rank allocates one peer buffer and one scratch b
 ## 5. Host side and SGLang integration
 
 `spec.py` accepts only gfx950, TP 8, widths 1 to 8, bf16, the `aiter` attention backend, and `--moe-runner-backend`
-`auto` or `aiter`. Its `features` set is empty. Thus SGLang refuses each feature of its default list, for example
-speculative decoding, expert parallelism and DP attention. The spec gives a reason for each unsupported setting. If
-there is a reason, the server stops at startup with an error that lists each reason.
+`auto` or `aiter`. Its `features` set has only `SPECULATIVE_DECODING`. Thus SGLang refuses the other features of its
+default list, for example expert parallelism and DP attention. With speculative decoding, the spec needs one chain of
+draft tokens for each request. It refuses `--speculative-eagle-topk` values other than 1. It also refuses
+`--speculative-num-draft-tokens` values other than `--speculative-num-steps` + 1. The spec gives a reason for each
+unsupported setting. If there is a reason, the server stops at startup with an error that lists each reason.
 
 On each rank, `_build` makes one K2 launch for each CUDA graph width and compiles them before the first step. The log
-shows "Qwen3.8 monokernel: N K2 launches (widths [...]) in T s".
+shows "Qwen3.8 monokernel: N K2 launches (widths [...]) in T s". In the NEXTN test, each request has 4 rows, so the
+widths are 4 and 8.
 
-SGLang uses only the CUDA graph key of a step, which is the width, to choose between K2 and SGLang's forward. Thus each
-rank makes the same choice, and a CUDA graph can replay it. A step with input embeddings or auxiliary hidden states runs
-SGLang's forward.
+SGLang uses only the CUDA graph key of a step to choose between K2 and SGLang's forward. The key gives the width, which
+is the number of requests times the rows of each request. Thus each rank makes the same choice, and a CUDA graph can
+replay it. A step with input embeddings or auxiliary hidden states runs SGLang's forward.
 
 The folder needs no SGLang changes. Start the server with `--monokernel-backend amd` and
 `SGLANG_ROCM_GDN_ONLINE_MXFP4=0`. After sgl-project/sglang#45389, the flag is `--enable-amd-monokernel`.
@@ -121,7 +129,9 @@ K2 launch, on the same input. On the rows that K2 and SGLang route to the same e
 least 0.99, the value in `spec.NUMERICS`.
 
 The e2e test runs K2 on steps of width 1 to 8 and SGLang's forward on wider steps. It also runs GSM8K, measures the
-KL divergence of decode against prefill, runs check mode, and injects a fault on one rank.
+KL divergence of decode against prefill, runs check mode, and injects a fault on one rank. `TestMonokernelVerify` runs
+GSM8K at 4 concurrent requests on a NEXTN server. Its verify steps have 4 to 16 rows, and K2 serves the steps of up to
+8 rows.
 
 ## 7. Limitations
 
@@ -129,7 +139,8 @@ K2 runs only with:
 
 - the checkpoint `amd/Qwen3.8-2.4T-A95B-Quark-MXFP4`
 - TP 8 on gfx950
-- decode steps of width 1 to 8, with no speculative decoding such as MTP
+- decode and NEXTN verify steps of width 1 to 8
+- one chain of draft tokens for each request, with `--speculative-eagle-topk 1`
 - bf16 GDN projections, so start the server with `SGLANG_ROCM_GDN_ONLINE_MXFP4=0`
 - no fused shared expert, so start the server without `--enforce-shared-experts-fusion`
 - the `aiter` attention backend

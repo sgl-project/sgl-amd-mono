@@ -1,5 +1,5 @@
-"""The Qwen3.8 MoE server that the monokernel serving test launches: MI355X, TP8,
-decode steps."""
+"""The Qwen3.8 MoE servers that the monokernel serving test launches: MI355X, TP8,
+decode steps, and NEXTN verify steps."""
 
 import os
 
@@ -43,4 +43,18 @@ ARGS = [
     '{"enable_multithread_load": true}',
     "--reasoning-parser",
     "qwen3",
+]
+# NEXTN as benchmarked: verify steps of up to 2 requests (8 rows) run K2
+NEXTN = [
+    "--speculative-algorithm",
+    "NEXTN",
+    "--speculative-draft-model-path",
+    MODEL,
+    "--speculative-num-steps",
+    "3",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "4",
+    "--enable-linear-replayssm-spec",
 ]
