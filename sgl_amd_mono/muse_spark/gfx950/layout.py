@@ -65,14 +65,22 @@ def token_passes(s: int) -> int:
     return -(-s // TOKENS_PER_PASS)
 
 
+X_FLAG_COPIES = (
+    32  # copies of a merged launch's x flags (a K1 CTA polls copy bid % X_FLAG_COPIES)
+)
+
+
 def k1_scratch_layout() -> dict:
     """K1's scratch regions, name -> (byte offset, bytes), sized for MAX_TOKENS:
     the K parts' fp32 partials (a pair a (part, token, row)) and, in a merged
-    launch, a flag a token for its x."""
+    launch, a flag a token for its x, in ``X_FLAG_COPIES`` copies (MAX_TOKENS pairs
+    apart): every CTA polls the x flags, and 256 CTAs polling one copy's lines queue
+    at the lines' memory channel (a poll round trip of ~1 us); a copy each eight
+    CTAs' worth of XCD spreads them."""
     return pair_layout(
         [
             ("k1_part", PARTS * MAX_TOKENS * QKVG_ROWS),
-            ("k1_xflag", MAX_TOKENS),
+            ("k1_xflag", X_FLAG_COPIES * MAX_TOKENS),
             ("k1_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
         ],
         align=256,

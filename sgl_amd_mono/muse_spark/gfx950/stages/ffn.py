@@ -55,31 +55,39 @@ co-resident)::
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_ir_value
 
 from sgl_amd_mono.common.mx import FP4, mfma_scaled
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    CM_NT,
+    CM_SYS,
     ballot,
     bf2_f32,
     bf16_pair,
     bf16_round,
     butterfly,
+    clock,
     fp8_to_bf16x8,
+    fresh,
     hw_exp2,
     hw_rsq,
     lane_gather,
     mfma_bf16,
     popcount,
+    read_lane_i32,
     row_sum,
     rsrc,
-    sum_partials,
+    sfresh64,
     uniform,
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, cdiv, pair_layout
+from sgl_amd_mono.common.sync import MASK_OOB, _spin_masked, sent_word, shift
 from sgl_amd_mono.muse_spark.gfx950.config import (
     EXPERTS,
     HIDDEN,
@@ -94,14 +102,21 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     TOP_K,
 )
 from sgl_amd_mono.muse_spark.gfx950.device import (
+    acquire_loads,
     global_atomic,
     poll_flags,
     release_stores,
     stamp,
 )
-from sgl_amd_mono.muse_spark.gfx950.layout import TRACE_LAYERS, TRACE_SLOTS
+from sgl_amd_mono.muse_spark.gfx950.layout import (
+    TRACE_LAYERS,
+    TRACE_SLOTS,
+    X_FLAG_COPIES,
+)
 from sgl_amd_mono.muse_spark.gfx950.stages.mxfp4 import (
     e2m1_code,
+    fp4_load_offsets,
+    fp4_unswizzle,
     lanes_before,
     mxfp4_scale,
 )
@@ -136,6 +151,25 @@ RED_SLOT_FLOATS = WAVES * 64 * 4  # one row set of MFMA accumulators
 RED_SLOTS = 8  # two parities x (gate pair + up pair)
 # ---------------------------------------------------------------- fin / unpool / bnd
 AR_PARTS_MAX = 8
+# the fin flags in F_FLAG_COPIES copies (FF_STRIDE pairs apart): the unpool CTAs poll
+# every (token, part) flag, and a hundred CTAs polling one copy's lines queue at their
+# memory channel (a poll round trip of ~1 us); an unpool CTA polls copy bid % 64 (the
+# fin's flag stores: a lane a copy, wave 4 of a split fin task; 64 copies measured
+# ~-0.37 us a target case over 16 in the paired TP8 A/B, 7 rounds)
+F_FLAG_COPIES = 64
+FF_STRIDE = MAX_TOKENS * AR_PARTS_MAX
+# the all-reduce's result rows (``k3_fbuf``) in FB_COPIES copies (FB_WORDS words apart):
+# every unpool CTA stages every row of its pass; an unpool CTA reads copy bid % fb_copies(S)
+FB_COPIES = 8
+FB_WORDS = MAX_TOKENS * MOE_HIDDEN // 2
+
+
+def fb_copies(tokens: int) -> int:
+    """The ``k3_fbuf`` copies written at this width (the wide step's fin stores are on
+    the heaviest rank's critical path: one copy)."""
+    return FB_COPIES if tokens <= 8 else 1
+
+
 UNP_ROWS = 16  # unpooler rows an unpool task: the MFMA's M
 UNP_TASKS = HIDDEN // UNP_ROWS  # 512 row tiles, 1 / npes of them a rank
 UNP_STEPS = MOE_HIDDEN // WAVES // 32  # 16 bf16 MFMA steps a wave
@@ -222,9 +256,9 @@ def k3_scratch_layout() -> dict:
         [
             ("k3_mid", MAX_TOKENS * TOP_K * MID_PAIRS),
             ("k3_y", MAX_TOKENS * TOP_K * MOE_HIDDEN // 2),
-            ("k3_fflag", MAX_TOKENS * AR_PARTS_MAX),
+            ("k3_fflag", F_FLAG_COPIES * MAX_TOKENS * AR_PARTS_MAX),
             ("k3_ss", MAX_TOKENS * TOP_K * DN_T),
-            ("k3_fbuf", MAX_TOKENS * MOE_HIDDEN // 4),
+            ("k3_fbuf", FB_COPIES * MAX_TOKENS * MOE_HIDDEN // 4),
             (
                 "k3_nscal",
                 MAX_TOKENS * 2,
@@ -420,29 +454,28 @@ def w2_rsrc(c, e):
 
 
 def fp4_tile_loads(c, r_w, r_s, row, chunks):
-    """This lane's loads of one 16-row tile (``row``: its row) over the wave's
-    ``chunks`` k chunks: (weight words, scale bytes) in flight. A lane's 16 B are
-    32 E2M1 of the row at byte row K / 2 + chunk 64 + lane group 16; the wave's
-    chunks' 16 scale bytes of the row are one load (byte 4 kc + g4: chunk kc's,
-    lane group g4's)."""
+    """This lane's loads of one 16-row tile (``row``: its row, the tile's first + lane
+    % 16) over the wave's ``chunks`` k chunks: (weight words, scale bytes) in flight.
+    The MFMA wants a lane's 16 B = 32 E2M1 of the row at byte row K / 2 + chunk 64 +
+    lane group 16; the words are loaded in the ``mxfp4.FP4_LOAD_LAYOUT`` lane map (a
+    lane group reads whole sectors) and brought to that layout at the MFMAs
+    (``tile_mfmas_a4``); the wave's chunks' 16 scale bytes of the row are one load (byte
+    4 kc + g4: chunk kc's, lane group g4's)."""
     lane, wave = c["lane"], c["wave"]
-    g4 = lane // 16
     assert chunks == 4
+    row_b = chunks * WAVES * CHUNK // 2
+    lane_off, reg_off = fp4_load_offsets(lane, row_b)
+    base = (row - lane % 16) * row_b + wave * (chunks * CHUNK // 2) + lane_off
     wts = []
     for kc in range(chunks):
-        k_chunk = wave * chunks + kc
         wts.append(
             fx.Vector(
                 bo.buffer_load(
                     r_w,
-                    (
-                        row * (chunks * WAVES * CHUNK // 2)
-                        + k_chunk * (CHUNK // 2)
-                        + g4 * 16
-                    )
-                    // 4,
+                    (base + reg_off[kc]) // 4,
                     vec_width=4,
                     dtype=T.i32,
+                    cache_modifier=CM_NT,  # read once a layer
                 )
             )
         )
@@ -454,14 +487,21 @@ def fp4_tile_loads(c, r_w, r_s, row, chunks):
             dtype=T.i32,
         )
     )
-    scs = [(fx.Int32(sc16[kc]) >> (8 * g4)) & 0xFF for kc in range(chunks)]
-    return wts, scs
+    # the scale bytes are taken at the MFMAs (``tile_mfmas_a4``): taken here, a loop
+    # that carries the next tile's loads would wait for them at its back edge
+    return wts, [sc16]
 
 
 def tile_mfmas_a4(wts, scs, xb):
     """A tile's fp32 accumulator over the wave's chunks: the scaled E2M1 x E2M1
     MFMA on the weight words against the staged column blocks ``xb[kc]`` =
     (words, scale)."""
+    if len(scs) == 1:
+        # the raw scale words (``fp4_tile_loads``): lane group g4's byte of chunk kc
+        g4 = (fx.thread_idx.x % 64) // 16
+        sc16 = scs[0]
+        scs = [(fx.Int32(sc16[kc]) >> (8 * g4)) & 0xFF for kc in range(len(wts))]
+    wts = fp4_unswizzle(wts, fx.thread_idx.x % 64)
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for kc in range(len(wts)):
         acc = mfma_scaled(
@@ -536,6 +576,35 @@ def stage_xq_all(c, xv):
                 )
                 fx.ptr_store(fx.Int32(w4[j]).bitcast(fx.Float32), xcol + at)
     gpu.barrier()
+
+
+def xq_dma_ok(S) -> bool:
+    """``xq_dma`` covers the step: whole 1 KB DMA rows of code and of scale words."""
+    return (S * XQW * 4) % 1024 == 0 and (S * XSW * 4) % 1024 == 0
+
+
+def xq_dma(c):
+    """``stage_xq_all``'s LDS image of every token's blocks, DMA'd straight from K2's
+    ``xinq`` by this wave alone (16 B a lane an instruction, ``sc1``: other CTAs stored
+    them in this launch): the codes then the scales, each a contiguous run of tokens in
+    ``xcol``. The caller waits (``s_waitcnt vmcnt(0)``) and holds the barrier. On the
+    poll wave, behind nothing but its own share of the first weights: issued on every
+    wave, the loads returned behind each wave's weights (loads complete in order)."""
+    S, lane, xcol = c["S"], c["lane"], c["xcol"]
+    W_TOK = XQW + XSW
+    r = rsrc(c["args"]["xinq"])
+    for i in range_constexpr(S * XQW * 4 // 1024):
+        byte = i * 1024 + lane * 16
+        tk = byte // (XQW * 4)
+        lds_dma_sc1(r, xcol + i * 256, tk * (W_TOK * 4) + byte % (XQW * 4))
+    for j in range_constexpr(S * XSW * 4 // 1024):
+        byte = j * 1024 + lane * 16
+        tk = byte // (XSW * 4)
+        lds_dma_sc1(
+            r,
+            xcol + (TILE_COLS * XQW + j * 256),
+            tk * (W_TOK * 4) + XQW * 4 + byte % (XSW * 4),
+        )
 
 
 def xq_b_tok(c, tok, chunks, kc):
@@ -633,11 +702,109 @@ def ug_or_dn_pair_loads(c, q, pr, dq, n_tiles, use_dn):
     ]
 
 
-def dn_pair_loads(c, q, n_tiles):
-    """dn item q's tile pair: 32 rows of the expert's down weight."""
+def pair_loads_e(c, q, pr, dq, e_u, e_d, use_dn, a=None):
+    """``ug_or_dn_pair_loads`` with the tiles' experts given (``first_pair_mask``);
+    ``a``: the weights' bases (default: the arguments)."""
+    l16 = c["lane"] % 16
+    a = c["args"] if a is None else a
+    UGT, DNT, R13, R2, UP0 = (
+        c["ug_t"],
+        c["dn_t"],
+        c["w13_rows"],
+        c["w2_rows"],
+        c["up_row0"],
+    )
+    w_addr = use_dn.select(a["w2"] + fx.Int64(e_d) * (R2 * W2_ROW_BYTES), a["w13"] + fx.Int64(e_u) * (R13 * W13_ROW_BYTES))  # fmt: skip
+    s_addr = use_dn.select(a["s2"] + fx.Int64(e_d) * (R2 * W2_SCALE_COLS), a["s13"] + fx.Int64(e_u) * (R13 * W13_SCALE_COLS))  # fmt: skip
+    r_w, r_s = rsrc(w_addr), rsrc(s_addr)
+    return [
+        [
+            list(part)
+            for part in fp4_tile_loads(
+                c,
+                r_w,
+                r_s,
+                use_dn.select(
+                    (dq % DNT) * 32 + t * 16 + l16,
+                    pr * UP0 + (q % UGT) * 32 + t * 16 + l16,
+                ),
+                UG_CHUNKS,
+            )
+        ]  # fmt: skip
+        for t in range(2)
+    ]
+
+
+def nth_expert(mask, n_tiles, t):
+    """The local expert of column tile ``t`` (0 or 1) of a plan whose experts (one tile
+    each, S <= TILE_COLS) are ``mask``'s set bits in order, clamped as ``tile_info``
+    clamps it (an empty plan: expert 0)."""
+    tc = fx.max(fx.min(t, n_tiles - 1), fx.Int32(0))
+    m1 = (tc == 1).select(mask & (mask - 1), mask)  # the tile's bit is the lowest left
+    low = m1 & (fx.Int32(0) - m1)
+    e = popcount(low - 1)
+    return (m1 == 0).select(fx.Int32(0), fx.min(e, fx.Int32(LOCAL_EXPERTS - 1)))
+
+
+def first_pair_mask(c, mask):
+    """This CTA's first pair's weights (``stage_ug``'s ``cur``) from the picked local
+    experts' mask alone, before the plan: at S <= TILE_COLS an expert holds one column
+    tile and the tiles list the picked experts in order, so the plan's tiles are the
+    mask's set bits."""
+    bid, UGT, DNT = c["bid"], c["ug_t"], c["dn_t"]
+    n_tiles = popcount(mask)
+    q_of, n_ug = ug_count(c, n_tiles)
+    q0 = q_of(0)
+    dq0, _ = dn_range(c, n_tiles)
+    use_dn0 = n_ug == 0
+    e_u = nth_expert(mask, n_tiles, fx.min(q0 // UGT, fx.Int32(1)))
+    e_d = nth_expert(mask, n_tiles, fx.min(dq0 // DNT, fx.Int32(1)))
+    return pair_loads_e(c, q0, 0, dq0, e_u, e_d, use_dn0)
+
+
+def first_pair_table(c):
+    """``first_pair_mask``'s plan arithmetic for every plan size, before the routing is
+    known (``run_k3``: while it is polled): lane i holds n_tiles = i's first dn item
+    and whether the CTA has no ug item, as dq0 | use_dn << 16 (``ug_count`` /
+    ``dn_range``'s integer ops, lane-parallel; at S <= TILE_COLS n_tiles <= the local
+    experts), and the expert weights' bases pinned in SGPRs (the routing's critical
+    path then reloads no kernel argument and runs no runtime division)."""
+    a = c["args"]
+    ntv = fx.min(c["lane"], fx.Int32(LOCAL_EXPERTS))
+    _, n_ug = ug_count(c, ntv)
+    dq0, _ = dn_range(c, ntv)
+    # (opaque moves: LLVM neither sinks the arithmetic past the routing's wait nor
+    # rematerializes the bases from the kernarg segment after it)
+    tab = fresh(fx.Int32(dq0) | (n_ug == 0).select(fx.Int32(1 << 16), fx.Int32(0)))
+    return tab, {k: sfresh64(a[k]) for k in ("w13", "s13", "w2", "s2")}
+
+
+def first_pair_fast(c, mask, tab, ka):
+    """``first_pair_mask`` (the same loads) from ``first_pair_table``'s lane for this
+    plan size and its pinned bases."""
+    bid, UGT, DNT = c["bid"], c["ug_t"], c["dn_t"]
+    n_tiles = popcount(mask)
+    w = read_lane_i32(tab, n_tiles)
+    dq0 = w & 0xFFFF
+    use_dn0 = ((w >> 16) & 1) != 0
+    q0 = bid  # (``ug_balanced``: the CTA's first ug item)
+    e_u = nth_expert(mask, n_tiles, fx.min(q0 // UGT, fx.Int32(1)))
+    e_d = nth_expert(mask, n_tiles, fx.min(dq0 // DNT, fx.Int32(1)))
+    return pair_loads_e(c, q0, 0, dq0, e_u, e_d, use_dn0, dict(c["args"], **ka))
+
+
+def dn_pair_loads(c, q, n_tiles, null=None):
+    """dn item q's tile pair: 32 rows of the expert's down weight. ``null``: no
+    pair (an empty buffer: zeros, no traffic)."""
     l16 = c["lane"] % 16
     e, _, _ = tile_info(c, q // c["dn_t"], n_tiles)
     r_w, r_s = w2_rsrc(c, e)
+    if null is not None:
+        nb = null.select(fx.Int32(0), fx.Int32(0x7FFFFFFF))
+        a = c["args"]
+        rows = c["w2_rows"]
+        r_w = rsrc(a["w2"] + fx.Int64(e) * (rows * W2_ROW_BYTES), nb)
+        r_s = rsrc(a["s2"] + fx.Int64(e) * (rows * W2_SCALE_COLS), nb)
     return [
         [
             list(part)
@@ -649,13 +816,42 @@ def dn_pair_loads(c, q, n_tiles):
     ]
 
 
+UNP_CLAIM_WORD = (
+    2  # the claim counter's word in ``k3_ugq`` (``ug_dyn``'s queue is word 0)
+)
+
+
+@flyc.jit
+def unp_claim(c, n_pool: int):
+    """(``UNP_DYN``) This pool CTA's ticket among the launch's pool CTAs (past the fin
+    tasks) in the order their dn stage ended: the first ``unp_jobs`` take the unpool
+    jobs, so a CTA whose dn ends last carries no unpool or early K1 weights into the
+    fin hops (its CU's loads delayed the fin flags' poll). One atomic add a CTA on a
+    counter that starts the launch at 0: the launch's last claim (every pool CTA
+    claims once) zeroes it again, the next launch's claims coming after this one."""
+    tid, nt = c["tid"], c["nt"]
+    addr = c["ugq"].value + fx.Int64(4 * UNP_CLAIM_WORD)
+    if tid == 0:
+        ticket = global_atomic(addr, 1)
+        if ticket == n_pool - 1:
+            global_atomic(addr, 0, xchg=True)
+        fx.ptr_store(ticket, nt + 2)
+    gpu.barrier()
+    return uniform(fx.ptr_load(nt + 2))
+
+
 def unp_gtask(c, k):
     """CTA ``bid``'s k-th unpool job: (its index among the rank's jobs, its row tile of
     the unpooler, its token pass; outside the rank's jobs: the tile past the buffer, no
     traffic). A job is one row tile over one pass of XS_LDS_MAX tokens, so a wide
-    step's passes spread over the unpool CTAs instead of queuing on a tile's."""
+    step's passes spread over the unpool CTAs instead of queuing on a tile's. With
+    ``unp_job`` (``unp_claim``) the job is the CTA's claimed ticket, not its place."""
     b = c["bases"]
-    job = c["bid"] - b["unp0"] + b["unp_stride"] * k
+    if const_expr(c.get("unp_job") is not None):
+        assert k == 0
+        job = c["unp_job"]  # (``unp_claim``)
+    else:
+        job = c["bid"] - b["unp0"] + b["unp_stride"] * k
     live = (job >= 0) & (job < b["unp_jobs"])
     tile = job // b["unp_passes"]
     ps = job % b["unp_passes"]
@@ -686,6 +882,20 @@ def unp_w_loads(c, gtask):
     ]
 
 
+@flyc.jit
+def unp_w_loads_if(c, gtask, live):
+    """``unp_w_loads`` on a CTA with an unpool job (``live``); zeros, and no loads at
+    all, on the others (a load past the buffer still holds the wave's in-order
+    returns: the fin CTAs' polls came back behind them)."""
+    got = [
+        fx.Vector.filled(2 if c["fp8_unpool"] else 4, 0, fx.Int32)
+        for _ in range(UNP_STEPS)
+    ]
+    if live:
+        got = unp_w_loads(c, gtask)
+    return got
+
+
 def unp_a(c, w):
     """An unpooler weight step as the MFMA's bf16 A operand (FP8 codes decoded)."""
     if c["fp8_unpool"]:
@@ -709,7 +919,7 @@ def unp_scale(c, row):
 
 # ---------------------------------------------------------------- 0. the plan
 @flyc.jit
-def stage_plan(c):
+def stage_plan(c, ids_lds=None):
     """The step's plan in LDS, the same on every CTA: wave w owns local experts
     4 w .. 4 w + 4 and walks every pick (token p / TOP_K, slot p % TOP_K) in rounds
     of 64; a pick's column is its rank among its expert's picks in pick order (a
@@ -724,19 +934,26 @@ def stage_plan(c):
     r_ids = rsrc(a["ids"])
     PICKS = S * TOP_K
     ROUNDS = cdiv(PICKS, 64)
-    # every round's ids, in flight at once (every wave loads them: 8 x 64 ids a round)
-    p_ids = [
-        fx.Int32(
-            bo.buffer_load(
-                r_ids,
-                fx.min(rr * 64 + lane, PICKS - 1),
-                vec_width=1,
-                dtype=T.i32,
-                cache_modifier=CM_DEV,
-            )
-        )  # fmt: skip
-        for rr in range(ROUNDS)
-    ]
+    # every round's ids, in flight at once (every wave loads them: 8 x 64 ids a round),
+    # or (``ids_lds``, a merged launch) from the words ``run_k3`` polled into LDS
+    if const_expr(ids_lds is not None):
+        p_ids = [
+            fx.ptr_load(ids_lds + fx.min(rr * 64 + lane, PICKS - 1)).bitcast(fx.Int32)
+            for rr in range(ROUNDS)
+        ]
+    else:
+        p_ids = [
+            fx.Int32(
+                bo.buffer_load(
+                    r_ids,
+                    fx.min(rr * 64 + lane, PICKS - 1),
+                    vec_width=1,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )  # fmt: skip
+            for rr in range(ROUNDS)
+        ]
     cnts = [
         fx.Int32(0) for _ in range(EPW)
     ]  # this wave's experts' picks so far (uniform)
@@ -781,6 +998,62 @@ def stage_plan(c):
                 fx.ptr_store(lane * COLS + j * TILE_COLS, tile_of + (tile0 + j))
     gpu.barrier()
     return uniform(fx.ptr_load(nt))
+
+
+POLL_WAVE = (
+    WAVES - 1
+)  # a merged launch's K3 prologue polls on the last wave (``run_k3``)
+EARLY_FIRST = (
+    True  # the first pair from the picked experts' mask, before the plan (``run_k3``)
+)
+FP_TABLE = True  # ``first_pair_table`` while the routing is polled (``run_k3``)
+
+
+def ug_first_loads(c, q, dq, n_tiles, use_dn, live):
+    """``ug_or_dn_pair_loads(c, q, 0, dq, n_tiles, use_dn)`` with the buffers emptied
+    where ``live`` is off (zeros, no traffic): the first pair split over the waves'
+    issue times (``stage_ug``: the poll wave issues its share after the expert input's
+    wait, the others at the plan); the two shares are OR-ed (``or_pair``)."""
+    l16 = c["lane"] % 16
+    a = c["args"]
+    e_u, _, _ = tile_info(c, q // c["ug_t"], n_tiles)
+    e_d, _, _ = tile_info(c, dq // c["dn_t"], n_tiles)
+    UGT, DNT, R13, R2 = c["ug_t"], c["dn_t"], c["w13_rows"], c["w2_rows"]
+    w_addr = use_dn.select(a["w2"] + fx.Int64(e_d) * (R2 * W2_ROW_BYTES), a["w13"] + fx.Int64(e_u) * (R13 * W13_ROW_BYTES))  # fmt: skip
+    s_addr = use_dn.select(a["s2"] + fx.Int64(e_d) * (R2 * W2_SCALE_COLS), a["s13"] + fx.Int64(e_u) * (R13 * W13_SCALE_COLS))  # fmt: skip
+    nb = live.select(fx.Int32(0x7FFFFFFF), fx.Int32(0))
+    r_w, r_s = rsrc(w_addr, nb), rsrc(s_addr, nb)
+    return [
+        [
+            list(part)
+            for part in fp4_tile_loads(
+                c,
+                r_w,
+                r_s,
+                use_dn.select(
+                    (dq % DNT) * 32 + t * 16 + l16, (q % UGT) * 32 + t * 16 + l16
+                ),
+                UG_CHUNKS,
+            )
+        ]  # fmt: skip
+        for t in range(2)
+    ]
+
+
+def or_pair(x, y):
+    """Two ``ug_first_loads`` shares (one of them zeros) as one pair's loads."""
+    return [
+        [
+            [
+                fx.Vector.from_elements(
+                    [fx.Int32(u[i]) | fx.Int32(v[i]) for i in range(4)], fx.Int32
+                )
+                for u, v in zip(px, py)
+            ]
+            for px, py in zip(tx, ty)
+        ]  # fmt: skip
+        for tx, ty in zip(x, y)
+    ]
 
 
 @flyc.jit
@@ -991,39 +1264,145 @@ def put_rows(c, region, width, r, rows, e, col0, n, vals_of):
             )
 
 
+UG_COST, DN_COST = 5, 3  # a ug item's and a dn item's relative time (``dn_caps``)
+
+
+def ug_balanced(c):
+    """The ug items round-robin over the CTAs (item ``bid + BLOCKS k``) and the dn
+    ranges weighted by each CTA's ug load (``dn_range``): with the x of every token
+    staged once (``xq_pre``) a tile change costs nothing, the tiles' mids complete in
+    rounds, and the CTAs that run one ug item fewer take more dn items, of the tiles
+    whose mids are already in."""
+    return bool(c["xq_pre"])
+
+
+def ug_count(c, n_tiles):
+    """This CTA's ug items: (item of the CTA's k-th, count)."""
+    bid, UGT = c["bid"], c["ug_t"]
+    TU = n_tiles * UGT
+    if ug_balanced(c):
+        n = (fx.max(TU - bid, fx.Int32(0)) + (BLOCKS - 1)) // BLOCKS
+        return (lambda k: bid + BLOCKS * k), n
+    q0 = (bid * TU) // BLOCKS
+    return (lambda k: q0 + k), ((bid + 1) * TU) // BLOCKS - q0
+
+
+def dn_caps(n_tiles, ug_t, dn_t):
+    """The balanced dn shares (``ug_balanced``) of a plan of ``n_tiles``: (light
+    CTAs, a light CTA's dn items, a heavy CTA's). The ``h`` heavy CTAs run one ug
+    item more (``ug_count``); a CTA ends after its ug items (``UG_COST`` each) and
+    its dn items (``DN_COST``), so the shares are the whole items that end every CTA
+    by the earliest time E with enough items: E sits on a light CTA's dn step
+    (family 1: a heavy CTA takes ceil(U / D) fewer) or a heavy CTA's (family 2: a
+    light CTA takes floor(U / D) more). Plain Python ints or traced Int32."""
+    U, D = UG_COST, DN_COST
+    fu, cu = U // D, -(-U // D)
+    TU, TD = n_tiles * ug_t, n_tiles * dn_t
+    R, h = TU // BLOCKS, TU % BLOCKS
+    na = BLOCKS - h
+    if isinstance(TD, int):
+        mx = max
+    else:
+
+        def mx(x, y):
+            return fx.max(x, fx.Int32(y))
+
+    def sel(p, x, y):
+        return (x if p else y) if isinstance(p, bool) else p.select(x, y)
+
+    # family 1: (m, m - cu) items, E = U R + D m
+    m1 = sel(na * cu >= TD, (TD + na - 1) // na, (TD + h * cu + BLOCKS - 1) // BLOCKS)
+    e1 = U * R + D * m1
+    # family 2: (m + fu, m) items, E = U (R + 1) + D m
+    m2 = (mx(TD - na * fu, 0) + BLOCKS - 1) // BLOCKS
+    e2 = U * (R + 1) + D * m2
+    one = e1 <= e2
+    cap_a = sel(one, m1, m2 + fu)
+    cap_b = sel(one, mx(m1 - cu, 0), m2)
+    return na, cap_a, cap_b, h
+
+
+def dn_range(c, n_tiles):
+    """This CTA's dn items: a contiguous tile-major range (first, count). Balanced
+    (``ug_balanced``): the light CTAs first (bid h .., one ug item fewer: they take
+    the leading tiles, whose ug items ran in the full rounds), then the heavy ones
+    (bid 0 .. h), each taking its share (``dn_caps``) until the items run out."""
+    bid, UGT, DNT = c["bid"], c["ug_t"], c["dn_t"]
+    TD = n_tiles * DNT
+    if not ug_balanced(c):
+        q0 = (bid * TD) // BLOCKS
+        return q0, ((bid + 1) * TD) // BLOCKS - q0
+    na, cap_a, cap_b, h = dn_caps(n_tiles, UGT, DNT)
+
+    def start(j):
+        return fx.min(fx.min(j, na) * cap_a + fx.max(j - na, fx.Int32(0)) * cap_b, TD)
+
+    j = (bid >= h).select(bid - h, bid + na)
+    d0 = start(j)
+    return d0, start(j + 1) - d0
+
+
 @flyc.jit
-def stage_ug(c, n_tiles):
-    """This CTA's contiguous range of the ug items (tile, 32-row block), each two
-    pairs (gate rows, then up rows): the tile's x restaged at a tile boundary, the
-    next pair's weights issued before this pair's MFMAs, and after the up pair the
-    SwiGLU mids of the 32 rows leave as MXFP4 blocks. The reduction rows alternate
-    between items: one barrier an item."""
+def stage_ug(c, n_tiles, xin_wait=None, first=None):
+    """This CTA's ug items (tile, 32-row block; ``ug_count``), each two pairs (gate
+    rows, then up rows): the tile's x restaged at a tile boundary, the next pair's
+    weights issued before this pair's MFMAs, and after the up pair the SwiGLU mids
+    of the 32 rows leave as MXFP4 blocks. The reduction rows alternate between
+    items: one barrier an item. ``xin_wait``: the expert input's flags, waited for
+    first (``run_k3`` polls them before the plan)."""
     S, bid, red = c["S"], c["bid"], c["red"]
     UGT, DNT = c["ug_t"], c["dn_t"]  # items a tile (TP experts: the rank's slices)
-    TU = n_tiles * UGT
-    q0 = (bid * TU) // BLOCKS
-    n_items = 2 * (((bid + 1) * TU) // BLOCKS - q0)
-    # the first tile's x goes out before the first weights: loads complete in
-    # order, so x lands (and is quantized) while the weights stream
+    q_of, n_ug = ug_count(c, n_tiles)
+    q0 = q_of(0)
+    n_items = 2 * n_ug
     t0 = q0 // UGT
     e0, c0, n0 = tile_info(c, t0, n_tiles)
     pre = c["xq_pre"]
-    xv0 = xq_all_loads(c) if pre else xq_loads(c, e0, c0, n0)
     # the dn stage's first item: its weights go out as the loop's last prefetch (a
     # duplicate of the last pair went out there before; a CTA without ug items
     # issues them first thing), so they land while the dn stage waits for its mids
-    TD = n_tiles * DNT
-    dq0 = (bid * TD) // BLOCKS
-    cur = ug_or_dn_pair_loads(c, q0, 0, dq0, n_tiles, n_items == 0)
-    if const_expr(pre):
-        stage_xq_all(
-            c, xv0
-        )  # every token's blocks: a tile change is only the lanes' tokens
-    else:
-        stage_xq_cols(c, e0, c0, n0, xv0)
+    dq0, _ = dn_range(c, n_tiles)
+    # (merged launch, ``early_w``) the first pair's weights go out at the plan, before
+    # the expert input's wait, on every wave but the one polling the expert input's
+    # flags (a poll returns in order behind its wave's loads); that wave issues its share
+    # once the flags are in. They stream while xn finishes; the x blocks follow them
+    # (needed only for the first MFMAs, which wait for the weights anyway). Otherwise
+    # the first tile's x goes out before the first weights: loads complete in order,
+    # so x lands (and is quantized) while the weights stream
+    early_w = xin_wait is not None and pre
+    use_dn0 = n_items == 0
+    # (``xq_dma``) every wave's share at the plan, the poll wave's too: its xin poll then
+    # returns once that share landed, and it DMAs the staged blocks to LDS after the
+    # flags, behind nothing else; the other waves stage no x (their loads would return
+    # behind their weights)
+    dma = early_w and xq_dma_ok(S)
+    cur = None
+    if const_expr(first is not None):
+        cur = first  # (issued before the plan: ``first_pair_mask``)
+    elif const_expr(dma):
+        cur = ug_or_dn_pair_loads(c, q0, 0, dq0, n_tiles, use_dn0)
+    elif const_expr(early_w):
+        cur = ug_first_loads(c, q0, dq0, n_tiles, use_dn0, c["wave"] != POLL_WAVE)
+    if const_expr(xin_wait is not None):
+        xin_wait(dma)
+        stamp(c, 14)  # the expert input arrived
+    if const_expr(not dma):
+        if const_expr(early_w):
+            late = ug_first_loads(c, q0, dq0, n_tiles, use_dn0, c["wave"] == POLL_WAVE)
+        xv0 = xq_all_loads(c) if pre else xq_loads(c, e0, c0, n0)
+        if const_expr(early_w):
+            cur = or_pair(cur, late)
+        else:
+            cur = ug_or_dn_pair_loads(c, q0, 0, dq0, n_tiles, use_dn0)
+        if const_expr(pre):
+            stage_xq_all(
+                c, xv0
+            )  # every token's blocks: a tile change is only the lanes' tokens
+        else:
+            stage_xq_cols(c, e0, c0, n0, xv0)
     cur_t = t0
     for i in range(0, n_items):
-        q = q0 + i // 2
+        q = q_of(i // 2)
         pr = i % 2
         ti = q // UGT
         e, col0, n = tile_info(c, ti, n_tiles)
@@ -1034,7 +1413,7 @@ def stage_ug(c, n_tiles):
                 cur_t = ti
         i1 = fx.min(i + 1, n_items - 1)
         nxt = ug_or_dn_pair_loads(
-            c, q0 + i1 // 2, i1 % 2, dq0, n_tiles, i + 1 >= n_items
+            c, q_of(i1 // 2), i1 % 2, dq0, n_tiles, i + 1 >= n_items
         )
         if const_expr(pre):
             tok = lane_token(c, e, col0, n)
@@ -1061,7 +1440,7 @@ def stage_ug(c, n_tiles):
 
 
 @flyc.jit
-def stage_ug_dyn(c, n_tiles):
+def stage_ug_dyn(c, n_tiles, xin_wait=None):
     """The ug items from a queue (merged launch, pre-quantized x): CTA bid's first
     item is ``bid``, every later one ``BLOCKS`` + a ticket of the launch's queue
     word (``k3_ugq``, zeroed at the launch's entry by CTA 0 before its xn task's
@@ -1077,6 +1456,9 @@ def stage_ug_dyn(c, n_tiles):
     dq0 = (bid * TD) // BLOCKS
     ctr = c["ugq"].value
     no = fx.Int32(0) == fx.Int32(1)
+    if const_expr(xin_wait is not None):
+        xin_wait()  # (before the first ticket: the queue word is zeroed before the flags)
+        stamp(c, 14)  # the expert input arrived
     xv = xq_all_loads(c)
     tk = fx.Int32(0)
     if tid == 0:
@@ -1128,123 +1510,283 @@ def stage_ug_dyn(c, n_tiles):
 
 @flyc.jit
 def stage_dn(c, n_tiles, first=None):
-    """This CTA's contiguous range of the dn items (tile, 32-row block): the tile's
-    mid blocks restaged at a tile boundary, the next item's weights issued before
-    this item's MFMAs, each item's 32 y rows of its columns to ``k3_y``. ``first``:
-    the first item's weights, in flight (the ug stage's last prefetch)."""
+    """This CTA's contiguous range of the dn items (tile, 32-row block), streamed
+    like the ug pairs: the next item's weights issued before this item's MFMAs, the
+    tile's mid blocks restaged at a tile boundary, and the items taken in groups of
+    two of one tile (the range's last item, or the last of a tile, alone) that
+    share one barrier and one epilogue (waves 0 .. 3 the first item's rows, 4 .. 7
+    the second's), each item's 32 y rows of its columns to ``k3_y``. ``first``: the
+    first item's weights, in flight (the ug stage's last prefetch). Each item's sum
+    of squares is its four waves' partials in wave order, published as before."""
     S, bid, red = c["S"], c["bid"], c["red"]
     DNT = c["dn_t"]
-    TD = n_tiles * DNT
-    q0 = (bid * TD) // BLOCKS
-    n_items = ((bid + 1) * TD) // BLOCKS - q0
+    if const_expr(c["ug_dyn"]):
+        TD = n_tiles * DNT
+        q0 = (bid * TD) // BLOCKS
+        n_items = ((bid + 1) * TD) // BLOCKS - q0
+    else:
+        q0, n_items = dn_range(c, n_tiles)
     cur = (
         first if first is not None else dn_pair_loads(c, q0, n_tiles)
     )  # (a trace-time choice)
     cur_t = fx.Int32(-1)
     # the finalize's sum of squares (v = bf16(bf16(y) pen_w), the fin stage's values)
     # of each item's 32 rows of each column: a wave partial a column in LDS (two
-    # parities), summed and published an item later, behind that item's barrier
+    # parities), summed and published a group later, behind that group's barrier
     tid, lane, wave, misc, put = c["tid"], c["lane"], c["wave"], c["misc"], c["put"]
     r_pw = rsrc(c["args"]["pen_w"])
-    j16, rp = tid % TILE_COLS, tid // TILE_COLS
-    prev_q, prev_e, prev_c0, prev_n = (
+    j16, rp = (
+        tid % TILE_COLS,
+        tid // TILE_COLS,
+    )  # column, row pair of the group (0 .. 31)
+    hp = tid // TILE_COLS  # a publishing thread's item of its group (threads 0 .. 31)
+    HW = WAVES // 2  # waves an item's rows
+    prev_q, prev_e, prev_c0, prev_n, prev_k = (
         fx.Int32(-1),
+        fx.Int32(0),
         fx.Int32(0),
         fx.Int32(0),
         fx.Int32(0),
     )
 
-    def publish_ss(par, pq, pe, pc0, pn):
-        if (pq >= 0) & (tid < TILE_COLS) & (tid < pn):
-            tot = fx.ptr_load(misc + (par * (WAVES * TILE_COLS) + tid))
-            for w in range_constexpr(1, WAVES):
+    def publish_ss(par, pq, pe, pc0, pn, pk):
+        # thread (item hp < pk of the group, column j16 < pn): the item's four waves'
+        # partials in wave order
+        if (pq >= 0) & (hp < pk) & (j16 < pn):
+            w0 = hp * HW
+            tot = fx.ptr_load(misc + (par * (WAVES * TILE_COLS) + w0 * TILE_COLS + j16))
+            for w in range_constexpr(1, HW):
                 tot = tot + fx.ptr_load(
-                    misc + (par * (WAVES * TILE_COLS) + w * TILE_COLS + tid)
+                    misc + (par * (WAVES * TILE_COLS) + (w0 + w) * TILE_COLS + j16)
                 )
+            qq = pq + hp
             if const_expr(c["tpx"]):
                 # the item's part of the pick's sum, to every rank (DN_T parts in all)
-                at = pick_at(c, pe, pc0 + tid) * DN_T + c["rank"] * DNT + pq % DNT
+                at = pick_at(c, pe, pc0 + j16) * DN_T + c["rank"] * DNT + qq % DNT
                 for pr_ in range_constexpr(c["W"]):
                     put(c["peer_ssx"][pr_], at, tot)
             else:
-                put(c["ss"], pick_at(c, pe, pc0 + tid) * DN_T + pq % DN_T, tot)
+                put(c["ss"], pick_at(c, pe, pc0 + j16) * DN_T + qq % DN_T, tot)
 
+    g = fx.Int32(0)  # this item's place in its group
+    gk = fx.Int32(1)  # the group's items
+    gq = q0  # the group's first item
+    gpar = fx.Int32(0)  # the group's reduction rows' parity
+    pw_word = fx.Int32(0)
     for i in range(0, n_items):
         q = q0 + i
         ti = q // DNT
         e, col0, n = tile_info(c, ti, n_tiles)
+        if g == 0:
+            # a group: this item and the next one of the same tile
+            gk = ((i + 1 < n_items) & ((q + 1) // DNT == ti)).select(
+                fx.Int32(2), fx.Int32(1)
+            )
+            gq = q
+            # the post norm's weights of the group's rows go out ahead of the next
+            # item's weights: behind them the group's epilogue would wait for those
+            c0 = (q % DNT) * 32 + 2 * fx.min(rp, 16 * gk - 1)
+            if const_expr(c["tpx"]):
+                c0 = c0 + c["rank"] * c["w2_rows"]  # the rank's output columns
+            pw_word = fx.Int32(bo.buffer_load(r_pw, c0 // 2, vec_width=1, dtype=T.i32))
+        # the next item's weights stream while a tile's mids are polled (after the
+        # last item: none, no traffic ahead of the fin / unpool loads)
+        nxt = dn_pair_loads(
+            c, q0 + fx.min(i + 1, n_items - 1), n_tiles, null=i + 1 >= n_items
+        )
         if ti != cur_t:
             gpu.barrier()  # every thread is done with the previous tile's columns
             stage_mid_q(c, e, col0, n)
+            # the poll's loads are in (behind the weights in flight): said here, the
+            # compiler drains no load for the poll's registers on the path without a
+            # tile change (it drained the next item's before this item's MFMAs)
+            rocdl.s_waitcnt(vmcnt=0)
             stamp(c, 12)  # a tile's mids arrived (the CTA's last tile's survives)
             cur_t = ti
-        nxt = dn_pair_loads(c, q0 + fx.min(i + 1, n_items - 1), n_tiles)
         xb = [xq_b(c, n, DN_CHUNKS, kc) for kc in range(DN_CHUNKS)]
-        par = i % 2
-        pbase = par * (2 * RED_SLOT_FLOATS)
+        pbase = gpar * (4 * RED_SLOT_FLOATS)
         for t in range_constexpr(2):
-            tile_store(c, 2 * par + t, tile_mfmas_a4(cur[t][0], cur[t][1], xb))
-        gpu.barrier()
-        publish_ss((i + 1) % 2, prev_q, prev_e, prev_c0, prev_n)  # the previous item's
+            tile_store(c, 4 * gpar + 2 * g + t, tile_mfmas_a4(cur[t][0], cur[t][1], xb))
+        if g == gk - 1:
+            gpu.barrier()
+            publish_ss(
+                1 - gpar, prev_q, prev_e, prev_c0, prev_n, prev_k
+            )  # the previous group's
 
-        def y_of(row, j):
-            return row_sum(red + pbase + (row // 16) * RED_SLOT_FLOATS, row % 16, j)
+            def y_of(row, j):
+                return row_sum(red + pbase + (row // 16) * RED_SLOT_FLOATS, row % 16, j)
 
-        ya, yb = (
-            y_of(2 * fx.min(rp, fx.Int32(15)), j16),
-            y_of(2 * fx.min(rp, fx.Int32(15)) + 1, j16),
-        )
-        if const_expr(not c["tpx"]):
-            put_rows(
-                c,
-                c["y"],
-                MOE_HIDDEN,
-                q % DN_T,
-                32,
-                e,
-                col0,
-                n,
-                lambda row, j: (row % 2 == 0).select(ya, yb),
-            )
-        # (row pairs 16 .. 31 are no rows of the item: threads 256 .. 511 add 0)
-        c0 = (q % DNT) * 32 + 2 * fx.min(rp, fx.Int32(15))
-        if const_expr(c["tpx"]):
-            c0 = c0 + c["rank"] * c["w2_rows"]  # the rank's output columns
-        pw0, pw1 = bf2_f32(
-            fx.Int32(bo.buffer_load(r_pw, c0 // 2, vec_width=1, dtype=T.i32))
-        )
-        v0 = bf16_round(bf16_round(ya) * pw0)
-        v1 = bf16_round(bf16_round(yb) * pw1)
-        if const_expr(c["tpx"]):
-            # the finalized values v = bf16(y pen_w) to every rank: each finalizes the whole row
-            if (j16 < n) & (rp < 16):
-                at = pick_at(c, e, col0 + j16) * (MOE_HIDDEN // 2) + c0 // 2
-                for pr_ in range_constexpr(c["W"]):
-                    c["put_bf"](c["peer_vx"][pr_], 2 * at, [v0, v1])
-        ss = ((j16 < n) & (rp < 16)).select(v0 * v0 + v1 * v1, fx.Float32(0.0))
-        ss = butterfly(ss, (16, 32))  # the wave's four row pairs of column j16
-        if lane < TILE_COLS:
-            fx.ptr_store(
-                ss, misc + (par * (WAVES * TILE_COLS) + wave * TILE_COLS + lane)
-            )
-        prev_q, prev_e, prev_c0, prev_n = q, e, col0, n
+            rr = 2 * fx.min(
+                rp, 16 * gk - 1
+            )  # (row pairs past the group: its last, no store)
+            ya, yb = y_of(rr, j16), y_of(rr + 1, j16)
+            live = (j16 < n) & (rp < 16 * gk)
+            if const_expr(not c["tpx"]):
+                if live:
+                    c["put_bf"](
+                        c["y"],
+                        pick_at(c, e, col0 + j16) * MOE_HIDDEN
+                        + (gq % DN_T) * 32
+                        + 2 * rp,
+                        [ya, yb],
+                    )
+            c0 = (gq % DNT) * 32 + rr
+            if const_expr(c["tpx"]):
+                c0 = c0 + c["rank"] * c["w2_rows"]
+            pw0, pw1 = bf2_f32(pw_word)
+            v0 = bf16_round(bf16_round(ya) * pw0)
+            v1 = bf16_round(bf16_round(yb) * pw1)
+            if const_expr(c["tpx"]):
+                # the finalized values v = bf16(y pen_w) to every rank: each finalizes the whole row
+                if live:
+                    at = pick_at(c, e, col0 + j16) * (MOE_HIDDEN // 2) + c0 // 2
+                    for pr_ in range_constexpr(c["W"]):
+                        c["put_bf"](c["peer_vx"][pr_], 2 * at, [v0, v1])
+            ss = live.select(v0 * v0 + v1 * v1, fx.Float32(0.0))
+            ss = butterfly(ss, (16, 32))  # the wave's four row pairs of column j16
+            if lane < TILE_COLS:
+                fx.ptr_store(
+                    ss, misc + (gpar * (WAVES * TILE_COLS) + wave * TILE_COLS + lane)
+                )
+            prev_q, prev_e, prev_c0, prev_n, prev_k = gq, e, col0, n, gk
+            gpar = 1 - gpar
+            g = fx.Int32(0)
+        else:
+            g = fx.Int32(1)
         cur = nxt
-    gpu.barrier()  # ``red`` is reused by the fin and unpool stages; the last item's partials are in
-    publish_ss(
-        (n_items + 1) % 2, prev_q, prev_e, prev_c0, prev_n
-    )  # the last item's (parity n_items - 1)
+    gpu.barrier()  # ``red`` is reused by the fin and unpool stages; the last group's partials are in
+    publish_ss(1 - gpar, prev_q, prev_e, prev_c0, prev_n, prev_k)  # the last group's
 
 
 # ---------------------------------------------------------------- 3. fin + all-reduce
+# The all-reduce's partials (``ffn``) are zero-sentinel words, not tagged pairs: a
+# (source rank, token, column pair)'s bf16 pair as one word, stored complemented
+# (``zs_enc``: never 0, a word that was all ones becomes ``sent_word``'s NaN pair
+# first), so an unwritten word reads 0 -- the peer buffer starts zeroed and every
+# word is read and re-armed (0) by its one reader in the launch that pushed it, the
+# next push to it coming from a later launch. Half a tagged pair's bytes: the
+# heaviest rank's push (S x MOE_HIDDEN x 2 B to every peer) is link-bound.
+def zs_enc(w):
+    """The zero-sentinel word of bf16-pair word ``w``."""
+    return sent_word(w) ^ fx.Int32(-1)
+
+
+def zs_word(src, t, col):
+    """The word of (source rank, token t, column pair at ``col``) in ``ffn``."""
+    return ((src * MAX_TOKENS + t) * MOE_HIDDEN + col) // 2
+
+
+def poll_zs(base, offs, n, gap=1):
+    """Words ``off`` .. + ``n`` (n <= 4) of the zero-sentinel region at ``base``
+    (system scope) for every ``off`` in ``offs``, once none is 0, re-polling only the
+    specs still pending; [[n words decoded], ...] (the caller re-arms them)."""
+    r = rsrc(base, MASK_OOB)
+    N = len(offs)
+
+    def load(prev):
+        words = []
+        for e in range_constexpr(N):
+            off = fx.Int32(offs[e])
+            if const_expr(prev is not None):
+                d = prev[n * e] != fx.Int32(0)
+                for q in range_constexpr(1, n):
+                    d = d & (prev[n * e + q] != fx.Int32(0))
+                off = d.select(fx.Int32(MASK_OOB // 4), off)
+            w = bo.buffer_load(r, off, vec_width=n, dtype=T.i32, cache_modifier=CM_SYS)
+            w = (
+                [fx.Int32(w)]
+                if n == 1
+                else [fx.Int32(fx.Vector(w)[q]) for q in range(n)]
+            )
+            for q in range_constexpr(n):
+                if const_expr(prev is None):
+                    words.append(w[q])
+                else:
+                    words.append(d.select(prev[n * e + q], w[q]))
+        return fx.Vector.from_elements(words, fx.Int32)
+
+    def pending(v):
+        bad = v[0] == fx.Int32(0)
+        for e in range_constexpr(1, n * N):
+            bad = bad | (v[e] == fx.Int32(0))
+        return bad
+
+    v = _spin_masked(load, pending, gap)
+    return [[v[n * e + q] ^ fx.Int32(-1) for q in range(n)] for e in range(N)]
+
+
+def zs_store(base, off, words):
+    """Words ``off`` .. of a zero-sentinel region := ``words`` (one store, system scope)."""
+    if len(words) == 1:
+        bo.buffer_store(fx.Int32(words[0]), rsrc(base), off, cache_modifier=CM_SYS)
+    else:
+        bo.buffer_store(
+            fx.Vector.from_elements(words, fx.Int32),
+            rsrc(base),
+            off,
+            cache_modifier=CM_SYS,
+        )
+
+
+@flyc.jit
+def stamp_at(c, idx: int, who: int, zero: bool = False):
+    """``device.stamp`` written by thread ``who`` (a trace build's stamp from a wave
+    other than the first); ``zero``: the slot := 0 (a role this CTA did not take)."""
+    if const_expr(not c.get("trace_on", False)):
+        return
+    layer = c.get("layer")
+    if const_expr(layer is None):
+        base = c["bid"] * TRACE_SLOTS
+    else:
+        base = (layer % TRACE_LAYERS) * (BLOCKS * TRACE_SLOTS) + c["bid"] * TRACE_SLOTS
+    if c["tid"] == who:
+        now = fx.Int64(0) if zero else clock()
+        addr = c["trace"].value + fx.Int64((base + idx) * 8)
+        ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result
+        llvm.StoreOp(as_ir_value(now), ptr, alignment=8)
+
+
+@flyc.jit
+def fin_held(c, t):
+    """Token t's slots this rank holds, as ``pick`` gives them (>= 0: held, -1: not),
+    from the plan still in LDS (``pick_of`` / ``cnt_of``): a load of the ids here
+    returned ~1 us after the CTA's last dn item, and the fin poll's addresses wait
+    on it. Thread i scans local expert i / 16's columns 4 (i % 16) .. + 4; the
+    slots found are OR-ed over the CTA (``sums``, free outside the boundary)."""
+    tid, lane, wave, sums = c["tid"], c["lane"], c["wave"], c["sums"]
+    assert LOCAL_EXPERTS * COLS == 4 * THREADS
+    e = tid // 16
+    j0 = (tid % 16) * 4
+    cnt = fx.ptr_load(c["cnt_of"] + e)
+    m = fx.Int32(0)
+    for q in range_constexpr(4):
+        p = fx.ptr_load(c["pick_of"] + (e * COLS + j0 + q))
+        hit = (j0 + q < cnt) & ((p >> 3) == t)
+        m = m | hit.select(fx.Int32(1) << (p & (TOP_K - 1)), fx.Int32(0))
+    m = butterfly(m, (32, 16, 8, 4, 2, 1), bor)
+    if lane == 0:
+        fx.ptr_store(m.bitcast(fx.Float32), sums + wave)
+    gpu.barrier()
+    tot = fx.ptr_load(sums).bitcast(fx.Int32)
+    for w in range_constexpr(1, WAVES):
+        tot = tot | fx.ptr_load(sums + w).bitcast(fx.Int32)
+    return [
+        (((tot >> sl) & 1) != 0).select(fx.Int32(0), fx.Int32(-1))
+        for sl in range(TOP_K)
+    ]
+
+
 @flyc.jit
 def stage_fin(c, t, part):
     """fin task (token t, part): the part's columns of the token's slots (two or
     four elements a thread), the finalize (v = bf16(y pen_w), each slot's sum of
     squares over its whole row summed from the dn items' publishes in ``k3_ss``,
-    score / rms weighted sum in slot order), pushed as bf16 pairs to every rank's ``ffn``
-    region, then the same columns of every rank's partial summed in rank order ->
-    ``k3_fbuf`` (plain bf16) and the (token, part) flag. A token none of whose
-    picks this rank holds pushes zeros and polls nothing."""
+    score / rms weighted sum in slot order), pushed as zero-sentinel bf16-pair words
+    (``zs_enc``) to every rank's ``ffn`` region, then the same columns of every rank's
+    partial summed in rank order -> ``k3_fbuf`` (plain bf16) and the (token, part)
+    flag. A token none of whose picks this rank holds pushes zeros and polls nothing.
+    The token's held slots come from the plan in LDS (``fin_held``); the push and the
+    partials' poll run on separate waves (``split``)."""
     S, W, tid, lane, wave, red = (
         c["S"],
         c["W"],
@@ -1259,11 +1801,19 @@ def stage_fin(c, t, part):
     rank = c["rank"]
     AP = c["ar_parts"]
     AR_COLS = MOE_HIDDEN // AP
-    PPT = fin_ppt(AP)  # column pairs a thread
+    # (``split``) the first half of the threads computes and pushes the partial, the
+    # second half polls the ranks' partials of the same columns: a poll on a wave that
+    # pushed returns behind the pushes' acks (remote, ~1.6-1.9 us under the AR's egress)
+    HALF = THREADS // 2
+    split = cdiv(AR_COLS // 2, HALF) <= 2
+    PPT = cdiv(AR_COLS // 2, HALF) if split else fin_ppt(AP)  # column pairs a thread
     NV = 2 * PPT
-    act = NV * tid < AR_COLS
+    me = tid % HALF if split else tid
+    act = NV * me < AR_COLS
+    pusher = act & (tid < HALF) if split else act
+    poller = act & (tid >= HALF) if split else act
     col = part * AR_COLS + NV * fx.min(
-        tid, AR_COLS // NV - 1
+        me, AR_COLS // NV - 1
     )  # an idle thread loads the last columns
     # the post norm's weight of these columns (bf16 pairs)
     pwv = bo.buffer_load(rsrc(a["pen_w"]), col // 2, vec_width=PPT, dtype=T.i32)
@@ -1273,7 +1823,7 @@ def stage_fin(c, t, part):
         pwv = fx.Vector(pwv)
         pw_words = [pwv[q] for q in range(PPT)]
     pw = [bf2_f32(w)[h] for w in pw_words for h in range(2)]
-    es = [pick(c, t, sl) for sl in range(TOP_K)]
+    es = fin_held(c, t)
     scs = [
         fx.Float32(
             bo.buffer_load(
@@ -1301,6 +1851,7 @@ def stage_fin(c, t, part):
         hit = (wave == s_) & (es[s_] >= 0)
         psl = hit.select(fx.Int32(s_), psl)
         held_w = held_w | hit
+    stamp(c, 9)  # (trace) the fin poll's addresses known
     if fb >= 0:
         # the slots' y columns and this wave's slot's sum of squares in one poll round
         # (the ss publish trails its item's y by one item: polled apart it was a
@@ -1312,6 +1863,7 @@ def stage_fin(c, t, part):
             ]
             + [(ss_mb, (t * TOP_K + psl) * DN_T + 2 * lane, 2)]
         )  # fmt: skip
+        stamp(c, 13)  # the token's y columns and sums of squares arrived (fin CTAs)
         got_ss = got[TOP_K]
         vs = []
         for sl in range_constexpr(TOP_K):
@@ -1345,33 +1897,61 @@ def stage_fin(c, t, part):
         vals = [a0, a1]
     else:
         vals = [a0, a1, a2, a3]
-    if act:
-        # this rank's partial of these columns to every rank (itself too)
+    if pusher:
+        # this rank's partial of these columns to every rank (itself too), zero-sentinel words
+        enc = [
+            zs_enc(bf16_pair(vals[2 * q], vals[2 * q + 1]).bitcast(fx.Int32))
+            for q in range(PPT)
+        ]
         for pe in range_constexpr(W):
-            put_bf(c["peer_ffn"][pe], (rank * MAX_TOKENS + t) * MOE_HIDDEN + col, vals)
-    if act:
+            zs_store(c["peer_ffn"][pe].value, zs_word(rank, t, col), enc)
+    stamp(c, 10)  # (trace) the partial pushed
+    if poller:
         # the ranks' partials of the same columns, summed in rank order, one rounding
+        # (a spec a rank: its PPT words)
+        ws = poll_zs(own_ffn.value, [zs_word(src, t, col) for src in range(W)], PPT)
         words = []
         for q in range_constexpr(PPT):
-
-            def pair_at(src, q=q):
-                return ((src * MAX_TOKENS + t) * MOE_HIDDEN + col) // 2 + q
-
-            lo, hi = sum_partials(poll, own_ffn, pair_at, W)
+            lo, hi = bf2_f32(ws[0][q])
+            for src in range_constexpr(1, W):
+                lo2, hi2 = bf2_f32(ws[src][q])
+                lo = lo + lo2
+                hi = hi + hi2
             words.append(bf16_pair(lo, hi).bitcast(fx.Int32))
+        stamp_at(
+            c, 15, HALF if split else 0
+        )  # every rank's partials arrived (fin CTAs)
         r_f = rsrc(fbuf.value)
-        if const_expr(PPT == 1):
-            bo.buffer_store(
-                words[0], r_f, (t * MOE_HIDDEN + col) // 2, cache_modifier=CM_DEV
-            )
-        else:
-            bo.buffer_store(
-                fx.Vector.from_elements(words, fx.Int32), r_f, (t * MOE_HIDDEN + col) // 2, cache_modifier=CM_DEV
-            )  # fmt: skip
-    release_stores()
-    gpu.barrier()
-    if tid == 0:
-        put(c["fflag"], t * AP + part, fx.Int32(1))
+        for k_ in range_constexpr(fb_copies(c["S"])):  # every copy (``fb_copies``)
+            if const_expr(PPT == 1):
+                bo.buffer_store(
+                    words[0],
+                    r_f,
+                    k_ * FB_WORDS + (t * MOE_HIDDEN + col) // 2,
+                    cache_modifier=CM_DEV,
+                )
+            else:
+                bo.buffer_store(
+                    fx.Vector.from_elements(words, fx.Int32), r_f, k_ * FB_WORDS + (t * MOE_HIDDEN + col) // 2, cache_modifier=CM_DEV
+                )  # fmt: skip
+    if const_expr(split):
+        # only the fbuf stores precede the flag: the pushers' remote stores need no
+        # ack here (their readers check the words), and the flag goes from a poller
+        if tid >= HALF:
+            release_stores()
+        gpu.barrier()
+        fk = tid - HALF  # every copy of the flag, a lane each
+        if (fk >= 0) & (fk < F_FLAG_COPIES):
+            put(c["fflag"], fk * FF_STRIDE + t * AP + part, fx.Int32(1))
+    else:
+        release_stores()
+        gpu.barrier()
+        if tid < F_FLAG_COPIES:
+            put(c["fflag"], tid * FF_STRIDE + t * AP + part, fx.Int32(1))
+    if poller:
+        # re-arm the words read (the next push to them is a later launch's)
+        for src in range_constexpr(W):
+            zs_store(own_ffn.value, zs_word(src, t, col), [fx.Int32(0)] * PPT)
 
 
 @flyc.jit
@@ -1432,110 +2012,292 @@ def stage_fin_tpx(c, t, part):
             bf16_pair(acc[2 * q], acc[2 * q + 1]).bitcast(fx.Int32) for q in range(PPT)
         ]
         r_f = rsrc(fbuf.value)
-        if const_expr(PPT == 1):
-            bo.buffer_store(
-                words[0], r_f, (t * MOE_HIDDEN + col) // 2, cache_modifier=CM_DEV
-            )
-        else:
-            bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), r_f, (t * MOE_HIDDEN + col) // 2, cache_modifier=CM_DEV)  # fmt: skip
+        for k_ in range_constexpr(fb_copies(c["S"])):  # every copy (``fb_copies``)
+            if const_expr(PPT == 1):
+                bo.buffer_store(
+                    words[0],
+                    r_f,
+                    k_ * FB_WORDS + (t * MOE_HIDDEN + col) // 2,
+                    cache_modifier=CM_DEV,
+                )
+            else:
+                bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), r_f, k_ * FB_WORDS + (t * MOE_HIDDEN + col) // 2, cache_modifier=CM_DEV)  # fmt: skip
     release_stores()
     gpu.barrier()
-    if tid == 0:
-        put(c["fflag"], t * AP + part, fx.Int32(1))
+    if tid < F_FLAG_COPIES:
+        put(c["fflag"], tid * FF_STRIDE + t * AP + part, fx.Int32(1))
 
 
 # ---------------------------------------------------------------- 4. unpool
+UNP_DYN = (
+    True  # the unpool jobs claimed by the pool CTAs in dn-end order (``unp_claim``)
+)
+# (with UNP_DYN) the fin tasks claimed too, after the unpool jobs, by every CTA past the
+# bnd tasks in dn-end order: a fin task on a CTA whose dn item ended last (a fixed fin
+# CTA) began its prologue (~0.9 us) and its y poll after that item, on the critical path
+FIN_DYN = True
+
+
+def k1_early_map(c) -> bool:
+    """A merged launch's next K1 GEMV weights go out in K3 (``run_k3``): one unpool job
+    a CTA, bf16 unpooler (no scale loads behind them)."""
+    return c.get("k1_pre") is not None and c["bases"]["ku"] == 1 and not c["fp8_unpool"]
+
+
+def lds_dma_sc1(rsrc_v, lds_ptr, voffset):
+    """``device.lds_dma_16`` with the device-scope policy (``sc1``, before ``lds``:
+    data another CTA stored in this launch): 16 B a lane into LDS at ``lds_ptr`` + 16
+    lane, hidden from the compiler's wait counting (the caller waits)."""
+    r = as_ir_value(rsrc_v)
+    if "ptr<8>" in str(r.type):
+        r = bo._ptr8_to_v4i32(r)
+    rv = fx.Vector(r, (4,), fx.Int32)
+    rs = fx.Vector.from_elements([uniform(fx.Int32(rv[i])) for i in range(4)], fx.Int32)
+    base = uniform(fx.Int32(llvm.ptrtoint(T.i32, lds_ptr.llvm_ptr)))
+    llvm.inline_asm(
+        None,
+        [
+            as_ir_value(rs),
+            as_ir_value(base),
+            as_ir_value(fx.Int32(voffset)),
+            as_ir_value(uniform(fx.Int32(0))),
+        ],
+        "s_mov_b32 m0, $1\n\ts_nop 0\n\tbuffer_load_dwordx4 $2, $0, $3 offen sc1 lds",  # codespell:ignore offen
+        "s,s,v,s,~{m0},~{memory}",
+        has_side_effects=True,
+    )
+
+
+def unp_slot(blk, row):
+    """The LDS slot of 16-byte block ``blk`` (of 64 in a 1 KB DMA chunk) of staged row
+    ``row``: XOR-swizzled by the row, so the MFMA B reads (a lane a row, the same block)
+    hit eight distinct 16-byte bank groups instead of one (rows are 8 KB apart)."""
+    return blk ^ row
+
+
+def unp_rows_dma(c, r_f, t0, nt):
+    """A pass's rows (tokens t0 .., ``k3_fbuf``) into ``xcol`` by LDS DMA: 16 B a lane a
+    round at M0 + 16 lane, round i = row i, the lane's source block swizzled
+    (``unp_slot``) (the caller waits for them)."""
+    tid, wave, lane, xcol = c["tid"], c["wave"], c["lane"], c["xcol"]
+    assert nt * (MOE_HIDDEN // 8) // THREADS == nt and nt <= 8  # a round a row
+    for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
+        v = wave * 64 + unp_slot(lane, i) + THREADS * i
+        rocdl.raw_ptr_buffer_load_lds(
+            r_f,
+            (xcol + (i * THREADS + wave * 64) * 4).llvm_ptr,
+            16,
+            t0 * (MOE_HIDDEN * 2) + v * 16,
+            fx.Int32(0),
+            0,
+            CM_DEV,  # fmt: skip
+        )
+
+
+UNP_DMA_ALL = True  # (k1_early_map) every unpool wave stages its own rows' K eighth
+# (k1_early_map) An unpool CTA's waves ``unp_k1_claim`` .. issue their next-K1 GEMV
+# weights at the claim (behind the first tile's, as wave 0 .. before), the waves before
+# it once the CTA's rows are pushed. A CU's memory pipeline under the tail's load
+# streams ~27 GB/s (a task's 147 KB ~5.4 us; a wave stalls at issue while it is full),
+# and the fin-flag poll queues behind the bytes in flight: on the heaviest EP rank,
+# whose unpool CTAs claim at its dn end, ~1 us at t8. Fewer claim-time bytes return the
+# flags sooner; the deferred waves' weights land later in K1 (K1 needs ~5 us of lead):
+# t8 nets a gain with waves 1..3 deferred (5 / 8 lose), t16 (no heavy-rank lag) none.
+UNP_K1_CLAIM_T8 = 4
+UNP_K1_CLAIM_T16 = 1  # 1: wave 0's in K1, the others at the claim (unchanged)
+
+
+def unp_k1_claim(c) -> int:
+    return UNP_K1_CLAIM_T8 if c["S"] <= 8 else UNP_K1_CLAIM_T16
+
+
+def unp_k1_late(c) -> bool:
+    return UNP_DMA_ALL and c.get("k1_pre") is not None and unp_k1_claim(c) > 1
+
+
+def unp_k1_rest(c, kw, ku):
+    """The next K1's loads of the waves before ``unp_k1_claim`` (the others' in
+    flight since the claim: ``kw`` / ``ku``, zeros on these waves), merged in."""
+    rest = c["wave"] < unp_k1_claim(c)
+    rocdl.sched_barrier(0)
+    kl = c["k1_pre"](rest)
+    ul = c["k1_units_pre"](rest)
+    rocdl.sched_barrier(0)
+    kw = [[kw[i][j] | kl[i][j] for j in range(len(kw[i]))] for i in range(len(kw))]
+    ku = [
+        (rest.select(ul[p][0], ku[p][0]), rest.select(ul[p][1], ku[p][1]))
+        for p in range(len(ku))
+    ]
+    return kw, ku
+
+
+BND_PRE = (
+    True  # the boundary's row-independent VALU before its row wait (``stage_bnd``)
+)
+UNP_RED_WAVE = 64 * 4 + 64  # a wave's accumulators in ``red``, + the skew's 48
+
+
+def unp_red_at(wave, lane):
+    """Float offset of a lane's 4 unpool accumulators in ``red``, skewed by 16 floats a
+    16 lanes: the row sums (row r, token t a thread: lanes of 16 rows x 4 tokens) read
+    64 distinct banks instead of 16."""
+    return wave * UNP_RED_WAVE + lane * 4 + 16 * (lane // 16)
+
+
+@flyc.jit
+def unp_job(c, cur, gtask, t0, nt, live_k, first):
+    """An unpool job on rows already in ``xcol`` (``cur``: its weights): the MFMAs,
+    the wave-ordered row sums -> bf16, pushed to every rank's ``unp`` region
+    (``live_k``) as zero-sentinel words (``zs_enc``; the boundary polls and re-arms
+    them), or tagged pairs for a deferred K1. ``first``: the CTA's first job (its
+    trace stamps)."""
+    W, tid, lane, wave = c["W"], c["tid"], c["lane"], c["wave"]
+    red, misc, xcol, put_bf = c["red"], c["misc"], c["xcol"], c["put_bf"]
+    V4F = fx.Vector.make_type(4, fx.Float32)
+    l16, g4 = lane % 16, lane // 16
+    tl = fx.min(l16, nt - 1)
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    for kc in range_constexpr(UNP_STEPS):
+        # k = 512 wave + 32 kc + 8 g4: 16-byte block 4 kc + g4 of the row's chunk ``wave``
+        blk = unp_slot(kc * 4 + g4, tl)
+        fbv = fx.Vector(
+            fx.ptr_load(
+                xcol + (tl * (MOE_HIDDEN // 2) + wave * (MOE_HIDDEN // WAVES // 2) + blk * 4), result_type=V4F
+            )
+        )  # fmt: skip
+        acc = mfma_bf16(unp_a(c, cur[kc]), fbv.bitcast(fx.BFloat16), acc)
+    fx.ptr_store(acc, red + unp_red_at(wave, lane))
+    gpu.barrier()
+    if const_expr(first):
+        stamp(c, 10)  # the first job's MFMAs done
+    # branch = bf16(the fp32 sum over the waves, in wave order, x the row's FP8 scale)
+    if tid < UNP_ROWS * nt:
+        r, tk = tid % UNP_ROWS, tid // UNP_ROWS
+        tot = fx.Float32(0.0)
+        for w in range_constexpr(WAVES):
+            tot = tot + fx.ptr_load(red + (unp_red_at(w, 16 * (r // 4) + tk) + r % 4))
+        fx.ptr_store(bf16_round(tot * unp_scale(c, gtask * UNP_ROWS + r)), misc + tid)
+    gpu.barrier()
+    if const_expr(c["defer_k1"]):
+        # (the deferred K1 polls these rows as tagged pairs)
+        if live_k & (tid < (UNP_ROWS // 2) * nt):
+            tk = tid // (UNP_ROWS // 2)
+            rr = (tid % (UNP_ROWS // 2)) * 2
+            vals = [fx.ptr_load(misc + (tk * UNP_ROWS + rr)), fx.ptr_load(misc + (tk * UNP_ROWS + rr + 1))]  # fmt: skip
+            for pe in range_constexpr(W):
+                put_bf(
+                    c["peer_unp"][pe],
+                    (t0 + tk) * HIDDEN + gtask * UNP_ROWS + rr,
+                    vals,
+                )
+    else:
+        # zero-sentinel words (``zs_enc``), half a token's 16 rows (four words) a thread
+        if live_k & (tid < 2 * nt):
+            tk = tid // 2
+            r0 = (tid % 2) * (UNP_ROWS // 2)
+            enc = [
+                zs_enc(bf16_pair(fx.ptr_load(misc + (tk * UNP_ROWS + r0 + 2 * j)), fx.ptr_load(misc + (tk * UNP_ROWS + r0 + 2 * j + 1))).bitcast(fx.Int32))
+                for j in range(UNP_ROWS // 4)
+            ]  # fmt: skip
+            for pe in range_constexpr(W):
+                zs_store(
+                    c["peer_unp"][pe].value,
+                    ((t0 + tk) * HIDDEN + gtask * UNP_ROWS + r0) // 2,
+                    enc,
+                )
+    gpu.barrier()
+    if const_expr(first):
+        stamp(c, 11)  # the first job's rows pushed
+
+
 @flyc.jit
 def stage_unpool(c, first_w):
     """This CTA's unpool tasks (one at TP 8; ``first_w``: the first's weights,
     issued before the fin flags' wait, which streams them): the summed rows are
     staged in LDS by DMA in passes of XS_LDS_MAX tokens, each pass's 16 x tokens
-    bf16 sums pushed to every rank's ``unp`` region. A further task's weights go
-    out before the previous task's passes."""
-    S, W, tid, lane, wave = c["S"], c["W"], c["tid"], c["lane"], c["wave"]
-    red, misc, xcol, poll, put_bf = (
-        c["red"],
-        c["misc"],
-        c["xcol"],
-        c["poll"],
-        c["put_bf"],
-    )
+    bf16 sums pushed to every rank's ``unp`` region (zero-sentinel words, ``unp_job``).
+    A further task's weights go out before the previous task's passes."""
+    S, tid = c["S"], c["tid"]
     b = c["bases"]
     AP, KU = c["ar_parts"], b["ku"]
-    V4F = fx.Vector.make_type(4, fx.Float32)
-    l16, g4 = lane % 16, lane // 16
-    r_f = rsrc(c["fbuf"].value)
+    # this CTA's copy of the rows (``FB_COPIES``)
+    r_f = rsrc(
+        c["fbuf"].value + fx.Int64(fx.Int32(c["bid"] % fb_copies(S)) * (FB_WORDS * 4))
+    )
     assert S % XS_LDS_MAX == 0, S  # a job is one whole pass of XS_LDS_MAX tokens
-    task0, _, _ = unp_gtask(c, 0)
+    nt = XS_LDS_MAX  # every served width is whole passes
+    task0, gtask0, ps0 = unp_gtask(c, 0)
     live = (task0 >= 0) & (task0 < b["unp_jobs"])
     if live:
         rocdl.sched_barrier(0)
-        poll_flags(c, [(c["fflag"], S * AP)])
+        stamp(c, 13)  # (trace) the fin flags' poll issued (unpool CTAs)
+        ff = shift(
+            c["fflag"], fx.Int64(fx.Int32(c["bid"] % F_FLAG_COPIES) * (FF_STRIDE * 8))
+        )  # this CTA's copy
+        poll_flags(c, [(ff, S * AP)])
     stamp(c, 8)  # the fin flags arrived (unpool CTAs)
-    if live:
-        cur = first_w
-        for k in range_constexpr(KU):
-            task, gtask, job_ps = unp_gtask(c, k)
-            live_k = (task >= 0) & (
-                task < b["unp_jobs"]
-            )  # a dead job computes on a clamped pass, publishes nothing
-            t0 = fx.min(job_ps, b["unp_passes"] - 1) * XS_LDS_MAX
-            nt = XS_LDS_MAX  # every served width is whole passes
-            tl = fx.min(l16, nt - 1)
-            # the pass's rows by LDS DMA: 16 B a lane a round at M0 + 16 lane
-            for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
-                v = tid + THREADS * i
-                rocdl.raw_ptr_buffer_load_lds(
-                    r_f,
-                    (xcol + (i * THREADS + wave * 64) * 4).llvm_ptr,
-                    16,
-                    t0 * (MOE_HIDDEN * 2) + v * 16,
-                    fx.Int32(0),
-                    0,
-                    CM_DEV,  # fmt: skip
-                )
-            # the next job's weights go out behind this job's rows: loads complete in
-            # order, so the wait below counts them out (UNP_STEPS a lane still in flight)
-            if const_expr(k + 1 < KU):
-                nxt = unp_w_loads(c, unp_gtask(c, k + 1)[1])
-                rocdl.s_waitcnt(vmcnt=UNP_STEPS)
-            else:
+    if const_expr(
+        c.get("unp_job") is not None and c.get("trace_on", False) and not FIN_DYN
+    ):
+        # (trace) a pool CTA without a job this launch: its unpool slots := 0
+        if (~live) & (c["bid"] >= b["unp0"]):
+            for i_ in range_constexpr(4):
+                stamp_at(c, (8, 9, 10, 11)[i_], 0, True)
+            stamp_at(c, 13, 0, True)
+    if const_expr(c.get("k1_w") is not None):
+        # (``k1_early_map``: one job, waves 1 .. hold the next K1's weights in flight)
+        # the rows are staged by DMA the compiler's wait counting does not see (it
+        # would wait for every earlier load before the rows' LDS reads), each wave
+        # waits for its own; the barrier hands them to the waves
+        tp0 = fx.min(ps0, b["unp_passes"] - 1) * XS_LDS_MAX
+        late = unp_k1_late(c)
+        kw, ku = c["k1_w"], c["k1_units"]
+        if live:
+            if const_expr(UNP_DMA_ALL):
+                # (the claimed jobs' CTAs ended dn first: their K1 weights are in) every
+                # wave stages its own K eighth of the rows
+                w = c["wave"]
+                for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
+                    vw = unp_slot(c["lane"], i) + 64 * w + THREADS * i
+                    lds_dma_sc1(r_f, c["xcol"] + (i * THREADS + w * 64) * 4, tp0 * (MOE_HIDDEN * 2) + vw * 16)  # fmt: skip
+                rocdl.s_waitcnt(vmcnt=0)
+            elif c["wave"] == 0:
+                for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
+                    for w in range_constexpr(WAVES):
+                        vw = unp_slot(c["lane"], i) + 64 * w + THREADS * i
+                        lds_dma_sc1(r_f, c["xcol"] + (i * THREADS + w * 64) * 4, tp0 * (MOE_HIDDEN * 2) + vw * 16)  # fmt: skip
                 rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
-            if const_expr(k == 0):
-                stamp(c, 9)  # the first job's rows landed in LDS
-            acc = fx.Vector.filled(4, 0.0, fx.Float32)
-            for kc in range_constexpr(UNP_STEPS):
-                k0 = wave * (MOE_HIDDEN // WAVES) + kc * 32 + 8 * g4
-                fbv = fx.Vector(
-                    fx.ptr_load(
-                        xcol + (tl * (MOE_HIDDEN // 2) + k0 // 2), result_type=V4F
-                    )
-                )
-                acc = mfma_bf16(unp_a(c, cur[kc]), fbv.bitcast(fx.BFloat16), acc)
-            fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
-            gpu.barrier()
-            if const_expr(k == 0):
-                stamp(c, 10)  # the first job's MFMAs done
-            # branch = bf16(the fp32 sum over the waves, in wave order, x the row's FP8 scale)
-            if tid < UNP_ROWS * nt:
-                fx.ptr_store(bf16_round(row_sum(red, tid % UNP_ROWS, tid // UNP_ROWS) * unp_scale(c, gtask * UNP_ROWS + tid % UNP_ROWS)), misc + tid)  # fmt: skip
-            gpu.barrier()
-            if live_k & (tid < (UNP_ROWS // 2) * nt):
-                tk = tid // (UNP_ROWS // 2)
-                rr = (tid % (UNP_ROWS // 2)) * 2
-                vals = [fx.ptr_load(misc + (tk * UNP_ROWS + rr)), fx.ptr_load(misc + (tk * UNP_ROWS + rr + 1))]  # fmt: skip
-                for pe in range_constexpr(W):
-                    put_bf(
-                        c["peer_unp"][pe],
-                        (t0 + tk) * HIDDEN + gtask * UNP_ROWS + rr,
-                        vals,
-                    )
-            gpu.barrier()
-            if const_expr(k == 0):
-                stamp(c, 11)  # the first job's rows pushed
-            if const_expr(k + 1 < KU):
-                cur = nxt
+            stamp(c, 9)  # the first job's rows landed in LDS
+            unp_job(c, first_w, gtask0, tp0, nt, live, True)
+            if const_expr(late):
+                # (``unp_k1_claim``) the deferred waves' next-K1 loads, the rows pushed
+                kw, ku = unp_k1_rest(c, kw, ku)
+        if const_expr(late):
+            c["k1_w"], c["k1_units"] = kw, ku
+    else:
+        if live:
+            cur = first_w
+            for k in range_constexpr(KU):
+                task, gtask, job_ps = unp_gtask(c, k)
+                live_k = (task >= 0) & (
+                    task < b["unp_jobs"]
+                )  # a dead job computes on a clamped pass, publishes nothing
+                t0 = fx.min(job_ps, b["unp_passes"] - 1) * XS_LDS_MAX
+                unp_rows_dma(c, r_f, t0, nt)
+                # the next job's weights go out behind this job's rows: loads complete in
+                # order, so the wait below counts them out (UNP_STEPS a lane still in flight)
+                if const_expr(k + 1 < KU):
+                    nxt = unp_w_loads(c, unp_gtask(c, k + 1)[1])
+                    rocdl.s_waitcnt(vmcnt=UNP_STEPS)
+                else:
+                    rocdl.s_waitcnt(vmcnt=0)
+                gpu.barrier()
+                if const_expr(k == 0):
+                    stamp(c, 9)  # the first job's rows landed in LDS
+                unp_job(c, cur, gtask, t0, nt, live_k, k == 0)
+                if const_expr(k + 1 < KU):
+                    cur = nxt
 
 
 # ---------------------------------------------------------------- 5. the boundary
@@ -1547,7 +2309,9 @@ def stage_bnd(c, t, x_flag=None, x_put=None):
     (eps 1e-5) -> ``attn_out``. On the last layer the stream is rounded to bf16
     before that norm (the model's final-norm input dtype), whose weight is then the
     final norm's: ``c["last"]`` compiles the rule in, else the launch's ``last``
-    argument selects it. The operands go out before the wait on the row. ``x_flag``
+    argument selects it. The operands go out (and their row-independent VALU runs:
+    ``BND_PRE``) before the wait on the row, zero-sentinel words re-armed once read
+    (a deferred K1's build: tagged pairs). ``x_flag``
     (with ``x_put``, the next layer's mailbox): the next layer's K1 runs later in
     this launch; the token's flag."""
     tid, poll, own_unp = c["tid"], c["poll"], c["own_unp"]
@@ -1558,41 +2322,78 @@ def stage_bnd(c, t, x_flag=None, x_put=None):
     be = [fx.Vector(bo.buffer_load(rsrc(a["beta"]), e0 + 4 * i, vec_width=4, dtype=T.f32)) for i in range(4)]  # fmt: skip
     st = [fx.Vector(bo.buffer_load(rsrc(a["res"]), t * HIDDEN + e0 + 4 * i, vec_width=4, dtype=T.f32)) for i in range(4)]  # fmt: skip
     nw_w = [fx.Vector(bo.buffer_load(rsrc(a["npw"]), e0 // 2 + 4 * i, vec_width=4, dtype=T.i32)) for i in range(2)]  # fmt: skip
+    if const_expr(BND_PRE):
+        # the row-independent operands' VALU (weights unpacked, alpha st) before the
+        # wait: the row lands seconds of microseconds after these loads
+        fw = [
+            bf2_f32(fx.Int32(fw_w[k // 8][(k % 8) // 2]))[k % 2]
+            for k in range(BND_ELEMS)
+        ]
+        nw = [
+            bf2_f32(fx.Int32(nw_w[k // 8][(k % 8) // 2]))[k % 2]
+            for k in range(BND_ELEMS)
+        ]
+        ast = [
+            fx.Float32(al[k // 4][k % 4]) * fx.Float32(st[k // 4][k % 4])
+            for k in range(BND_ELEMS)
+        ]
     rocdl.sched_barrier(0)
-    got = poll([(own_unp, (t * HIDDEN + e0) // 2 + 2 * j, 2) for j in range(4)])
-    u = [bf2_f32(got[j][q])[h] for j in range(4) for q in range(2) for h in range(2)]
-    fw = [
-        bf2_f32(fx.Int32(fw_w[k // 8][(k % 8) // 2]))[k % 2] for k in range(BND_ELEMS)
-    ]
+    if const_expr(c["defer_k1"]):
+        got = poll([(own_unp, (t * HIDDEN + e0) // 2 + 2 * j, 2) for j in range(4)])
+        u = [
+            bf2_f32(got[j][q])[h] for j in range(4) for q in range(2) for h in range(2)
+        ]
+    else:
+        # the row's zero-sentinel words (``unp_job``), re-armed once read
+        got = poll_zs(
+            own_unp.value, [(t * HIDDEN + e0) // 2 + 4 * j for j in range(2)], 4
+        )
+        zs_store(own_unp.value, (t * HIDDEN + e0) // 2, [fx.Int32(0)] * 4)
+        zs_store(own_unp.value, (t * HIDDEN + e0) // 2 + 4, [fx.Int32(0)] * 4)
+        u = [
+            bf2_f32(got[j][q])[h] for j in range(2) for q in range(4) for h in range(2)
+        ]
+    stamp(c, 15)  # the token's unpooled row arrived (bnd CTAs)
+    if const_expr(not BND_PRE):
+        fw = [
+            bf2_f32(fx.Int32(fw_w[k // 8][(k % 8) // 2]))[k % 2]
+            for k in range(BND_ELEMS)
+        ]
+        nw = [
+            bf2_f32(fx.Int32(nw_w[k // 8][(k % 8) // 2]))[k % 2]
+            for k in range(BND_ELEMS)
+        ]
+        ast = [
+            fx.Float32(al[k // 4][k % 4]) * fx.Float32(st[k // 4][k % 4])
+            for k in range(BND_ELEMS)
+        ]
     # post_input = bf16(branch x weight), nb = bf16(post_input x rstd)
     pp = [bf16_round(u[k] * fw[k]) for k in range(BND_ELEMS)]
     ssp = pp[0] * pp[0]
     for k in range_constexpr(1, BND_ELEMS):
         ssp = ssp + pp[k] * pp[k]
     rstd = hw_rsq(block_sum(c, ssp, 0) / float(HIDDEN) + POST_EPS)
+    stamp(c, 9)  # (trace) the first norm's sum (every wave's row in)
     nb = [bf16_round(pp[k] * rstd) for k in range(BND_ELEMS)]
-    new = [
-        fx.Float32(al[k // 4][k % 4]) * fx.Float32(st[k // 4][k % 4]) + fx.Float32(be[k // 4][k % 4]) * nb[k]
-        for k in range(BND_ELEMS)
-    ]  # fmt: skip
+    new = [ast[k] + fx.Float32(be[k // 4][k % 4]) * nb[k] for k in range(BND_ELEMS)]
     for i in range_constexpr(4):
         bo.buffer_store(fx.Vector.from_elements(new[4 * i : 4 * i + 4], fx.Float32), rsrc(a["res"]), t * HIDDEN + e0 + 4 * i)  # fmt: skip
     if const_expr(c["last"]):
         pre = [bf16_round(v) for v in new]
     else:
-        is_last = a["last"] != 0
-        pre = [is_last.select(bf16_round(v), v) for v in new]
+        # (a uniform branch on the launch's argument: no rounding work on other layers)
+        pre = new
+        if a["last"] != 0:
+            pre = [bf16_round(v) for v in new]
     ss2 = pre[0] * pre[0]
     for k in range_constexpr(1, BND_ELEMS):
         ss2 = ss2 + pre[k] * pre[k]
     rstd2 = hw_rsq(block_sum(c, ss2, 1) / float(HIDDEN) + RMS_EPS)
+    stamp(c, 10)  # (trace) the second norm's sum
     if const_expr(c["defer_k1"]):
         # the next K1 folds its two operand halves with these (``pre_attn.stage_gemv``)
         if tid < 2:
             c["put"](c["nscal"], 2 * t + tid, (tid == 0).select(rstd, rstd2))
-    nw = [
-        bf2_f32(fx.Int32(nw_w[k // 8][(k % 8) // 2]))[k % 2] for k in range(BND_ELEMS)
-    ]
     for i in range_constexpr(2):
         words = [
             bf16_pair(pre[k] * rstd2 * nw[k], pre[k + 1] * rstd2 * nw[k + 1]).bitcast(
@@ -1606,8 +2407,13 @@ def stage_bnd(c, t, x_flag=None, x_put=None):
         # layer's tag (``x_put``)
         release_stores()
         gpu.barrier()
-        if tid == 0:
-            x_put(x_flag, t, fx.Int32(1))
+        stamp(c, 11)  # (trace) the stores drained
+        # from the last wave: the next K1's x-flag poll (wave 0, ``poll_flags``) would
+        # return behind this store's ack on the wave that issued it; every copy of the
+        # flag (``layout.X_FLAG_COPIES``, MAX_TOKENS pairs apart), a lane each
+        k = tid - (THREADS - 64)
+        if (k >= 0) & (k < X_FLAG_COPIES):
+            x_put(x_flag, k * MAX_TOKENS + t, fx.Int32(1))
 
 
 # ---------------------------------------------------------------- the launch's order
@@ -1620,32 +2426,144 @@ def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None, res_flag=
     b = c["bases"]
     AP = c["ar_parts"]
     stamp(c, 0)
+    if const_expr(c.get("trace_on", False) and FIN_DYN):
+        # (trace) the role stamps := 0: a CTA's fin / unpool role changes between launches
+        for i_ in range_constexpr(6):
+            stamp_at(c, (8, 9, 10, 11, 13, 15)[i_], 0, True)
+    xin_wait = None
+    ids_lds = None
+    first = None
     if const_expr(route_flag is not None):
+        # the routing first: the plan needs only the ids, polled straight from the
+        # route's tagged words (``route_flag``: token t's at t TOP_K .., the ids /
+        # scores stored before them) by the last wave alone -- every pushing wave of
+        # K2 (pool reduce, xn, boundary flags) is wave 0, and a poll returns in order
+        # behind its own wave's stores -- into LDS for every wave's plan. The expert
+        # input's flags (xn's norm + quantization, a little after the routing) are
+        # polled once now, a lane a token, and waited for after the plan
+        # (``stage_ug``) on the same wave, which issues no weights before that wait.
         # (``res_flag`` = (region, count): K2's boundary parts flag their stream columns
-        # after the x halves the routing came from; the boundary below reads them)
-        poll_flags(
-            c,
-            [(route_flag, S), (xin_flag, S)]
-            + ([res_flag] if res_flag is not None else []),
+        # late, after the CTA's pooler job; only the bnd CTAs read them, polled there
+        # after the dn stage, so the plan does not wait for them)
+        lane = c["lane"]
+        assert S <= 64 and TOP_K == 8
+        tl = fx.min(lane, fx.Int32(S - 1))  # this lane's token
+        xin_spec = [(xin_flag, tl, 1)]
+        xin_first = c["poll_issue"](xin_spec)
+        ids_lds = c["xcol"]  # (free until the ug stage stages x)
+        early_first = (
+            EARLY_FIRST
+            and not c["tpx"]
+            and not c["ug_dyn"]
+            and c["xq_pre"]
+            and S <= TILE_COLS
+            and xq_dma_ok(S)
         )
-    stamp(c, 1)  # the routing and expert input arrived (a merged launch) / entry
+        fp_table = FP_TABLE and early_first and ug_balanced(c)
+        if const_expr(fp_table):
+            fp_tab, fp_ka = first_pair_table(c)
+        if c["wave"] == POLL_WAVE:
+            got = c["poll"]([(route_flag, 2 * tl, 2)])
+            m = fx.Int32(0)
+            for sl in range_constexpr(TOP_K):
+                e = (fx.Int32(got[0][sl // 4]) >> (8 * (sl % 4))) & 255
+                fx.ptr_store(e.bitcast(fx.Float32), ids_lds + (tl * TOP_K + sl))
+                if const_expr(early_first):
+                    le = e - c["args"]["local_start"]
+                    ok = (le >= 0) & (le < LOCAL_EXPERTS)
+                    m = m | ok.select(fx.Int32(1) << fx.max(fx.min(le, LOCAL_EXPERTS - 1), 0), fx.Int32(0))  # fmt: skip
+            if const_expr(early_first):
+                # the picked local experts of every token (lanes past S repeat S - 1)
+                m = butterfly(m, (32, 16, 8, 4, 2, 1), bor)
+                if lane == 0:
+                    fx.ptr_store(m, c["nt"] + 1)
+        gpu.barrier()
+        acquire_loads()
+        if const_expr(early_first):
+            # the first pair's weights now, before the plan (every wave; the poll wave's
+            # expert-input poll returns behind its share, ``stage_ug``)
+            mask = uniform(fx.ptr_load(c["nt"] + 1))
+            if const_expr(fp_table):
+                first = first_pair_fast(c, mask, fp_tab, fp_ka)
+            else:
+                first = first_pair_mask(c, mask)
+
+        def xin_wait(dma=False):
+            if c["wave"] == POLL_WAVE:
+                c["poll_wait"](xin_spec, xin_first)
+                if const_expr(dma):
+                    acquire_loads()
+                    xq_dma(c)  # the staged blocks, from this wave alone
+                    rocdl.s_waitcnt(vmcnt=0)
+            gpu.barrier()
+            acquire_loads()
+
+    stamp(c, 1)  # the routing arrived (a merged launch) / entry
     if const_expr(c["tpx"]):
         n_tiles = stage_plan_tpx(c)
     else:
-        n_tiles = stage_plan(c)
+        n_tiles = stage_plan(c, ids_lds)
     stamp(c, 2)  # the plan built
     if const_expr(c["ug_dyn"]):
-        dn_first = stage_ug_dyn(c, n_tiles)
+        dn_first = stage_ug_dyn(c, n_tiles, xin_wait)
     else:
-        dn_first = stage_ug(c, n_tiles)
+        dn_first = stage_ug(c, n_tiles, xin_wait, first)
     stamp(c, 3)  # this CTA's ug items done
     stage_dn(c, n_tiles, dn_first)
     stamp(c, 4)  # this CTA's dn items done
+    if const_expr(res_flag is not None):
+        # the bnd CTAs' K2 stream columns (set long ago: one round trip, ahead of the
+        # K1 weights below, hidden by the fin / unpool hops the bnd waits on)
+        if bid < S:
+            poll_flags(c, [res_flag])
     # the unpool CTAs' first task's weights go out now, behind nothing, so the fin
-    # hops stream them; the fin CTAs carry none (their tile is past the buffer)
-    first_w = unp_w_loads(c, unp_gtask(c, 0)[1])  # the first job's tile
+    # hops stream them; the other CTAs issue none
+    fin_task = None
+    if const_expr(k1_early_map(c) and UNP_DYN):
+        # the pool CTAs (past the fin tasks) claim the unpool jobs in dn-end order;
+        # ``FIN_DYN``: every CTA past the bnd tasks claims, tickets past the unpool jobs
+        # take the fin tasks
+        claim0 = S if FIN_DYN else b["unp0"]
+        pool = bid >= claim0
+        tk_ = fx.Int32(-1)
+        if pool:
+            tk_ = unp_claim(c, BLOCKS - claim0)
+        c["unp_job"] = tk_  # (a ticket past the jobs is no unpool job: ``unp_gtask``)
+        if const_expr(FIN_DYN):
+            ft_ = tk_ - b["unp_jobs"]
+            fin_task = ((ft_ >= 0) & (ft_ < S * AP)).select(ft_, fx.Int32(-1))
+    job0, gtask0, _ = unp_gtask(c, 0)
+    unp_live0 = (job0 >= 0) & (job0 < b["unp_jobs"])
+    first_w = unp_w_loads_if(c, gtask0, unp_live0)  # the first job's tile
+    if const_expr(k1_early_map(c)):
+        # the next layer's K1 GEMV weights of the CTAs K3 keeps longest go out now, so
+        # they land during the tail's waits instead of after them (``pre_attn.run_k1``):
+        # every wave of a boundary CTA (they wait for the unpooled rows) and waves 1 ..
+        # of an unpool CTA; its wave 0 polls the fin flags, which would return behind
+        # them (loads complete in order), so it issues its slice at K1. The other
+        # waves issue none here (``pre_attn.gemv_w_loads_if``)
+        if const_expr(unp_k1_late(c)):
+            # (``unp_k1_claim``) an unpool CTA's waves before it issue theirs once its
+            # rows are pushed (``stage_unpool``), not in K1
+            now = (bid < S) | (unp_live0 & (c["wave"] >= unp_k1_claim(c)))
+            c["k1_early"] = (bid < S) | unp_live0
+            c["k1_units"] = c["k1_units_pre"](now)
+            c["k1_w"] = c["k1_pre"](now)
+        else:
+            early = (bid < S) | (unp_live0 & (c["wave"] != 0))
+            c["k1_early"] = early
+            c["k1_units"] = c["k1_units_pre"](
+                early
+            )  # (the units' token words, a pair a pass)
+            c["k1_w"] = c["k1_pre"](early)
     rocdl.sched_barrier(0)
-    if (bid >= b["fin0"]) & (bid < b["fin0"] + S * AP):
+    if const_expr(fin_task is not None):
+        if fin_task >= 0:
+            if const_expr(c["tpx"]):
+                stage_fin_tpx(c, fin_task // AP, fin_task % AP)
+            else:
+                stage_fin(c, fin_task // AP, fin_task % AP)
+    elif (bid >= b["fin0"]) & (bid < b["fin0"] + S * AP):
         if const_expr(c["tpx"]):
             stage_fin_tpx(c, (bid - b["fin0"]) // AP, (bid - b["fin0"]) % AP)
         else:
