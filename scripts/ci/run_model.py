@@ -16,9 +16,10 @@ differ only in the package or in ``--enable-amd-monokernel``. Sides:
   is kept as the monokernel-off reference (``monokernel_off_ref``) and reused
   until the next weekly run.
 
-PR mode: base, then the unit, kernel and timing tests, on and off (GSM8K only),
-then the model's serving tests. A model whose ``models.py`` entry merged before
-its package has no base package; its off side runs the speed test as its base. (A
+PR mode: the base branch's unit tests, base, then the unit, kernel and timing
+tests, on and off (GSM8K only), then the model's serving tests. A model whose
+``models.py`` entry merged before its package has no base package; its off side
+runs the speed test as its base. (A
 model new in the PR is not run at all: ``models.py`` comes from the base branch.) The smoke tier (a model that runs only
 because shared code changed) runs no accuracy benchmark, whose bound its serving
 tests hold, and times only the gate concurrencies.
@@ -174,33 +175,42 @@ class Run:
 
     # -- tests ----------------------------------------------------------------
 
-    def pytest(self, name, files, timeout):
-        files = [f for f in files if (Path(self.args.pr) / f).exists()]
+    def pytest(self, name, files, timeout, src=None, into="tests"):
+        """Run ``files`` of the checkout ``src`` (default: the PR) and record the
+        counts, and which tests failed, as ``result[into][name]``."""
+        src = src or self.args.pr
+        files = [f for f in files if (Path(src) / f).exists()]
         if not files:
             return
-        xml = self.logs / f"{name}.xml"
+        log = name if into == "tests" else f"{into.split('_')[0]}-{name}"  # base-unit
+        xml = self.logs / f"{log}.xml"
         rc = self.sh(
             f"python3 -m pytest -v -rA --junitxml={xml} " + " ".join(files),
-            name,
-            cwd=self.args.pr,
+            log,
+            cwd=src,
             timeout=timeout,
         )
         counts = {"passed": 0, "failed": 0, "skipped": 0, "rc": rc}
+        failed_ids = []
         if xml.exists():
             for case in ET.parse(xml).getroot().iter("testcase"):
                 tags = {c.tag for c in case}
                 if tags & {"failure", "error"}:
                     counts["failed"] += 1
+                    failed_ids.append(f"{case.get('classname')}::{case.get('name')}")
                 elif "skipped" in tags:
                     counts["skipped"] += 1
                 else:
                     counts["passed"] += 1
+            # every failure by id, so the report can tell the PR's own from the
+            # base branch's (a run that failed whole has none: it judges by count)
+            counts["failed_ids"] = sorted(failed_ids)
         elif rc:
             counts["failed"] = 1  # collection or the run itself failed
         if rc == 124:
             counts["failed"] = max(counts["failed"], 1)
             counts["timeout"] = True
-        self.result["tests"][name] = counts
+        self.result.setdefault(into, {})[name] = counts
         self.save()
 
     # -- servers --------------------------------------------------------------
@@ -517,6 +527,8 @@ class Run:
         if a.mode in ("nightly", "weekly"):
             # first the sgl-amd-mono the image pins: what a user of this SGLang runs
             self.step("pinned", self.pinned, serve=self.key != "common" and not why)
+        if a.mode == "pr":
+            self.step("base-tests", self.base_tests)
         if self.key == "common":
             self.install(a.pr)
             self.pytest("unit", ["test/unit"], 1800)
@@ -644,6 +656,12 @@ class Run:
         self.microbench("base", self.args.base)
         if serve:
             self.side("base", True)
+
+    def base_tests(self):
+        """The base branch's unit tests, so the PR is held only to the failures it
+        adds: one that fails on the base too is the base branch's, not the PR's."""
+        self.install(self.args.base)
+        self.pytest("unit", ["test/unit"], 1800, src=self.args.base, into="base_tests")
 
     def step(self, name, fn, *args, **kwargs):
         """Run one step; an exception is recorded (the report fails on it) and the

@@ -239,6 +239,45 @@ def perf_check(key, r, needs_gain):
     )
 
 
+def _base_ids(r, name, c):
+    """The PR's and the base branch's failing test ids for ``name``, or None when
+    the run has no base tests to compare (nightly, or either side failed whole)."""
+    b = r.get("base_tests", {}).get(name)
+    if (
+        not b
+        or "failed_ids" not in b
+        or "failed_ids" not in c
+        or c.get("timeout")
+        or b.get("timeout")
+        or len(c["failed_ids"]) != c["failed"]
+    ):
+        return None
+    return set(c["failed_ids"]), set(b["failed_ids"])
+
+
+def base_failures(r, name, c):
+    """The PR's failures when every one of them also fails on the base branch."""
+    ids = _base_ids(r, name, c)
+    if not c["failed"] or ids is None or not ids[0] <= ids[1]:
+        return None
+    return sorted(ids[0])
+
+
+def new_failures(r, name, c):
+    """The PR's failures the base branch does not have, when both sides compare."""
+    ids = _base_ids(r, name, c)
+    return None if ids is None else sorted(ids[0] - ids[1])
+
+
+def _names(ids, n=3):
+    # "test.unit.test_contract::test_x[...]" -> "test_contract::test_x[...]"
+    short = [
+        f"`{cls.rsplit('.', 1)[-1]}::{test}`"
+        for cls, _, test in (i.partition("::") for i in ids[:n])
+    ]
+    return ", ".join(short) + (f" and {len(ids) - n} more" if len(ids) > n else "")
+
+
 def tests_check(key, r):
     m = MODELS.get(key, {})
     t = r.get("tests", {})
@@ -254,12 +293,25 @@ def tests_check(key, r):
             states.append(FAIL)
             parts.append(f"{name}: did not run")
             continue
-        states.append(FAIL if c["failed"] else PASS)
         s = f"{name} {c['passed']} passed"
-        if c["failed"]:
+        inherited = base_failures(r, name, c)
+        if inherited is not None:
+            # every failure also fails on the base branch: the PR's tests pass
+            states.append(WARN)
+            s += (
+                f", {c['failed']} failed, all also on the base branch"
+                f" (not this PR's): {_names(inherited)}"
+            )
+        elif c["failed"]:
+            states.append(FAIL)
             s += f", **{c['failed']} failed**" + (
                 " (timed out)" if c.get("timeout") else ""
             )
+            new = new_failures(r, name, c)
+            if new is not None:
+                s += f" ({len(new)} new: {_names(new)})"
+        else:
+            states.append(PASS)
         if c["skipped"]:
             s += f", {c['skipped']} skipped"
         parts.append(s)

@@ -62,7 +62,7 @@ these sides:
 
 | Check | PR test, full tier | PR test, smoke tier | Nightly | Weekly |
 | --- | --- | --- | --- | --- |
-| Tests | unit, the model's kernel tests and serving tests (`test/e2e`) | same | same | same |
+| Tests | unit (on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same | unit, kernel and serving tests | same |
 | Kernel microbenchmark | the model's timing scripts, base and PR | same | main | main |
 | Accuracy | sgl-eval GSM8K (1319 questions), on and off; GPQA too with `run-ci-extra` | the serving tests' GSM8K and KL bounds | GSM8K, GPQA Diamond (and MMMU-Pro for vision models), on | the nightly's and AIME26 x4, on and off |
 | E2E performance | InferenceX fixed length at the model's concurrencies, base and on | the gate concurrencies only | on (against the monokernel-off reference) | off and on |
@@ -87,7 +87,10 @@ package: its speed is compared against the off side.
 
 The PR test's status fails when:
 
-- a test fails, or a serving test, benchmark or server does not finish;
+- a test fails, or a serving test, benchmark or server does not finish. A unit
+  test that fails on the base branch too (its merge-base, run the same way) is
+  the base branch's: when every unit failure is one, the Tests check warns and
+  names them instead of failing. The nightly has no base, so it fails on any;
 - the monokernel server logs no routing (every step ran SGLang's own path);
 - GSM8K (and GPQA, with `run-ci-extra`) loses significantly with the monokernels
   on: of the questions the on and off runs answer differently, the on run gets
