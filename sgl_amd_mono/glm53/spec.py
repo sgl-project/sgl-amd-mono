@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from typing import Optional
 
 import msgspec
 import torch
@@ -236,6 +237,38 @@ def _deadline(key, deadline_s: float, longest_s: int) -> float:
     return min(max(deadline_s, 0.5 * get_device().watchdog_timeout), longest_s)
 
 
+def _quant_reason(quant: dict) -> Optional[str]:
+    """Why the checkpoint's quantization is not one the kernels run, or None: the FP8
+    block-128 checkpoint, or the MXFP4 one (static FP4 weights, dynamic FP4
+    activations, an E8M0 a 32 values). Each layer's tensors are checked as loaded."""
+    method = quant.get("quant_method")
+    if method == "fp8" and list(quant.get("weight_block_size") or ()) == [128, 128]:
+        return None
+    if method == "quark":
+        g = quant.get("global_quant_config") or {}
+
+        def mx(spec: dict, dynamic: bool) -> bool:
+            return (
+                spec.get("dtype") == "fp4"
+                and spec.get("qscheme") == "per_group"
+                and spec.get("group_size") == 32
+                and spec.get("scale_format", "e8m0") == "e8m0"
+                and bool(spec.get("is_dynamic")) == dynamic
+            )
+
+        if mx(g.get("weight") or {}, False) and mx(g.get("input_tensors") or {}, True):
+            return None
+        return (
+            "needs the MXFP4 checkpoint (E2M1 a 32 with an E8M0, dynamic "
+            f"MXFP4 activations), got weight {g.get('weight')!r} input "
+            f"{g.get('input_tensors')!r}"
+        )
+    return (
+        "needs the FP8 block-128 or the MXFP4 checkpoint, got "
+        f"{method!r} {quant.get('weight_block_size')!r}"
+    )
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     reasons = [
         f"needs GLM-5.3's {key} = {want!r}, got {getattr(hf_config, key, None)!r}"
@@ -261,14 +294,9 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         or cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
     ):
         reasons.append("MTP verifies one draft chain: topk 1, draft tokens = steps + 1")
-    quant = getattr(hf_config, "quantization_config", None) or {}
-    if quant.get("quant_method") != "fp8" or list(
-        quant.get("weight_block_size") or ()
-    ) != [128, 128]:
-        reasons.append(
-            "needs the FP8 block-128 checkpoint, got "
-            f"{quant.get('quant_method')!r} {quant.get('weight_block_size')!r}"
-        )
+    why = _quant_reason(getattr(hf_config, "quantization_config", None) or {})
+    if why is not None:
+        reasons.append(why)
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -484,7 +512,8 @@ class _Built:
             check.compare(
                 L, ref, out[:S], positions, forward_batch, S, step=step, scores=scores
             )
-            if L.w.dense:
+            # the FP8 dense MLP's own parts (the layer is compared whole for MXFP4)
+            if L.w.dense and not L.w.mxfp4:
                 check.dense(L, L.ops[W], ref, out[:S], S)
         return out
 
@@ -598,6 +627,10 @@ def _build(model, hf_config, ctx) -> _Built:
     if len(shuffled) != 1:
         raise ValueError("GLM-5.3 monokernel: the layers' FP8 layouts differ")
     fp8_shuffled = shuffled.pop()
+    mxfp4 = {L.w.mxfp4 for L in layers.values()}
+    if len(mxfp4) != 1:
+        raise ValueError("GLM-5.3 monokernel: the layers' MLPs differ in FP8 / MXFP4")
+    mxfp4 = mxfp4.pop()
     dense = {L.w.dense for L in layers.values() if L.w.dense}
     if len(dense) > 1 or not layers[0].w.dense or layers[0].w.index is None:
         raise ValueError(
@@ -663,6 +696,7 @@ def _build(model, hf_config, ctx) -> _Built:
                 dense=layers[ids[0]].w.dense,
                 tokens=kind == "embed",
                 vocab_rows=vocab_rows if kind == "embed" else 0,
+                mxfp4=mxfp4,
             )
             rt = runtime(key)
             runtimes[w, kind] = rt

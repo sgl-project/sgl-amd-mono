@@ -306,8 +306,23 @@ def test_config_reasons_name_each_mismatch():
     assert "index_topk_freq" in text
     assert "MoE" in text
     assert "--page-size 1" in text
-    assert "FP8 block-128" in text
+    assert "MXFP4 checkpoint" in text
     assert "RoPE 'yarn'" in text
+    fp4 = {"dtype": "fp4", "qscheme": "per_group", "group_size": 32}
+    quant = {
+        "quant_method": "quark",
+        "global_quant_config": {
+            "weight": {**fp4, "is_dynamic": False},
+            "input_tensors": {**fp4, "is_dynamic": True},
+        },
+    }
+    mxfp4 = SimpleNamespace(**{**vars(GLM53), "quantization_config": quant})
+    assert glm53._config_disable_reasons(CFG, mxfp4) == []
+    int8 = {**quant, "global_quant_config": {"weight": {"dtype": "int8"}}}
+    other = SimpleNamespace(**{**vars(GLM53), "quantization_config": int8})
+    assert "MXFP4 checkpoint" in " ".join(glm53._config_disable_reasons(CFG, other))
+    bf16 = SimpleNamespace(**{**vars(GLM53), "quantization_config": {}})
+    assert "FP8 block-128" in " ".join(glm53._config_disable_reasons(CFG, bf16))
 
 
 def _linear(shuffled=True):
@@ -421,7 +436,7 @@ def test_model_reasons(tp8):
     bad[9] = _layer(n_experts=256)
     bad[0] = _dense_layer(indexer=False)
     reasons = " | ".join(glm53._model_disable_reasons(_model(bad), GLM53, {}))
-    assert "layer 5: needs block-FP8 experts" in reasons
+    assert "layer 5: needs block-FP8 or MXFP4 experts" in reasons
     assert "layer 9: needs the shared expert fused" in reasons
     # layer 0 runs the indexer: the MoE layers before the first indexer one read its
     # top-k (and layers 1 and 2 recompute it)
@@ -558,6 +573,52 @@ def test_the_dense_mlp_is_copied_as_expert_slices(shuffled):
     mlp.down_proj.aiter_bpreshuffled = not shuffled
     with pytest.raises(ValueError, match="one FP8 layout"):
         _dense_mlp(mlp, 0, inter, {})
+
+
+def test_the_mxfp4_dense_mlp_is_copied_as_expert_slices():
+    # An MXFP4 dense MLP (row-major E2M1 bytes, an E8M0 a 32) as the experts'
+    # slices in AITER's MoE layouts: slice e's gate and up rows, then down's matching
+    # K columns, as (16, 16) bytes and e8m0_shuffle'd codes
+    fp4_utils = pytest.importorskip("aiter.utility.fp4_utils")
+    from sgl_amd_mono.glm53.gfx950.config import HIDDEN
+    from sgl_amd_mono.glm53.gfx950.weights import _dense_mxfp4
+
+    inter, n, di = 256, 6, DENSE_TP8
+    g = torch.Generator().manual_seed(0)
+
+    def u8(*shape):
+        return torch.randint(0, 256, shape, generator=g, dtype=torch.uint8)
+
+    gu, s_gu, dn, s_dn = (
+        u8(2 * di, HIDDEN // 2),
+        u8(2 * di, HIDDEN // 32),
+        u8(HIDDEN, di // 2),
+        u8(HIDDEN, di // 32),
+    )
+    mlp = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(weight=gu, weight_scale=s_gu),
+        down_proj=SimpleNamespace(weight=dn, weight_scale=s_dn),
+    )
+    copies = {}
+    w_ug, c_ug, w_dn, c_dn, slices = _dense_mxfp4(mlp, 0, inter, copies)
+    assert slices == n and len(copies) == 4
+    assert w_ug.shape == (n, 2 * inter, HIDDEN // 2)
+    assert w_dn.shape == (n, HIDDEN, inter // 2)
+    for e in range(n):
+        rows = slice(e * inter, (e + 1) * inter)
+        ug = torch.cat([gu[rows], gu[di:][rows]])
+        assert torch.equal(check.unshuffle(w_ug[e]), ug)
+        assert torch.equal(
+            check.unshuffle(w_dn[e]), dn[:, e * inter // 2 :][:, : inter // 2]
+        )
+        s = torch.cat([s_gu[rows], s_gu[di:][rows]])
+        assert torch.equal(c_ug[e], fp4_utils.e8m0_shuffle(s))
+        s = s_dn[:, e * inter // 32 :][:, : inter // 32].contiguous()
+        assert torch.equal(c_dn[e], fp4_utils.e8m0_shuffle(s))
+    # SGLang's ASM GEMM layout refuses
+    mlp.gate_up_proj.use_aiter_asm_fp4_gemm = True
+    with pytest.raises(ValueError, match="row-major Triton"):
+        _dense_mxfp4(mlp, 0, inter, {})
 
 
 def _vocab_module(tp, rank=1, padding=0, added=0, method="UnquantizedEmbeddingMethod"):
