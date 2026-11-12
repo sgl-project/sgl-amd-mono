@@ -61,8 +61,13 @@ DENSE_INTER = 12288
 MAX_SEQ = 1 << 20
 # the live rows' positions, in order: past and below the 2048-key top-k
 POSITIONS = [8447, 1500, 5000, 300, 8447, 2047, 2048, 9000]
+POSITIONS += [3000, 700, 4096, 2049, 6000, 1024, 8000, 2100]
 TOPK = 2048
 PAGE = 64
+# --split-check's bound on a row's update against the wide launch's (the expert-
+# grouped MXFP4 down against the per-row one at 16 rows: 2.4e-4 at most; with one
+# expert group dropped: 0.25 or more)
+SPLIT_DELTA_REL = 2e-3
 
 
 def _gen(seed: int, device) -> torch.Generator:
@@ -123,7 +128,18 @@ def head_weights(rank: int, tp: int, device):
     return Glm53HeadWeights(g_norm=g_norm, w_head=w.bfloat16())
 
 
-def layer_weights(layer: int, rank: int, tp: int, device, kind: str):
+def _mxfp4(g, shape, device):
+    """Random MXFP4 experts [E, rows, K] as AITER's A4W4 bytes: (E, rows, K / 2)
+    packed FP4 and (E, rows, K / 32) E8M0 scales near 1."""
+    E, rows, k = shape
+    w = torch.randint(0, 256, (E, rows, k // 2), generator=g, device=device)
+    s = 125 + torch.randint(0, 4, (E, rows, k // 32), generator=g, device=device)
+    return w.to(torch.uint8), s.to(torch.uint8)
+
+
+def layer_weights(
+    layer: int, rank: int, tp: int, device, kind: str, mxfp4: bool = False
+):
     """Layer ``layer``'s random tensors as this rank's shard (every rank draws the
     same): block-FP8 projections and experts read in place, W_UK / W_UV, the router
     and the indexer's weights_proj packed; the shared expert is slot 256. A dense
@@ -153,6 +169,10 @@ def layer_weights(layer: int, rank: int, tp: int, device, kind: str):
     s_ug = _scales(g, (E, 2 * inter // 128, HIDDEN // 128), HIDDEN, device)
     w_dn = _fp8(g, (E, HIDDEN, inter), device)
     s_dn = _scales(g, (E, HIDDEN // 128, inter // 128), GLM5_GLOBAL_INTER, device)
+    mxfp4 = mxfp4 and kind not in ("dense", "embed")
+    if mxfp4:
+        w_ug, s_ug = _mxfp4(g, (E, 2 * inter, HIDDEN), device)
+        w_dn, s_dn = _mxfp4(g, (E, HIDDEN, inter), device)
     table, keep = None, ()
     if index:
         w_k = _fp8(g, (INDEX_DIM, HIDDEN), device)
@@ -205,6 +225,7 @@ def layer_weights(layer: int, rank: int, tp: int, device, kind: str):
         index=table,
         keep=keep,
         dense=dense,
+        mxfp4=mxfp4,
     )
 
 
@@ -330,19 +351,21 @@ class Model:
             Glm53Runtime,
         )
 
-        self.kinds, W = kinds, len(positions)
+        self.kinds, self.requests, W = kinds, requests, len(positions)
         if first is None:
             first = 0 if kinds[:1] == ["embed"] else 3
         live = [p for p in positions if p is not None]
-        pages = Pages(max(requests) + 1, max(live) + W + 1, device)
+        self.pages = pages = Pages(max(requests) + 1, max(live) + W + 1, device)
         self.caches = [
             layer_caches(first + i, pages, has_index(k), device, args.kv == "fp8")
             for i, k in enumerate(kinds)
         ]
         self.cos, self.sin = rope(max(live) + W + 1, device)
         self.step_tables, self.topk0 = make_step(positions, requests, pages, device)
+        mxfp4 = getattr(args, "mxfp4", False)
         self.weights = [
-            layer_weights(first + i, rank, tp, device, k) for i, k in enumerate(kinds)
+            layer_weights(first + i, rank, tp, device, k, mxfp4)
+            for i, k in enumerate(kinds)
         ]
         vocab_rows = VOCAB // tp
         self.runtimes = {}
@@ -360,6 +383,8 @@ class Model:
                 dense=w.dense,
                 tokens=kind == "embed",
                 vocab_rows=vocab_rows if kind == "embed" else 0,
+                mxfp4=w.mxfp4,
+                native_fp4=w.mxfp4 and getattr(args, "native_fp4", False),
             )
             self.runtimes[kind] = Glm53Runtime(key, rank, group, device)
             self.runtimes[kind].set_deadline(args.deadline)
@@ -434,6 +459,8 @@ def rows_of(width: int, rowset: str):
         return [POSITIONS[r] + s % 4 for s, r in enumerate(reqs)], reqs
     pad = int(rowset[1:])
     live = width - pad
+    if live > len(POSITIONS):
+        raise ValueError(f"{rowset} at {width} rows needs {live} positions")
     return POSITIONS[:live] + [None] * pad, list(range(live)) + [0] * pad
 
 
@@ -516,6 +543,89 @@ def check_replays(model: Model, replays: int) -> bool:
             print(f"replay {n} differs from the eager step", flush=True)
             ok = False
     del graph
+    return ok
+
+
+def check_split(model: Model, rows: int, rank, tp, group, device, args) -> bool:
+    """Each launch of a step against ``rows``-row launches on runs of its rows (whole
+    requests) from the same caches, top-k and that launch's inputs: a row's update
+    (output - input) within ``SPLIT_DELTA_REL`` of the wide launch's, relative per
+    row. Above 4 rows the MXFP4 down sums a row's experts in an order that depends on
+    the launch's other rows, so the rows are not bitwise equal."""
+    from sgl_amd_mono.glm53.gfx950.runner import Glm53Caches
+
+    if model.head is not None:
+        raise ValueError("--split-check runs without the tail")
+    st = model.step_tables
+    positions = [
+        None if s < 0 else p for p, s in zip(st.positions.tolist(), st.slots.tolist())
+    ]
+    requests = model.requests
+    W = len(positions)
+    snap = [
+        (c.kv.clone(), c.idx.clone() if c.idx is not None else None)
+        for c in model.caches
+    ]
+    ins = [model.h.clone()]
+    model.step(after=lambda i, out: ins.append(out.clone()))
+    torch.cuda.synchronize()
+    ok = True
+    for r0 in range(0, W, rows):
+        sel = list(range(r0, min(r0 + rows, W)))
+        if r0 and positions[r0] is not None and requests[r0] == requests[r0 - 1]:
+            raise ValueError(f"row {r0} splits a request")
+        pos = [positions[s] for s in sel]
+        req = [requests[s] for s in sel]
+        sub = Model(
+            model.kinds,
+            pos,
+            req,
+            rank,
+            tp,
+            group,
+            device,
+            args,
+            head=model.head is not None,
+        )
+        sub.caches = [
+            Glm53Caches(kv=kv.clone(), idx=idx.clone() if idx is not None else None)
+            for kv, idx in snap
+        ]
+        sub.cos, sub.sin = model.cos, model.sin
+        sub.step_tables, _ = make_step(pos, req, model.pages, device)
+        topk0 = torch.zeros_like(sub.step_tables.topk)
+        for j, s in enumerate(sel):
+            a, b = int(st.indptr[s]), int(st.indptr[s + 1])
+            c = int(sub.step_tables.indptr[j])
+            topk0[c : c + b - a] = model.topk0[a:b]
+        sub.topk0 = topk0
+        sst = sub.step_tables
+        sst.topk.copy_(topk0)
+        live = torch.tensor([p is not None for p in pos], device=device)
+        worst = 0.0
+        for i, op in enumerate(sub.ops):
+            x = ins[i][sel]
+            got = op.launch(x.clone(), sub.caches[i], sub.cos, sub.sin, sst)
+            d_got = got.float() - x.float()
+            d_ref = ins[i + 1][sel].float() - x.float()
+            rel = (d_got - d_ref).norm(dim=1) / d_ref.norm(dim=1).clamp_min(1e-30)
+            worst = max(worst, float(rel[live].max()))
+        for rt in sub.runtimes.values():
+            rt.advance_step()
+        torch.cuda.synchronize()
+        print(
+            f"rows {sel[0]}-{sel[-1]}: update against the {W}-row launch's, "
+            f"max rel {worst:.3g}",
+            flush=True,
+        )
+        if not worst <= SPLIT_DELTA_REL:
+            ok = False
+        # a wait past its deadline runs on (stop=False): its rows are not a reference
+        if sub.errors():
+            print(f"rows {sel[0]}-{sel[-1]}: error words set", flush=True)
+            ok = False
+        sub.close()
+        del sub
     return ok
 
 
@@ -810,6 +920,13 @@ def main() -> int:
     ap.add_argument("--writes", action="store_true")
     ap.add_argument("--replays", type=int, default=0, help="graph replays of a step")
     ap.add_argument("--check-tags", action="store_true")
+    ap.add_argument(
+        "--split-check",
+        type=int,
+        default=0,
+        metavar="ROWS",
+        help="a wider step equals ROWS-row launches on runs of its rows",
+    )
     ap.add_argument("--check-dense", action="store_true")
     ap.add_argument("--check-embed", action="store_true", help="with --launches 1")
     ap.add_argument("--check-head", action="store_true")
@@ -817,9 +934,19 @@ def main() -> int:
     ap.add_argument("--perturb", action="store_true", help="negate one input value")
     ap.add_argument("--similar", type=float, default=0.0, help="rows routing alike")
     ap.add_argument("--compare", nargs=2, metavar=("A_DIR", "B_DIR"))
+    ap.add_argument(
+        "--positions", default="", help="comma-separated live-row positions"
+    )
+    ap.add_argument("--mxfp4", action="store_true", help="MXFP4 (A4W4) MoE experts")
+    ap.add_argument(
+        "--native-fp4", action="store_true", help="MXFP8 x MXFP4 MFMA (with --mxfp4)"
+    )
     args = ap.parse_args()
     if args.compare:
         return compare(*args.compare)
+    if args.positions:
+        global POSITIONS
+        POSITIONS = [int(p) for p in args.positions.split(",")]
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", torch.cuda.current_device())
@@ -856,6 +983,8 @@ def main() -> int:
             ok &= check_replays(model, args.replays)
         if args.check_tags:
             ok &= check_tags(model)
+        if args.split_check and W > args.split_check:
+            ok &= check_split(model, args.split_check, rank, tp, group, device, args)
         if args.check_dense:
             ok &= check_dense(model, rank, group)
         if args.check_embed:

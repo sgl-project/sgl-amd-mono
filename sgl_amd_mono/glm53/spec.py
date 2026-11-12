@@ -59,9 +59,19 @@ from sgl_amd_mono.glm53 import HF_CONFIG
 
 # kernel widths; a step of fewer rows runs at the next width, the rest pad rows (a
 # one-row launch never completes on gfx950)
-WIDTHS = (2, 4, 8)
+WIDTHS = (2, 4, 8, 12, 16)
 ROWS = tuple(range(1, max(WIDTHS) + 1))
 TP_SIZES = (4, 8)
+# TP sizes whose launches take fewer rows than max(WIDTHS): TP4's 16 local heads put
+# a 16-row launch past the LDS budget (a wider step runs SGLang's path)
+TP_MAX_ROWS = {4: 12}
+
+
+def max_rows(tp: int) -> int:
+    """The most rows a launch takes at TP ``tp``."""
+    return TP_MAX_ROWS.get(tp, max(WIDTHS))
+
+
 # SGLang's DSA cache on ROCm: 64-token pages
 PAGE_SIZE = 64
 TOPK = 2048
@@ -236,6 +246,25 @@ def _deadline(key, deadline_s: float, longest_s: int) -> float:
     return min(max(deadline_s, 0.5 * get_device().watchdog_timeout), longest_s)
 
 
+def _is_fp8_block128(quant: dict) -> bool:
+    return quant.get("quant_method") == "fp8" and list(
+        quant.get("weight_block_size") or ()
+    ) == [128, 128]
+
+
+def _is_quark_mxfp4(quant: dict) -> bool:
+    """GLM-5.2's Quark checkpoint: MXFP4 experts (FP4 weights and inputs, one E8M0
+    scale per 32), every other linear bf16 (copied as block FP8 at build)."""
+    if quant.get("quant_method") != "quark":
+        return False
+    glob, mxfp4 = quant.get("global_quant_config") or {}, ("fp4", 32, "e8m0")
+    for t in ("weight", "input_tensors"):
+        q = glob.get(t) or {}
+        if (q.get("dtype"), q.get("group_size"), q.get("scale_format")) != mxfp4:
+            return False
+    return not (quant.get("layer_quant_config") or quant.get("layer_type_quant_config"))
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     reasons = [
         f"needs GLM-5.3's {key} = {want!r}, got {getattr(hf_config, key, None)!r}"
@@ -262,11 +291,9 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     ):
         reasons.append("MTP verifies one draft chain: topk 1, draft tokens = steps + 1")
     quant = getattr(hf_config, "quantization_config", None) or {}
-    if quant.get("quant_method") != "fp8" or list(
-        quant.get("weight_block_size") or ()
-    ) != [128, 128]:
+    if not (_is_fp8_block128(quant) or _is_quark_mxfp4(quant)):
         reasons.append(
-            "needs the FP8 block-128 checkpoint, got "
+            "needs the FP8 block-128 or Quark MXFP4 checkpoint, got "
             f"{quant.get('quant_method')!r} {quant.get('weight_block_size')!r}"
         )
     if importlib.util.find_spec("flydsl") is None:
@@ -378,6 +405,7 @@ class _Built:
         # per width, the guard blocks of its runtimes: a step advances them at once
         self.epochs = epochs
         self.max_position = context_len - 1
+        self.max_rows = max(w for w, _ in runtimes)
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
         self.cos, self.sin = cos, sin
         self.steps, self.ids = {}, {}
@@ -420,7 +448,7 @@ class _Built:
     ):
         """``DeepseekV2ForCausalLM.forward`` for a routed decode or verify step."""
         lm = self.lm
-        if input_embeds is not None:
+        if input_embeds is not None or plan.key.rows > self.max_rows:
             return type(lm).forward(
                 lm, input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
@@ -631,7 +659,13 @@ def _build(model, hf_config, ctx) -> _Built:
     # the keys an indexer row scores at most: the served context's, in whole tasks
     tasks = -(-context_len // INDEX_KEYS_PER_TASK)
     max_seq = tasks * INDEX_KEYS_PER_TASK
-    widths = sorted({_width(r) for r in ctx.widths})
+    cap = max_rows(tp)
+    widths = sorted({_width(r) for r in ctx.widths if r <= cap})
+    if not widths:
+        raise ValueError(
+            f"GLM-5.3 monokernel: TP{tp} runs at most {cap} rows on the kernels, and "
+            f"this server's decode graphs route {sorted(ctx.widths)}"
+        )
     runtimes, heads = {}, {}
     epochs = {w: Glm53Epochs(len(kinds) + 1, device) for w in widths}
 
@@ -663,6 +697,10 @@ def _build(model, hf_config, ctx) -> _Built:
                 dense=layers[ids[0]].w.dense,
                 tokens=kind == "embed",
                 vocab_rows=vocab_rows if kind == "embed" else 0,
+                mxfp4=layers[ids[0]].w.mxfp4,
+                # MXFP8 rows x MXFP4 experts on the FP4 MFMA: at 6 rows and 64K
+                # keys 69 us a shared layer, the bf16 rows' dequant path 106 us
+                native_fp4=layers[ids[0]].w.mxfp4,
             )
             rt = runtime(key)
             runtimes[w, kind] = rt

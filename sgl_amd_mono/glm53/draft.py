@@ -182,8 +182,19 @@ def _standard_reasons(model, hf_config) -> list[str]:
         reasons.append("needs SGLang's gfx950 fused DSA indexer on the NextN layer")
     if get_parallel().tp_size not in target.TP_SIZES:
         reasons.append(f"TP{get_parallel().tp_size}")
-    if not isinstance(model.model.eh_proj, torch.nn.Linear):
-        reasons.append(f"eh_proj is a {type(model.model.eh_proj).__name__}")
+    eh = model.model.eh_proj
+    # SGLang builds an unquantized ReplicatedLinear for a Quark checkpoint's eh_proj
+    plain = isinstance(eh, torch.nn.Linear) or (
+        type(getattr(eh, "quant_method", None)).__name__ == "UnquantizedLinearMethod"
+        and getattr(eh, "bias", None) is None
+    )
+    if not plain:
+        reasons.append(f"eh_proj is a {type(eh).__name__}")
+    from sgl_amd_mono.glm53.gfx950.weights import experts_reason
+
+    why = experts_reason(model.model.decoder.mlp)
+    if why is not None:
+        reasons.append(f"the NextN experts: {why}")
     return reasons
 
 
@@ -547,7 +558,7 @@ def _build(model, hf_config, ctx):
         )
     max_seq = -(-context_len // INDEX_KEYS_PER_TASK) * INDEX_KEYS_PER_TASK
     kv_fp8 = get_model().kv_cache_dtype == "fp8_e4m3"
-    extend_widths = sorted(ctx.widths)
+    extend_widths = sorted(w for w in ctx.widths if w <= target.max_rows(tp))
     # a draft decode step of 5 to 8 rows runs SGLang's path: the NextN shared launch
     # at 8 rows faulted in a kernel check (a process of several launches, not alone)
     decode_widths = [w for w in target.WIDTHS if w <= 4]

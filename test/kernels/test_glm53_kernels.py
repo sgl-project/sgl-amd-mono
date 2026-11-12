@@ -38,7 +38,7 @@ CHECK = Path(__file__).with_name("glm53") / "check_layer.py"
 TOPK = Path(__file__).with_name("glm53") / "check_topk.py"
 NEXTN = Path(__file__).with_name("glm53") / "check_nextn.py"
 # the widths the spec builds at each TP size
-WIDTHS = {4: "2,4,8", 8: "2,4,8"}
+WIDTHS = {4: "2,4,8,12", 8: "2,4,8,12,16"}
 
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")

@@ -3,7 +3,7 @@ or 8): ``torchrun --nproc-per-node 8 test/kernels/glm53/check_nextn.py --rows 2,
 --kv fp8``. A NextN launch starts from the step's token ids (e: their embedding rows,
 pushed by the rank that holds each) and the h rows, through its entry
 eh_proj(enorm(e) | hnorm(h)); the indexer kind runs the draft extend (4 rows a
-request, widths 4 and 8), the shared kind a draft decode step (widths 2 and 4).
+request, widths 4 to 16), the shared kind a draft decode step (widths 2 and 4).
 Each width runs with and without a pad row.
 
 - ``entry``: the NextN launch against the plain launch of its kind fed the NextN
@@ -39,7 +39,7 @@ from sgl_amd_mono.glm53.gfx950.config import HIDDEN  # noqa: E402
 EH_REL, EH_F32_REL = 1e-4, 7e-3
 VOCAB = C.VOCAB
 # the rows a width runs: draft extend rows (requests of 4) or one request a row
-ROWS = {"index": {4: ("v4", "v4p"), 8: ("v4", "v4p")}, "shared": {}}
+ROWS = {"index": {w: ("v4", "v4p") for w in (4, 8, 12, 16)}, "shared": {}}
 for _w in (2, 4):
     ROWS["shared"][_w] = ("p0", "p1")
 
@@ -378,7 +378,12 @@ def main() -> int:
     ap.add_argument("--only", default="tables,entry,replay")
     ap.add_argument("--replays", type=int, default=20)
     ap.add_argument("--deadline", type=float, default=10.0)
+    ap.add_argument(
+        "--positions", default="", help="comma-separated live-row positions"
+    )
     args = ap.parse_args()
+    if args.positions:
+        C.POSITIONS = [int(p) for p in args.positions.split(",")]
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", torch.cuda.current_device())

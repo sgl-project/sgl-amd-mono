@@ -138,7 +138,7 @@ def down_prefetch_batch(samples: int, native_fp4_mfma: bool = False) -> int:
     if samples <= 4:
         return 9
     if native_fp4_mfma:
-        return 4 if samples <= 6 else 3
+        return 4 if samples <= 6 else 3 if samples <= 12 else 6
     return 8
 
 
