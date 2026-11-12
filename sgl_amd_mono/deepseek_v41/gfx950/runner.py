@@ -12,7 +12,7 @@ import msgspec
 import torch
 from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
 
-from sgl_amd_mono.common import guard
+from sgl_amd_mono.common import guard, resources
 from sgl_amd_mono.common.plan import BLOCKS
 
 from .attention.index_query import DIM as IQ_DIM
@@ -285,7 +285,7 @@ class DSV41MonoRunner:
         _ensure_writable_flydsl_cache()
         from sgl_amd_mono.common.peer import PeerBuffer
 
-        self.tp, self.rank = tp, rank
+        self.tp, self.rank, self.group = tp, rank, group
         self.route = dict(experts=experts, topk=topk, swa_width=swa_width)
         if ug_groups not in (None, 1, 2):
             raise ValueError(
@@ -472,6 +472,7 @@ class DSV41MonoRunner:
             kernels.append(self.k2i.kernel(tokens))
         for launch in kernels:
             compile_only(launch)
+            resources.check(launch, log=self.rank == 0, group=self.group)
 
     def ffn_kernel(self, tokens: int):
         key = (tokens, "ffn")
