@@ -236,6 +236,25 @@ def _deadline(key, deadline_s: float, longest_s: int) -> float:
     return min(max(deadline_s, 0.5 * get_device().watchdog_timeout), longest_s)
 
 
+def _is_fp8_block128(quant: dict) -> bool:
+    return quant.get("quant_method") == "fp8" and list(
+        quant.get("weight_block_size") or ()
+    ) == [128, 128]
+
+
+def _is_quark_mxfp4(quant: dict) -> bool:
+    """GLM-5.2's Quark checkpoint: MXFP4 experts (FP4 weights and inputs, one E8M0
+    scale per 32), every other linear bf16 (copied as block FP8 at build)."""
+    if quant.get("quant_method") != "quark":
+        return False
+    glob, mxfp4 = quant.get("global_quant_config") or {}, ("fp4", 32, "e8m0")
+    for t in ("weight", "input_tensors"):
+        q = glob.get(t) or {}
+        if (q.get("dtype"), q.get("group_size"), q.get("scale_format")) != mxfp4:
+            return False
+    return not (quant.get("layer_quant_config") or quant.get("layer_type_quant_config"))
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     reasons = [
         f"needs GLM-5.3's {key} = {want!r}, got {getattr(hf_config, key, None)!r}"
@@ -262,11 +281,9 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     ):
         reasons.append("MTP verifies one draft chain: topk 1, draft tokens = steps + 1")
     quant = getattr(hf_config, "quantization_config", None) or {}
-    if quant.get("quant_method") != "fp8" or list(
-        quant.get("weight_block_size") or ()
-    ) != [128, 128]:
+    if not (_is_fp8_block128(quant) or _is_quark_mxfp4(quant)):
         reasons.append(
-            "needs the FP8 block-128 checkpoint, got "
+            "needs the FP8 block-128 or Quark MXFP4 checkpoint, got "
             f"{quant.get('quant_method')!r} {quant.get('weight_block_size')!r}"
         )
     if importlib.util.find_spec("flydsl") is None:
@@ -663,6 +680,10 @@ def _build(model, hf_config, ctx) -> _Built:
                 dense=layers[ids[0]].w.dense,
                 tokens=kind == "embed",
                 vocab_rows=vocab_rows if kind == "embed" else 0,
+                mxfp4=layers[ids[0]].w.mxfp4,
+                # MXFP8 rows x MXFP4 experts on the FP4 MFMA: at 6 rows and 64K
+                # keys 69 us a shared layer, the bf16 rows' dequant path 106 us
+                native_fp4=layers[ids[0]].w.mxfp4,
             )
             rt = runtime(key)
             runtimes[w, kind] = rt

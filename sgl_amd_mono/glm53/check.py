@@ -639,6 +639,8 @@ def entry_values(m, e: torch.Tensor, h: torch.Tensor, x: torch.Tensor):
     """A NextN entry's rows ``x`` against SGLang's eh_proj on its enorm | hnorm of
     the e and h rows, and against an f32 entry; and SGLang's rows."""
     stock = m.eh_proj(torch.cat((m.enorm(e), m.hnorm(h)), -1))
+    if isinstance(stock, tuple):
+        stock = stock[0]
     f32 = torch.cat((_rms(e, m.enorm.weight), _rms(h, m.hnorm.weight)), -1)
     f32 = f32 @ m.eh_proj.weight.float().t()
     values = {

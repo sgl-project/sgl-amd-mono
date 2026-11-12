@@ -40,7 +40,9 @@ class Glm53Build(msgspec.Struct, frozen=True):
     a dense MLP of that many expert-shaped slices instead of the MoE; ``tokens``:
     the layer starts from the step's tokens and ``vocab_rows`` embedding rows a
     rank; ``eh``: the layer starts from the NextN entry, eh_proj(enorm(e) |
-    hnorm(h)); ``head``: the tail, on ``vocab_rows`` LM-head rows a rank."""
+    hnorm(h)); ``head``: the tail, on ``vocab_rows`` LM-head rows a rank.
+    ``mxfp4``: the experts are Quark MXFP4 in AITER's A4W4 layout, not block FP8;
+    ``native_fp4``: their rows as MXFP8 on the FP4 MFMA (else bf16 rows)."""
 
     rows: int
     tp: int
@@ -57,6 +59,8 @@ class Glm53Build(msgspec.Struct, frozen=True):
     head: bool = False
     vocab_rows: int = 0
     eh: bool = False
+    mxfp4: bool = False
+    native_fp4: bool = False
 
     @property
     def heads(self) -> int:
@@ -106,6 +110,7 @@ class Glm53Weights(msgspec.Struct, frozen=True):
     index: Optional[torch.Tensor] = None
     keep: tuple = ()
     dense: int = 0
+    mxfp4: bool = False
 
 
 class Glm53Caches(msgspec.Struct, frozen=True):
@@ -218,6 +223,7 @@ class Glm53Runtime:
             tokens=key.tokens,
             head_vocab=key.vocab_rows * key.tp if key.head else 0,
             eh_tiles=key.eh_tiles,
+            native_fp4_mfma=key.native_fp4,
         )
         self.launch = build_glm5_monokernel(
             key.rows,
@@ -247,6 +253,9 @@ class Glm53Runtime:
             vocab_rows=key.vocab_rows,
             tail=key.head,
             eh_entry=key.eh,
+            expert_mxfp4=key.mxfp4,
+            atom_experts=key.mxfp4,
+            native_fp4_mfma=key.native_fp4,
         )
         self.dispatch = partial(_run_compiled, self.launch)
         self.peer = PeerBuffer(self.sy["_bytes"], group, rank, key.tp, device)
@@ -326,6 +335,10 @@ class Glm53LayerOp:
             raise ValueError(
                 f"weights with shuffled={weights.shuffled} on a runtime with "
                 f"fp8_shuffled={key.fp8_shuffled}"
+            )
+        if weights.mxfp4 != key.mxfp4:
+            raise ValueError(
+                f"weights with mxfp4={weights.mxfp4} on a runtime with mxfp4={key.mxfp4}"
             )
         if (eh is not None) != key.eh:
             raise ValueError(

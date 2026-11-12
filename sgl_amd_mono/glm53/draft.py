@@ -182,8 +182,19 @@ def _standard_reasons(model, hf_config) -> list[str]:
         reasons.append("needs SGLang's gfx950 fused DSA indexer on the NextN layer")
     if get_parallel().tp_size not in target.TP_SIZES:
         reasons.append(f"TP{get_parallel().tp_size}")
-    if not isinstance(model.model.eh_proj, torch.nn.Linear):
-        reasons.append(f"eh_proj is a {type(model.model.eh_proj).__name__}")
+    eh = model.model.eh_proj
+    # SGLang builds an unquantized ReplicatedLinear for a Quark checkpoint's eh_proj
+    plain = isinstance(eh, torch.nn.Linear) or (
+        type(getattr(eh, "quant_method", None)).__name__ == "UnquantizedLinearMethod"
+        and getattr(eh, "bias", None) is None
+    )
+    if not plain:
+        reasons.append(f"eh_proj is a {type(eh).__name__}")
+    from sgl_amd_mono.glm53.gfx950.weights import experts_reason
+
+    why = experts_reason(model.model.decoder.mlp)
+    if why is not None:
+        reasons.append(f"the NextN experts: {why}")
     return reasons
 
 
@@ -582,6 +593,11 @@ def _build(model, hf_config, ctx):
             eh=True,
             tokens=True,
             vocab_rows=eh.emb.shape[0],
+            # the NextN layer's own experts: the target's launches take theirs the
+            # same way, and Glm53LayerOp refuses weights whose mxfp4 is not the
+            # runtime's
+            mxfp4=weights.mxfp4,
+            native_fp4=weights.mxfp4,
         )
 
     head = head_weights(model, tp, rank, m.shared_head.norm)

@@ -378,7 +378,12 @@ def main() -> int:
     ap.add_argument("--only", default="tables,entry,replay")
     ap.add_argument("--replays", type=int, default=20)
     ap.add_argument("--deadline", type=float, default=10.0)
+    ap.add_argument(
+        "--positions", default="", help="comma-separated live-row positions"
+    )
     args = ap.parse_args()
+    if args.positions:
+        C.POSITIONS = [int(p) for p in args.positions.split(",")]
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", torch.cuda.current_device())
