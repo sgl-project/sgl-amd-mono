@@ -29,5 +29,7 @@ MAX_ROWS = 8
 # The attention's TP-local output per rank at TP8: 12 heads of 128. o_proj's
 # input, which is where the launch starts.
 CORE = 1536
+# The shared experts' gate | up rows per rank at TP8 (2 x 768).
+SHARED_GATE_UP = 1536
 # Attention-residual bank rows readable at a layer's MLP seam.
 MAX_BLOCKS = 8

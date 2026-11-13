@@ -180,4 +180,7 @@ SPEC = msgspec.structs.replace(
     model_disable_reasons=_model_disable_reasons,
     build=_build,
     config_disable_reasons=_config_disable_reasons,
+    # The wide launch reads SGLang's MoE front in place, so the narrow one
+    # keeps no bf16 copies of it either: a static FP8 front is refused.
+    load_tensor=None,
 )

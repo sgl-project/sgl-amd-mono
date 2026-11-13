@@ -28,7 +28,11 @@ kind.
 The kernels read SGLang's weights in place. The dense weights are read as bf16
 in their checkpoint layout. The experts are read in whichever MXFP4 layout
 ``Mxfp4MoEMethod`` left behind. There is no prepared-weight copy, so the KV
-cache budget pays nothing.
+cache budget pays nothing, with one exception: when SGLang serves the MoE front
+in static FP8, its router gate, latent down and shared gate | up weights become
+views of one pre-shuffled E4M3 tensor, so the launch reads bf16 copies of them
+kept from the checkpoint at load (``_load_tensor``, about 82 MiB a layer, under
+``SGLANG_AMD_MONO_K3_BF16_FRONT=1``).
 
 Two further differences from DeepSeek-V4.1 are deliberate. Each is argued in
 the module that holds it. The mailbox epoch is bumped by the host, not advanced
@@ -42,7 +46,8 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
-from typing import Any
+import re
+from typing import Any, Optional
 
 import msgspec
 import torch
@@ -73,6 +78,7 @@ from sgl_amd_mono.kimi_k3 import (
     LINEAR_ATTN_CONFIG,
     MAX_BLOCKS,
     MAX_ROWS,
+    SHARED_GATE_UP,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +94,10 @@ K2_OPT = os.environ.get("SGLANG_AMD_MONO_K3_K2_OPT")
 MLA_PRE = os.environ.get("SGLANG_AMD_MONO_K3_MLA_PRE", "1") == "1"
 # SGLANG_AMD_MONO_K3_K1=0 builds no K1: every KDA layer keeps SGLang's attention.
 K1 = os.environ.get("SGLANG_AMD_MONO_K3_K1", "1") == "1"
+# SGLANG_AMD_MONO_K3_BF16_FRONT=1 keeps the MoE front's bf16 weights at load
+# (_load_tensor), which SGLang's static FP8 front needs. Off, that front is
+# refused, and every load path SGLang has stays open to the launch.
+BF16_FRONT_ENV = "SGLANG_AMD_MONO_K3_BF16_FRONT"
 
 # The SGLang names this glue reads, by file under the sglang package (``f(p)``:
 # a parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
@@ -213,6 +223,105 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     return reasons
 
 
+FRONT_COPY = "bf16 MoE front"
+# The MoE front weights the launch reads, by their module path under the MoE.
+FRONT = ("gate", "routed_expert_down_proj", "shared_experts.gate_up_proj")
+# The checkpoint's shared gate and up projections, whose TP rows SGLang merges.
+_SHARED_HALVES = ("shared_experts.gate_proj", "shared_experts.up_proj")
+_CKPT_FRONT = re.compile(
+    r"(?:language_model\.)?model\.layers\.(?P<i>\d+)\.block_sparse_moe\."
+    r"(?P<w>gate|routed_expert_down_proj|shared_experts\.(?:gate|up)_proj)\.weight"
+)
+
+
+def _load_tensor(copies: dict, model, name: str, tensor: torch.Tensor) -> None:
+    """Keep each covered layer's MoE front from the checkpoint, on the host: the
+    router gate, the latent down projection and this rank's rows of the shared
+    gate | up projection, merged as ``MergedColumnParallelLinear`` merges them.
+    ``_build`` uploads them only if SGLang has replaced its own with FP8 views."""
+    from sglang.srt.runtime_context import get_parallel
+
+    m = _CKPT_FRONT.fullmatch(name)
+    if m is None or int(m["i"]) not in _covered_layers(model.config):
+        return
+    i, w = int(m["i"]), m["w"]
+    if w in _SHARED_HALVES:
+        p = get_parallel()
+        rows = tensor.shape[0] // p.tp_size
+        tensor = tensor.narrow(0, p.tp_rank * rows, rows)
+    copies[FRONT_COPY, i, w] = tensor.to("cpu", copy=True)
+    halves = [copies.get((FRONT_COPY, i, h)) for h in _SHARED_HALVES]
+    if all(h is not None for h in halves):
+        copies[FRONT_COPY, i, FRONT[2]] = torch.cat(halves)
+        for h in _SHARED_HALVES:
+            del copies[FRONT_COPY, i, h]
+
+
+def _load_hook():
+    """The spec's load hook: ``_load_tensor`` when asked for, else none."""
+    return _load_tensor if os.environ.get(BF16_FRONT_ENV, "0") == "1" else None
+
+
+def _module_front(moe) -> tuple:
+    """SGLang's front weights, None where the module or its weight is missing."""
+
+    def weight(path: str):
+        module = moe
+        for attr in path.split("."):
+            module = getattr(module, attr, None)
+        return getattr(module, "weight", None)
+
+    return tuple(weight(w) for w in FRONT)
+
+
+def _is_bf16(weight) -> bool:
+    return weight is not None and weight.dtype == torch.bfloat16
+
+
+def _kept_front(copies: dict, i: int) -> Optional[tuple]:
+    """Layer i's front as kept at load, or None if any of it is missing."""
+    kept = tuple(copies.get((FRONT_COPY, i, w)) for w in FRONT)
+    return None if any(t is None for t in kept) else kept
+
+
+def _front_weights(moe, copies: dict, i: int) -> tuple:
+    """The front weights the launch reads: SGLang's while they are bf16, else
+    the checkpoint's kept at load, else SGLang's (which the checks refuse)."""
+    own = _module_front(moe)
+    if all(_is_bf16(w) for w in own):
+        return own
+    return _kept_front(copies, i) or own
+
+
+def _front_disable_reasons(front: tuple, hidden: int) -> list[str]:
+    """The launch reads the front as raw bf16 rows: an FP8 view is read as bf16
+    without an error, so every weight is checked."""
+    expected = (
+        ("router gate", HF_CONFIG["num_experts"]),
+        ("latent down projection", HF_CONFIG["routed_expert_hidden_size"]),
+        ("shared gate_up projection", SHARED_GATE_UP),
+    )
+    reasons = []
+    for (name, rows), weight in zip(expected, front):
+        if weight is None:
+            reasons.append(f"no {name}")
+            continue
+        if (
+            _is_bf16(weight)
+            and tuple(weight.shape) == (rows, hidden)
+            and weight.is_contiguous()
+        ):
+            continue
+        why = f"the {name} is not a contiguous bf16 [{rows}, {hidden}]"
+        if not _is_bf16(weight):
+            why += (
+                f" ({weight.dtype}, and no bf16 copy of it was kept at load: "
+                f"SGLang's static FP8 front needs {BF16_FRONT_ENV}=1)"
+            )
+        reasons.append(why)
+    return reasons
+
+
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     """Every per-layer check the config cannot answer. The kernels read each
     weight as a raw address, so a wrong dtype, shape or layout is read as if it
@@ -283,6 +392,10 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             ),
         )
         reasons += [f"layer {i}: {why}" for ok, why in checks if not ok]
+        front = _front_weights(moe, copies, i)
+        reasons += [
+            f"layer {i}: {why}" for why in _front_disable_reasons(front, hidden)
+        ]
         if reasons and i > covered[0]:
             break  # one layer's reasons say it for all
     return reasons
@@ -301,10 +414,14 @@ def _build(model, hf_config, ctx):
     # the peer handshake is collective: every rank reaches it here
     runner = K3MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
     runner.set_deadline(ctx.deadline_s)
+    covered = _covered_layers(hf_config)
+    fronts = {
+        i: _place_front(backbone.layers[i].mlp, ctx.copies, i, device) for i in covered
+    }
     layers, batches = {}, {}
     for rows in ctx.widths:
-        for i in _covered_layers(hf_config):
-            packed = _weights(backbone.layers[i], i, rows, runner)
+        for i in covered:
+            packed = _weights(backbone.layers[i], i, rows, runner, fronts[i])
             layers.setdefault(rows, {})[i] = packed
         # FlyDSL compiles a launcher on its first call, and the first real call
         # is inside a CUDA graph capture, where compiling aborts the process.
@@ -318,6 +435,21 @@ def _build(model, hf_config, ctx):
         batches[rows] = k1_mod.build_batch(layers[rows], device)
         _warmup(runner, layers[rows], rows)
     return _Built(model, runner, layers, batches)
+
+
+def _place_front(moe, copies: dict, i: int, device) -> tuple:
+    """Layer i's front on the device, as the launch reads it. Copies kept at
+    load go to the device only when SGLang's own front is not bf16; the copies
+    then hold the device tensors (SGLang logs them), else they drop layer i's."""
+    front = _front_weights(moe, copies, i)
+    if all(f is o for f, o in zip(front, _module_front(moe))):
+        for w in FRONT:
+            copies.pop((FRONT_COPY, i, w), None)
+        return front
+    placed = tuple(t.to(device) for t in front)
+    for w, t in zip(FRONT, placed):
+        copies[FRONT_COPY, i, w] = t
+    return placed
 
 
 def _warmup(runner, packed_layers: dict, rows: int) -> None:
@@ -458,6 +590,7 @@ SPEC = MonoSpec(
     build=_build,
     api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
+    load_tensor=_load_hook(),
 )
 
 
@@ -469,6 +602,7 @@ class _Layer(msgspec.Struct):
     i: int
     key: Any
     module: Any  # the KimiK3DecoderLayer, for the tensors read per step
+    front: tuple = ()  # the bf16 router gate, latent down, shared gate | up
     k1: Any = None  # the KDA front launch (gfx950/k1.py), where it applies
     mla: Any = None  # (MlaPreBuild, weights): an MLA layer's projection front
 
@@ -480,9 +614,10 @@ def _k2_blocks(layer) -> int:
     return layer.prev_valid_blocks + int(layer.is_block_write_layer)
 
 
-def _weights(layer, i: int, rows: int, runner) -> _Layer:
+def _weights(layer, i: int, rows: int, runner, front: tuple) -> _Layer:
     """This layer's build key at one launch width. The weights themselves are
-    read in place at launch, so nothing is packed or copied here."""
+    read in place at launch, so nothing is packed or copied here; ``front`` is
+    ``_place_front``'s."""
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
     from sgl_amd_mono.kimi_k3.gfx950 import layer as k2
     from sgl_amd_mono.kimi_k3.gfx950.layer import K2Build
@@ -505,6 +640,7 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
             fault_after=runner.fault_after,
         ),
         module=layer,
+        front=front,
     )
 
 
@@ -625,6 +761,7 @@ def _k2_launch(
 
     module = packed.module
     moe, experts = module.mlp, module.mlp.experts
+    w_gate, w_ld, w_sgu = packed.front
     k2.k2_launch(
         packed.key,
         core=core,
@@ -634,10 +771,10 @@ def _k2_launch(
         ares_nw=module.mlp_res_norm.weight,
         ares_qk=module.mlp_res_proj.weight.view(HIDDEN),
         in_nw=module.post_attention_layernorm.weight,
-        w_gate=moe.gate.weight,
+        w_gate=w_gate,
         bias=moe.gate.e_score_correction_bias,
-        w_ld=moe.routed_expert_down_proj.weight,
-        w_sgu=moe.shared_experts.gate_up_proj.weight,
+        w_ld=w_ld,
+        w_sgu=w_sgu,
         w_sd=moe.shared_experts.down_proj.weight,
         w13=experts.w13_weight,
         w13s=experts.w13_weight_scale,
