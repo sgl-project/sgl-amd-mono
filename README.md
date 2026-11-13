@@ -115,6 +115,11 @@ SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 python -m sglang.launch_server \
   --enable-amd-monokernel
 ```
 
+The launch reads the MoE front (router gate, latent down, shared gate | up) as
+bf16, so the server refuses to start with the monokernel when SGLang serves
+that front in static FP8 (`SGLANG_K3_TARGET_DENSE_FP8=front` or `wide`); keep
+that variable unset or `off`.
+
 Kimi-K3.1, with DFLASH (the launches read and write the ReplaySSM ring):
 
 ```bash
