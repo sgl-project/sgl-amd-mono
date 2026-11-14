@@ -12,11 +12,12 @@ from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import CM_DEV
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources, key_tuple
-from sgl_amd_mono.common.sync import Mailbox, sreg
+from sgl_amd_mono.common.sync import Mailbox, shift, sreg
 from sgl_amd_mono.muse_spark.gfx950 import compat
 from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
 from sgl_amd_mono.muse_spark.gfx950.device import global_atomic, step_tag
 from sgl_amd_mono.muse_spark.gfx950.layout import (
+    X_FLAG_COPIES,
     attn_rows,
     k1_scratch_layout,
     kattn_scratch_layout,
@@ -498,6 +499,15 @@ def build_layer(key: LayerBuild):
                     c1.update(
                         d_poll=c3["poll"], d_unp=c3["own_unp"], d_nscal=c3["nscal"]
                     )
+                else:
+                    # K3's tail issues the K1 GEMV weights of the CTAs it keeps
+                    # longest (``ffn.stage_unpool``): their own task, or none (past
+                    # the last task: zeros, no traffic)
+                    def k1_pre(early):
+                        return pre_attn.gemv_w_loads_if(c1, bid, w1, early)
+
+                    c3["k1_pre"] = k1_pre
+                    c3["k1_units_pre"] = lambda early: pre_attn.units_pre_if(c1, early)
                 ffn.run_k3(
                     c3,
                     route_flag=rflag,
@@ -507,7 +517,18 @@ def build_layer(key: LayerBuild):
                     res_flag=(c2["resflag"], S * post_attn.a_parts(S)),
                 )
                 gpu.barrier()
-                pre_attn.run_k1(c1, bid, x_flag=c1["xflag"])
+                if const_expr(c3.get("k1_w") is not None):
+                    c1.update(
+                        k1_w=c3["k1_w"],
+                        k1_early=c3["k1_early"],
+                        k1_units=c3["k1_units"],
+                    )
+                # this CTA's copy of the x flags (``layout.X_FLAG_COPIES``)
+                x_copy = shift(
+                    c1["xflag"],
+                    fx.Int64(fx.Int32(bid % X_FLAG_COPIES) * (MAX_TOKENS * 8)),
+                )
+                pre_attn.run_k1(c1, bid, x_flag=x_copy)
             else:
                 ffn.run_k3(
                     c3,

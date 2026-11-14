@@ -15,7 +15,7 @@ from sgl_amd_mono.common.ops import peer_bases
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, kernel_sources, key_tuple
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.muse_spark.gfx950 import compat
-from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
+from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS, MOE_HIDDEN
 from sgl_amd_mono.muse_spark.gfx950.device import step_tag
 from sgl_amd_mono.muse_spark.gfx950.stages import post_attn
 from sgl_amd_mono.muse_spark.gfx950.stages.post_attn import (
@@ -71,6 +71,16 @@ class K2Build(msgspec.Struct, frozen=True):
     pshard: bool = False  # w_pool is the rank's 1 / npes of the pooler rows; partials to every rank (``poolx``)
 
 
+def auto_pshard(key: K2Build) -> bool:
+    """The pooler sharded in the kernel at TP 8 (no new argument): ``w_pool`` is the
+    full replicated pooler, each rank streams its contiguous slice of MOE_HIDDEN / 8
+    rows (offset ``rank * MOE_HIDDEN / 8`` rows) and pushes the partial pooled rows to
+    every rank's ``poolx`` (the ``pshard`` dataflow; the sums and their order are the
+    replicated pooler's, so the expert input is bit-identical). Widths up to 16 only
+    (see ``runner._pshard``); not with the FP8 copy."""
+    return not key.pshard and key.npes == 8 and key.tokens <= 16 and not key.fp8_pool
+
+
 def k2_context(
     key: K2Build,
     lds,
@@ -88,6 +98,7 @@ def k2_context(
     tid = fx.thread_idx.x
     mb = Mailbox(tag)
     sy = sym_layout(key.npes)
+    auto_ps = auto_pshard(key)
     c = {
         "S": key.tokens,
         "W": key.npes,
@@ -103,6 +114,8 @@ def k2_context(
         "put_bf": mb.put_bf,
         "put_words": mb.put_words,
         "poll": mb.poll,
+        "poll_masked": mb.poll_masked,
+        "tag": tag,
         "args": args,
         "rank": rank,
         "sym": sym,
@@ -114,10 +127,14 @@ def k2_context(
         "fp8_pool": key.fp8_pool,
         "defer_k1": key.defer_k1,
         "xq_pre": key.xq_pre,
-        "pshard": key.pshard,
+        # the sharded pooler: the pre-sliced rows (``key.pshard``), or at TP 8 the rank's
+        # contiguous row slice of the full pooler, found here (``auto_pshard``)
+        "pshard": key.pshard or auto_ps,
+        "pool_row0": rank * (MOE_HIDDEN // key.npes) if auto_ps else 0,
         "own_poolx": preg(sym, sy["poolx"][0], "poolx"),
     }
     c["peer_poolx"] = [preg(base, sy["poolx"][0], "poolx") for base in c["bases"]]
+    c["peers"], c["sy_poolx"] = peers, sy["poolx"][0]  # (``post_attn.rot_poolx``)
     for region, (off, _) in layout.items():
         if region in ("k2_xbuf", "k2_xbuf2", "k2_c1", "k2_xinq"):
             c[region[3:]] = scratch + fx.Int64(
