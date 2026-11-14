@@ -630,7 +630,8 @@ SPEC = MonoSpec(
             widths=target.ROWS, tp_sizes=target.TP_SIZES, resident_blocks=BLOCKS
         )
     },
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # its target's PD gate (decode on MoRI) holds for the draft as well
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.PD_DISAGGREGATION}),
     # the launcher checks the target's requirements; the draft-step wrapper checks
     # a draft step's attention backend against these
     requires=Requirements(attention_backends=DRAFT_ATTENTION_BACKENDS),

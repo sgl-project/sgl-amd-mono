@@ -178,8 +178,8 @@ The serving test uses more flags (`test/e2e/qwen38_a95b_mxfp4_server.py`).
 
 For MoRI PD, enable monokernels only on the decode server
 (`--disaggregation-mode decode --disaggregation-transfer-backend mori`): TP8 for
-DeepSeek-V4-Pro, TP2 or TP4 for DeepSeek-V4.1-Flash. Leave the flag off on prefill;
-both peers must use the same KV layout.
+DeepSeek-V4-Pro and GLM-5.3, TP2 or TP4 for DeepSeek-V4.1-Flash. Leave the flag off
+on prefill; both peers must use the same KV layout.
 
 Qwen3.8-Flash-Next, with its MTP head (one MI355X; the server flags of `test/e2e/qwen38_flash_next_server.py`, which also caps running requests at 16 to step past 8):
 
