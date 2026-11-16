@@ -297,6 +297,21 @@ class TestMonokernelTP2(_Serving, CustomTestCase):
     TP = 2
 
 
+def _triton_fp4_gemm_args() -> list:
+    """The server args that keep Quark MXFP4 on the Triton FP4 GEMM. With
+    sgl-project/sglang#43360, auto picks the ASM GEMM on gfx95, so the test asks
+    for triton; before it, Triton is the default (the ASM GEMM needs
+    SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM=1) and the choice does not exist."""
+    from sglang.srt.arg_groups.choices import FP4_GEMM_RUNNER_BACKEND_CHOICES
+
+    if "triton" in FP4_GEMM_RUNNER_BACKEND_CHOICES:
+        return ["--fp4-gemm-backend", "triton"]
+    return []
+
+
+_TRITON_FP4_GEMM = _triton_fp4_gemm_args()
+
+
 class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
         # SGLANG_AMD_MONO_CHECK (eager) runs the normal layer next to each
@@ -307,18 +322,16 @@ class TestMonokernelCheck(CustomTestCase):
                 tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
                 tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
             ):
-                # the bit-exact bounds hold against the Triton FP4 GEMM; auto
-                # picks the ASM one on gfx95, which rounds differently
+                # the bit-exact bounds hold against the Triton FP4 GEMM
                 process = _launch(
                     tp,
                     mono=True,
                     log=(out, err),
-                    extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
-                    extra_args=[
-                        "--disable-cuda-graph",
-                        "--fp4-gemm-backend",
-                        "triton",
-                    ],
+                    extra_env={
+                        "SGLANG_AMD_MONO_CHECK": "1",
+                        "SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM": "0",
+                    },
+                    extra_args=["--disable-cuda-graph", *_TRITON_FP4_GEMM],
                 )
                 try:
                     for n in (1, cap):
