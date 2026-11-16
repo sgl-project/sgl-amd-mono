@@ -83,6 +83,8 @@ SGLANG_READS = {
         "speculative_num_steps",
         "speculative_num_draft_tokens",
         "watchdog_timeout",
+        "disaggregation_mode",
+        "disaggregation_transfer_backend",
     ),
     "srt/distributed/parallel_state.py": ("cpu_group",),
     "srt/environ.py": (
@@ -269,6 +271,12 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
             "needs the FP8 block-128 checkpoint, got "
             f"{quant.get('quant_method')!r} {quant.get('weight_block_size')!r}"
         )
+    mode = cfg.disaggregation_mode
+    if mode not in (None, "null"):
+        if mode != "decode":
+            reasons.append("PD monokernels support the decode role only")
+        elif cfg.disaggregation_transfer_backend != "mori":
+            reasons.append("PD monokernels require the mori transfer backend")
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -707,7 +715,8 @@ SPEC = MonoSpec(
     devices={
         "gfx950": DeviceLimits(widths=ROWS, tp_sizes=TP_SIZES, resident_blocks=BLOCKS)
     },
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # MoRI transfers into the same MLA KV and index-key caches the kernels read
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.PD_DISAGGREGATION}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsa"}),

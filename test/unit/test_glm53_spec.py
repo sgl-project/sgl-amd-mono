@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels import spec as registry
 
 import sgl_amd_mono
-from sgl_amd_mono.glm53 import HF_CONFIG, check
+from sgl_amd_mono.glm53 import HF_CONFIG, check, draft
 from sgl_amd_mono.glm53 import spec as glm53
 from sgl_amd_mono.glm53.gfx950.weights import rope_tables
 
@@ -39,11 +39,15 @@ GLM53 = SimpleNamespace(
     architectures=["GlmMoeDsaForCausalLM"],
 )
 # the server arguments the spec reads before load: no speculative decoding
-CFG = SimpleNamespace(page_size=None, speculative_algorithm=None)
+CFG = SimpleNamespace(
+    page_size=None,
+    speculative_algorithm=None,
+    disaggregation_mode="null",
+    disaggregation_transfer_backend="mooncake",
+)
 # MTP: SGLang's GLM-5.3 default draft chain (NEXTN resolves to EAGLE)
 MTP = SimpleNamespace(
-    page_size=None,
-    speculative_algorithm="EAGLE",
+    **{**vars(CFG), "speculative_algorithm": "EAGLE"},
     speculative_eagle_topk=1,
     speculative_num_steps=3,
     speculative_num_draft_tokens=4,
@@ -257,6 +261,29 @@ def test_mtp_runs_one_draft_chain(changes, refused):
     reasons = glm53._config_disable_reasons(cfg, GLM53)
     assert len(reasons) == int(refused)
     assert all("one draft chain" in r for r in reasons)
+
+
+def test_pd_runs_on_a_mori_decode_server_only():
+    def reasons(mode, backend="mori"):
+        cfg = SimpleNamespace(
+            **{
+                **vars(MTP),
+                "disaggregation_mode": mode,
+                "disaggregation_transfer_backend": backend,
+            }
+        )
+        return [
+            r for r in glm53._config_disable_reasons(cfg, GLM53) if "FlyDSL" not in r
+        ]
+
+    pd = registry.Feature.PD_DISAGGREGATION
+    assert pd in glm53.SPEC.features and pd in draft.SPEC.features
+    assert reasons("null") == reasons(None) == []
+    assert reasons("decode") == []
+    assert reasons("prefill") == ["PD monokernels support the decode role only"]
+    assert reasons("decode", "mooncake") == [
+        "PD monokernels require the mori transfer backend"
+    ]
 
 
 def test_the_layer_check_counts_the_own_chain_keys_a_row_drops():

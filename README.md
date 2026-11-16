@@ -179,8 +179,8 @@ The serving test uses more flags (`test/e2e/qwen38_a95b_mxfp4_server.py`).
 
 For MoRI PD, enable monokernels only on the decode server
 (`--disaggregation-mode decode --disaggregation-transfer-backend mori`): TP8 for
-DeepSeek-V4-Pro, TP2 or TP4 for DeepSeek-V4.1-Flash. Leave the flag off on prefill;
-both peers must use the same KV layout.
+DeepSeek-V4-Pro and GLM-5.3, TP2 or TP4 for DeepSeek-V4.1-Flash. Leave the flag off
+on prefill; both peers must use the same KV layout.
 
 Qwen3.5-397B-A17B-FP8 (128x128 block FP8), with decode graphs at the kernels'
 widths (the flags of `test/e2e/qwen35_a17b_fp8_server.py`):
