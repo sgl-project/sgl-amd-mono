@@ -61,11 +61,10 @@ SGLANG_READS = {
     "srt/layers/layer_boundary/residual/batch.py": ("start", "final_norm"),
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
         "linear_attn_backend",
-        "req_to_token_pool",
+        "state_layer_cache",
         "_track_mamba_state_decode",
     ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
-    "srt/mem_cache/memory_pool.py": ("mamba2_layer_cache",),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "srt/model_executor/forward_batch_info.py": (
         "input_embeds",
@@ -242,7 +241,7 @@ class _Built:
     def _state(self, i, layer, lab):
         from .gfx950 import weights as W
 
-        cache = lab.req_to_token_pool.mamba2_layer_cache(layer.linear_attn.layer_id)
+        cache = lab.state_layer_cache(layer.linear_attn.layer_id)
         state = self.states.get(i)
         if (
             state is None
