@@ -28,10 +28,8 @@ co-resident, so every wait makes progress.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T, as_ir_value
+from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.mx import clamp_fp8
 from sgl_amd_mono.common.ops import (
@@ -41,10 +39,8 @@ from sgl_amd_mono.common.ops import (
     bf16_pair,
     bf16_round,
     butterfly,
-    clock,
     fp8_pack4,
     hw_rsq,
-    lane_gather,
     mfma_bf16,
     row_sum,
     rsrc,
@@ -67,11 +63,10 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     RMS_EPS,
 )
 from sgl_amd_mono.muse_spark.gfx950.device import (
-    TRACE_BLOCKS,
-    TRACE_LAYERS,
-    TRACE_SLOTS,
     poll_flags,
     stamp,
+    udiv,
+    umod,
 )
 from sgl_amd_mono.muse_spark.gfx950.layout import (
     ELEMS,
@@ -104,34 +99,9 @@ RED_PITCH = WAVES * RED_WAVE + 16
 assert RED_PITCH % 64 == 16
 
 
-@flyc.jit
-def stamp_wave(c, idx):
-    """(trace) stamp ``idx`` (traced) from this wave's lane 0."""
-    if const_expr(not c.get("trace_on", False)):
-        return
-    layer = c.get("layer")
-    base = (layer % TRACE_LAYERS) * (TRACE_BLOCKS * TRACE_SLOTS) + c[
-        "bid"
-    ] * TRACE_SLOTS
-    if c["lane"] == 0:
-        now = clock()
-        addr = c["trace"].value + fx.Int64((base + idx) * 8)
-        ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result
-        llvm.StoreOp(as_ir_value(now), ptr, alignment=8)
-
-
 def red_at(it, wave, lane):
     """Float offset of lane ``lane`` of wave ``wave``'s accumulators of row tile ``it``."""
     return it * RED_PITCH + wave * RED_WAVE + lane * 4 + 4 * (lane // 16)
-
-
-def row_sum_sk(red, it, r, t):
-    """Row r (of 16), token t of row tile ``it``'s accumulators (``red_at``), summed in
-    wave order (``ops.row_sum`` on the skewed layout)."""
-    tot = fx.Float32(0.0)
-    for w in range(WAVES):
-        tot = tot + fx.ptr_load(red + (red_at(it, w, 16 * (r // 4) + t) + r % 4))
-    return tot
 
 
 def gemv_k(lane, wave, kpart, kc):
@@ -185,20 +155,10 @@ def gemv_w_loads_if(c, task, w, live):
 # The partials go out from the waves that run no head / gate unit (waves
 # unit_waves(S) ..): a unit wave's partial polls would return behind its own
 # partial stores' acks (a wave's memory operations complete in order). A lane sums
-# four consecutive rows of a token (16-byte LDS reads, in wave order as
-# ``row_sum_sk``) and stores them as one 16-byte word quad (``put_store``); the unit
-# waves start polling once the CTA's partials are issued (PUT_BARRIER: polls issued
-# while the partials are still being stored slow the hand-off down by ~0.7 us).
-SPLIT_PUT = True
-PUT_BARRIER = True
-
-
-def _ud(a, b):
-    return fx.Int32(fx.Uint32(a) // (b if isinstance(b, int) else fx.Uint32(b)))
-
-
-def _um(a, b):
-    return fx.Int32(fx.Uint32(a) % (b if isinstance(b, int) else fx.Uint32(b)))
+# four consecutive rows of a token (16-byte LDS reads, in wave order) and stores
+# them as one 16-byte word quad (``put_store``); the unit waves start polling once
+# the CTA's partials are issued (polls issued while the partials are still being
+# stored slow the hand-off down by ~0.7 us).
 
 
 # The K parts' partials are zero-sentinel words, not tagged pairs: a partial's fp32
@@ -232,15 +192,17 @@ def part_put(c, kpart, tk, row, v):
 
 def put_quad(c, rg, kpart, t, qi):
     """Row set ``qi`` (set r4 of PUT_ROWS rows, token tl of tile ``t``): rows
-    PUT_ROWS r4 .. of token tl summed over the waves in order (``row_sum_sk``'s sums)
+    PUT_ROWS r4 .. of token tl summed over the waves in order (in wave order)
     -> the parts' words (one 16-byte store)."""
     red, part = c["red"], c["part"]
     VF = fx.Vector.make_type(PUT_ROWS, fx.Float32)
-    r4 = _um(qi, QUADS)
-    tl = _ud(qi, QUADS)
+    r4 = umod(qi, QUADS)
+    tl = udiv(qi, QUADS)
     r0 = r4 * PUT_ROWS
     # red_at(r0 / 16, w, 16 ((r0 % 16) / 4) + tl) + r0 % 4: the set's floats
-    base = _ud(r0, ROWS) * RED_PITCH + _ud(_um(r0, ROWS), 4) * 68 + tl * 4 + _um(r0, 4)
+    base = (
+        udiv(r0, ROWS) * RED_PITCH + udiv(umod(r0, ROWS), 4) * 68 + tl * 4 + umod(r0, 4)
+    )
     tot = [fx.Float32(0.0)] * PUT_ROWS
     for w in range(WAVES):
         v = fx.Vector(fx.ptr_load(red + (base + w * RED_WAVE), result_type=VF))
@@ -285,14 +247,13 @@ def put_quads(c, rg, kpart, t, nt):
             got.append((pi, tot))
         for p in range_constexpr(rounds):
             put_store(c, got[p][0], got[p][1])
-        if wave == uw:
-            stamp_wave(
-                c, 6
-            )  # (trace) the partials issued (a wave whose lanes all store)
+        stamp(
+            c, 6, 64 * uw
+        )  # (trace) the partials issued (a wave whose lanes all store)
 
 
 @flyc.jit
-def stage_gemv(c, rg, kpart, first=None, tail_barrier=False):
+def stage_gemv(c, rg, kpart, first=None):
     """GEMV task: K part ``kpart`` of row group ``rg`` (64 rows, four MFMA tiles) for
     every token tile. Lane l of wave w holds row l % 16 of each tile and, per
     k-step, k = 1024 kpart + 128 w + 32 kc + 8 (l / 16) .. + 8 of the weight (A) and
@@ -340,23 +301,8 @@ def stage_gemv(c, rg, kpart, first=None, tail_barrier=False):
         if const_expr(t == 0):
             stamp(c, 5)  # (trace) the first tile's MFMAs done (x landed)
         nt = min(TILE, S - t * TILE)
-        if const_expr(SPLIT_PUT):
-            put_quads(c, rg, kpart, t, nt)
-            if const_expr(t + 1 < tiles or tail_barrier or PUT_BARRIER):
-                gpu.barrier()  # ``red`` is reused by the next token tile / task
-        else:
-            # this token tile's partials of the part: thread (row of the group, token of the tile)
-            n_out = G_ROWS * nt
-            for p in range_constexpr(-(-n_out // THREADS)):
-                idx = tid + p * THREADS
-                if idx < n_out:
-                    r = idx % G_ROWS
-                    tk = t * TILE + idx // G_ROWS
-                    v = row_sum_sk(red, r // ROWS, r % ROWS, idx // G_ROWS)
-                    part_put(c, kpart, tk, rg * G_ROWS + r, v)
-            if const_expr(t == tiles - 1):
-                stamp(c, 6)  # (trace) the partials issued
-            gpu.barrier()  # ``red`` is reused by the next token tile / task
+        put_quads(c, rg, kpart, t, nt)
+        gpu.barrier()  # ``red`` is reused; the unit waves poll past the partials
 
 
 @flyc.jit
@@ -565,9 +511,6 @@ def poll_part_zs(base, offs, gap=1):
     return [v[e] ^ fx.Int32(-1) for e in range(N)]
 
 
-DPP_QUAD = True  # the norm's quad gather by DPP broadcasts (bit-identical values)
-
-
 @flyc.jit
 def stage_unit(c, j, tk, pos, slot):
     """Unit (task ``j``, token ``tk``) on this wave, lane d = dim d: the token's row j
@@ -608,28 +551,18 @@ def stage_unit(c, j, tk, pos, slot):
     )
     offs = [part_word(hf, tk, j * HEAD_DIM + d) for hf in range(PARTS)]
     gq = poll_part_zs(part.value, offs)
-    stamp_wave(c, 7 + 2 * c["wave"])  # (trace) the unit's partials polled
     v = gq[0].bitcast(fx.Float32)
     for hf in range_constexpr(1, PARTS):
         v = v + gq[hf].bitcast(fx.Float32)
     e = bf16_round(v)
     # the per-head norm: the sum of squares of dims 4 (d / 4) .. + 4 in order, then the
     # groups' butterfly
-    q0 = d - d % ELEMS
-    if const_expr(DPP_QUAD):
-        # lane q0 + k of the quad by a DPP quad broadcast (no LDS round trip)
-        ei = e.bitcast(fx.Int32)
-        eq = [
-            fx.Int32(update_dpp_i32(ei, ei, 0x55 * k, 0xF, 0xF, False)).bitcast(
-                fx.Float32
-            )
-            for k in range(ELEMS)
-        ]
-    else:
-        eq = [
-            lane_gather(e.bitcast(fx.Int32), q0 + k).bitcast(fx.Float32)
-            for k in range(ELEMS)
-        ]
+    # lane d - d % ELEMS + k of the quad by a DPP quad broadcast (no LDS round trip)
+    ei = e.bitcast(fx.Int32)
+    eq = [
+        fx.Int32(update_dpp_i32(ei, ei, 0x55 * k, 0xF, 0xF, False)).bitcast(fx.Float32)
+        for k in range(ELEMS)
+    ]
     ss = fx.Float32(0.0)
     for k in range_constexpr(ELEMS):
         ss = ss + eq[k] * eq[k]
@@ -685,7 +618,6 @@ def stage_unit(c, j, tk, pos, slot):
     r_p = rsrc(part.value)
     for o in offs:
         bo.buffer_store(fx.Int32(0), r_p, o, cache_modifier=CM_DEV)
-    stamp_wave(c, 8 + 2 * c["wave"])  # (trace) the unit's stores issued
 
 
 @flyc.jit
@@ -754,7 +686,7 @@ def run_k1(c, bid, x_flag=None):
             )  # (deferred: the GEMV polls its unpooled rows itself)
         stamp(c, 1)  # x arrived (a merged launch)
         if bid >= S:
-            stage_gemv(c, bid // K_PARTS, bid % K_PARTS, first, tail_barrier=True)
+            stage_gemv(c, bid // K_PARTS, bid % K_PARTS, first)
         if bid >= BLOCKS - S:
             t2 = bid - (BLOCKS - S)
             stage_gemv(c, t2 // K_PARTS, t2 % K_PARTS, extra)

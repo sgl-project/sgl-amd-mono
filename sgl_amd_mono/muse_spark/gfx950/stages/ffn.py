@@ -55,7 +55,6 @@ co-resident)::
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
@@ -72,7 +71,6 @@ from sgl_amd_mono.common.ops import (
     bf16_pair,
     bf16_round,
     butterfly,
-    clock,
     fp8_to_bf16x8,
     fresh,
     hw_exp2,
@@ -823,7 +821,7 @@ UNP_CLAIM_WORD = (
 
 @flyc.jit
 def unp_claim(c, n_pool: int):
-    """(``UNP_DYN``) This pool CTA's ticket among the launch's pool CTAs (past the fin
+    """This pool CTA's ticket among the launch's pool CTAs (past the fin
     tasks) in the order their dn stage ended: the first ``unp_jobs`` take the unpool
     jobs, so a CTA whose dn ends last carries no unpool or early K1 weights into the
     fin hops (its CU's loads delayed the fin flags' poll). One atomic add a CTA on a
@@ -1003,10 +1001,6 @@ def stage_plan(c, ids_lds=None):
 POLL_WAVE = (
     WAVES - 1
 )  # a merged launch's K3 prologue polls on the last wave (``run_k3``)
-EARLY_FIRST = (
-    True  # the first pair from the picked experts' mask, before the plan (``run_k3``)
-)
-FP_TABLE = True  # ``first_pair_table`` while the routing is polled (``run_k3``)
 
 
 def ug_first_loads(c, q, dq, n_tiles, use_dn, live):
@@ -1244,24 +1238,6 @@ def put_mid_block(c, blk, e, col0, n, mid_of):
             put(mid, base + r // 8, word)
             if r == 0:
                 put(mid, base + 4, byte)
-
-
-@flyc.jit
-def put_rows(c, region, width, r, rows, e, col0, n, vals_of):
-    """Thread (column j = tid % 16, row pair rp = tid / 16): rows 2 rp, + 1 of the
-    item's ``rows`` for column j < n -> ``region`` (``width`` elements a row) at
-    the column's pick's row, ``vals_of(row, j)`` the value, bf16 pairs."""
-    tid, put_bf = c["tid"], c["put_bf"]
-    j = tid % TILE_COLS
-    for g in range_constexpr(cdiv(rows // 2, THREADS // TILE_COLS)):
-        rp = tid // TILE_COLS + g * (THREADS // TILE_COLS)
-        if (j < n) & (rp < rows // 2):
-            p = pick_at(c, e, col0 + j)
-            put_bf(
-                region,
-                p * width + r * rows + 2 * rp,
-                [vals_of(2 * rp, j), vals_of(2 * rp + 1, j)],
-            )
 
 
 UG_COST, DN_COST = 5, 3  # a ug item's and a dn item's relative time (``dn_caps``)
@@ -1729,24 +1705,6 @@ def zs_store(base, off, words):
 
 
 @flyc.jit
-def stamp_at(c, idx: int, who: int, zero: bool = False):
-    """``device.stamp`` written by thread ``who`` (a trace build's stamp from a wave
-    other than the first); ``zero``: the slot := 0 (a role this CTA did not take)."""
-    if const_expr(not c.get("trace_on", False)):
-        return
-    layer = c.get("layer")
-    if const_expr(layer is None):
-        base = c["bid"] * TRACE_SLOTS
-    else:
-        base = (layer % TRACE_LAYERS) * (BLOCKS * TRACE_SLOTS) + c["bid"] * TRACE_SLOTS
-    if c["tid"] == who:
-        now = fx.Int64(0) if zero else clock()
-        addr = c["trace"].value + fx.Int64((base + idx) * 8)
-        ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result
-        llvm.StoreOp(as_ir_value(now), ptr, alignment=8)
-
-
-@flyc.jit
 def fin_held(c, t):
     """Token t's slots this rank holds, as ``pick`` gives them (>= 0: held, -1: not),
     from the plan still in LDS (``pick_of`` / ``cnt_of``): a load of the ids here
@@ -1918,9 +1876,7 @@ def stage_fin(c, t, part):
                 lo = lo + lo2
                 hi = hi + hi2
             words.append(bf16_pair(lo, hi).bitcast(fx.Int32))
-        stamp_at(
-            c, 15, HALF if split else 0
-        )  # every rank's partials arrived (fin CTAs)
+        stamp(c, 15, HALF if split else 0)  # every rank's partials arrived (fin CTAs)
         r_f = rsrc(fbuf.value)
         for k_ in range_constexpr(fb_copies(c["S"])):  # every copy (``fb_copies``)
             if const_expr(PPT == 1):
@@ -2029,13 +1985,10 @@ def stage_fin_tpx(c, t, part):
 
 
 # ---------------------------------------------------------------- 4. unpool
-UNP_DYN = (
-    True  # the unpool jobs claimed by the pool CTAs in dn-end order (``unp_claim``)
-)
-# (with UNP_DYN) the fin tasks claimed too, after the unpool jobs, by every CTA past the
-# bnd tasks in dn-end order: a fin task on a CTA whose dn item ended last (a fixed fin
-# CTA) began its prologue (~0.9 us) and its y poll after that item, on the critical path
-FIN_DYN = True
+# (k1_early_map) the unpool jobs are claimed by the pool CTAs in dn-end order
+# (``unp_claim``), and the fin tasks too, after the unpool jobs, by every CTA past the
+# bnd tasks: a fin task on a CTA whose dn item ended last (a fixed fin CTA) began its
+# prologue (~0.9 us) and its y poll after that item, on the critical path
 
 
 def k1_early_map(c) -> bool:
@@ -2094,7 +2047,6 @@ def unp_rows_dma(c, r_f, t0, nt):
         )
 
 
-UNP_DMA_ALL = True  # (k1_early_map) every unpool wave stages its own rows' K eighth
 # (k1_early_map) An unpool CTA's waves ``unp_k1_claim`` .. issue their next-K1 GEMV
 # weights at the claim (behind the first tile's, as wave 0 .. before), the waves before
 # it once the CTA's rows are pushed. A CU's memory pipeline under the tail's load
@@ -2112,7 +2064,7 @@ def unp_k1_claim(c) -> int:
 
 
 def unp_k1_late(c) -> bool:
-    return UNP_DMA_ALL and c.get("k1_pre") is not None and unp_k1_claim(c) > 1
+    return c.get("k1_pre") is not None and unp_k1_claim(c) > 1
 
 
 def unp_k1_rest(c, kw, ku):
@@ -2131,9 +2083,6 @@ def unp_k1_rest(c, kw, ku):
     return kw, ku
 
 
-BND_PRE = (
-    True  # the boundary's row-independent VALU before its row wait (``stage_bnd``)
-)
 UNP_RED_WAVE = 64 * 4 + 64  # a wave's accumulators in ``red``, + the skew's 48
 
 
@@ -2236,14 +2185,6 @@ def stage_unpool(c, first_w):
         )  # this CTA's copy
         poll_flags(c, [(ff, S * AP)])
     stamp(c, 8)  # the fin flags arrived (unpool CTAs)
-    if const_expr(
-        c.get("unp_job") is not None and c.get("trace_on", False) and not FIN_DYN
-    ):
-        # (trace) a pool CTA without a job this launch: its unpool slots := 0
-        if (~live) & (c["bid"] >= b["unp0"]):
-            for i_ in range_constexpr(4):
-                stamp_at(c, (8, 9, 10, 11)[i_], 0, True)
-            stamp_at(c, 13, 0, True)
     if const_expr(c.get("k1_w") is not None):
         # (``k1_early_map``: one job, waves 1 .. hold the next K1's weights in flight)
         # the rows are staged by DMA the compiler's wait counting does not see (it
@@ -2253,20 +2194,13 @@ def stage_unpool(c, first_w):
         late = unp_k1_late(c)
         kw, ku = c["k1_w"], c["k1_units"]
         if live:
-            if const_expr(UNP_DMA_ALL):
-                # (the claimed jobs' CTAs ended dn first: their K1 weights are in) every
-                # wave stages its own K eighth of the rows
-                w = c["wave"]
-                for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
-                    vw = unp_slot(c["lane"], i) + 64 * w + THREADS * i
-                    lds_dma_sc1(r_f, c["xcol"] + (i * THREADS + w * 64) * 4, tp0 * (MOE_HIDDEN * 2) + vw * 16)  # fmt: skip
-                rocdl.s_waitcnt(vmcnt=0)
-            elif c["wave"] == 0:
-                for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
-                    for w in range_constexpr(WAVES):
-                        vw = unp_slot(c["lane"], i) + 64 * w + THREADS * i
-                        lds_dma_sc1(r_f, c["xcol"] + (i * THREADS + w * 64) * 4, tp0 * (MOE_HIDDEN * 2) + vw * 16)  # fmt: skip
-                rocdl.s_waitcnt(vmcnt=0)
+            # (the claimed jobs' CTAs ended dn first: their K1 weights are in) every
+            # wave stages its own K eighth of the rows
+            w = c["wave"]
+            for i in range_constexpr(nt * (MOE_HIDDEN // 8) // THREADS):
+                vw = unp_slot(c["lane"], i) + 64 * w + THREADS * i
+                lds_dma_sc1(r_f, c["xcol"] + (i * THREADS + w * 64) * 4, tp0 * (MOE_HIDDEN * 2) + vw * 16)  # fmt: skip
+            rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             stamp(c, 9)  # the first job's rows landed in LDS
             unp_job(c, first_w, gtask0, tp0, nt, live, True)
@@ -2309,8 +2243,8 @@ def stage_bnd(c, t, x_flag=None, x_put=None):
     (eps 1e-5) -> ``attn_out``. On the last layer the stream is rounded to bf16
     before that norm (the model's final-norm input dtype), whose weight is then the
     final norm's: ``c["last"]`` compiles the rule in, else the launch's ``last``
-    argument selects it. The operands go out (and their row-independent VALU runs:
-    ``BND_PRE``) before the wait on the row, zero-sentinel words re-armed once read
+    argument selects it. The operands go out (and their row-independent VALU runs)
+    before the wait on the row, zero-sentinel words re-armed once read
     (a deferred K1's build: tagged pairs). ``x_flag``
     (with ``x_put``, the next layer's mailbox): the next layer's K1 runs later in
     this launch; the token's flag."""
@@ -2322,21 +2256,18 @@ def stage_bnd(c, t, x_flag=None, x_put=None):
     be = [fx.Vector(bo.buffer_load(rsrc(a["beta"]), e0 + 4 * i, vec_width=4, dtype=T.f32)) for i in range(4)]  # fmt: skip
     st = [fx.Vector(bo.buffer_load(rsrc(a["res"]), t * HIDDEN + e0 + 4 * i, vec_width=4, dtype=T.f32)) for i in range(4)]  # fmt: skip
     nw_w = [fx.Vector(bo.buffer_load(rsrc(a["npw"]), e0 // 2 + 4 * i, vec_width=4, dtype=T.i32)) for i in range(2)]  # fmt: skip
-    if const_expr(BND_PRE):
-        # the row-independent operands' VALU (weights unpacked, alpha st) before the
-        # wait: the row lands seconds of microseconds after these loads
-        fw = [
-            bf2_f32(fx.Int32(fw_w[k // 8][(k % 8) // 2]))[k % 2]
-            for k in range(BND_ELEMS)
-        ]
-        nw = [
-            bf2_f32(fx.Int32(nw_w[k // 8][(k % 8) // 2]))[k % 2]
-            for k in range(BND_ELEMS)
-        ]
-        ast = [
-            fx.Float32(al[k // 4][k % 4]) * fx.Float32(st[k // 4][k % 4])
-            for k in range(BND_ELEMS)
-        ]
+    # the row-independent operands' VALU (weights unpacked, alpha st) before the
+    # wait: the row lands microseconds after these loads
+    fw = [
+        bf2_f32(fx.Int32(fw_w[k // 8][(k % 8) // 2]))[k % 2] for k in range(BND_ELEMS)
+    ]
+    nw = [
+        bf2_f32(fx.Int32(nw_w[k // 8][(k % 8) // 2]))[k % 2] for k in range(BND_ELEMS)
+    ]
+    ast = [
+        fx.Float32(al[k // 4][k % 4]) * fx.Float32(st[k // 4][k % 4])
+        for k in range(BND_ELEMS)
+    ]
     rocdl.sched_barrier(0)
     if const_expr(c["defer_k1"]):
         got = poll([(own_unp, (t * HIDDEN + e0) // 2 + 2 * j, 2) for j in range(4)])
@@ -2354,19 +2285,6 @@ def stage_bnd(c, t, x_flag=None, x_put=None):
             bf2_f32(got[j][q])[h] for j in range(2) for q in range(4) for h in range(2)
         ]
     stamp(c, 15)  # the token's unpooled row arrived (bnd CTAs)
-    if const_expr(not BND_PRE):
-        fw = [
-            bf2_f32(fx.Int32(fw_w[k // 8][(k % 8) // 2]))[k % 2]
-            for k in range(BND_ELEMS)
-        ]
-        nw = [
-            bf2_f32(fx.Int32(nw_w[k // 8][(k % 8) // 2]))[k % 2]
-            for k in range(BND_ELEMS)
-        ]
-        ast = [
-            fx.Float32(al[k // 4][k % 4]) * fx.Float32(st[k // 4][k % 4])
-            for k in range(BND_ELEMS)
-        ]
     # post_input = bf16(branch x weight), nb = bf16(post_input x rstd)
     pp = [bf16_round(u[k] * fw[k]) for k in range(BND_ELEMS)]
     ssp = pp[0] * pp[0]
@@ -2426,10 +2344,6 @@ def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None, res_flag=
     b = c["bases"]
     AP = c["ar_parts"]
     stamp(c, 0)
-    if const_expr(c.get("trace_on", False) and FIN_DYN):
-        # (trace) the role stamps := 0: a CTA's fin / unpool role changes between launches
-        for i_ in range_constexpr(6):
-            stamp_at(c, (8, 9, 10, 11, 13, 15)[i_], 0, True)
     xin_wait = None
     ids_lds = None
     first = None
@@ -2451,15 +2365,16 @@ def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None, res_flag=
         xin_spec = [(xin_flag, tl, 1)]
         xin_first = c["poll_issue"](xin_spec)
         ids_lds = c["xcol"]  # (free until the ug stage stages x)
+        # the first pair from the picked experts' mask, before the plan; with a
+        # balanced plan, ``first_pair_table`` while the routing is polled
         early_first = (
-            EARLY_FIRST
-            and not c["tpx"]
+            not c["tpx"]
             and not c["ug_dyn"]
             and c["xq_pre"]
             and S <= TILE_COLS
             and xq_dma_ok(S)
         )
-        fp_table = FP_TABLE and early_first and ug_balanced(c)
+        fp_table = early_first and ug_balanced(c)
         if const_expr(fp_table):
             fp_tab, fp_ka = first_pair_table(c)
         if c["wave"] == POLL_WAVE:
@@ -2519,19 +2434,15 @@ def run_k3(c, route_flag=None, xin_flag=None, x_flag=None, x_put=None, res_flag=
     # the unpool CTAs' first task's weights go out now, behind nothing, so the fin
     # hops stream them; the other CTAs issue none
     fin_task = None
-    if const_expr(k1_early_map(c) and UNP_DYN):
-        # the pool CTAs (past the fin tasks) claim the unpool jobs in dn-end order;
-        # ``FIN_DYN``: every CTA past the bnd tasks claims, tickets past the unpool jobs
-        # take the fin tasks
-        claim0 = S if FIN_DYN else b["unp0"]
-        pool = bid >= claim0
+    if const_expr(k1_early_map(c)):
+        # every CTA past the bnd tasks claims in dn-end order: the unpool jobs, then
+        # (tickets past them) the fin tasks
         tk_ = fx.Int32(-1)
-        if pool:
-            tk_ = unp_claim(c, BLOCKS - claim0)
+        if bid >= S:
+            tk_ = unp_claim(c, BLOCKS - S)
         c["unp_job"] = tk_  # (a ticket past the jobs is no unpool job: ``unp_gtask``)
-        if const_expr(FIN_DYN):
-            ft_ = tk_ - b["unp_jobs"]
-            fin_task = ((ft_ >= 0) & (ft_ < S * AP)).select(ft_, fx.Int32(-1))
+        ft_ = tk_ - b["unp_jobs"]
+        fin_task = ((ft_ >= 0) & (ft_ < S * AP)).select(ft_, fx.Int32(-1))
     job0, gtask0, _ = unp_gtask(c, 0)
     unp_live0 = (job0 >= 0) & (job0 < b["unp_jobs"])
     first_w = unp_w_loads_if(c, gtask0, unp_live0)  # the first job's tile

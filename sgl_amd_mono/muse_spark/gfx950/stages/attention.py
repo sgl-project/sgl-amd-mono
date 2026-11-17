@@ -43,34 +43,29 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import rocdl as rocdl_raw
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T, as_ir_value
+from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     ballot,
-    clock,
     fp8_to_bf16x8,
     hw_exp2,
     mfma_bf16,
     permlane_swap,
     read_lane_i32,
     rsrc,
-    uniform,
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES
 from sgl_amd_mono.muse_spark.gfx950.config import HEAD_DIM, LOCAL_KV_HEADS, LOG2E, Q_K
 from sgl_amd_mono.muse_spark.gfx950.device import (
-    TRACE_BLOCKS,
-    TRACE_LAYERS,
-    TRACE_SLOTS,
     lds_dma_16,
     poll_flags,
     release_stores,
     stamp,
+    udiv,
+    umod,
 )
 from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_CHUNK as CHUNK
 from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_IDS_CHUNKS as IDS_CHUNKS
@@ -96,9 +91,7 @@ COMB_ROW = PART_ROW  # a tile row's (m, l, pad, pad, O[64]) in the LDS tree
 # (SGLANG_AMD_MONO_ATTN_RING_WAIT0=1: wait for both chunks, a diagnostic)
 import os as _os
 
-SPEC_R = int(
-    _os.environ.get("SGLANG_AMD_MONO_ATTN_SPEC_R", "2")
-)  # speculative page ids for R <= this (0: off)
+SPEC_R = 2  # speculative page ids for R <= this
 SPEC_CHUNKS = 64  # chunks a wave's speculative ids cover (a lane each)
 RING_WAIT = 0 if _os.environ.get("SGLANG_AMD_MONO_ATTN_RING_WAIT0", "0") == "1" else 4
 MERGE_LANES = 4  # partitions folded side by side a (row, 8 dims): 16 x 8 x 4 = THREADS
@@ -118,90 +111,6 @@ BLK = 16 * HEAD_DIM + 32  # floats a (request, head, partition, row tile) partia
 BLK_ML = 16 * HEAD_DIM  # the block's (m, l) pairs, after its O
 G_O = 8 * 16 * 2  # the grouped merge's LDS: the groups' (m, l) pairs, then their O rows
 G_PITCH = HEAD_DIM + 4  # floats a group O row in LDS (bank spread)
-
-
-# (trace builds) a task's stage clocks are kept in LDS and written out at the end:
-# a mid-stage global stamp store sits in the wave's vmcnt queue (and the compiler
-# drains it before later waits), which delays the stage it measures. Clocks
-# 0 .. 7 are a task's (the CTA's last task's), 8 / 9 the key counts in / the
-# sizing done, or a merge job's flags seen / o rows released.
-LCLK_TID = int(
-    _os.environ.get("ATTN_LCLK_TID", "0")
-)  # (trace diagnostic) the thread of the task clocks 0 .. 7
-LCLK_N = 10  # LDS clocks -> stamps 6 .. 15
-LCLK_LEGACY = (
-    (3, 2),
-    (4, 4),
-    (5, 5),
-)  # stamps 3 / 4 / 5 (loop begins, first chunk, loop done) <- clocks
-
-
-@flyc.jit
-def lclk(c, k: int):
-    """(trace builds) thread 0 keeps the clock now in LDS clock pair ``k`` (the
-    merge's ``red`` area, unused by the tasks): no global store mid-stage."""
-    if const_expr(c.get("trace_on", False)):
-        if c["tid"] == (LCLK_TID if k < 8 else 0):
-            now = clock()
-            base = c["red"] + 2 * k
-            fx.ptr_store(fx.Int32(now).bitcast(fx.Float32), base)
-            fx.ptr_store(fx.Int32(now >> 32).bitcast(fx.Float32), base + 1)
-
-
-@flyc.jit
-def lclk_after(c, k: int, v):
-    """(trace builds) ``lclk`` once ``v`` (an int32) is computed."""
-    if const_expr(c.get("trace_on", False)):
-        llvm.inline_asm(
-            None,
-            [as_ir_value(uniform(fx.Int32(v)))],
-            "; $0",
-            "s",
-            has_side_effects=True,
-        )
-        lclk(c, k)
-
-
-@flyc.jit
-def lclk_init(c):
-    if const_expr(c.get("trace_on", False)):
-        if c["tid"] < 2 * LCLK_N:
-            fx.ptr_store(fx.Float32(0.0), c["red"] + c["tid"])
-
-
-@flyc.jit
-def lclk_flush(c):
-    """(trace builds) LDS clocks -> stamps 6 .. 6 + LCLK_N (thread 0, 0 = unset)."""
-    if const_expr(c.get("trace_on", False)):
-        layer = c.get("layer")
-        if const_expr(layer is None):
-            base = c["bid"] * TRACE_SLOTS
-        else:
-            base = (layer % TRACE_LAYERS) * (TRACE_BLOCKS * TRACE_SLOTS) + c[
-                "bid"
-            ] * TRACE_SLOTS
-        if c["tid"] == 0:
-            outs = [(6 + k, k) for k in range(LCLK_N)] + list(LCLK_LEGACY)
-            for slot, k in outs:
-                lo = fx.ptr_load(c["red"] + 2 * k).bitcast(fx.Int32)
-                hi = fx.ptr_load(c["red"] + (2 * k + 1)).bitcast(fx.Int32)
-                now = (fx.Int64(hi) << 32) | (fx.Int64(lo) & fx.Int64(0xFFFFFFFF))
-                addr = c["trace"].value + fx.Int64((base + slot) * 8)
-                ptr = llvm.IntToPtrOp(
-                    ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)
-                ).result
-                llvm.StoreOp(as_ir_value(now), ptr, alignment=8)
-
-
-def _ud(a, b):
-    """a // b of nonnegative int32 values as an unsigned division (no floor fixups:
-    the same quotient in about half the scalar instructions)."""
-    return fx.Int32(fx.Uint32(a) // (b if isinstance(b, int) else fx.Uint32(b)))
-
-
-def _um(a, b):
-    """a % b of nonnegative int32 values (unsigned)."""
-    return fx.Int32(fx.Uint32(a) % (b if isinstance(b, int) else fx.Uint32(b)))
 
 
 def comb_floats(nt: int) -> int:
@@ -277,7 +186,6 @@ def run_kattn(c, o_flag=None):
     r_q = rsrc(a["q"])
     r_part = rsrc(part_w.value)
     stamp(c, 0)
-    lclk_init(c)
 
     # the requests' key counts, loaded once at entry (a dynamic request's count is
     # a select of them: no second dependent load in front of a task)
@@ -299,7 +207,7 @@ def run_kattn(c, o_flag=None):
     # with two barriers) once its chunk range is known): lane cc holds this
     # wave's two ids (key tiles kt) of chunk cc
     spv = []
-    if const_expr(SPEC_R and R <= SPEC_R):
+    if const_expr(R <= SPEC_R):
         for rr in range_constexpr(R):
             spv.append(
                 [
@@ -325,10 +233,10 @@ def run_kattn(c, o_flag=None):
     def chunk_range(keys, qpos_lo):
         """The chunks [lo, hi) of a request with ``keys`` keys a window from its
         first row's position leaves unmasked (every chunk of a full one)."""
-        hi = _ud(keys + CHUNK - 1, CHUNK)
+        hi = udiv(keys + CHUNK - 1, CHUNK)
         ctx = keys - QL
         first = fx.max(ctx + qpos_lo - window + 1, fx.Int32(0))
-        lo = (window > 0).select(_ud(first, CHUNK), fx.Int32(0))
+        lo = (window > 0).select(udiv(first, CHUNK), fx.Int32(0))
         return lo, hi
 
     # the partitions: a request's keys from its first unmasked chunk (a sliding
@@ -344,7 +252,6 @@ def run_kattn(c, o_flag=None):
         sp = span_of(fx.Int32(rr))
         max_span = fx.max(max_span, sp)
         total_span = total_span + sp
-    lclk_after(c, 8, total_span)  # (trace) the key counts in
 
     # the partition (chunks a task) from the step's total chunk work, so that the
     # step has one task a CTA whatever the request mix (a task costs ~12 us beside
@@ -357,11 +264,11 @@ def run_kattn(c, o_flag=None):
         n = fx.Int32(0)
         for rr in range_constexpr(R):
             lo_r, hi_r = chunk_range(seq_len_of(fx.Int32(rr)), 0)
-            n = n + _ud((hi_r - lo_r) + pc_ - 1, pc_)
+            n = n + udiv((hi_r - lo_r) + pc_ - 1, pc_)
         return n * (LOCAL_KV_HEADS * TASK_TILES)
 
-    per_cta = _ud(total_span * (LOCAL_KV_HEADS * TASK_TILES) + BLOCKS - 1, BLOCKS)
-    floor_ = _ud(max_span + DIRECT_MAX - 1, DIRECT_MAX)
+    per_cta = udiv(total_span * (LOCAL_KV_HEADS * TASK_TILES) + BLOCKS - 1, BLOCKS)
+    floor_ = udiv(max_span + DIRECT_MAX - 1, DIRECT_MAX)
     pc = fx.max(fx.max(per_cta, floor_), fx.Int32(1))
     # (one request: pc >= floor_ = ceil(span / DIRECT_MAX) keeps its tasks within
     # LOCAL_KV_HEADS TASK_TILES DIRECT_MAX <= BLOCKS, so no rounding check moves pc:
@@ -378,12 +285,11 @@ def run_kattn(c, o_flag=None):
         f2 = fx.Int32((fails >> 2) & 1)
         pc = pc + f0 + f0 * f1 + f0 * f1 * f2
     part = (part_in > 0).select(fx.max(part_in, floor_ * CHUNK), pc * CHUNK)
-    lclk_after(c, 9, part)  # (trace) the sizing done
 
     def n_parts_of(r):
         """Request r's partitions (its span's, the rest of the task slots idle)."""
         lo, hi = chunk_range(seq_len_of(r), 0)
-        return _ud((hi - lo) * CHUNK + part - 1, part)
+        return udiv((hi - lo) * CHUNK + part - 1, part)
 
     # every request's partition count at once: lane rr divides request rr's
     # (one vector division; read back a lane each)
@@ -419,21 +325,20 @@ def run_kattn(c, o_flag=None):
         keys = seq_len_of(r)
         ctx = keys - QL
         ks = wave  # this wave's key split
-        lclk(c, 0)  # (trace) the task begins
         # Q: rows 16 (rt0 + it) + i = 8 qpos + hg of (request r, head h), 16 B a thread,
         # loaded at a block's start and stored to LDS after its first chunks' K / V
         # loads are issued (Q lands beside them instead of in front of the page ids;
         # loaded inside the block loop: a load before a loop that uses it makes the
         # compiler wait for it at the loop's preheader)
         q_thr = tid < NT * 16 * HEAD_DIM // 8
-        i_t = _ud(tid, 16 * HEAD_DIM // 8)
-        q_row = _ud(_um(tid, 16 * HEAD_DIM // 8), HEAD_DIM // 8)
+        i_t = udiv(tid, 16 * HEAD_DIM // 8)
+        q_row = udiv(umod(tid, 16 * HEAD_DIM // 8), HEAD_DIM // 8)
         q_rowg = (rt0 + i_t) * 16 + q_row
-        q_d0 = _um(tid, HEAD_DIM // 8) * 8
-        q_t = r * QL + _ud(fx.min(q_rowg, ROWS - 1), GQA)
-        q_off = _ud(
+        q_d0 = umod(tid, HEAD_DIM // 8) * 8
+        q_t = r * QL + udiv(fx.min(q_rowg, ROWS - 1), GQA)
+        q_off = udiv(
             q_t * Q_K
-            + (h * GQA + _um(fx.min(q_rowg, ROWS - 1), GQA)) * HEAD_DIM
+            + (h * GQA + umod(fx.min(q_rowg, ROWS - 1), GQA)) * HEAD_DIM
             + q_d0,
             2,
         )
@@ -446,7 +351,7 @@ def run_kattn(c, o_flag=None):
         # exceeds it by TAU (lazy rescale, every row of the wave at once).
         r_lane = [(rt0 + it) * 16 + l16 for it in range(NT)]
         qpos = [
-            fx.min(_ud(fx.min(r_lane[it], ROWS - 1), GQA), QL - 1) for it in range(NT)
+            fx.min(udiv(fx.min(r_lane[it], ROWS - 1), GQA), QL - 1) for it in range(NT)
         ]
         row_live = [r_lane[it] < ROWS for it in range(NT)]
         m_ref = [
@@ -459,8 +364,8 @@ def run_kattn(c, o_flag=None):
             [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(4)] for _ in range(NT)
         ]
         lo, hi = chunk_range(keys, 0)
-        c_lo = fx.max(lo, lo + p * _ud(part, CHUNK))
-        c_hi = fx.min(hi, lo + (p + 1) * _ud(part, CHUNK))
+        c_lo = fx.max(lo, lo + p * udiv(part, CHUNK))
+        c_hi = fx.min(hi, lo + (p + 1) * udiv(part, CHUNK))
 
         # The chunk loop: a wave's 32 keys of a chunk are two K pages and two V pages
         # (1 KB each, one head), landed in LDS by DMA (16 B a lane; chunk-major: dims
@@ -551,7 +456,7 @@ def run_kattn(c, o_flag=None):
         if n_blk > 0:
             if stage_ids:
                 stage_block(c_lo)
-            lclk(c, 2)  # (trace) page ids in LDS, the first DMAs issued next
+            stamp(c, 3)  # a task's chunk loop begins (the last task's stamps survive)
             issue_head(c_lo, fx.min(c_lo + IDS_CHUNKS, c_hi) - 1)
         for b in range(0, n_blk):
             b_lo = c_lo + b * IDS_CHUNKS
@@ -568,7 +473,6 @@ def run_kattn(c, o_flag=None):
                     qv.bitcast(fx.BFloat16), qs + ((i_t * 16 + q_row) * Q_PITCH + q_d0)
                 )
             gpu.barrier()
-            lclk(c, 1)  # (trace) Q in LDS
             # each tile's A operands of this lane: row l16, dims 8 g4 + 32 step
             qa = [
                 [
@@ -583,7 +487,7 @@ def run_kattn(c, o_flag=None):
                 for it in range(NT)
             ]
             for cc in range(b_lo, b_hi):
-                sl = _um(cc - b_lo, 2)
+                sl = umod(cc - b_lo, 2)
                 slot = wring + sl * SLOT_WORDS
                 key0 = cc * CHUNK + ks * KEYS_PER_WAVE
                 # chunk cc's pages landed (cc + 1's in flight, when there is one)
@@ -591,8 +495,6 @@ def run_kattn(c, o_flag=None):
                     rocdl.s_waitcnt(vmcnt=RING_WAIT)
                 else:
                     rocdl.s_waitcnt(vmcnt=0)
-                if cc == b_lo:
-                    lclk(c, 3)  # (trace) the first chunk landed
                 # the chunk's K operands (tile kt, step: key l16, dims 32 step + 8 g4)
                 kb = []
                 for kt in range_constexpr(KEY_TILES):
@@ -707,13 +609,13 @@ def run_kattn(c, o_flag=None):
                 ]
                 rocdl.s_waitcnt(lgkmcnt=0)  # every read of the slot is done
                 if cc == b_lo:
-                    lclk(c, 4)  # (trace) the first chunk computed
+                    stamp(c, 4)  # the first chunk done
                 if cc + 2 <= b_last:
                     issue(cc + 2, sl, b_lo)  # chunk cc + 2 into this slot
             rocdl.s_waitcnt(
                 vmcnt=0
             )  # (nothing in flight: the block's last chunk waited)
-        lclk(c, 5)  # (trace) the chunk loop done
+        stamp(c, 5)  # the chunk loop done
         gpu.barrier()  # every wave is done with the ring: the merge tree reuses the LDS
 
         # ---- the key splits merge in LDS in one round: every wave writes its
@@ -736,7 +638,6 @@ def run_kattn(c, o_flag=None):
                         fx.Float32(accs[it][dt][e]), base + (O_OFF + dt * 16 + l16)
                     )
         gpu.barrier()
-        lclk(c, 6)  # (trace) the split records in LDS
         RPW = 2 * NT  # rows a wave: NT 16 / 8
         LPR = 64 // RPW  # lanes a row: 16 or 32
         DPL = HEAD_DIM // LPR  # dims a lane: 4 or 2
@@ -776,7 +677,6 @@ def run_kattn(c, o_flag=None):
             )
         release_stores()
         gpu.barrier()
-        lclk(c, 7)  # (trace) the partial rows released
         if tid == 0:
             put(pflag, pflag_at(r, h, rt0, p), fx.Int32(1))
 
@@ -804,18 +704,18 @@ def run_kattn(c, o_flag=None):
         # HBM). Groups of 8 partitions x TASK_TILES jobs; the last np_r % 8 partitions
         # in a tail group.
         # (unsigned divisions: every operand is nonnegative)
-        jq = _ud(local, TASK_TILES * np_r)
+        jq = udiv(local, TASK_TILES * np_r)
         j = local - jq * (TASK_TILES * np_r)
-        h = _um(jq, LOCAL_KV_HEADS)
-        full = _ud(np_r, 8) * 8
-        g, w = _ud(j, 8 * TASK_TILES), _um(j, 8 * TASK_TILES)
+        h = umod(jq, LOCAL_KV_HEADS)
+        full = udiv(np_r, 8) * 8
+        g, w = udiv(j, 8 * TASK_TILES), umod(j, 8 * TASK_TILES)
         jt = j - TASK_TILES * full
         tail = fx.max(np_r - full, fx.Int32(1))
         in_full = j < TASK_TILES * full
         jt_c = fx.max(jt, fx.Int32(0))  # (jt < 0 only in the unselected branch)
-        jtq = _ud(jt_c, tail)
-        p = in_full.select(g * 8 + _um(w, 8), full + (jt_c - jtq * tail))
-        rt0 = in_full.select(_ud(w, 8), jtq) * NT
+        jtq = udiv(jt_c, tail)
+        p = in_full.select(g * 8 + umod(w, 8), full + (jt_c - jtq * tail))
+        rt0 = in_full.select(udiv(w, 8), jtq) * NT
         attn_task(r, h, rt0, p, job)
     stamp(c, 1)  # the attention tasks done
 
@@ -940,7 +840,6 @@ def run_kattn(c, o_flag=None):
         """The partitions of (request r, head h) for row tile rt -> its o rows."""
         np_r = n_parts_sel(r)
         poll_flags(c, [(pflag, pflag_at(r, h, rt, 0), np_r)])
-        lclk(c, 8)  # (trace) the merge's flags seen
         r_src = rsrc(part_w.value, part_floats * 4)
         row_c = fx.min(rt * 16 + row16, ROWS - 1) - rt * 16
         m = fx.Float32(NEG)
@@ -1097,7 +996,6 @@ def run_kattn(c, o_flag=None):
             # the (request, head, row tile)'s o rows are out: its flag, for the og tasks
             release_stores()
             gpu.barrier()
-            lclk(c, 9)  # (trace) the o rows released
             if tid == 0:
                 put(o_flag, (r * LOCAL_KV_HEADS + h) * ROW_TILES + rt, fx.Int32(1))
 
@@ -1106,5 +1004,4 @@ def run_kattn(c, o_flag=None):
         h = (mbid // ROW_TILES) % LOCAL_KV_HEADS
         r = mbid // (ROW_TILES * LOCAL_KV_HEADS)
         merge_job(r, h, rt)
-    lclk_flush(c)
     stamp(c, 2)  # the merge done (end)

@@ -58,8 +58,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
@@ -71,7 +69,6 @@ from sgl_amd_mono.common.ops import (
     bf16_pair,
     bf16_round,
     butterfly,
-    clock,
     fp8_to_bf16x8,
     hw_exp2,
     hw_rsq,
@@ -100,7 +97,6 @@ from sgl_amd_mono.muse_spark.gfx950.config import (
     TOP_K,
 )
 from sgl_amd_mono.muse_spark.gfx950.device import (
-    TRACE_BLOCKS,
     acquire_loads,
     poll_flags,
     release_stores,
@@ -216,7 +212,6 @@ def o_rs(c) -> bool:
 # ``xbuf`` / ``ss`` -> every CTA) is gone from the chain; the stream update stays on the
 # chain CTAs (``stage_a_part_res``, from the all-gathered sums and the rstd every CTA
 # formed). Same arithmetic, bit for bit.
-OB = True
 XST_T0 = AG_T0 + RS_MAX_TOKENS  # attn rows [0][48 ..]: the statistics (``ob``)
 XST0 = (
     XST_T0 * HIDDEN // 2
@@ -244,7 +239,7 @@ def xn_cta0(c):
 def ob(c) -> bool:
     """The owner-side boundary statistics (sharded pooler, reduce-scatter, a whole
     number of 8-token groups)."""
-    return OB and o_rs(c) and c["pshard"] and c["S"] % 8 == 0
+    return o_rs(c) and c["pshard"] and c["S"] % 8 == 0
 
 
 def ob_g(s: int) -> int:
@@ -347,22 +342,6 @@ def poll_sent_vec(base, offs, n, cm, gap=1):
 
     v = _spin_masked(load, pending, gap)
     return [[v[n * e + q] for q in range(n)] for e in range(N)]
-
-
-@flyc.jit
-def stamp_by(c, idx: int, who: int):
-    """``device.stamp`` written by thread ``who`` (a wave the CTA's thread 0 is not in)."""
-    if const_expr(not c.get("trace_on", False)):
-        return
-    layer = c.get("layer")
-    base = c["bid"] * TRACE_SLOTS
-    if const_expr(layer is not None):
-        base = (layer % TRACE_LAYERS) * (TRACE_BLOCKS * TRACE_SLOTS) + base
-    if c["tid"] == who:
-        now = clock()
-        addr = c["trace"].value + fx.Int64((base + idx) * 8)
-        ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result
-        llvm.StoreOp(as_ir_value(now), ptr, alignment=8)
 
 
 def pick_base(c, r):
@@ -598,26 +577,13 @@ def st_words(ptr, d, words, cm=0):
 
 # ---------------------------------------------------------------- og tasks
 # ---------------------------------------------------------------- o tasks
-OCONTIG = False  # (the fused o pass) the o weights in whole row segments (``w_contig_loads``):
-# measured +0.8 us on o done at t16 (the o weights land before the og rows; the LDS
-# transposes then sit on the o pass)
-
-
-def o_contig(c) -> bool:
-    """The fused o pass streams its weights in whole row segments, transposed in LDS."""
-    return OCONTIG and o_fused(c)
-
-
 def o_w_loads(c, task):
     """The o_proj weight words of o task ``task``'s rows, this lane's: in flight
     (a task past the last reads past the buffer: zeros, no traffic). Row-major
-    bf16, 16 B a lane a k-step, read once a layer (nontemporal). (``o_contig``: as
-    ``w_contig_loads``' whole row segments; ``stage_o_fused`` transposes them.)"""
+    bf16, 16 B a lane a k-step, read once a layer (nontemporal)."""
     lane, wave = c["lane"], c["wave"]
     row = task * ROWS + lane % 16
     r_wo = rsrc(c["args"]["w_o"], HIDDEN * Q_K * 2)
-    if o_contig(c):
-        return w_contig_loads(r_wo, task * ROWS, wave * O_K_PER_WAVE, Q_K, lane)
     return [
         fx.Vector(
             bo.buffer_load(
@@ -757,14 +723,12 @@ def bf4_f32(w):
 
 
 # LDS layouts without bank conflicts (same values, same sums):
-# - (``OG_SWZ``, the fused o pass) token t's og row in ``xs`` with its 16 B chunks
+# - (the fused o pass) token t's og row in ``xs`` with its 16 B chunks
 #   XOR-swizzled by t % 16: the o MFMAs' B loads (16 tokens, a lane each, 2 KB apart)
 #   were 16-way conflicts;
-# - (``ACC_ROT``) a wave's MFMA accumulators in ``red`` with each 16-lane group rotated
+# - a wave's MFMA accumulators in ``red`` with each 16-lane group rotated
 #   by 4 lanes a group: ``row_sum``'s readers (row r, token t: lane 16 (r / 4) + t,
 #   element r % 4) were 4-way conflicts.
-OG_SWZ = True
-ACC_ROT = True
 
 
 def xs_word(t, w, swz):
@@ -775,9 +739,7 @@ def xs_word(t, w, swz):
 
 
 def acc_slot(lane):
-    """A wave's accumulator slot (16 B) of lane ``lane`` (``ACC_ROT``)."""
-    if not ACC_ROT:
-        return lane
+    """A wave's accumulator slot (16 B) of lane ``lane``."""
     g = lane >> 4
     return (g << 4) + (((lane & 15) + (g << 2)) & 15)
 
@@ -789,8 +751,6 @@ def acc_store(red, wave, lane, acc):
 
 def acc_row_sum(red, r, t):
     """``ops.row_sum`` of a row set ``acc_store`` filled: row r, token t, wave order."""
-    if not ACC_ROT:
-        return row_sum(red, r, t)
     g = r >> 2
     slot = (g << 4) + ((t + (g << 2)) & 15)
     tot = fx.Float32(0.0)
@@ -879,7 +839,6 @@ def stage_o(c, task, wts):
 # launch their tasks move to helper CTAs (a third task each, ``o_help0`` ..), and a
 # CTA's tasks run as one pass: one MFMA loop sharing the B rows, one LDS reduction,
 # the pushes on disjoint waves (the same sums, wave order and rounding as ``stage_o``).
-O_MOVE = True  # the merge CTAs' o tasks on helpers
 
 
 def o_fused(c) -> bool:
@@ -891,7 +850,7 @@ def o_merge_ctas(c, o_flag, QL) -> int:
     """The level-2 merge CTAs whose o tasks move to helpers (0: none moved): the
     attention's ``R LOCAL_KV_HEADS ROW_TILES`` last CTAs (``attention.run_kattn``'s
     ``mbid``), in a merged launch."""
-    if o_flag is None or not o_fused(c) or not O_MOVE:
+    if o_flag is None or not o_fused(c):
         return 0
     n = (c["S"] // QL) * LOCAL_KV_HEADS * ((QL * GQA + 15) // 16)
     h0 = o_help0(c)
@@ -949,14 +908,11 @@ def stage_o_fused(c, tasks, wts, lives):
     assert NT_ * ROWS * S <= ROWS * MAX_TOKENS
     l16, g4 = lane % 16, lane // 16
     V4F = fx.Vector.make_type(4, fx.Float32)
-    if const_expr(o_contig(c)):
-        # (the og rows' barrier is behind: ``red`` past the sigmoids is free)
-        wts = [w_transpose(c, w) for w in wts]
     accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(NT_)]
     tok = fx.min(l16, S - 1)
     for s in range_constexpr(O_STEPS):
         k0 = wave * O_K_PER_WAVE + s * K_STEP + 8 * g4
-        xb = fx.Vector(fx.ptr_load(xs + xs_word(tok, k0 // 2, OG_SWZ), result_type=V4F))
+        xb = fx.Vector(fx.ptr_load(xs + xs_word(tok, k0 // 2, True), result_type=V4F))
         for k in range_constexpr(NT_):
             accs[k] = mfma_bf16(
                 wts[k][s].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), accs[k]
@@ -1042,7 +998,7 @@ def run_o_fused(c, o_flag, QL, tasks, wtasks, lives):
     )  # the gate words first: the sigmoids need not wait for the weights
     rocdl.sched_barrier(0)
     wts = [o_w_loads(c, t) for t in wtasks]
-    stage_og_rows(c, o_flag, QL, g_pre, OG_SWZ)
+    stage_og_rows(c, o_flag, QL, g_pre, swz=True)
     if const_expr(ob(c)):
         release_stores()  # the re-arm (long landed); the fused pass's barriers precede its pushes
     stamp(c, 12)  # the og rows in LDS
@@ -1102,7 +1058,7 @@ def stage_o_reduce(c, j):
             ],
             batch=W,
         )
-        stamp_by(c, 14, RED_T0)  # the ranks' partials of the reduce arrived
+        stamp(c, 14, RED_T0)  # the ranks' partials of the reduce arrived
         sums = []
         for q in range_constexpr(RED_PW):
             acc0, acc1 = bf2_f32(ws[0][q])
@@ -1117,7 +1073,7 @@ def stage_o_reduce(c, j):
                 ag_put(c, dst, tk, col, sums)
             else:
                 put_bf(dst, (AG_T0 + tk) * HIDDEN + col, sums)
-        stamp_by(c, 15, RED_T0)  # the sums pushed
+        stamp(c, 15, RED_T0)  # the sums pushed
 
 
 def ob_poll(c, t, col, NC):
@@ -1166,12 +1122,12 @@ def stage_o_reduce_ob(c, j):
             [(c["own_attn"], ((src * MAX_TOKENS + t) * HIDDEN + col) // 2, RED_PW) for src in range(W)],
             batch=W,
         )  # fmt: skip
-        stamp_by(c, 14, RED_T0)  # the ranks' partials of the reduce arrived
+        stamp(c, 14, RED_T0)  # the ranks' partials of the reduce arrived
         sums, _ = ob_sums(c, 4, ws)
         for k in range_constexpr(W):
             dst = preg(pick_base(c, (rank + 1 + k) % W), c["sy_attn"], "attn")
             ag_put(c, dst, t, col, sums)
-        stamp_by(c, 15, RED_T0)  # the sums pushed
+        stamp(c, 15, RED_T0)  # the sums pushed
 
 
 @flyc.jit
@@ -1614,14 +1570,13 @@ def stage_a_part_res(c, t, part):
 # loads through its own 4 KB of LDS (``red`` row sets WT_RED0 .., the 16 B chunks
 # XOR-swizzled by row: conflict-free) into the MFMA layout: the same A registers, bit
 # for bit, once the weights landed (while the x words are in flight).
-WCONTIG = True
 WT_RED0 = 4  # the transposes' ``red`` row sets (4 KB a wave)
 assert WAVES * 1024 <= 4 * RED_FLOATS
 
 
 def wcontig(c) -> bool:
     """The pooler / router weights in whole row segments (``ob``, the BF16 pooler)."""
-    return WCONTIG and ob(c) and not c["fp8_pool"]
+    return ob(c) and not c["fp8_pool"]
 
 
 def w_contig_loads(r_w, row0, k0, row_len, lane):
@@ -2071,12 +2026,6 @@ def wave_max_rot(v):
     return xred(v, 32, fx.max)
 
 
-TOP8_FAST = (
-    True  # ``stage_route``'s picks from the lanes' sorted keys (``wave_max_rot``)
-)
-XN_HW_CVT = True  # ``stage_xn``'s E2M1 codes by the gfx950 conversion
-
-
 # ---------------------------------------------------------------- route and xn tasks
 @flyc.jit
 def stage_route(c, t, route_flag=None):
@@ -2112,7 +2061,7 @@ def stage_route(c, t, route_flag=None):
             ],
             batch=4 * R_PARTS,  # one round trip for the parts' logits
         )
-        stamp_by(c, 10, RW * 64)  # the parts' logits arrived (route CTAs)
+        stamp(c, 10, RW * 64)  # the parts' logits arrived (route CTAs)
         keys = []
         for h in range_constexpr(4):
             e = lane + 64 * h
@@ -2131,33 +2080,25 @@ def stage_route(c, t, route_flag=None):
         k0, k1, k2_, k3 = keys
         pid = fx.Int32(0)
         packed = [fx.Int32(0), fx.Int32(0)]  # the picks as bytes (``route_flag``)
-        if const_expr(TOP8_FAST):
-            # the same picks: each lane's four keys sorted once (the keys are distinct),
-            # then a pick is the wave max of the lanes' heads (``wave_max_rot``: a single
-            # value a step, no shuffle of the xor partner's two halves) and its lane pops
-            def cx(x, y):
-                return fx.max(x, y), fx.min(x, y)
 
-            k0, k1 = cx(k0, k1)
-            k2_, k3 = cx(k2_, k3)
-            k0, k2_ = cx(k0, k2_)
-            k1, k3 = cx(k1, k3)
-            k1, k2_ = cx(k1, k2_)
-            for p in range_constexpr(TOP_K):
-                m = wave_max_rot(k0)
-                hit = k0 == m
-                k0 = hit.select(k1, k0)
-                k1 = hit.select(k2_, k1)
-                k2_ = hit.select(k3, k2_)
-                k3 = hit.select(fx.Int32(-(2**31)), k3)
-                pid = (lane == p).select(255 - (m & 255), pid)
-                packed[p // 4] = packed[p // 4] | ((255 - (m & 255)) << (8 * (p % 4)))
-        for p in range_constexpr(0 if TOP8_FAST else TOP_K):
-            m = butterfly(fx.max(fx.max(k0, k1), fx.max(k2_, k3)), (32, 16, 8, 4, 2, 1), fx.max)  # fmt: skip
-            k0 = (k0 == m).select(fx.Int32(-(2**31)), k0)
-            k1 = (k1 == m).select(fx.Int32(-(2**31)), k1)
-            k2_ = (k2_ == m).select(fx.Int32(-(2**31)), k2_)
-            k3 = (k3 == m).select(fx.Int32(-(2**31)), k3)
+        # the same picks: each lane's four keys sorted once (the keys are distinct),
+        # then a pick is the wave max of the lanes' heads (``wave_max_rot``: a single
+        # value a step, no shuffle of the xor partner's two halves) and its lane pops
+        def cx(x, y):
+            return fx.max(x, y), fx.min(x, y)
+
+        k0, k1 = cx(k0, k1)
+        k2_, k3 = cx(k2_, k3)
+        k0, k2_ = cx(k0, k2_)
+        k1, k3 = cx(k1, k3)
+        k1, k2_ = cx(k1, k2_)
+        for p in range_constexpr(TOP_K):
+            m = wave_max_rot(k0)
+            hit = k0 == m
+            k0 = hit.select(k1, k0)
+            k1 = hit.select(k2_, k1)
+            k2_ = hit.select(k3, k2_)
+            k3 = hit.select(fx.Int32(-(2**31)), k3)
             pid = (lane == p).select(255 - (m & 255), pid)
             packed[p // 4] = packed[p // 4] | ((255 - (m & 255)) << (8 * (p % 4)))
         if lane < TOP_K:
@@ -2230,7 +2171,7 @@ def stage_xn(c, t, xin_flag=None):
     if const_expr(c["xq_pre"]):
         # the same blocks K3 would quantize from the bf16 row (``ffn.stage_xq_cols``): a
         # thread's eight values one code word, four threads a 32-value block
-        from sgl_amd_mono.muse_spark.gfx950.stages.mxfp4 import e2m1_code, mxfp4_scale
+        from sgl_amd_mono.muse_spark.gfx950.stages.mxfp4 import mxfp4_scale
 
         vals = [bf16_round(x) for x in out]
         amax = abs(vals[0])
@@ -2238,26 +2179,21 @@ def stage_xn(c, t, xin_flag=None):
             amax = fx.max(amax, abs(vals[k]))
         amax = butterfly(amax, (1, 2), fx.max)
         byte, qs = mxfp4_scale(amax)
-        if const_expr(XN_HW_CVT):
-            # ``e2m1_code`` of the same products bit for bit by the gfx950 conversion
-            # (scale 1: half to even, saturating at 6, the sign kept even at 0), two
-            # values a byte: 4 instructions for the thread's 8 codes
-            word = fx.Int32(0)
-            for j in range_constexpr(4):
-                word = fx.Int32(
-                    rocdl.cvt_scalef32_pk_fp4_f32(
-                        T.i32,
-                        as_ir_value(word),
-                        as_ir_value(vals[2 * j] * qs),
-                        as_ir_value(vals[2 * j + 1] * qs),
-                        as_ir_value(fx.Float32(1.0)),
-                        j,
-                    )
+        # ``e2m1_code`` of the same products bit for bit by the gfx950 conversion
+        # (scale 1: half to even, saturating at 6, the sign kept even at 0), two
+        # values a byte: 4 instructions for the thread's 8 codes
+        word = fx.Int32(0)
+        for j in range_constexpr(4):
+            word = fx.Int32(
+                rocdl.cvt_scalef32_pk_fp4_f32(
+                    T.i32,
+                    as_ir_value(word),
+                    as_ir_value(vals[2 * j] * qs),
+                    as_ir_value(vals[2 * j + 1] * qs),
+                    as_ir_value(fx.Float32(1.0)),
+                    j,
                 )
-        else:
-            word = e2m1_code(vals[0], qs)
-            for k in range_constexpr(1, 8):
-                word = word | (e2m1_code(vals[k], qs) << (4 * k))
+            )
         XQW_, XSW_ = MOE_HIDDEN // 8, MOE_HIDDEN // 32
         base = t * (XQW_ + XSW_)
         bo.buffer_store(word, rsrc(c["xinq"]), base + tid, cache_modifier=CM_DEV)
@@ -2325,7 +2261,7 @@ def run_chain(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
     stamp(c, 5)  # the pooler passes done
     if const_expr(c["pshard"]):
         stage_pool_reduce(c, rt0, part)
-        stamp_by(c, 13, PR_WAVE * 64)  # the reduce share pushed
+        stamp(c, 13, PR_WAVE * 64)  # the reduce share pushed
     if (bid >= AP0) & (bid < AP0 + A_PARTS * S):
         stage_a_part_res(c, (bid - AP0) // A_PARTS, (bid - AP0) % A_PARTS)
     stamp(c, 6)  # the boundary's stream update done (boundary CTAs)
@@ -2391,7 +2327,7 @@ def run_stream(c, o_flag=None, QL=8, xin_flag=None, route_flag=None):
     stamp(c, 5)  # the router / pooler passes done
     if const_expr(c["pshard"]):
         stage_pool_reduce(c, rt0, part)
-        stamp_by(c, 6, PR_WAVE * 64)  # the reduce share pushed
+        stamp(c, 6, PR_WAVE * 64)  # the reduce share pushed
     else:
         stamp(c, 6)  # the pooled rows out (with the passes)
     X0 = xn_cta0(c)
@@ -2403,11 +2339,6 @@ def run_stream(c, o_flag=None, QL=8, xin_flag=None, route_flag=None):
             # after its passes (on a chain CTA it waited behind the boundary's stream
             # update, itself behind the CTA's pushes)
             stage_route(c, bid - ROUTE0, route_flag)
-
-
-K2END_WAIT = (
-    True  # the early CTAs wait for the last route flag at K2's end (one thread)
-)
 
 
 @flyc.jit
@@ -2423,9 +2354,7 @@ def run_k2(c, route_flag=None, xin_flag=None, o_flag=None, QL=8):
         run_chain(c, route_flag, xin_flag, o_flag, QL)
     else:
         run_stream(c, o_flag, QL, xin_flag, route_flag)
-    if const_expr(
-        K2END_WAIT and c["pshard"] and xin_flag is not None and route_flag is not None
-    ):
+    if const_expr(c["pshard"] and xin_flag is not None and route_flag is not None):
         # a CTA without a route / xn task waits for the last token's flags here, one
         # thread each, before K3's poll of every token's flags (a thread a flag): the
         # ~200 CTAs done early would spin on them all, slowing the hand-offs still due

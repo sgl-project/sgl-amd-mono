@@ -50,9 +50,6 @@ class K3Build(msgspec.Struct, frozen=True):
     ug_dyn: bool = False  # the ug items past each CTA's first from a launch-wide queue (``k3_ugq``; merged + xq_pre)
 
 
-LAZY_PEERS = True  # the peer bases a lane each, read at their use (``_LazyPeers``)
-
-
 class _LazyPeers:
     """Every rank's region ``off`` of the peer buffers (``preg``), the base read at the
     use from the table loaded a 32-bit half a lane at K3's entry (``k3_context``): its
@@ -96,9 +93,8 @@ def k3_context(
     tid = fx.thread_idx.x
     mb = Mailbox(tag)
     ffn_off, unp_off = sym_layout["ffn"][0], sym_layout["unp"][0]
-    lazy = LAZY_PEERS and not key.tpx and 2 * npes <= 64
-    if lazy:
-        # lane i: word i of the bases table (no wait here: see ``_LazyPeers``)
+    if not key.tpx and 2 * npes <= 64:
+        # the peer bases a lane each, read at their use; lane i: word i of the bases table (no wait here: see ``_LazyPeers``)
         pv = fx.Int32(
             bo.buffer_load(
                 rsrc(peers),
