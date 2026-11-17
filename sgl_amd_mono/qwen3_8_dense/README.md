@@ -63,7 +63,8 @@ SGLang runs the embedding, the final norm and the logits processor.
   Triton changes it. The conv, the delta
   rule and the gated norm use the rounding, reduction order and FMA contractions of SGLang's Triton kernels. Thus both
   launches match SGLang's Triton FP4 path bit for bit (`NUMERICS` is `BITWISE`, every bound 0).
-- SGLang's ASM FP4 GEMM (`--fp4-gemm-backend aiter`, or `auto` on gfx95 for AITER-tuned shapes) quantizes activations
+- SGLang's ASM FP4 GEMM (`SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM=1`; with sgl-project/sglang#43360, `--fp4-gemm-backend
+  aiter`, or `auto` on gfx95 for AITER-tuned shapes) quantizes activations
   with its own kernel. On it the launches are close to SGLang's path but not equal. Under
   `--enable-deterministic-inference` or `--rl-on-policy-target` the spec refuses a layer on that GEMM.
 - The kernels read each MXFP4 weight in the (16, 16)-shuffled order with plain e8m0 scales. A layer on the Triton GEMM is
@@ -91,7 +92,8 @@ sgl-project/sglang#45389).
 - The kernel tests run on 2 GPUs with random weights in SGLang's layouts. They compare K1 and K2 with SGLang's stock ops,
   bit for bit, at widths 1 to 8.
 - Check mode (`SGLANG_AMD_MONO_CHECK=1`, eager only) runs SGLang's own layer code next to each launch on the same input
-  and checks every output and state row against `NUMERICS`. Use `--fp4-gemm-backend triton`; on the ASM GEMM it warns
+  and checks every output and state row against `NUMERICS`. Keep the Triton FP4 GEMM (the default before sglang#43360,
+  `--fp4-gemm-backend triton` after it); on the ASM GEMM it warns
   at startup and the bit-exact bounds miss.
 - The e2e test compares a monokernel server with the same server without it: the startup routing line, GSM8K past the
   cap, the KL divergence of decode against prefill, a batch that crosses the cap and back, an image request and the
@@ -102,4 +104,4 @@ sgl-project/sglang#45389).
 - the checkpoint `amd/Qwen3.8-27B-Quark-AWQ-MXFP4` (or one with the same config and quantization)
 - TP 1 or 2 on gfx950
 - decode steps of up to 4 rows at TP1 and 8 at TP2; no speculative verify steps
-- bit-exact results only on `--fp4-gemm-backend triton`
+- bit-exact results only on SGLang's Triton FP4 GEMM
