@@ -57,7 +57,10 @@ SGLang runs the embedding, the final norm and the logits processor.
 
 ## 3. Numerics and weights
 
-- Each GEMM in K1 and K2 takes the K splits of SGLang's Triton `gemm_afp4wfp4`, in the same order. The conv, the delta
+- Each GEMM in K1 and K2 takes the K splits of SGLang's Triton `gemm_afp4wfp4` and adds the split partials in the
+  order of its split-K reduce (3 splits: (p0 + p2) + p1; 4 splits: (p0 + p2) + (p1 + p3); `dense_ffn.split_total`).
+  That order comes from AITER's reduce kernel as Triton compiles it; `check_k2.py --stock` fails if a new AITER or
+  Triton changes it. The conv, the delta
   rule and the gated norm use the rounding, reduction order and FMA contractions of SGLang's Triton kernels. Thus both
   launches match SGLang's Triton FP4 path bit for bit (`NUMERICS` is `BITWISE`, every bound 0).
 - SGLang's ASM FP4 GEMM (`--fp4-gemm-backend aiter`, or `auto` on gfx95 for AITER-tuned shapes) quantizes activations

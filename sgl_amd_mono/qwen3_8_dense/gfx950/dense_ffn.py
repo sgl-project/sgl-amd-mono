@@ -119,13 +119,16 @@ def d_splits(s: int, tp: int) -> int:
 
 def split_total(vals):
     """fp32 split partials added as the stock split-K reduce: ``tl.sum`` over
-    the split axis padded with zeros to a power of 2 (adjacent pairs, then
-    pairs of pairs); one split is the chain itself."""
+    the split axis padded with zeros to a power of 2, as a butterfly: split i
+    plus split i + n / 2, halving n (3 splits (p0 + p2) + p1, 4 splits
+    (p0 + p2) + (p1 + p3)); one split is the chain itself. Split counts up to 2
+    add in any order the same."""
     v = list(vals)
     while len(v) & (len(v) - 1):
         v.append(fx.Float32(0.0))
     while len(v) > 1:
-        v = [v[2 * i] + v[2 * i + 1] for i in range(len(v) // 2)]
+        h = len(v) // 2
+        v = [v[i] + v[i + h] for i in range(h)]
     return v[0]
 
 
@@ -884,13 +887,13 @@ def run_gate_up(c, ops):
 
 
 def row_sum_waves(red, r, t, gu, n=4):
-    """Row r, token t summed over the waves of gate (gu 0: 0, 2, 4, 6) or up
-    (1, 3, 5, 7), the first ``n`` of them, in order (gu traced)."""
-    tot = fx.Float32(0.0)
-    for k in range(n):
-        w = 2 * k + gu
-        tot = tot + fx.ptr_load(red + ((w * 64 + 16 * (r // 4) + t) * 4 + r % 4))
-    return tot
+    """Row r, token t: the partials of the waves of gate (gu 0: 0, 2, 4, 6) or
+    up (1, 3, 5, 7), the first ``n`` of them, added as ``split_total`` (gu
+    traced)."""
+    return split_total(
+        fx.ptr_load(red + (((2 * k + gu) * 64 + 16 * (r // 4) + t) * 4 + r % 4))
+        for k in range(n)
+    )
 
 
 # ---------------------------------------------------------------- down

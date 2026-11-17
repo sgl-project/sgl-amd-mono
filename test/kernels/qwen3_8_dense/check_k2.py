@@ -10,8 +10,10 @@ need more than 24 bits, where the same GEMMs summed in K quarters differ from
 stock and K2 must still match it.
 
 ``--stock``: the stock properties K2 relies on: at K2's K sizes the stock MXFP4
-GEMM's output is bf16(fp32(exact sum)), and its split counts are the ones K2
-follows at every width.
+GEMM's output is bf16(fp32(exact sum)), its split counts are the ones K2
+follows at every width, and its split-K reduce adds the partials in
+``split_total``'s order (on crafted weights that tell the orders apart). ``--tp
+1`` also runs the folded o_proj on such weights.
 
 Widths 1..``max_tokens(tp)`` (past the serving caps), each with its own weights
 and Mailbox layer tag, over many input draws: a norm reduced in another order
@@ -301,6 +303,117 @@ def stock_splits(fails):
                 fails.append(f"stock {name} TP{tp} splits")
 
 
+def split_sum(p, pairs="butterfly"):
+    """fp32 split partials [n, M, N] added as ``dense_ffn.split_total`` (padded
+    with zeros to a power of 2, split i + split i + n / 2, halving n), or with
+    adjacent pairs (``pairs="adjacent"``, the order K1 and K2 used before)."""
+    v = list(p)
+    while len(v) & (len(v) - 1):
+        v.append(torch.zeros_like(v[0]))
+    while len(v) > 1:
+        h = len(v) // 2
+        if pairs == "butterfly":
+            v = [v[i] + v[i + h] for i in range(h)]
+        else:
+            v = [v[2 * i] + v[2 * i + 1] for i in range(h)]
+    return v[0]
+
+
+# Weights whose split partials tell the reduce orders apart, in blocks of 32 K
+# (``cancel_blocks``): on an all-ones input, a big partial B, -B in another
+# split, small S in the others (|S| < ulp(B) / 2), so an order that adds an S to
+# B before -B loses that S.
+ORDER_CASES = {
+    # name: (K, stock splits at widths 1..8, crafted blocks)
+    "K2 TP1 o_proj": (
+        D.CORE,
+        D.O_SPLITS,
+        [(0, "big"), (96, "neg"), (48, "small"), (144, "small")],
+    ),  # fmt: skip
+    "K1 TP2 out_proj": (D.CORE // 2, 3, [(0, "big"), (32, "neg"), (64, "small")]),
+}
+
+
+def order_weights(g, k, blocks):
+    """A random MXFP4 [HIDDEN, k] with rows 0..3 crafted (``ORDER_CASES``)."""
+    w, ws = mxfp4(g, D.HIDDEN, k)
+    cancel_blocks(w, ws, range(4), blocks, g)
+    return w, ws
+
+
+def stock_split_order(fails):
+    """The stock split-K reduce adds the partials as ``split_total``, and the
+    crafted weights tell that order apart from adjacent pairs, at the GEMMs with
+    more than 2 splits up to 8 rows."""
+    g = torch.Generator(device="cuda").manual_seed(5)
+    for name, (k, splits, blocks) in ORDER_CASES.items():
+        w, ws = order_weights(g, k, blocks)
+        bad, blind = [], []
+        for s in (1, 2, 4, 8):
+            for draw in range(16):
+                x = rnd(g, s, k)
+                x[0] = 1.0
+                y = linear(x, w, ws)
+                p = linear_parts(x, w, ws)
+                assert p.dim() == 3 and p.size(0) == splits, (name, tuple(p.shape))
+                if not torch.equal(split_sum(p).to(BF), y):
+                    bad.append((s, draw))
+                if torch.equal(split_sum(p, "adjacent").to(BF), y):
+                    blind.append((s, draw))
+        report(fails, f"stock {name} reduce is split_total's order", bad, 64)
+        report(fails, f"stock {name} crafted weights tell the orders apart", blind, 64)
+
+
+def oproj_order(fails, sizes):
+    """K2's folded o_proj on ``ORDER_CASES`` weights, all-ones core rows: random
+    draws rarely tell the 4-split reduce orders apart, these do (``res_out`` is
+    o_proj's bf16 output plus the residual)."""
+    act = SiluAndMul()
+    k, _, blocks = ORDER_CASES["K2 TP1 o_proj"]
+    for s in sizes:
+        g = torch.Generator(device="cuda").manual_seed(60 + s)
+        w_o, w_os = order_weights(g, k, blocks)
+        w13, w13s = mxfp4(g, 2 * D.INTER, D.HIDDEN)
+        w2, w2s = mxfp4(g, D.HIDDEN, D.INTER)
+        ln_w = rnd(g, D.HIDDEN, scale=0.1)
+        core = torch.ones(s, D.CORE, dtype=BF, device="cuda")
+        residual = rnd(g, s, D.HIDDEN, scale=2.0)
+        o = linear(core, w_o, w_os)
+        x, res_ref = gemma_norm(o, residual, ln_w)
+        out_ref = linear(act(linear(x, w13, w13s)), w2, w2s)
+        p = linear_parts(core, w_o, w_os)
+        blind = torch.equal(split_sum(p, "adjacent").to(BF), o)
+        key = D.FfnBuild(tokens=s, eps=EPS, shuffled=True, oproj=True)
+        out = torch.empty(s, D.HIDDEN, dtype=BF, device="cuda")
+        res_out = torch.empty_like(out)
+        epoch = guard_epoch()
+        scratch = torch.zeros(D.scratch_bytes(key), dtype=torch.uint8, device="cuda")
+        next_step(epoch)
+        D.dense_ffn(
+            key,
+            hidden=core,
+            residual=residual,
+            out=out,
+            res_out=res_out,
+            scratch=scratch,
+            epoch=epoch,
+            layer=0,
+            w_o=D.shuffle_w(w_o),
+            w_os=w_os,
+            ln_w=ln_w,
+            w13=D.shuffle_w(w13),
+            w13s=w13s,
+            w2=D.shuffle_w(w2),
+            w2s=w2s,
+        )
+        exact = torch.equal(res_out, res_ref) and torch.equal(out, out_ref)
+        errors = guard_errors(epoch)
+        print(f"K2 o_proj order TP1 width {s}: adjacent pairs differ {not blind}, "
+              f"K2 exact {exact}, guard words {errors}", flush=True)  # fmt: skip
+        if blind or not exact or any(errors):
+            fails.append(f"K2 o_proj order TP1 width {s}")
+
+
 def cancel_blocks(w, ws, rows, blocks, g):
     """Rows ``rows`` of an MXFP4 [n, k] zeroed but for ``blocks``: (block, kind),
     kind "big" (random fp4, scale 2^30), "neg" (the previous big block negated)
@@ -422,8 +535,10 @@ def main():
     if args.stock:
         stock_accumulation(fails)
         stock_splits(fails)
+        stock_split_order(fails)
     if args.tp == 1:
         ffn_tp1(fails, widths(1, args.widths), args.draws or DRAWS)
+        oproj_order(fails, [s for s in widths(1, args.widths) if s <= 8])
     elif args.tp == 2:
         ffn_tp2(fails, widths(2, args.widths), args.draws or DRAWS // 2)
     if args.tp:

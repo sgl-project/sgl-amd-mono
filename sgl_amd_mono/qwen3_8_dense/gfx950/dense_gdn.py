@@ -31,7 +31,8 @@ of the heads (``Geo``) on the full input; nothing crosses ranks. One launch,
              flag a CTA) -> CTAs 0 .. 159 qdq the S core rows and run their 32
              hidden columns of out_proj's K share (``dense_ffn``'s o_proj stage)
              in the stock GEMM's K splits (``o_splits``), each chained in order,
-             the splits summed in order -> bf16 ``out``, the rank's partial
+             the splits added as the stock reduce (``dense_ffn.split_total``)
+             -> bf16 ``out``, the rank's partial
 
 Bit-exact with the stock decode path (the Triton conv update,
 ``fused_recurrent_gated_delta_rule_packed_decode``, RMSNormGated): the same
@@ -825,8 +826,8 @@ def o_core(c):
 
 @flyc.jit
 def o_out(c):
-    """Thread (t, j), owner CTAs: its 8 of the 32 columns summed over the K
-    quarters in order -> bf16 -> ``out``."""
+    """Thread (t, j), owner CTAs: its 8 of the 32 columns, the K splits added as
+    the stock reduce -> bf16 -> ``out``."""
     s, tid, bid = c["S"], c["tid"], c["bid"]
     t = fx.min(tid // 4, s - 1)
     j = tid % 4
