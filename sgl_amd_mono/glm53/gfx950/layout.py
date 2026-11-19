@@ -120,10 +120,11 @@ def dn_tile(samples: int, expert_mxfp4: bool = False) -> int:
     return 32 if samples == 1 or (samples > 4 and expert_mxfp4) else HIDDEN // BLOCKS
 
 
-def sparse_keys_per_task(samples: int, heads: int = WAVES) -> int:
-    """Use narrower sparse tiles when samples or attention heads fill LDS."""
+def sparse_keys_per_task(samples: int, heads: int = WAVES, dcp: bool = False) -> int:
+    """Use narrower sparse tiles when samples or attention heads fill LDS (under DCP
+    a split task stages only its head group's queries)."""
 
-    return 32 if heads > 2 * WAVES else 64
+    return 32 if heads > 2 * WAVES and not dcp else 64
 
 
 def sample_wave_batches(samples: int) -> int:
@@ -208,7 +209,9 @@ def layout(
             "flags": 2 * part,
             "_bytes": 2 * part + FLAG_BYTES,
         }
-    split_count = sparse_attention_topk // sparse_keys_per_task(samples, heads)
+    split_count = sparse_attention_topk // sparse_keys_per_task(
+        samples, heads, dcp_size > 1
+    )
     output_heads = heads if output_heads is None else output_heads
     pair_bytes = 8
     items = [
@@ -334,13 +337,15 @@ def stage_tasks(
     uv_tasks: int = 0,
     q_heads: int = 0,
     dcp_lists: bool = False,
+    dcp: bool = False,
 ):
     """Return ``(stage name, task count)`` pairs in execution order; with ``tokens``
     led by the embedding rows' push, with ``eh_tiles`` by the NextN entry (each tile's
     K parts, ``eh_parts``). With ``head_rows`` (this rank's LM-head rows) the tail's
     instead. DCP: ``uv_tasks`` (uv's tasks a sample) and ``q_heads`` (the heads whose
-    query this rank projects) differ from the attention ``heads``, and ``dcp_lists``
-    adds a task a row that cuts the selection to this rank's keys."""
+    query this rank projects) differ from the attention ``heads``, ``dcp_lists``
+    adds a task a row that cuts the selection to this rank's keys, and ``dcp`` sizes
+    the split tiles (``sparse_keys_per_task``)."""
     q_heads = q_heads or heads
 
     if head_rows:
@@ -379,7 +384,7 @@ def stage_tasks(
             "split",
             samples
             * (heads // WAVES)
-            * (sparse_attention_topk // sparse_keys_per_task(samples, heads)),
+            * (sparse_attention_topk // sparse_keys_per_task(samples, heads, dcp)),
         ),
         ("uv", samples * (uv_tasks or heads * V_DIM // UV_TILE)),
         ("o", N_ROW_TILES),
@@ -418,6 +423,7 @@ def stage_bases(
     uv_tasks: int = 0,
     q_heads: int = 0,
     dcp_lists: bool = False,
+    dcp: bool = False,
 ):
     """Return ``{stage name: base CTA}``: task ``t`` of a stage runs on CTA
     ``(base + t) % BLOCKS``."""
@@ -434,6 +440,7 @@ def stage_bases(
             uv_tasks=uv_tasks,
             q_heads=q_heads,
             dcp_lists=dcp_lists,
+            dcp=dcp,
         )
     )
     base, acc = {}, 0

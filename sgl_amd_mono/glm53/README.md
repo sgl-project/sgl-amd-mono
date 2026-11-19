@@ -55,9 +55,10 @@ slots s with s % tp == r, at row s // tp, and every rank keeps the whole index-K
 - the indexer scores the whole sequence on every rank and selects the same top-2048; the `dcp_list` stage keeps, in
   list order, the slots this rank holds, as its cache rows, and their count after the lists (`W * 2048 + 1 + s`), which
   the launches that reuse the selection read;
-- the split attends this rank's keys for all heads, skipping the splits past its count; each head's partial (its
-  latent, max and sum) goes to the rank that projects the head, which merges the ranks' partials by their LSE and
-  applies W_UV;
+- the split attends this rank's keys for all heads in 64-key tiles (a task stages only its head group's queries),
+  skipping the splits past its count; each head's partial (its latent, max and sum) goes to the rank that projects
+  the head, which merges the ranks' partials by their LSE and applies W_UV. Every row's merges run before the W_UV
+  tiles, so a tile waits only for merges of earlier task rounds;
 - a row's MLA row is written by the rank that keeps it; the index-K row by every rank.
 
 The NextN draft attends SGLang's replica of its cache and runs SGLang's path.

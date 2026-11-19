@@ -302,7 +302,7 @@ def build_glm5_monokernel(
     # the activation and mid scales: one a 32 values (MXFP8 or MXFP4), else one a 128
     PER32 = native_fp4_mfma or act_fp4
     attention_k_chunks_per_unit = 1 if attention_bf16 else 2
-    SPLIT_KEYS = sparse_keys_per_task(S, heads)
+    SPLIT_KEYS = sparse_keys_per_task(S, heads, dcp_size > 1)
     assert topk % SPLIT_KEYS == 0 and 1 <= S <= 12
     assert 1 <= launches_per_step <= LAYER_SLOTS
     assert not with_indexer or (
@@ -396,7 +396,8 @@ def build_glm5_monokernel(
     QS = QK_DIM // 2 + 4
     KS = KV_LORA // 2 + 4
     PS = PE_DIM // 2 + 4
-    KT_OFF = H * QS
+    # DCP: a split task stages one head group's queries (64 heads would not fit)
+    KT_OFF = max(WAVES * QS, H * (SPLIT_KEYS // 2)) if dcp_size > 1 else H * QS
     PT_OFF = KT_OFF + SPLIT_KEYS * KS
     # The input projection stages up to eight samples' normalized activations in LDS
     # (96 KiB at S=8, inside the arena the split tiles already need) and runs its
@@ -517,6 +518,7 @@ def build_glm5_monokernel(
         uv_tasks=UV_TASKS,
         q_heads=HQ,
         dcp_lists=DCP_LISTS,
+        dcp=D > 1,
     ):
         first[name] = acc
         acc += n
@@ -531,6 +533,7 @@ def build_glm5_monokernel(
         uv_tasks=UV_TASKS,
         q_heads=HQ,
         dcp_lists=DCP_LISTS,
+        dcp=D > 1,
     )
     # the embedding push runs ahead of qkv_a on the CTAs from 0; the tail's stages
     # start at CTA 0
@@ -5514,9 +5517,10 @@ def build_glm5_monokernel(
             stamp("uv", tt, 4)
 
         if const_expr(D > 1):
-            # A sample's tasks: H merges (this rank's splits of a head, sent to the
-            # head's owner only), then the owner's L * V_DIM / UV_TILE W_UV tiles,
-            # each combining its head's D partials by LSE.
+            # Every sample's H merges (this rank's splits of a head, sent to the head's
+            # owner only), then every sample's L * V_DIM / UV_TILE W_UV tiles of the
+            # owner, each combining its head's D partials by LSE: a tile waits only for
+            # merges of earlier rounds.
             N_UV_OWN = L * V_DIM // UV_TILE
             dcp_base = fx.Int64(SY["dcp"]) + fx.Int64(peer_slot) * fx.Int64(
                 SY["_dcp_part_stride"]
@@ -5524,8 +5528,10 @@ def build_glm5_monokernel(
             for tt in range(start("uv"), S * UV_TASKS, G):
                 tt = fx.Int32(tt)
                 stamp("uv", tt, 0)
-                s = tt // UV_TASKS
-                k = tt % UV_TASKS
+                merge = tt < S * H
+                own_t = tt - S * H
+                s = merge.select(tt // H, own_t // N_UV_OWN)
+                k = merge.select(tt % H, H + own_t % N_UV_OWN)
                 if k < H:
                     head = k
                     # this rank's splits of the row that hold keys (the others ran no task)
