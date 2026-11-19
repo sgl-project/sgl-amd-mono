@@ -53,6 +53,8 @@ class MoeBuild(msgspec.Struct, frozen=True):
     topk: int = TOPK
     # FP4 groups an ug task (``RouteShape.ug_groups``)
     ug_groups: int = 2
+    # one token tile: ug on every CTA, the shared expert's too (``runner.ug_all_at``)
+    ug_all: bool = False
 
 
 class RouteShape(msgspec.Struct, frozen=True):
