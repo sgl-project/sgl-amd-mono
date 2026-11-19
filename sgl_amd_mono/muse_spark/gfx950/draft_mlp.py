@@ -31,9 +31,10 @@ from flydsl.expr.typing import Int32, Int64, T
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import (
-    CM_DEV,
     CM_NT,
+    CM_SYS,
     bf2_f32,
+    bf16_pair,
     bf16_round,
     butterfly,
     hw_rsq,
@@ -51,7 +52,7 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
     pair_layout,
 )
-from sgl_amd_mono.common.sync import Mailbox, preg, sreg
+from sgl_amd_mono.common.sync import Mailbox, _spin, preg, sreg
 from sgl_amd_mono.muse_spark.gfx950 import compat
 from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
 from sgl_amd_mono.muse_spark.gfx950.device import (
@@ -92,15 +93,15 @@ C_ROWS, C_TILES = 128, 8  # a coefficient GEMV task's rows
 G_ROWS, G_TILES, G_ROUND = (
     448,
     28,
-    4,
-)  # a gate / up GEMV task's rows, in rounds of 4 tiles (32 + 32 VGPRs in flight)
+    7,
+)  # a gate / up GEMV task's rows, in rounds of 7 tiles (the next round's in flight)
 D_KPARTS, D_RGS, D_ROWS, D_TILES, D_ROUND = (
     7,
     32,
     256,
     16,
-    4,
-)  # the down GEMV: 224 tasks, rounds of 4 tiles
+    8,
+)  # the down GEMV: 224 tasks, rounds of 8 tiles
 D_TASKS = D_KPARTS * D_RGS
 C_RED, G_RED, D_RED = (
     COEF_ROWS // BLOCKS,
@@ -121,13 +122,20 @@ assert (
 assert D_TASKS <= BLOCKS and G_RED % 2 == 0 and D_RED % 2 == 0 and THREADS == 64 * WAVES
 
 
+# The K parts' sums of squares go out in SS_COPIES copies (a lane a copy): every CTA
+# polls every word, and 256 CTAs polling one copy's lines queue at their memory
+# channel; a CTA polls copy bid % SS_COPIES (D-pre's scheme).
+SS_COPIES = 16
+SS_STRIDE = K_PARTS * MAX_TOKENS
+
+
 def dm_scratch_layout() -> dict:
     """D-MLP's scratch regions (pairs), sized for MAX_TOKENS: the K parts' sums of
     squares, the coefficient partials and sums, the gate / up partials, the
     activations (bf16 pairs), the down partials, the trace."""
     return pair_layout(
         [
-            ("dm_ss", K_PARTS * MAX_TOKENS),
+            ("dm_ss", SS_COPIES * K_PARTS * MAX_TOKENS),
             ("dm_cpart", K_PARTS * MAX_TOKENS * COEF_ROWS),
             ("dm_coef", MAX_TOKENS * COEF_ROWS),
             ("dm_gpart", K_PARTS * MAX_TOKENS * GU_ROWS),
@@ -248,23 +256,19 @@ def lds_b(c, base, tok_of, k_of):
 
 
 # ---------------------------------------------------------------- S0: the norm, the coefficient GEMV
-@flyc.jit
-def stage_norm(c, rg, kp):
-    """res' = bf16(res + attn_out) on this K part (row group 0 writes it out), the
-    K part's sums of squares published (row group 0), every part's polled; h =
-    RMSNorm(res') w_post -> ``hbuf``."""
-    S, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
-    put, poll, hbuf, ssl, nf = c["put"], c["poll"], c["hbuf"], c["ssl"], c["nf"]
+def norm_loads(c, kp):
+    """stage_norm's loads (w_post, res / attn_out of the wave's tokens), issued ahead
+    of the coefficient task's weights: loads return in issue order, so the K part's
+    sums of squares go out before W_kp has streamed in."""
+    S, lane, wave = c["S"], c["lane"], c["wave"]
     a = c["args"]
-    V8B = fx.Vector.make_type(8, fx.BFloat16)
-    ch = kp * K_PART + 8 * lane  # this lane's eight channels
-    r_res, r_attn, r_out = rsrc(a["res"]), rsrc(a["attn_out"]), rsrc(a["res_out"])
+    ch = kp * K_PART + 8 * lane
+    r_res, r_attn = rsrc(a["res"]), rsrc(a["attn_out"])
     wv = fx.Vector(
         bo.buffer_load(rsrc(a["w_post"]), ch // 2, vec_width=4, dtype=T.i32)
     ).bitcast(fx.BFloat16)
-    TPW = S // WAVES  # tokens a wave
-    rp = []
-    for j in range_constexpr(TPW):
+    ra = []
+    for j in range(S // WAVES):
         t = wave + WAVES * j
         rv = fx.Vector(
             bo.buffer_load(r_res, (t * H + ch) // 2, vec_width=4, dtype=T.i32)
@@ -272,6 +276,27 @@ def stage_norm(c, rg, kp):
         av = fx.Vector(
             bo.buffer_load(r_attn, (t * H + ch) // 2, vec_width=4, dtype=T.i32)
         ).bitcast(fx.BFloat16)
+        ra.append((rv, av))
+    return wv, ra
+
+
+@flyc.jit
+def stage_norm(c, rg, kp, loaded):
+    """res' = bf16(res + attn_out) on this K part (row group 0 writes it out), the
+    K part's sums of squares published (row group 0), every part's polled; h =
+    RMSNorm(res') w_post -> ``hbuf``. ``loaded``: ``norm_loads``'s values."""
+    S, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    put, poll, hbuf, ssl, nf = c["put"], c["poll"], c["hbuf"], c["ssl"], c["nf"]
+    a = c["args"]
+    V8B = fx.Vector.make_type(8, fx.BFloat16)
+    ch = kp * K_PART + 8 * lane  # this lane's eight channels
+    r_out = rsrc(a["res_out"])
+    wv, ra = loaded
+    TPW = S // WAVES  # tokens a wave
+    rp = []
+    for j in range_constexpr(TPW):
+        t = wave + WAVES * j
+        rv, av = ra[j]
         r8 = [bf16_round(fx.Float32(rv[e]) + fx.Float32(av[e])) for e in range(8)]
         ss = r8[0] * r8[0]
         for e in range_constexpr(1, 8):
@@ -279,16 +304,19 @@ def stage_norm(c, rg, kp):
         ss = butterfly(ss, (1, 2, 4, 8, 16, 32))
         if rg == 0:
             bo.buffer_store(fx.Vector.from_elements(r8, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32), r_out, (t * H + ch) // 2)  # fmt: skip
-            if lane == 0:
-                put(c["ss"], kp * MAX_TOKENS + t, ss)
+            if lane < SS_COPIES:
+                put(c["ss"], lane * SS_STRIDE + kp * MAX_TOKENS + t, ss)
         rp.append(r8)
-    # every part's sum of squares of every token (a pair a thread a pass; idle threads repeat one)
+    # every part's sum of squares of every token, from this CTA's copy (a pair a thread a pass)
     N = S * K_PARTS
+    cp = (c["bid"] % SS_COPIES) * SS_STRIDE
     for p in range_constexpr(-(-N // THREADS)):
-        idx = fx.min(tid + p * THREADS, N - 1)
-        got = poll([(c["ss"], (idx % K_PARTS) * MAX_TOKENS + idx // K_PARTS, 1)])
-        if tid + p * THREADS < N:
-            fx.ptr_store(got[0][0].bitcast(fx.Float32), ssl + idx)
+        idx = tid + p * THREADS
+        if idx < N:
+            # thread idx polls (part idx / S, token idx % S): a wave's polls cover whole lines
+            kq, tq = idx // S, idx % S
+            got = poll([(c["ss"], cp + kq * MAX_TOKENS + tq, 1)])
+            fx.ptr_store(got[0][0].bitcast(fx.Float32), ssl + (tq * K_PARTS + kq))
     gpu.barrier()
     if tid < S:
         tot = fx.ptr_load(ssl + tid * K_PARTS)
@@ -329,39 +357,51 @@ def stage_coef(c, rg, kp, w):
 @flyc.jit
 def stage_coef_reduce(c, bid):
     """Rows 8 bid .. of the coefficients for every token: the K parts' partials summed
-    in part order -> ``dm_coef`` [token][row] (fp32) and, with a ``coef_out`` argument
-    (D-pre: D-post reads it), the plain fp32 [S, COEF_ROWS] tensor."""
-    S, tid, poll, put = c["S"], c["tid"], c["poll"], c["put"]
+    in part order -> ``dm_coef`` [token][row] (fp32). The 16 K parts' polls are
+    spread over every wave (a K part group a wave set, ``KPG`` specs a thread, not 16
+    on one or two waves with the rest spinning on a clamped item's lines); the raw
+    partials go through ``red`` and the item's threads sum them in part order."""
+    S, tid, poll, put, red = c["S"], c["tid"], c["poll"], c["put"], c["red"]
     cpart, coef = c["cpart"], c["coef"]
-    a = c["args"]
     N = C_RED * S
-    for p in range_constexpr(-(-N // THREADS)):
-        idx = fx.min(tid + p * THREADS, N - 1)
-        j, t = idx % C_RED, idx // C_RED
-        row = bid * C_RED + j
-        got = poll(
-            [
-                (cpart, (kp * MAX_TOKENS + t) * COEF_ROWS + row, 1)
-                for kp in range(K_PARTS)
-            ],
-            batch=K_PARTS,
-        )
-        v = got[0][0].bitcast(fx.Float32)
+    IW = -(-N // 64)  # waves an item set spans
+    assert (
+        WAVES % IW == 0
+        and K_PARTS % (WAVES // IW) == 0
+        and K_PARTS * IW * 64 <= RED_TILES * RED_FLOATS
+    )
+    NI = 64 * IW
+    KPG = K_PARTS // (WAVES // IW)  # K parts a thread polls
+    item = tid % NI
+    kg = tid // NI
+    idx = fx.min(item, N - 1)
+    j, t = idx % C_RED, idx // C_RED
+    row = bid * C_RED + j
+    got = poll(
+        [
+            (cpart, ((kg * KPG + q) * MAX_TOKENS + t) * COEF_ROWS + row, 1)
+            for q in range(KPG)
+        ],
+        batch=KPG,
+    )
+    for q in range_constexpr(KPG):
+        fx.ptr_store(got[q][0].bitcast(fx.Float32), red + ((kg * KPG + q) * NI + item))
+    gpu.barrier()
+    if tid < N:
+        v = fx.ptr_load(red + tid)
         for kp in range_constexpr(1, K_PARTS):
-            v = v + got[kp][0].bitcast(fx.Float32)
-        if tid + p * THREADS < N:
-            put(coef, t * COEF_ROWS + row, v)
-            if const_expr("coef_out" in a):
-                bo.buffer_store(
-                    v, rsrc(a["coef_out"]), t * COEF_ROWS + row, cache_modifier=CM_DEV
-                )
+            v = v + fx.ptr_load(red + (kp * NI + tid))
+        put(coef, t * COEF_ROWS + row, v)
+    # ``red``'s next writer (stage_gu) runs past stage_conv0's barriers
 
 
 # ---------------------------------------------------------------- S2: conv0, the gate / up GEMV
 @flyc.jit
 def stage_conv0(c, kp):
     """``hbuf`` <- conv0(h) on this K part: coefficient = base[0][tap][channel] +
-    delta[token][0][tap][group], tap 1 reads the block's previous row."""
+    delta[token][0][tap][group], tap 1 reads the block's previous row. The base
+    weights load ahead of the coefficients' polls, and every pass's poll goes out in
+    one batch (one round trip at 16 rows, not two)."""
     S, tid, lane, wave, poll, hbuf, cf = (
         c["S"],
         c["tid"],
@@ -374,16 +414,6 @@ def stage_conv0(c, kp):
     a = c["args"]
     GP = K_PART // GROUP  # groups a K part: 32
     V8B = fx.Vector.make_type(8, fx.BFloat16)
-    # the deltas of this part's groups: (token, tap, group) a thread
-    N = S * TAPS * GP
-    for p in range_constexpr(-(-N // THREADS)):
-        idx = fx.min(tid + p * THREADS, N - 1)
-        t, tap, g = idx // (TAPS * GP), (idx // GP) % TAPS, idx % GP
-        got = poll(
-            [(c["coef"], t * COEF_ROWS + (0 * TAPS + tap) * GROUPS + kp * GP + g, 1)]
-        )
-        if tid + p * THREADS < N:
-            fx.ptr_store(got[0][0].bitcast(fx.Float32), cf + idx)
     ch = kp * K_PART + 8 * lane
     r_base = rsrc(a["base"])
     b0 = [
@@ -394,6 +424,22 @@ def stage_conv0(c, kp):
         ).bitcast(fx.BFloat16)
         for tap in range(TAPS)
     ]
+    # the deltas of this part's groups: (token, tap, group) a thread a pass
+    N = S * TAPS * GP
+    R = -(-N // THREADS)
+    specs = []
+    for p in range_constexpr(R):
+        idx = fx.min(tid + p * THREADS, N - 1)
+        t, tap, g = idx // (TAPS * GP), (idx // GP) % TAPS, idx % GP
+        specs.append(
+            (c["coef"], t * COEF_ROWS + (0 * TAPS + tap) * GROUPS + kp * GP + g, 1)
+        )
+    got = poll(specs, batch=R)
+    for p in range_constexpr(R):
+        if tid + p * THREADS < N:
+            fx.ptr_store(
+                got[p][0].bitcast(fx.Float32), cf + fx.min(tid + p * THREADS, N - 1)
+            )
     gpu.barrier()  # the deltas are in
     TPW = S // WAVES
     outs = []
@@ -461,11 +507,87 @@ def stage_gu(c, rg, kp):
 
 
 # ---------------------------------------------------------------- S3: the activations
+def act_spread(s: int) -> bool:
+    """``stage_act``'s item sets tile the waves and their raw partials fit ``red``
+    (S <= 32); wider steps take ``stage_act_wide``."""
+    iw = -(-(G_RED // 2) * s // 64)
+    return (
+        WAVES % iw == 0
+        and K_PARTS % (WAVES // iw) == 0
+        and K_PARTS * 2 * iw * 64 * 2 <= RED_TILES * RED_FLOATS
+    )
+
+
 @flyc.jit
 def stage_act(c, bid):
     """Dims 14 bid .. of the intermediate for every token: the K parts' gate and up
     partials summed in part order, rounded to bf16, a = silu(g) u -> ``dm_act``
-    [token][dim] bf16 pairs (two dims a thread)."""
+    [token][dim] bf16 pairs (two dims a thread). The 32 gate / up polls of an item are
+    spread over every wave (``KPG`` K parts a thread, not 32 specs on one or two waves
+    while the others spin on a clamped item's lines): the raw partial pairs go
+    through ``red`` and the item's threads sum them in part order."""
+    S, tid, poll, put_bf, red = c["S"], c["tid"], c["poll"], c["put_bf"], c["red"]
+    gpart, act = c["gpart"], c["act"]
+    PAIRS = G_RED // 2  # 7 dim pairs a CTA
+    N = PAIRS * S
+    IW = -(-N // 64)
+    assert act_spread(S)
+    NI = 64 * IW
+    KPG = K_PARTS // (WAVES // IW)
+    item = tid % NI
+    kg = tid // NI
+    idx = fx.min(item, N - 1)
+    j, t = idx % PAIRS, idx // PAIRS
+    d0 = bid * G_RED + 2 * j
+    specs = [
+        (gpart, ((kg * KPG + q) * MAX_TOKENS + t) * GU_ROWS + h * I + d0, 2)
+        for q in range(KPG)
+        for h in range(2)
+    ]
+    gu = poll(specs, batch=2 * KPG)
+    for q in range_constexpr(KPG):
+        kp = kg * KPG + q
+        for h in range_constexpr(2):  # 0 gate, 1 up
+            fx.ptr_store(
+                fx.Vector.from_elements(
+                    [fx.Int32(gu[2 * q + h][0]), fx.Int32(gu[2 * q + h][1])], fx.Int32
+                ).bitcast(fx.Float32),
+                red + (((kp * 2 + h) * NI + item) * 2),
+            )
+    gpu.barrier()
+    if tid < N:
+        V2F = fx.Vector.make_type(2, fx.Float32)
+        g0, g1, u0, u1 = (
+            fx.Float32(0.0),
+            fx.Float32(0.0),
+            fx.Float32(0.0),
+            fx.Float32(0.0),
+        )
+        for kp in range_constexpr(K_PARTS):
+            gv = fx.Vector(
+                fx.ptr_load(red + (((kp * 2 + 0) * NI + tid) * 2), result_type=V2F)
+            )
+            uv = fx.Vector(
+                fx.ptr_load(red + (((kp * 2 + 1) * NI + tid) * 2), result_type=V2F)
+            )
+            g0 = g0 + gv[0]
+            g1 = g1 + gv[1]
+            u0 = u0 + uv[0]
+            u1 = u1 + uv[1]
+        g0, g1, u0, u1 = bf16_round(g0), bf16_round(g1), bf16_round(u0), bf16_round(u1)
+        a0 = bf16_round(g0 * sigmoid(g0)) * u0
+        a1 = bf16_round(g1 * sigmoid(g1)) * u1
+        put_bf(act, t * I + d0, [a0, a1])
+    # ``red``'s next writer is stage_down, which barriers once its weights are issued
+
+
+# ---------------------------------------------------------------- S4: the down GEMV
+@flyc.jit
+def stage_act_wide(c, bid):
+    """Dims 14 bid .. of the intermediate for every token: the K parts' gate and up
+    partials summed in part order, rounded to bf16, a = silu(g) u -> ``dm_act``
+    [token][dim] bf16 pairs (two dims a thread). ``stage_act`` for the steps whose
+    spread polls do not fit (``act_spread``): an item's 32 polls on its own thread."""
     S, tid, poll, put_bf = c["S"], c["tid"], c["poll"], c["put_bf"]
     gpart, act = c["gpart"], c["act"]
     PAIRS = G_RED // 2  # 7 dim pairs a CTA
@@ -500,7 +622,6 @@ def stage_act(c, bid):
             put_bf(act, t * I + d0, [a0, a1])
 
 
-# ---------------------------------------------------------------- S4: the down GEMV
 @flyc.jit
 def stage_down(c, rg, kp):
     """The down GEMV task (``rg``, ``kp``): rows 256 rg .. of W_down over K part kp (of
@@ -514,11 +635,15 @@ def stage_down(c, rg, kp):
         for kc in range(K_STEPS)
     ]
 
+    polled = {}  # token tile -> its B operands: polled once, reused by every round
+
     def xb_of(t):
+        if const_expr(t in polled):
+            return polled[t]
         tok = fx.min(t * TILE + lane % 16, S - 1)
         # a spec is at most two pairs (a 16 B load): four pairs a k-step as two specs
         got = poll([(act, (tok * I + k_lane[kc]) // 2 + 2 * q, 2) for kc in range(K_STEPS) for q in range(2)], batch=2 * K_STEPS)  # fmt: skip
-        return [
+        xb = [
             fx.Vector.from_elements(
                 [
                     fx.Int32(got[2 * kc][0]),
@@ -530,6 +655,8 @@ def stage_down(c, rg, kp):
             ).bitcast(fx.BFloat16)
             for kc in range(K_STEPS)
         ]
+        polled[t] = xb
+        return xb
 
     cur = w_loads(c, a["w_down"], I, rg * D_ROWS, D_ROUND, kp)
     for rd in range_constexpr(D_TILES // D_ROUND):
@@ -537,6 +664,8 @@ def stage_down(c, rg, kp):
             nxt = w_loads(
                 c, a["w_down"], I, rg * D_ROWS + (rd + 1) * D_ROUND * ROWS, D_ROUND, kp
             )
+        if const_expr(rd == 0):
+            gpu.barrier()  # stage_act's reads of ``red`` are done (the weights are already issued)
 
         def publish(r, tk, v, rd=rd):
             put(
@@ -551,52 +680,142 @@ def stage_down(c, rg, kp):
 
 
 # ---------------------------------------------------------------- S5: the reduce, the all-reduce, conv1, out
+# The ranks' partials of D-MLP's TP sum are zero-sentinel words, not tagged pairs (as
+# D-post's): a (source rank, token, row pair)'s bf16 pair as one word, stored
+# complemented (``zs_enc``: never 0; an all-ones word becomes a NaN pair first), so an
+# unwritten word reads 0. The ``dm`` region starts zeroed and every word is read and
+# re-armed (0) by its one reader in the launch that pushed it; the next push to it is
+# a later D-MLP's, which a peer reaches only past this rank's later D-post TP sum,
+# behind the re-arm. Half a tagged pair's bytes. The push and the poll run on separate
+# waves: a poll on a wave that pushed returns behind the pushes' remote acks.
+ZS_SENT_NAN = (
+    -4128832
+)  # 0xFFC0FFC0: what an all-ones (sentinel-complement) pair becomes
+
+
+def zs_enc(w):
+    """The zero-sentinel word of bf16-pair word ``w`` (never 0)."""
+    w = fx.Int32(w)
+    return (w == fx.Int32(-1)).select(fx.Int32(ZS_SENT_NAN), w) ^ fx.Int32(-1)
+
+
+def zs_word(src, t, col):
+    """The word of (source rank, token t, row pair at ``col``) in the ``dm`` region,
+    blocked [rank][32-row block][token][16 pairs]: a CTA's block of every token is one
+    contiguous run, so a wave's pushes are whole 256 B runs."""
+    return ((src * (H // D_RED) + col // D_RED) * MAX_TOKENS + t) * (D_RED // 2) + (
+        col % D_RED
+    ) // 2
+
+
+def zs_push(peers, rank, t, col, v0, v1):
+    """This rank's (v0, v1) of (token t, rows col, col + 1) to every rank's region."""
+    enc = zs_enc(bf16_pair(v0, v1).bitcast(fx.Int32))
+    for pe in range_constexpr(len(peers)):
+        bo.buffer_store(
+            enc, rsrc(peers[pe].value), zs_word(rank, t, col), cache_modifier=CM_SYS
+        )
+
+
+def zs_poll(specs):
+    """``Mailbox.poll`` for zero-sentinel words: (region, word, 1) specs polled until
+    none is 0, re-armed (0), and returned decoded as bf16-pair words."""
+    r = rsrc(specs[0][0].value)
+    offs = [i for _, i, _ in specs]
+
+    def load_all():
+        return fx.Vector.from_elements(
+            [
+                fx.Int32(
+                    bo.buffer_load(
+                        r, fx.Int32(o), vec_width=1, dtype=T.i32, cache_modifier=CM_SYS
+                    )
+                )
+                for o in offs
+            ],
+            fx.Int32,
+        )
+
+    def pending(v):
+        bad = v[0] == fx.Int32(0)
+        for e in range_constexpr(1, len(offs)):
+            bad = bad | (v[e] == fx.Int32(0))
+        return bad
+
+    v = _spin(load_all, pending)
+    for o in offs:
+        bo.buffer_store(fx.Int32(0), r, fx.Int32(o), cache_modifier=CM_SYS)
+    return [[v[e] ^ fx.Int32(-1)] for e in range(len(offs))]
+
+
+def out_split(s: int) -> bool:
+    """``stage_out``'s items fit half the threads (S <= 16): the pushes on the first
+    half, the polls on the other waves; wider steps take ``stage_out_wide``."""
+    return (D_RED // 2) * s <= THREADS // 2
+
+
 @flyc.jit
-def stage_out(c, bid):
-    """Rows 32 bid .. of d for every token: the K parts' partials summed, pushed as
-    bf16 pairs to every rank's ``dm`` region, the ranks' summed in rank order (two
-    rows a thread), conv1 with side 1's coefficients over the block, out (bf16)."""
-    S, W, tid, poll, put_bf = c["S"], c["W"], c["tid"], c["poll"], c["put_bf"]
+def stage_out_wide(c, bid):
+    """``stage_out`` for the steps whose items do not fit half the threads
+    (``out_split``): the pushes in passes of HALF items on threads 0 .. HALF - 1, the
+    polls (side 1's coefficients, then the ranks' words) in passes on threads HALF ..
+    (waves that push nothing), then conv1 over the block in passes of THREADS items."""
+    S, W, tid = c["S"], c["W"], c["tid"]
     dpart, dbuf, cf1 = c["dpart"], c["dbuf"], c["cf1"]
     a = c["args"]
     rank = c["rank"]
     GP = D_RED // GROUP  # groups a CTA: 2
     PAIRS = D_RED // 2  # 16 row pairs
-    # side 1's deltas of this CTA's groups: (token, tap, group) a thread
     N1 = S * TAPS * GP
-    for p in range_constexpr(-(-N1 // THREADS)):
-        idx = fx.min(tid + p * THREADS, N1 - 1)
-        t, tap, g = idx // (TAPS * GP), (idx // GP) % TAPS, idx % GP
-        got = poll(
-            [(c["coef"], t * COEF_ROWS + (1 * TAPS + tap) * GROUPS + bid * GP + g, 1)]
-        )
-        if tid + p * THREADS < N1:
-            fx.ptr_store(got[0][0].bitcast(fx.Float32), cf1 + idx)
     N = PAIRS * S
-    for p in range_constexpr(-(-N // THREADS)):
-        idx = fx.min(tid + p * THREADS, N - 1)
-        j, t = idx % PAIRS, idx // PAIRS
-        col = bid * D_RED + 2 * j
-        got = poll(
-            [(dpart, (kp * MAX_TOKENS + t) * H + col, 2) for kp in range(D_KPARTS)],
-            batch=D_KPARTS,
+    HALF = THREADS // 2
+    NP = -(-N // HALF)  # passes of HALF items
+    assert N1 <= HALF
+    if tid < HALF:
+        for p in range_constexpr(NP):
+            i = tid + p * HALF
+            idx = fx.min(i, N - 1)
+            j, t = idx % PAIRS, idx // PAIRS
+            col = bid * D_RED + 2 * j
+            got = c["poll"](
+                [(dpart, (kp * MAX_TOKENS + t) * H + col, 2) for kp in range(D_KPARTS)],
+                batch=D_KPARTS,
+            )
+            v0, v1 = fx.Float32(0.0), fx.Float32(0.0)
+            for kp in range_constexpr(D_KPARTS):
+                v0 = v0 + got[kp][0].bitcast(fx.Float32)
+                v1 = v1 + got[kp][1].bitcast(fx.Float32)
+            if i < N:
+                zs_push(c["peer_dm"], rank, t, col, v0, v1)
+    else:
+        q0 = tid - HALF
+        q1 = fx.min(q0, N1 - 1)
+        t1, tap1, g1 = q1 // (TAPS * GP), (q1 // GP) % TAPS, q1 % GP
+        cfv = c["poll"](
+            [
+                (
+                    c["coef"],
+                    t1 * COEF_ROWS + (1 * TAPS + tap1) * GROUPS + bid * GP + g1,
+                    1,
+                )
+            ]
         )
-        v0, v1 = fx.Float32(0.0), fx.Float32(0.0)
-        for kp in range_constexpr(D_KPARTS):
-            v0 = v0 + got[kp][0].bitcast(fx.Float32)
-            v1 = v1 + got[kp][1].bitcast(fx.Float32)
-        live = tid + p * THREADS < N
-        if live:
-            for pe in range_constexpr(W):
-                put_bf(c["peer_dm"][pe], (rank * MAX_TOKENS + t) * H + col, [v0, v1])
-
-        def pair_at(src):
-            return ((src * MAX_TOKENS + t) * H + col) // 2
-
-        d0, d1 = sum_partials(poll, c["own_dm"], pair_at, W)
-        if live:
-            fx.ptr_store(d0, dbuf + (t * D_RED + 2 * j))
-            fx.ptr_store(d1, dbuf + (t * D_RED + 2 * j + 1))
+        if q0 < N1:
+            fx.ptr_store(cfv[0][0].bitcast(fx.Float32), cf1 + q0)
+        for p in range_constexpr(NP):
+            q = q0 + p * HALF
+            qq = fx.min(q, N - 1)
+            jq, tq = qq % PAIRS, qq // PAIRS
+            colq = bid * D_RED + 2 * jq
+            if q < N:
+                d0, d1 = sum_partials(
+                    zs_poll,
+                    c["own_dm"],
+                    lambda src, tq=tq, colq=colq: zs_word(src, tq, colq),
+                    W,
+                )
+                fx.ptr_store(d0, dbuf + (tq * D_RED + 2 * jq))
+                fx.ptr_store(d1, dbuf + (tq * D_RED + 2 * jq + 1))
     gpu.barrier()
     r_base, r_out = rsrc(a["base"]), rsrc(a["out"])
     for p in range_constexpr(-(-N // THREADS)):
@@ -609,14 +828,88 @@ def stage_out(c, bid):
         tp = fx.max(t - 1, fx.Int32(0))
         vals = []
         for e in range_constexpr(2):
-            b0e, b1e = bw[0][e], bw[1][e]
-            c0 = b0e + fx.ptr_load(cf1 + ((t * TAPS + 0) * GP + g))
-            c1 = b1e + fx.ptr_load(cf1 + ((t * TAPS + 1) * GP + g))
+            c0 = bw[0][e] + fx.ptr_load(cf1 + ((t * TAPS + 0) * GP + g))
+            c1 = bw[1][e] + fx.ptr_load(cf1 + ((t * TAPS + 1) * GP + g))
             cur = fx.ptr_load(dbuf + (t * D_RED + 2 * j + e))
             prev = fx.ptr_load(dbuf + (tp * D_RED + 2 * j + e))
             vals.append(c0 * cur + has_prev.select(c1 * prev, fx.Float32(0.0)))
         if tid + p * THREADS < N:
             bo.buffer_store(fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0], r_out, (t * H + col) // 2)  # fmt: skip
+
+
+@flyc.jit
+def stage_out(c, bid):
+    """Rows 32 bid .. of d for every token: the K parts' partials summed and pushed as
+    zero-sentinel bf16 pair words to every rank's ``dm`` region (threads 0 .. N - 1),
+    the ranks' polled and summed in rank order (two rows a thread, threads HALF ..,
+    on other waves, with side 1's coefficients), conv1 over the block, out (bf16)."""
+    S, W, tid = c["S"], c["W"], c["tid"]
+    dpart, dbuf, cf1 = c["dpart"], c["dbuf"], c["cf1"]
+    a = c["args"]
+    rank = c["rank"]
+    poll = zs_poll
+    GP = D_RED // GROUP  # groups a CTA: 2
+    PAIRS = D_RED // 2  # 16 row pairs
+    N1 = S * TAPS * GP
+    N = PAIRS * S
+    HALF = THREADS // 2
+    assert out_split(S) and N1 <= N
+    r_base, r_out = rsrc(a["base"]), rsrc(a["out"])
+    # conv1's base weights of the output items, loaded ahead of the polls
+    idx = fx.min(tid, N - 1)
+    j, t = idx % PAIRS, idx // PAIRS
+    col = bid * D_RED + 2 * j
+    bw = [bf2_f32(fx.Int32(bo.buffer_load(r_base, ((1 * TAPS + tap) * H + col) // 2, vec_width=1, dtype=T.i32))) for tap in range(TAPS)]  # fmt: skip
+    if tid < N:
+        got = c["poll"](
+            [(dpart, (kp * MAX_TOKENS + t) * H + col, 2) for kp in range(D_KPARTS)],
+            batch=D_KPARTS,
+        )
+        v0, v1 = fx.Float32(0.0), fx.Float32(0.0)
+        for kp in range_constexpr(D_KPARTS):
+            v0 = v0 + got[kp][0].bitcast(fx.Float32)
+            v1 = v1 + got[kp][1].bitcast(fx.Float32)
+        zs_push(c["peer_dm"], rank, t, col, v0, v1)
+    q = tid - HALF
+    poller = (q >= 0) & (q < N)
+    qq = fx.min(fx.max(q, fx.Int32(0)), N - 1)
+    jq, tq = qq % PAIRS, qq // PAIRS
+    colq = bid * D_RED + 2 * jq
+
+    def pair_at(src):
+        return zs_word(src, tq, colq)
+
+    if poller:
+        # side 1's deltas of this CTA's groups: (token, tap, group) a poller
+        q1 = fx.min(qq, N1 - 1)
+        t1, tap1, g1 = q1 // (TAPS * GP), (q1 // GP) % TAPS, q1 % GP
+        cfv = c["poll"](
+            [
+                (
+                    c["coef"],
+                    t1 * COEF_ROWS + (1 * TAPS + tap1) * GROUPS + bid * GP + g1,
+                    1,
+                )
+            ]
+        )
+        if q < N1:
+            fx.ptr_store(cfv[0][0].bitcast(fx.Float32), cf1 + qq)
+        d0, d1 = sum_partials(poll, c["own_dm"], pair_at, W)
+        fx.ptr_store(d0, dbuf + (tq * D_RED + 2 * jq))
+        fx.ptr_store(d1, dbuf + (tq * D_RED + 2 * jq + 1))
+    gpu.barrier()
+    g = (2 * j) // GROUP
+    has_prev = (t % BLOCK) >= 1
+    tp = fx.max(t - 1, fx.Int32(0))
+    vals = []
+    for e in range_constexpr(2):
+        c0 = bw[0][e] + fx.ptr_load(cf1 + ((t * TAPS + 0) * GP + g))
+        c1 = bw[1][e] + fx.ptr_load(cf1 + ((t * TAPS + 1) * GP + g))
+        cur = fx.ptr_load(dbuf + (t * D_RED + 2 * j + e))
+        prev = fx.ptr_load(dbuf + (tp * D_RED + 2 * j + e))
+        vals.append(c0 * cur + has_prev.select(c1 * prev, fx.Float32(0.0)))
+    if tid < N:
+        bo.buffer_store(fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0], r_out, (t * H + col) // 2)  # fmt: skip
 
 
 # ---------------------------------------------------------------- the launch
@@ -626,10 +919,11 @@ def run_dmlp(c):
     bid, n = c["bid"], c["stages"]
     rg, kp = bid // K_PARTS, bid % K_PARTS
     stamp(c, 0)
+    loaded = norm_loads(c, kp)  # ahead of W_kp: the sums of squares do not wait for it
     w0 = w_loads(
         c, c["args"]["w_kp"], H, rg * C_ROWS, C_TILES, kp
     )  # the coefficient task's weights, in flight
-    stage_norm(c, rg, kp)
+    stage_norm(c, rg, kp, loaded)
     stamp(c, 1)
     if const_expr(n > 1):
         stage_coef(c, rg, kp, w0)
@@ -644,14 +938,20 @@ def run_dmlp(c):
         stage_gu(c, rg, kp)
     stamp(c, 5)
     if const_expr(n > 5):
-        stage_act(c, bid)
+        if const_expr(act_spread(c["S"])):
+            stage_act(c, bid)
+        else:
+            stage_act_wide(c, bid)
     stamp(c, 6)
     if const_expr(n > 6):
         if bid < D_TASKS:
             stage_down(c, bid // D_KPARTS, bid % D_KPARTS)
     stamp(c, 7)
     if const_expr(n > 7):
-        stage_out(c, bid)
+        if const_expr(out_split(c["S"])):
+            stage_out(c, bid)
+        else:
+            stage_out_wide(c, bid)
     stamp(c, 8)
 
 

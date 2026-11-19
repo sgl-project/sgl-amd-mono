@@ -205,6 +205,25 @@ def test_dpre_matches_the_attention_input_path(rows, first):
     )
 
 
+def _push_partials(peers, d):
+    """D-attn's o projection rows ``d`` (bf16 [S, H], one rank: the whole sum) into
+    rank 0's ``do`` region as its zero-sentinel words (``draft_attn.stage_og``)."""
+    from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
+    from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
+
+    S = d.shape[0]
+    off = DH.do_sym_layout(1)["do"][0]
+    words = peers.bytes[off : off + MAX_TOKENS * DH.H * 2].view(torch.int32)
+    t = torch.arange(S, device=d.device)[:, None]
+    col = torch.arange(0, DH.H, 2, device=d.device)[None, :]
+    idx = ((col // DH.O_ROWS) * MAX_TOKENS + t) * (DH.O_ROWS // 2) + (
+        col % DH.O_ROWS
+    ) // 2
+    w = d.contiguous().view(torch.int32)  # [S, H / 2]: (col, col + 1) a word
+    w = torch.where(w == -1, torch.full_like(w, -4128832), w)  # (a NaN pair, not 0)
+    words[idx] = w ^ -1
+
+
 @pytest.mark.parametrize("rows", [8, 16])
 def test_dpost_matches_the_attention_output_path(rows):
     from sgl_amd_mono.common import guard
@@ -232,6 +251,8 @@ def test_dpost_matches_the_attention_output_path(rows):
     launch = DH.build_dpost(DH.DPostBuild(tokens=rows, npes=1))
     try:
         for step in range(2):
+            # D-attn's pushes (its o GEMV): D-post re-arms the words it reads
+            _push_partials(peers, o @ w["w_o"].T)
             launch(
                 o.data_ptr(), w["w_o"].data_ptr(), coef.data_ptr(), w["base"].data_ptr(), attn_out.data_ptr(),
                 scratch.data_ptr(), peers.local, peers.addresses.data_ptr(), 0, epoch.data_ptr(), LAYER,
