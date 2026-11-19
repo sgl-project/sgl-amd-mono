@@ -866,7 +866,6 @@ def main() -> int:
     ap.add_argument(
         "--positions", default="", help="comma-separated live-row positions"
     )
-    ap.add_argument("--mxfp4", action="store_true", help="MXFP4 (A4W4) MoE experts")
     ap.add_argument(
         "--native-fp4", action="store_true", help="MXFP8 x MXFP4 MFMA (with --mxfp4)"
     )

@@ -154,14 +154,6 @@ def dcp_summary_index(source, sample, tile, item, samples, n_uv):
     return ((source * samples + sample) * n_uv + tile) * DCP_SUMMARY_PAIRS + item
 
 
-def dcp_uv_owner(tile, output_heads, rank):
-    return tile // (V_DIM // UV_TILE) // output_heads == rank
-
-
-def dcp_local_uv_tile(tile, output_heads):
-    return tile % (output_heads * V_DIM // UV_TILE)
-
-
 def ug_split(samples: int, inter: int = INTER):
     """Return the balanced up/gate leftover split for batches two and four."""
 
@@ -266,6 +258,9 @@ def layout(
             ("index_qh", samples * INDEX_Q_ROWS // 2 * pair_bytes),
             ("index_scores", samples * index_max_seq * pair_bytes),
             ("indices", samples * sparse_attention_topk * pair_bytes),
+            # DCP: each row's selection cut to this rank's cache rows, and its count
+            ("dcp_idx", samples * sparse_attention_topk * pair_bytes * (dcp_size > 1)),
+            ("dcp_cnt", samples * pair_bytes * (dcp_size > 1)),
             # sliced top-k: per row, digit and slice the slice's 64 counts (two a
             # pair); per row the candidates (key, cache slot) under the threshold's prefix
             (
@@ -293,20 +288,27 @@ def layout(
 
     part = npes * samples * HIDDEN * pair_bytes
     region = 2 * part
-    dcp_part = (
-        dcp_size * samples * (heads * V_DIM // UV_TILE) * DCP_SUMMARY_PAIRS * pair_bytes
-        if dcp_size > 1
-        else 0
-    )
+    dcp = dcp_size > 1
+    # DCP: each source rank's merge summary of a head (latent, max, sum)
+    dcp_part = dcp_size * samples * heads * DCP_SUMMARY_PAIRS * pair_bytes if dcp else 0
+    # DCP: every head's absorbed query, pushed by the rank that projects it
+    lat_part = samples * heads * KV_LORA // 2 * pair_bytes if dcp else 0
+    pe_part = samples * heads * PE_DIM // 2 * pair_bytes if dcp else 0
+    qg = 2 * region + 2 * dcp_part
+    flags = qg + 2 * lat_part + 2 * pe_part
     symmetric = {
         "attn": 0,
         "ffn": region,
         "dcp": 2 * region,
+        "qg_lat": qg,
+        "qg_pe": qg + 2 * lat_part,
         # the guard's error flags: rank r writes word r of every rank's flags
-        "flags": 2 * region + 2 * dcp_part,
+        "flags": flags,
         "_part_stride": part,
         "_dcp_part_stride": dcp_part,
-        "_bytes": 2 * region + 2 * dcp_part + FLAG_BYTES,
+        "_qg_lat_stride": lat_part,
+        "_qg_pe_stride": pe_part,
+        "_bytes": flags + FLAG_BYTES,
     }
     if tokens or eh_tiles:
         symmetric["xin"] = symmetric["_bytes"]
@@ -329,11 +331,17 @@ def stage_tasks(
     tokens: bool = False,
     head_rows: int = 0,
     eh_tiles: int = 0,
+    uv_tasks: int = 0,
+    q_heads: int = 0,
+    dcp_lists: bool = False,
 ):
     """Return ``(stage name, task count)`` pairs in execution order; with ``tokens``
     led by the embedding rows' push, with ``eh_tiles`` by the NextN entry (each tile's
     K parts, ``eh_parts``). With ``head_rows`` (this rank's LM-head rows) the tail's
-    instead."""
+    instead. DCP: ``uv_tasks`` (uv's tasks a sample) and ``q_heads`` (the heads whose
+    query this rank projects) differ from the attention ``heads``, and ``dcp_lists``
+    adds a task a row that cuts the selection to this rank's keys."""
+    q_heads = q_heads or heads
 
     if head_rows:
         return [("lmhead", head_rows // HEAD_TILE), ("gather", BLOCKS)]
@@ -349,7 +357,7 @@ def stage_tasks(
     if with_indexer:
         tasks += [("index_key", samples)]
     tasks += [
-        ("q_b", heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
+        ("q_b", q_heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
     ]
     if with_indexer:
         # index_qh: each row's query, rotated and Hadamard-transformed, 8 heads a task
@@ -357,13 +365,15 @@ def stage_tasks(
             ("index_q", INDEX_Q_ROWS // INDEX_TILE),
             ("index_qh", samples * INDEX_HEADS // 8),
         ]
-    tasks += [("uk", heads * KV_LORA // UK_TILE)]
+    tasks += [("uk", q_heads * KV_LORA // UK_TILE)]
     if with_indexer:
         tasks += [
             # one task a CTA: its runs of the requests' keys
             ("index_score", BLOCKS),
             ("index_slice", samples * INDEX_SEL_SLICES),
         ]
+        if dcp_lists:
+            tasks += [("dcp_list", samples)]
     tasks += [
         (
             "split",
@@ -371,7 +381,7 @@ def stage_tasks(
             * (heads // WAVES)
             * (sparse_attention_topk // sparse_keys_per_task(samples, heads)),
         ),
-        ("uv", samples * (heads * V_DIM // UV_TILE)),
+        ("uv", samples * (uv_tasks or heads * V_DIM // UV_TILE)),
         ("o", N_ROW_TILES),
         ("router", samples * N_ROUTER),
         (
@@ -405,6 +415,9 @@ def stage_bases(
     index_max_seq: int = 4096,
     expert_mxfp4: bool = False,
     inter: int = INTER,
+    uv_tasks: int = 0,
+    q_heads: int = 0,
+    dcp_lists: bool = False,
 ):
     """Return ``{stage name: base CTA}``: task ``t`` of a stage runs on CTA
     ``(base + t) % BLOCKS``."""
@@ -418,6 +431,9 @@ def stage_bases(
             index_max_seq,
             expert_mxfp4,
             inter=inter,
+            uv_tasks=uv_tasks,
+            q_heads=q_heads,
+            dcp_lists=dcp_lists,
         )
     )
     base, acc = {}, 0
@@ -452,4 +468,6 @@ def stage_bases(
         base["index_score"] = 0
         # the selection's slices past uk's CTAs
         base["index_slice"] = (base["uk"] + tasks["uk"]) % BLOCKS
+        if dcp_lists:
+            base["dcp_list"] = (base["index_slice"] + tasks["index_slice"]) % BLOCKS
     return base

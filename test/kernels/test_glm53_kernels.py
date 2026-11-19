@@ -17,7 +17,11 @@ launch of its kind fed its own entry rows, bitwise, with its entry within its
 bounds, its step tables equal to the torch ops, and a draft step's graph replaying
 bitwise (``glm53/check_nextn.py``). With MXFP4 MLPs: each
 launch kind's MLP against the AITER ops SGLang runs (``glm53/check_mxfp4.py``), the
-cache writes, the graph replays and the NextN launches as above."""
+cache writes, the graph replays and the NextN launches as above. Under decode
+context parallelism over the TP group (``glm53/check_dcp.py``), an indexer launch
+and the shared launches reading its lists against the TP launches on the same
+inputs: the output within its bound, each rank's lists its cut of TP's, its MLA rows
+TP's at its slots, the same output on every rank, and a replaying graph."""
 
 import subprocess
 import sys
@@ -40,6 +44,7 @@ CHECK = Path(__file__).with_name("glm53") / "check_layer.py"
 TOPK = Path(__file__).with_name("glm53") / "check_topk.py"
 NEXTN = Path(__file__).with_name("glm53") / "check_nextn.py"
 MXFP4 = Path(__file__).with_name("glm53") / "check_mxfp4.py"
+DCP = Path(__file__).with_name("glm53") / "check_dcp.py"
 # the widths the spec builds at each TP size
 WIDTHS = {4: "2,4,8", 8: "2,4,8"}
 
@@ -157,6 +162,11 @@ class TestMonoGlm53Kernels(CustomTestCase):
 
     def test_mxfp4_nextn_launches_equal_the_plain_ones_on_their_entry(self):
         self._check("--mxfp4", script=NEXTN)
+
+    def test_dcp_launches_equal_the_tp_ones(self):
+        # an indexer launch and two shared launches, one rowset ending in a pad row
+        for kv in ("bf16", "fp8"):
+            self._check("--kv", kv, script=DCP)
 
 
 if __name__ == "__main__":

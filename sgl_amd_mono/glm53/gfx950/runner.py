@@ -21,7 +21,14 @@ from typing import Optional
 import msgspec
 import torch
 
-from .config import GLM5_GLOBAL_HEADS, GLM5_GLOBAL_INTER, HIDDEN, KV_LORA, PE_DIM
+from .config import (
+    GLM5_GLOBAL_HEADS,
+    GLM5_GLOBAL_INTER,
+    HIDDEN,
+    KV_LORA,
+    PE_DIM,
+    glm5_attention_heads,
+)
 from .layout import EH_ARGS, HEAD_TILE, INDEX_DIM, layout
 
 TOPK = 2048
@@ -43,7 +50,9 @@ class Glm53Build(msgspec.Struct, frozen=True):
     hnorm(h)); ``head``: the tail, on ``vocab_rows`` LM-head rows a rank;
     ``mxfp4``: the MoE and dense MLPs are MXFP4, not block FP8; ``native_fp4``:
     their rows as MXFP8 on the FP4 MFMA in ATOM's layout (GLM-5.2's checkpoint),
-    else the rows are MXFP4 too (``act_fp4``)."""
+    else the rows are MXFP4 too (``act_fp4``). ``dcp``: the decode context parallel
+    size (the TP size, or 1): a rank keeps the MLA rows of slots s with s % dcp ==
+    rank, at s // dcp, and attends them for every head of the group."""
 
     rows: int
     tp: int
@@ -62,9 +71,16 @@ class Glm53Build(msgspec.Struct, frozen=True):
     eh: bool = False
     mxfp4: bool = False
     native_fp4: bool = False
+    dcp: int = 1
 
     @property
     def heads(self) -> int:
+        """The heads a rank attends."""
+        return glm5_attention_heads(self.tp, self.dcp)
+
+    @property
+    def out_heads(self) -> int:
+        """The heads a rank projects (q_b, W_UV, o_proj)."""
         return GLM5_GLOBAL_HEADS // self.tp
 
     @property
@@ -221,7 +237,8 @@ class Glm53Runtime:
             key.with_indexer,
             key.index_max_seq,
             inter=key.inter,
-            output_heads=key.heads,
+            output_heads=key.out_heads,
+            dcp_size=key.dcp,
             tokens=key.tokens,
             head_vocab=key.vocab_rows * key.tp if key.head else 0,
             eh_tiles=key.eh_tiles,
@@ -240,7 +257,8 @@ class Glm53Runtime:
             kv_cache_layout="atom",
             kv_cache_dtype="fp8" if key.kv_fp8 else "bf16",
             inter=key.inter,
-            output_heads=key.heads,
+            output_heads=key.out_heads,
+            dcp_size=key.dcp,
             uv_scale_rows=128,
             # the other layers read the top-k buffer, not the index cache
             index_paged=key.with_indexer,
