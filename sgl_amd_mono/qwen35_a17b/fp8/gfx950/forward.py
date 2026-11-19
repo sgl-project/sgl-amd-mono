@@ -38,12 +38,9 @@ from sgl_amd_mono.qwen35_a17b.fp8.gfx950.verify import verify_core
 SGLANG_READS = {
     "srt/distributed/communication_op.py": ("tensor_model_parallel_all_reduce",),
     "srt/distributed/parallel_state.py": ("get_tp_group", "ca_comm"),
-    "srt/model_executor/forward_context.py": (
-        "get_attn_backend",
-        "get_req_to_token_pool",
-    ),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "srt/layers/attention/hybrid_linear_attn_backend.py": ("state_layer_cache",),
     "srt/mem_cache/memory_pool.py": (
-        "mamba2_layer_cache",
         "intermediate_ssm",
         "intermediate_conv_window",
     ),
@@ -158,17 +155,19 @@ def final_norm(partial, residual, norm):
     return _reduce_norm(partial, residual, norm)[0]
 
 
-def _mamba(layer_id: int, forward_batch):
-    from sglang.srt.model_executor.forward_context import (
-        get_attn_backend,
-        get_req_to_token_pool,
-    )
+def _linear_backend():
+    """The GDN backend. A hybrid backend keeps it on ``linear_attn_backend``."""
+    from sglang.srt.model_executor.forward_context import get_attn_backend
 
     backend = get_attn_backend()
-    linear = getattr(backend, "linear_attn_backend", backend)
+    return getattr(backend, "linear_attn_backend", backend)
+
+
+def _mamba(layer_id: int, forward_batch):
+    linear = _linear_backend()
     meta = linear.forward_metadata
     idx = meta.mamba_cache_indices
-    cache = get_req_to_token_pool().mamba2_layer_cache(layer_id)
+    cache = linear.state_layer_cache(layer_id)
     return cache.conv[0], cache.temporal, idx
 
 
@@ -234,9 +233,7 @@ class _CaptureInput(nn.Module):
 
 
 def _layer_cache(layer_id: int):
-    from sglang.srt.model_executor.forward_context import get_req_to_token_pool
-
-    return get_req_to_token_pool().mamba2_layer_cache(layer_id)
+    return _linear_backend().state_layer_cache(layer_id)
 
 
 def _verify_state(cache, slots, inter):
