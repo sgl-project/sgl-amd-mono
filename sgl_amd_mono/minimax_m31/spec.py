@@ -680,7 +680,10 @@ def build(model, hf_config, ctx):
     from sglang.srt.distributed import get_tp_group
 
     from sgl_amd_mono.common.peer import PeerBuffer
+    from sgl_amd_mono.minimax_m31 import host_lens
     from sgl_amd_mono.minimax_m31.runner import FfnRunner
+
+    host_lens.install()
 
     group = get_tp_group()
     rank, device = (

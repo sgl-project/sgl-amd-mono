@@ -323,6 +323,7 @@ MODELS = {
             "test/kernels/test_minimax_m31_ffn.py",
             "test/kernels/test_minimax_m31_nvfp4.py",
             "test/kernels/test_minimax_m31_attention.py",
+            "test/kernels/test_minimax_m31_draft.py",
         ],
         "e2e_tests": ["test/e2e/test_minimax_m31_server.py"],
         "microbench": [],

@@ -9,15 +9,15 @@ selects this folder for MiniMax-M3.1-Flash and `sgl_amd_mono/minimax_m3/` for Mi
 A row is one query token of a step. A DSpark verify step has 8 rows for each request: the 7 draft tokens and the
 token before them.
 
-| | target model in `spec.py` |
-| --- | --- |
-| model class | `MiniMaxM3SparseForConditionalGeneration` (`minimax_m3_vl`) |
-| checkpoint | `MiniMaxAI/MiniMax-M3.1-Flash`: NVFP4 routed experts, which SGLang converts to MXFP4 at load, and MXFP8 (block 32) for the other weights |
-| GPU and TP | gfx950 (MI350X and MI355X), TP 4 |
-| SGLang steps | decode, and DSpark `target_verify` |
-| widths | the FFN launch and K1: 1 to 16 rows. K2a and K2b: verify steps of 1 or 2 requests (8 or 16 rows). |
-| KV cache | SGLang's NVFP4 pool (`MiniMaxM3Nvfp4KVPool`), page size 128 |
-| other steps | SGLang's forward runs prefill, extend and the steps wider than 16 rows |
+| | target model in `spec.py` | DSpark draft in `draft.py` |
+| --- | --- | --- |
+| model class | `MiniMaxM3SparseForConditionalGeneration` (`minimax_m3_vl`) | `DSparkMiniMaxDraftModel` |
+| checkpoint | `MiniMaxAI/MiniMax-M3.1-Flash`: NVFP4 routed experts, which SGLang converts to MXFP4 at load, and MXFP8 (block 32) for the other weights | its `dspark/` folder: 5 sliding-window layers with MXFP8 projections, a VanillaMarkov head |
+| GPU and TP | gfx950 (MI350X and MI355X), TP 4 | gfx950, TP 4 |
+| SGLang steps | decode, and DSpark `target_verify` | the draft steps, which SGLang runs as `TARGET_VERIFY` batches of the draft model |
+| widths | the FFN launch and K1: 1 to 16 rows. K2a and K2b: verify steps of 1 or 2 requests (8 or 16 rows). | 1 or 2 requests (7 or 14 rows) |
+| KV cache | SGLang's NVFP4 pool (`MiniMaxM3Nvfp4KVPool`), page size 128 | SGLang's bf16 draft pool, page size 128, triton draft attention |
+| other steps | SGLang's forward runs prefill, extend and the steps wider than 16 rows | SGLang's draft forward runs the wider draft steps |
 
 The model has 60 layers, and each layer has sparse attention. Layers 0 to 2 have a dense FFN. Layers 3 to 59 have the
 MoE: this document calls them the 57 sparse layers.
@@ -36,6 +36,15 @@ MoE: this document calls them the 57 sparse layers.
 | `nvfp4.py` | the row quantizer of SGLang's NVFP4 pool, which K1 uses to write K, V and the index K |
 | `sync.py` | the tagged hand-offs and the bounded waits of one launch |
 | `residency.py` | the HIP occupancy check: a persistent grid needs every CTA resident at once |
+| `draft.py` | the draft's `MonoSpec`, its refusal reasons, the build, and the forward `_Draft.forward` |
+| `drafter/layer.py` | the draft launch: the 5 layers and the final norm in one persistent kernel (adapted from vLLM's MiniMax-M3 drafter) |
+| `drafter/attention.py` | the sliding-window attention of the draft launch: split-KV partitions and merge tasks |
+| `drafter/device.py` | the device helpers of the draft launch: memory, bounded waits, the MXFP8 GEMV and the row norms |
+| `drafter/layout.py` | the shapes, the CTA roles and the memory layout of the draft launch |
+| `drafter/runner.py` | the host side of the draft launch: packed weights, pointer table, scratch and peer buffer |
+| `draft_sampler.py` | the sampled Markov block through SGLang's draft-sampler entry, with its startup check |
+| `markov/markov.hip`, `markov/__init__.py` | the Markov step in two launches, DeepSeek-V4.1's HIP kernels with bf16 step logits |
+| `host_lens.py` | the opt-in switch that lets decode and verify steps keep their `seq_lens` on the GPU (section 8) |
 
 | test file | contents |
 | --- | --- |
@@ -44,6 +53,9 @@ MoE: this document calls them the 57 sparse layers.
 | `test/kernels/test_minimax_m31_nvfp4.py` | the NVFP4 rows against SGLang's quantizer, byte for byte |
 | `test/kernels/test_minimax_m31_attention.py` | K1, K2a and K2b against SGLang's kernels |
 | `test/kernels/minimax_m31/time_ffn.py` | the time of the FFN launch at TP 4, with cold weights and a fixed number of routed experts |
+| `test/kernels/test_minimax_m31_draft.py` | runs `minimax_m31/check_draft.py` and `minimax_m31/check_markov.py` under torchrun at TP 4 |
+| `test/kernels/minimax_m31/check_draft.py` | the draft launch against an f32 reference of SGLang's draft layers, and the window of each row bit for bit |
+| `test/kernels/minimax_m31/check_markov.py` | the Markov block against SGLang's arithmetic: tokens, bf16 step logits and graph replays |
 | `test/e2e/test_minimax_m31_server.py` | the serving tests: verify and decode GSM8K, check mode, and a stalled rank |
 
 ## 2. A step
@@ -108,7 +120,28 @@ last CTA of the row merges the softmax states of the 16 blocks into the bf16 out
 - Each wait has a deadline. A wait that passes it stops the launch on every rank, so no token of that step goes to a
   client. The fault test of `test_minimax_m31_server.py` stalls one wait to check this.
 
-## 6. Switches
+## 6. The DSpark draft step
+
+In a routed draft step, three parts replace SGLang's work:
+
+1. One draft launch runs the 5 layers and the final norm. It is one grid of 256 CTAs in three roles. 192 G CTAs run
+   the MXFP8 GEMVs. 48 L CTAs run the sliding-window attention (window 4096). 16 N CTAs add the partial sums of the 4
+   ranks and run the norms. The launch reads SGLang's bf16 draft K and V one page at a time and converts them to e4m3.
+   It writes the new K and V rows back in bf16.
+2. The verify step writes the context K and V rows of the draft through SGLang's fused writer
+   (`fused_kv_norm_rope_write`). The build dequantizes the draft's K and V projections to bf16 for it, because SGLang
+   has no projection for this draft on ROCm.
+3. The sampled Markov block runs in two launches for each position. At startup, every rank compares it with SGLang's
+   `draft_markov_block` on random inputs. On any difference, SGLang's block runs.
+
+## 7. GPU seq_lens (opt-in)
+
+On ROCm, SGLang's overlap scheduler synchronizes the host before each decode or verify step when an attention backend
+asks for the host copy of `seq_lens`. SGLang's MiniMax backends ask for it. With `SGLANG_AMD_MONO_M31_GPU_LENS=1`,
+`host_lens.py` declares that they do not need it, and an eager step without the host copy takes the bound of the
+graph capture. When SGLang's backends declare it themselves (sgl-project/sglang#50665), this switch has no effect.
+
+## 8. Switches
 
 | variable | effect |
 | --- | --- |
@@ -116,4 +149,8 @@ last CTA of the row merges the softmax states of the 16 blocks into the bf16 out
 | `SGLANG_AMD_MONO_M31_INDEX=0` | SGLang runs the index scores, the top-k and the sparse attention |
 | `SGLANG_AMD_MONO_M31_SPARSE=0` | SGLang runs the sparse attention |
 | `SGLANG_AMD_MONO_M31_K2_DEBUG=1` | K2a and K2b log out-of-range slots and lengths |
+| `SGLANG_AMD_MONO_M31_DRAFT=0` | SGLang runs the draft layers |
+| `SGLANG_AMD_MONO_M31_DRAFT_KV=0` | SGLang writes the context K and V rows of the draft |
+| `SGLANG_AMD_MONO_M31_MARKOV=0` | SGLang runs the Markov block |
+| `SGLANG_AMD_MONO_M31_GPU_LENS=1` | decode and verify steps keep their `seq_lens` on the GPU (section 7) |
 | `SGLANG_AMD_MONO_CHECK=1` | check mode: eager steps; each sparse layer's FFN launch against SGLang's modules on a copy of its input |

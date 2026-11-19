@@ -47,6 +47,7 @@ SPECS = {
         None,
     ): "sgl_amd_mono.qwen38_flash_next.spec:SPEC",
     ("MuseSparkForConditionalGeneration", None): "sgl_amd_mono.muse_spark.spec:SPEC",
+    ("DSparkMiniMaxDraftModel", None): "sgl_amd_mono.minimax_m31.draft:SPEC",
     ("DFlash2DraftModel", None): "sgl_amd_mono.muse_spark.draft:SPEC",
 }
 
