@@ -4,8 +4,8 @@
 A resident grid with one workgroup per CU (``plan``), wave ops and buffer access
 (``ops``), MX helpers (``mx``), device-incremented epoch tags (``epoch``), the tagged
 mailbox between workgroups and GPUs (``sync``), the deadlines and error words every
-wait runs under (``guard``), symmetric peer memory (``peer``) and timeline marks
-(``stamps``).
+wait runs under (``guard``), symmetric peer memory (``peer``), timeline marks
+(``stamps``) and what each compiled kernel asks of the GPU (``resources``).
 
 Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at 97359d6 (MIT License,
 Copyright (C) 2026, Advanced Micro Devices, Inc.) by way of vLLM's DeepSeek-V4.1
