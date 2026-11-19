@@ -12,10 +12,10 @@ convolution around each sublayer) with no head of its own.
 Stage 2 (the default): each layer runs as four launches, D-pre (the input norm's
 fused add, the attention convolution's coefficients and conv0, the qkv projection,
 the per-head q / k norm + table RoPE, q out and k / v into the fp8 cache), D-attn
-(the block attention over the compact windowed cache), D-post (the o projection,
-the TP sum, conv1) and D-MLP (the post norm's fused add, the convolutions, gate /
-up / down, the TP sum) — ``gfx950/draft_attn_half.py``, ``draft_attn.py``,
-``draft_mlp.py``. ``SGLANG_AMD_MONO_DRAFT_STAGE=1`` keeps the attention half on
+(the block attention over the compact windowed cache, then the o projection's
+partials pushed to every rank), D-post (the TP sum, conv1) and D-MLP (the post
+norm's fused add, the convolutions, gate / up / down, the TP sum) —
+``gfx950/draft_attn_half.py``, ``draft_attn.py``, ``draft_mlp.py``. ``SGLANG_AMD_MONO_DRAFT_STAGE=1`` keeps the attention half on
 SGLang's modules; ``SGLANG_AMD_MONO_DRAFT_KERNELS=0`` (stage 0) runs the model's
 own forward, so the wiring (attach, widths, block rows, graph capture) can be
 exercised with an output identical to the normal path. Check mode
@@ -289,7 +289,7 @@ class DraftRunner:
         if rows not in self._pre:
             self._pre[rows] = DH.build_dpre(DH.DPreBuild(tokens=rows))
             self._attn[rows] = DA.build_dattn(
-                DA.DAttnBuild(tokens=rows, q_len=DRAFT_TOKENS)
+                DA.DAttnBuild(tokens=rows, q_len=DRAFT_TOKENS, npes=self.npes)
             )
             self._post[rows] = DH.build_dpost(
                 DH.DPostBuild(tokens=rows, npes=self.npes)
@@ -392,7 +392,8 @@ class DraftRunner:
         dattn(
             _ptr(q), _ptr(o), _ptr(k_cache), _ptr(v_cache), _ptr(table), table.shape[1], table.numel() * 4, _ptr(rpi),
             int(rpi.dtype == torch.int64), _ptr(lens), int(lens.dtype == torch.int64), DRAFT_TOKENS, 0, 0,
-            _f32_bits(float(attn.scaling)), _ptr(self.scratch_attn), _ptr(self.epoch), i, stream=stream,
+            _f32_bits(float(attn.scaling)), _ptr(self.scratch_attn), _ptr(self.epoch), i, _ptr(v["w_o"]),
+            _ptr(self.peers_post.addresses), self.rank, stream=stream,
         )  # fmt: skip
         mark("D-attn")
         post(

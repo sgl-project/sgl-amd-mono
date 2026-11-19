@@ -2,8 +2,9 @@
 attention in torch: a block of 8 rows a request, 8 query heads of one KV head of
 128 dims, every block row sees the prefix's last ``window`` keys and all 8 block
 keys (an encoder-only layer), fp8 page-16 cache [slot, 1, 128], page ids through
-``req_to_token`` (per-token slots, pages contiguous); and that it compiles for the
-served widths."""
+``req_to_token`` (per-token slots, pages contiguous), then the o projection's
+partial rows it pushes for D-post (one rank: the whole sum); and that it compiles
+for the served widths."""
 
 import struct
 
@@ -67,6 +68,22 @@ def _reference(
     return out
 
 
+def _pushed_partials(peers, S):
+    """D-attn's o projection rows of rank 0 in the ``do`` region, decoded from their
+    zero-sentinel words (``draft_attn_half.zs_word``): f32 [S, H]."""
+    from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
+    from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
+
+    off = DH.do_sym_layout(1)["do"][0]
+    words = peers.bytes[off : off + MAX_TOKENS * DH.H * 2].view(torch.int32)
+    t = torch.arange(S, device=words.device)[:, None]
+    col = torch.arange(0, DH.H, 2, device=words.device)[None, :]
+    idx = ((col // DH.O_ROWS) * MAX_TOKENS + t) * (DH.O_ROWS // 2) + (
+        col % DH.O_ROWS
+    ) // 2
+    return (words[idx] ^ -1).contiguous().view(torch.bfloat16).float()
+
+
 @pytest.mark.parametrize(
     "R,window,part,lens",
     [
@@ -79,7 +96,10 @@ def _reference(
     ],
 )
 def test_dattn_matches_the_block_attention(R, window, part, lens):
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.muse_spark.gfx950 import draft_attn as D
+    from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
     from sgl_amd_mono.muse_spark.gfx950.layout import scratch_bytes
 
     ql = 8
@@ -117,18 +137,25 @@ def test_dattn_matches_the_block_attention(R, window, part, lens):
     scratch = torch.zeros(
         scratch_bytes(D.dattn_scratch_layout(S, ql)), dtype=torch.uint8, device=dev
     )
+    w_o = (torch.randn(DH.H, D.Q_K, device=dev) * 0.03).to(bf)
+    peers = PeerBuffer(DH.do_sym_bytes(1) + guard.FLAG_BYTES, None, 0, 1, dev)
+    peers.bytes.zero_()
     epoch = _epoch(dev)
-    launch = D.build_dattn(D.DAttnBuild(tokens=S, q_len=ql))
+    launch = D.build_dattn(D.DAttnBuild(tokens=S, q_len=ql, npes=1))
     scale_bits = struct.unpack("i", struct.pack("f", scale))[0]
-    for step in range(2):
-        launch(
-            q.data_ptr(), o.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
-            req_to_token.data_ptr(), MAX_CTX, req_to_token.numel() * 4, req_pool.data_ptr(), 1,
-            prefix.data_ptr(), 0, ql, window, part, scale_bits, scratch.data_ptr(), epoch.data_ptr(), LAYER,
-            stream=torch.cuda.current_stream(),
-        )  # fmt: skip
-        epoch[0] += 1
-    torch.cuda.synchronize()
+    try:
+        for step in range(2):
+            launch(
+                q.data_ptr(), o.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
+                req_to_token.data_ptr(), MAX_CTX, req_to_token.numel() * 4, req_pool.data_ptr(), 1,
+                prefix.data_ptr(), 0, ql, window, part, scale_bits, scratch.data_ptr(), epoch.data_ptr(), LAYER,
+                w_o.data_ptr(), peers.addresses.data_ptr(), 0, stream=torch.cuda.current_stream(),
+            )  # fmt: skip
+            epoch[0] += 1
+        torch.cuda.synchronize()
+        d = _pushed_partials(peers, S)
+    finally:
+        peers.close()
     ref = _reference(
         q, k_cache, v_cache, req_to_token, req_pool, prefix, ql, window, scale
     )
@@ -140,6 +167,13 @@ def test_dattn_matches_the_block_attention(R, window, part, lens):
     assert bad == 0.0, f"{bad:.2%} of the outputs off (max err {err.max().item():.4f})"
     cos = torch.nn.functional.cosine_similarity(got, ref, dim=-1).min().item()
     assert cos > 0.999, f"least row cosine {cos}"
+    # the o projection of the kernel's own o (fp32 sums in another order, one bf16 rounding)
+    d_ref = got @ w_o.float().T
+    d_err = (d - d_ref).abs()
+    d_bad = (d_err > d_ref.abs() * (1 / 32) + 2e-2).float().mean().item()
+    assert d_bad == 0.0, (
+        f"{d_bad:.2%} of the o projection off (max err {d_err.max().item():.4f})"
+    )
 
 
 @pytest.mark.parametrize("rows", [8, 16, 32, 64])
