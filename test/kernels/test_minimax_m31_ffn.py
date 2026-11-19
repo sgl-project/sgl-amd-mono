@@ -239,16 +239,21 @@ def test_ffn_stages_match_native(weights, s):
 
 @pytest.mark.parametrize("s", [8, 16])
 def test_o_proj_is_sglangs_to_the_bit(weights, s):
-    """The launch's o_proj partial is SGLang's (AITER's per-token FP8 quant, then
-    ``smallm_fp8_gemm``) bit for bit, in both of that GEMM's wave splits."""
+    """The launch's o_proj partial is SGLang's bit for bit: AITER's per-token FP8
+    quant, then the GEMM SGLang's ``fp8_utils`` dispatches for the shape,
+    ``smallm_fp8_gemm`` where it serves it (in both of its wave splits), else
+    AITER's ``gemm_a8w8_bpreshuffle``."""
     import aiter
 
     smallm = pytest.importorskip("sglang.kernels.ops.gemm.smallm_fp8_gfx950")
-    if not smallm.smallm_fp8_gemm_enabled():
-        pytest.skip("smallm_fp8_gemm is off")
     r = _run(weights, s)
     q, xs = aiter.per_token_quant_hip(r.attn, quant_dtype=aiter.dtypes.fp8)
-    want = smallm.smallm_fp8_gemm(q, weights.wo, xs, weights.wos, torch.bfloat16)
+    if smallm.smallm_fp8_gemm_supported(q, weights.wo, xs, torch.bfloat16):
+        want = smallm.smallm_fp8_gemm(q, weights.wo, xs, weights.wos, torch.bfloat16)
+    else:
+        want = aiter.gemm_a8w8_bpreshuffle(
+            q, weights.wo, xs, weights.wos, dtype=torch.bfloat16
+        )
     assert torch.equal(r.part, want)
 
 
