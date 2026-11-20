@@ -22,7 +22,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | GLM-5.3 (MXFP4) | MI355X (gfx950) | 4, 8 | As GLM-5.3 |
 | Kimi-K3 | MI350X, MI355X (gfx950) | 8 | Every MoE layer in decode and DSpark verify steps of up to 8 rows |
 | Kimi-K3.1 | MI350X, MI355X (gfx950) | 8 | Kimi-K3's launches on every MoE layer in DSpark and DFLASH verify steps of one request (the MLA layers' projection front too, without DCP), and one launch a KDA layer in verify steps of 2 to 48 requests |
-| MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
+| MiniMax-M3 (MXFP4) | MI355X (gfx950) | 2, 4, 8 | Every sparse layer in decode and verify steps of 1–12 rows at TP2, 1–16 at TP4 and 5–16 at TP8; a step outside its TP size's range runs the model's own forward |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
 | Qwen3.5-397B-A17B-FP8 | MI355X (gfx950) | 4, 8 (MTP verify: 4) | Decode steps of up to 8 rows, and EAGLE/MTP target-verify steps of up to 8 requests x 4 draft tokens: every layer's norms, FP8 quants and dense projections, and the 45 GDN layers' conv and gated delta (two launches a GDN layer in decode, three in verify). Attention, the MoE and the MTP draft run SGLang's kernels. See [its README](sgl_amd_mono/qwen35_a17b/README.md) |
 | Qwen3.8-2.4T-A95B (MXFP4 experts) | MI355X (gfx950) | 8 | All 92 layers in decode steps of up to 8 rows, and the layer tail (K2) of all 92 in NEXTN verify steps of up to 8 rows |
@@ -58,13 +58,12 @@ pip install -e .
 ### Usage
 
 ```bash
-SGLANG_USE_AITER=1 AITER_BF16_FP8_MOE_BOUND=0 python -m sglang.launch_server \
+python -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4.1-Flash \
   --tp 4 \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \
   --fp8-gemm-backend aiter \
-  --enforce-shared-experts-fusion \
   --monokernel-backend amd
 ```
 
@@ -92,21 +91,19 @@ The MXFP4 checkpoint `amd/GLM-5.3-Quark-MXFP4-AttnFP8` serves with the same flag
 and so does `amd/GLM-5.2-MXFP4` (MXFP4 routed experts, the rest bf16), whose bf16
 matrices the kernels copy to FP8 once at startup (`sgl_amd_mono/glm53/README.md`).
 
-MiniMax-M3, with an EAGLE3 draft:
+MiniMax-M3, at TP2, TP4 or TP8:
 
 ```bash
-SGLANG_USE_AITER=1 SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1 python -m sglang.launch_server \
+SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=1 \
+SGLANG_USE_AITER=1 \
+SGLANG_M3_USE_AITER_SPARSE_PA=1 \
+SGLANG_M3_USE_AITER_PREFILL_INDEXER=1 \
+python -m sglang.launch_server \
   --model-path amd/MiniMax-M3-MXFP4 \
-  --tp 4 \
-  --quantization quark \
-  --attention-backend aiter \
-  --kv-cache-dtype fp8_e4m3 \
+  --tp 2 \
   --page-size 128 \
-  --speculative-algorithm EAGLE3 \
-  --speculative-draft-model-path Inferact/MiniMax-M3-EAGLE3-GQA \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
+  --kv-cache-dtype fp8_e4m3 \
+  --attention-backend aiter \
   --monokernel-backend amd
 ```
 
@@ -278,8 +275,7 @@ sgl-amd-mono/
 │   │   └── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
 │   ├── minimax_m3/
 │   │   ├── spec.py      # spec and forward
-│   │   ├── weights.py   # the layer views the kernels read
-│   │   └── gfx950/      # kernels and launch runner
+│   │   └── gfx950/      # kernels, weight views and launch runner
 │   ├── minimax_m31/
 │   │   ├── spec.py      # spec and forward
 │   │   ├── ffn.py       # the FFN launch (from vLLM)
