@@ -58,6 +58,7 @@ from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    CM_NT,
     bf2_f32,
     bf16_pair,
 )
@@ -83,6 +84,7 @@ from sgl_amd_mono.common.ops import wave_umax as _wave_umax
 from sgl_amd_mono.common.ops import xred as _xred
 from sgl_amd_mono.common.ops import xshfl as _xshfl
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple
+from sgl_amd_mono.common.sync import _spin
 
 from . import layout as LY
 from .config import (
@@ -102,12 +104,16 @@ from .config import (
     TOPK,
     MonoBuild,
 )
-from .device import spin
 from .layout import scratch_layout
 
 SOURCES = kernel_sources(__name__)
 
 POLL_MAX = 24
+# Cache policy of the one-touch weight streams (CM_NT: nontemporal, so they do not evict the mailbox lines and
+# reused data from L2 / MALL): MoE MXFP4 experts (+ scales), FP8 projections (in_proj, out_proj, qsa proj, o_proj).
+W_CM_MOE = CM_NT
+W_CM_F8 = CM_NT
+W_CM_BF16 = 0  # mixers / router / PLE / MTP: several CTAs re-read them; CM_NT measured ~1.7% slower
 NEG_INF = -3.0e38
 LDS_WORDS = 40448  # 158 KB arena (gfx950: 160 KB per CU)
 RED_OFF = 0  # MFMA accumulator exchange: [tile][column tile][wave][lane][4] f32
@@ -459,7 +465,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     return bad
 
                 # under the guard: a deadline, checked every CHECK_POLLS polls
-                v = spin(load_all, pending)
+                v = _spin(load_all, pending)
                 res, e = [], 0
                 for sp, ok in zip(specs, oks):
                     vals = [v[e + 2 * q] for q in range(sp[2])]
@@ -505,7 +511,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     act_off + tcol(ct) * stride + k_word + (lane // 16) * 4
                 )
 
-            def unit_bf16(w_rsrc, rg, kc, NKC, b_word, coef=None, subs=(0, 1)):
+            def unit_bf16(
+                w_rsrc, rg, kc, NKC, b_word, coef=None, subs=(0, 1), cm=W_CM_BF16
+            ):
                 """16 rows x 64 K (chunk kc; subs: its 32-K halves to use) of a packed bf16 weight."""
                 wv = [
                     (
@@ -516,6 +524,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 (((rg * NKC + kc) * 2 + sp) * 64 + lane) * 4,
                                 vec_width=4,
                                 dtype=T.i32,
+                                cache_modifier=cm,
                             )
                         ),
                     )
@@ -537,6 +546,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             + (lane % 16) * 4,
                             vec_width=4,
                             dtype=T.i32,
+                            cache_modifier=W_CM_F8,
                         )
                     )
                     for h in range(2)
@@ -565,6 +575,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         ((((rg // 2) * D + d) * 4 + lane // 16) * 16 + lane % 16),
                         vec_width=1,
                         dtype=T.i32,
+                        cache_modifier=W_CM_MOE,
                     )
                 )
 
@@ -581,13 +592,22 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         ((rg * (K // 128) + kc) * 64 + lane) * 4,
                         vec_width=4,
                         dtype=T.i32,
+                        cache_modifier=W_CM_MOE,
                     )
                 )
                 D = (K // 32 + 7) // 8
                 dw = (((rg // 2) * D + kc // 2) * 4 + lane // 16) * 16 + lane % 16
                 # sdw: the dword preloaded by the task (mxfp4a_sdw)
                 if const_expr(sdw is None):
-                    sdw = fx.Int32(bo.buffer_load(s_rsrc, dw, vec_width=1, dtype=T.i32))
+                    sdw = fx.Int32(
+                        bo.buffer_load(
+                            s_rsrc,
+                            dw,
+                            vec_width=1,
+                            dtype=T.i32,
+                            cache_modifier=W_CM_MOE,
+                        )
+                    )
                 sw = sdw.shrui(
                     fx.Int32(8) * (fx.Int32(2) * (fx.Int32(kc) % 2) + fx.Int32(rg) % 2)
                 )
@@ -3010,6 +3030,13 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     # (pos % 4 == 3) is compressed from its 4 members (batch members from LDS, older ones from the ring)
                     r_ring = _rsrc(ptr(layer, LY.P_RING))
                     r_rp = _rsrc(ptr(GI, LY.G_ROPEPOS))
+                    # The RoPE positions are one buffer for all layers. With ring <= L + 2 a batch token's
+                    # position lands in the start slot of a group that completes in the batch, which a later
+                    # QSA layer of the step reads: only the step's last QSA layer stores them, so every layer
+                    # reads the positions as they were before the step (layout.P_RP_STORE).
+                    rp_flag = (
+                        ptr(layer, LY.P_RP_STORE) if const_expr(ring <= L + 2) else None
+                    )
                     NK = L * 128
                     NIK = (NK + THREADS - 1) // THREADS
                     qks = [fx.min(tid + i * THREADS, NK - 1) for i in range(NIK)]
@@ -3042,7 +3069,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 r_ring,
                                 (req * ring + pos % ring) * 128 + tid,
                             )
-                        if tid < 3:
+                        rp_on = tid < 3
+                        if const_expr(rp_flag is not None):
+                            rp_on = rp_on & (rp_flag != fx.Int64(0))
+                        if rp_on:
                             bo.buffer_store(
                                 fx.Vector.from_elements(
                                     [
