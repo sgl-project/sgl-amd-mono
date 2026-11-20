@@ -173,6 +173,8 @@ SPEC = msgspec.structs.replace(
             "speculative_algorithm": frozenset({"DSPARK", "DFLASH"}),
             # K1 and the wide KDA stage read and write the ReplaySSM ring
             "enable_linear_replayssm_spec": frozenset({True}),
+            # Unset stays float32 via ReplaySSM. The launch addresses each slot as float32.
+            "mamba_ssm_dtype": frozenset({None, "float32"}),
         },
         hf_config={"model_type": "kimi_k31"},
     ),

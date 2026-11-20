@@ -129,7 +129,8 @@ def kda_table(
     launch's ``kda_tab``.
 
     ``conv_state`` [slot, channel, token] by its strides (SGLang's conv cache
-    [slot, CONV_W - 1, C] is its ``.mT``), read only. ``conv_win`` [row, L,
+    [slot, CONV_W - 1, C] is its ``.mT``), read only. ``rstate`` is the committed
+    KDA state, float32, addressed as 4-byte elements. ``conv_win`` [row, L,
     CONV_W - 1, C] (SGLang's ``intermediate_conv_window`` of the layer; channels
     contiguous) gets request r's verify windows at row ``win_row[r]`` (int32,
     < 0: none)."""
@@ -140,6 +141,9 @@ def kda_table(
         conv_win.stride(),
     )
     assert win_row.dtype == torch.int32 and win_row.is_contiguous()
+    assert rstate.dtype == torch.float32, (
+        f"KDA state is {rstate.dtype}, and the wide launch addresses it as float32"
+    )
     rk, rv, rg, rb = ring if ring is not None else (None,) * 4
     ptrs = dict(
         w_fb=w_fb,
