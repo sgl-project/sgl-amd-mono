@@ -174,6 +174,11 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
     monkeypatch.setattr(mamba_utils, "mamba2_state_dtype", _dtypes())
     monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: True)
     assert flash.SPEC.config_disable_reasons(_cfg(), FLASH) == []
+    # --mamba-ssm-dtype bfloat16
+    monkeypatch.setattr(
+        mamba_utils, "mamba2_state_dtype", _dtypes(temporal=torch.bfloat16)
+    )
+    assert flash.SPEC.config_disable_reasons(_cfg(), FLASH) == []
     kda = TEXT.linear_attn_config["kda_layers"]
     text = SimpleNamespace(
         **{
@@ -188,7 +193,7 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
         }
     )
     monkeypatch.setattr(
-        mamba_utils, "mamba2_state_dtype", _dtypes(temporal=torch.bfloat16)
+        mamba_utils, "mamba2_state_dtype", _dtypes(temporal=torch.float16)
     )
     # SGLang's k-pool writer keeps the index cache row-major; the kernels write tiles
     monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: False)
@@ -203,13 +208,34 @@ def test_config_reasons_name_each_mismatch(monkeypatch):
         "hidden_size = 4096",
         "moe_layer_freq = 1",
         "num_heads = 64",
-        "KDA state in f32",
+        "KDA state in f32 or bf16",
         "--page-size 64",
         "preshuffled layout",
         "Quark checkpoint",
     ):
         assert want in joined, joined
     assert len(reasons) == 7, reasons
+
+
+def test_the_state_dtype_is_the_pool_s_not_the_checkpoint_s(monkeypatch):
+    # SGLang allocates the pool with mamba2_state_dtype(None): a mamba_ssm_dtype in
+    # the checkpoint's config does not reach it
+    import sglang.srt.configs.mamba_utils as mamba_utils
+    import sglang.srt.layers.attention.dsa.utils as dsa_utils
+
+    seen = []
+
+    def dtypes(config):
+        seen.append(config)
+        return SimpleNamespace(temporal=torch.float32, conv=torch.bfloat16)
+
+    monkeypatch.setattr(mamba_utils, "mamba2_state_dtype", dtypes)
+    monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: True)
+    text = SimpleNamespace(**{**vars(TEXT), "mamba_ssm_dtype": "float16"})
+    config = SimpleNamespace(**{**vars(FLASH), "text_config": text})
+    assert flash.SPEC.config_disable_reasons(_cfg(), config) == []
+    assert flash._state_dtypes().temporal == torch.float32
+    assert seen == [None, None]
 
 
 @pytest.mark.parametrize(
@@ -705,3 +731,124 @@ def test_a_step_that_captures_hidden_states_hands_on_the_normed_rows(monkeypatch
         assert torch.equal(off.hidden.float()[:, 0], torch.tensor([45.0]))
     # the logits are the tail's either way
     assert torch.equal(on.out, off.out)
+
+
+def _build_keys(monkeypatch, temporal, widths=(2, 4, 8)):
+    """The build keys ``_build`` makes, on fake weights and runtimes, with the KDA
+    state pool in ``temporal``."""
+    import sglang.srt.configs.mamba_utils as mamba_utils
+    import sglang.srt.runtime_context as runtime_context
+
+    from sgl_amd_mono.glm53_flash.gfx950 import runner, weights
+
+    monkeypatch.setattr(mamba_utils, "mamba2_state_dtype", _dtypes(temporal=temporal))
+    group = SimpleNamespace(cpu_group=None)
+    monkeypatch.setattr(
+        runtime_context,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_size=4, tp_rank=0, tp_group=group),
+    )
+    monkeypatch.setattr(
+        runtime_context, "get_spec", lambda: SimpleNamespace(speculative_algorithm=None)
+    )
+    monkeypatch.setattr(
+        runtime_context,
+        "process_model_config",
+        lambda: SimpleNamespace(context_len=4096),
+    )
+    monkeypatch.setattr(
+        runtime_context, "get_device", lambda: SimpleNamespace(watchdog_timeout=300)
+    )
+    dsa = SimpleNamespace(fp8=(True,) * 3, shuffled=(False,) * 3)
+    monkeypatch.setattr(
+        weights, "dense_weights", lambda *a: SimpleNamespace(shuffled=False)
+    )
+    monkeypatch.setattr(weights, "layer_weights", lambda *a: None)
+    monkeypatch.setattr(weights, "kda_weights", lambda *a: None)
+    monkeypatch.setattr(weights, "dsa_weights", lambda *a: dsa)
+    monkeypatch.setattr(weights, "embed_weights", lambda *a: None)
+    monkeypatch.setattr(weights, "head_weights", lambda *a: None)
+    keys = []
+
+    class Runtime:
+        def __init__(self, key, *args):
+            keys.append(key)
+
+        def set_deadline(self, s):
+            pass
+
+        def precompile(self):
+            pass
+
+    monkeypatch.setattr(runner, "FlashRuntime", Runtime)
+    monkeypatch.setattr(runner, "FlashLayerOp", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "FlashHeadOp", lambda *a: None)
+    norm = SimpleNamespace(weight=torch.zeros(1))
+    lm = _Lm()
+    lm.model = SimpleNamespace(
+        layers=[
+            SimpleNamespace(is_linear_attn=i % 4 != 3, input_layernorm=norm)
+            for i in range(45)
+        ]
+    )
+    ctx = SimpleNamespace(widths=widths, copies={}, deadline_s=10.0)
+    flash._build(lm, FLASH, ctx)
+    return keys
+
+
+@_needs_gpu
+def test_a_bf16_state_pool_builds_every_kda_launch_for_a_bf16_state(monkeypatch):
+    # layer 0 (from the tokens), the dense layers and the KDA layers update a KDA
+    # state; the sparse-attention layers and the tail do not
+    def kind(k):
+        if k.head:
+            return "head"
+        if k.dsa:
+            return "dsa"
+        return "embed" if k.tokens else ("dense" if k.dense else "kda")
+
+    for temporal, bf16 in ((torch.float32, False), (torch.bfloat16, True)):
+        keys = _build_keys(monkeypatch, temporal)
+        assert {(k.rows, kind(k)) for k in keys} == {
+            (w, n) for w in (2, 4, 8) for n in ("embed", "dense", "kda", "dsa", "head")
+        }
+        for k in keys:
+            assert k.state_bf16 == (bf16 and kind(k) in ("embed", "dense", "kda")), k
+
+
+def _kda_cache(rec, ir, slots=3, heads=2, p3=6, rows=2, verify=4):
+    """SGLang's state_layer_cache of one KDA layer: the recurrent state in ``rec``,
+    the verify scratch in ``ir``."""
+    return SimpleNamespace(
+        conv=[torch.zeros(slots, 3, p3, dtype=torch.bfloat16)],
+        temporal=torch.zeros(slots, heads, 128, 128, dtype=rec),
+        intermediate_ssm=torch.zeros(rows, verify, heads, 128, 128, dtype=ir),
+        intermediate_conv_window=[
+            torch.zeros(rows, verify, 3, p3, dtype=torch.bfloat16)
+        ],
+    )
+
+
+@_needs_gpu
+def test_a_kda_layer_binds_an_f32_or_bf16_state_and_scratch_of_its_dtype():
+    attn = SimpleNamespace(conv_w=torch.zeros(6), a_log=torch.zeros(2))
+
+    def bind(rec, ir, verify):
+        L = flash._Layer(5, None, "kda", attn)
+        cache = _kda_cache(rec, ir)
+        backend = SimpleNamespace(state_layer_cache=lambda i: cache)
+        flash._Built._bind_kda(L, backend, verify)
+        return L.state, cache
+
+    for dtype in (torch.float32, torch.bfloat16):
+        for verify in (1, 4):
+            state, cache = bind(dtype, dtype, verify)
+            assert state.rec_state is cache.temporal
+            assert (state.inter_rec is cache.intermediate_ssm) == (verify > 1)
+    # a verify scratch in the other dtype; an f16 state
+    with pytest.raises(RuntimeError, match="verify scratch"):
+        bind(torch.bfloat16, torch.float32, 4)
+    with pytest.raises(RuntimeError, match="verify scratch"):
+        bind(torch.float32, torch.bfloat16, 4)
+    with pytest.raises(RuntimeError, match="KDA state"):
+        bind(torch.float16, torch.float16, 1)

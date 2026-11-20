@@ -1,5 +1,6 @@
 """The GLM-5.3-Flash servers that the monokernel serving test launches: MI35x, TP4,
-decode steps, and with ``MTP`` the NextN draft's verify steps."""
+decode steps, with ``MTP`` the NextN draft's verify steps, and with ``BF16_STATE``
+a bf16 KDA state."""
 
 import os
 
@@ -52,3 +53,6 @@ MTP = [
     "--speculative-num-draft-tokens",
     "4",
 ]
+# The KDA state pool in bf16 (f32 without it). SGLang's HIP prefill takes a bf16
+# state with sgl-project/sglang#49036; without it, its Triton prefill runs
+BF16_STATE = ["--mamba-ssm-dtype", "bfloat16"]
