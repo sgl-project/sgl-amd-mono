@@ -9,6 +9,7 @@ refactor proof against the sgl-project/sglang#43516 kernels, bit for bit
 import importlib.util
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from sglang.test.test_utils import CustomTestCase
 
 CHECKS = Path(__file__).with_name("qwen38_a95b_mxfp4")
 NE = 2  # experts: enough to catch a wrong expert stride
+CHAIN_CASES = 10  # len(CHAIN_CASES) of check_k2.py
 SGLANG_43516 = "sglang.kernels.ops.moe.qwen3_5_mono_flydsl"
 
 
@@ -124,6 +126,15 @@ class TestQwen38MoeK1(CustomTestCase):
 class TestQwen38MoeK2(CustomTestCase):
     def test_k2(self):
         self.assertEqual(_run("check_k2.py", "--replays", "200", ranks=8), 0)
+
+    def test_chain(self):
+        # a process a case: a launch that hangs stops only its own case
+        rcs = []
+        for n in range(CHAIN_CASES):
+            rcs.append(_run("check_k2.py", "--case", str(n), ranks=8))
+            if rcs[-1]:
+                time.sleep(30)  # the GPUs of the stopped launch come free
+        self.assertEqual(rcs, [0] * CHAIN_CASES)
 
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
