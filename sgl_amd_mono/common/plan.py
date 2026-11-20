@@ -20,9 +20,10 @@ from pathlib import Path
 import msgspec
 
 # ---------------------------------------------------------------- execution model
-BLOCKS = 256
+from sgl_amd_mono.common.arch import BLOCKS, WAVE  # noqa: E402
+
 THREADS = 512
-WAVES = THREADS // 64
+WAVES = THREADS // WAVE
 
 
 def first_task(bid, base):

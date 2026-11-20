@@ -66,7 +66,14 @@ def register_specs() -> None:
     except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         from sglang.srt.monokernels.spec import register
 
+    # SGLANG_AMD_MONO_MUSE_DRAFT=0: the Muse Spark DFlash2 draft is not registered, so SGLang runs the draft's own
+    # forward (a stack whose draft configuration the draft kernels do not read) while the target runs the kernels
+    skip = set()
+    if os.environ.get("SGLANG_AMD_MONO_MUSE_DRAFT", "1") == "0":
+        skip.add("sgl_amd_mono.muse_spark.draft:SPEC")
     for (architecture, model_type), path in SPECS.items():
+        if path in skip:
+            continue
         register(
             backend=BACKEND, architecture=architecture, path=path, model_type=model_type
         )

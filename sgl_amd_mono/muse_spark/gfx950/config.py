@@ -3,6 +3,8 @@
 
 import os
 
+from sgl_amd_mono.common.arch import GFX1250
+
 HIDDEN = 8192
 HEAD_DIM = 64
 LOCAL_Q_HEADS = 16  # 128 / TP8
@@ -45,4 +47,7 @@ MAX_TOKENS = 64  # C8 x 8 draft tokens
 WIDTHS = tuple(
     int(x) for x in os.environ.get("SGLANG_AMD_MONO_MUSE_WIDTHS", "8,16").split(",")
 )
-assert all(w in (8, 16, 32, 64) for w in WIDTHS) and WIDTHS, WIDTHS
+# (the gfx1250 build also serves plain decode steps, every width of 1 to 16 rows; this module is imported there
+# for the model constants)
+_ROWS = (*range(1, 17), 32, 64) if GFX1250 else (8, 16, 32, 64)
+assert all(w in _ROWS for w in WIDTHS) and WIDTHS, WIDTHS

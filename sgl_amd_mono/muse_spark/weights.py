@@ -9,8 +9,10 @@ at startup) on SGLang's ROCm Muse Spark modules, and only then are the views tak
 
 Everything is read in place except the copies logged at startup: a norm's
 effective weight (``weight + gain_center``) where the model has not cached it, a
-residual gate's alpha / beta where not precomputed, and the router's bf16 hi + lo
-split where the model did not pack it next to the pooler (``SGLANG_MUSE_JOINT_ROUTER_POOLER``).
+residual gate's alpha / beta where not precomputed as fp32, and (gfx950) the router's
+bf16 hi + lo split where the model did not pack it next to the pooler
+(``SGLANG_MUSE_JOINT_ROUTER_POOLER``). The gfx1250 kernels read the model's fp32
+router weight itself.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ QUANT_BF16 = os.environ.get("SGLANG_AMD_MONO_MUSE_QUANT_BF16", "0") == "1"
 # 0.958 / 0.967 over two seeds; the same build with them off 0.950): long reasoning cannot afford them
 FP8_DENSE = os.environ.get("SGLANG_AMD_MONO_MUSE_FP8_DENSE", "0") == "1"
 
+from sgl_amd_mono.common.arch import GFX1250
 from sgl_amd_mono.muse_spark import TP
 from sgl_amd_mono.muse_spark.gfx950.config import (
     EXPERTS,
@@ -238,12 +241,70 @@ def _attention_reasons(attn, i: int) -> list[str]:
     return why
 
 
+def gfx1250_packed_experts(experts):
+    """gfx1250: the MXFP4 experts in aiter's grouped A8W4 layout (``moe_shuffle_weight`` /
+    ``moe_shuffle_scale``: GU-interleaved w13, n32k4 scales), (w13, w2, s13, s2), or None. SGLang keeps them as
+    ``experts.gfx1250_a8w4`` (the stored tensors dropped); a MoE backend that shuffles the stored tensors in place
+    with the same two functions marks them ``flydsl1250_ready`` or ``w4a8_ready``."""
+    packed = getattr(experts, "gfx1250_a8w4", None)
+    if packed is not None and len(packed) == 5:
+        return tuple(packed[:4])
+    if getattr(experts, "flydsl1250_ready", False):
+        return (
+            experts.w13_weight.data,
+            experts.w2_weight.data,
+            experts.w13_weight_scale.data,
+            experts.w2_weight_scale.data,
+        )
+    if getattr(experts, "w4a8_ready", False):
+        # the same bytes in place (both preparations give identical storage); this backend keeps the scales as the
+        # [E, K / 32, N] transposed view of that storage, so the view back is the contiguous tensor the kernels
+        # address
+        s13, s2 = experts.w13_weight_scale.data, experts.w2_weight_scale.data
+        return (
+            experts.w13_weight.data,
+            experts.w2_weight.data,
+            s13 if s13.is_contiguous() else s13.transpose(-1, -2),
+            s2 if s2.is_contiguous() else s2.transpose(-1, -2),
+        )
+    return None
+
+
+def _gfx1250_expert_reasons(experts, i: int) -> list[str]:
+    """gfx1250: the MXFP4 experts as SGLang left them after loading, shuffled once into
+    aiter's gfx1250 layout (``gfx1250_packed_experts``). The kernels read those
+    in place, so only their bytes are checked (the layout is aiter's)."""
+    E, what = LOCAL_EXPERTS, f"layer {i} experts"
+    packed = gfx1250_packed_experts(experts)
+    if packed is None:
+        return [
+            f"{what}: no gfx1250 A8W4 layout (SGLANG_ROCM_MUSE_GFX1250_A8W4, or a MoE backend "
+            "that shuffles the stored tensors in place)"
+        ]
+    why = []
+    want = (
+        ("w13", E * 2 * INTER * MOE_HIDDEN // 2),
+        ("w2", E * MOE_HIDDEN * INTER // 2),
+        ("s13", E * 2 * INTER * MOE_HIDDEN // MXFP4_GROUP),
+        ("s2", E * MOE_HIDDEN * INTER // MXFP4_GROUP),
+    )
+    for t, (name, nbytes) in zip(packed, want):
+        got = t.numel() * t.element_size()
+        if not t.is_contiguous() or got != nbytes:
+            why.append(
+                f"{what} {name}: {got} bytes contiguous={t.is_contiguous()}, want {nbytes}"
+            )
+    return why
+
+
 def _experts_reasons(experts, i: int) -> list[str]:
     kind = type(experts).__name__
     if kind not in EXPERT_TYPES:
         return [
             f"layer {i}: experts {kind}, the kernels read Quark MXFP4 or bf16 experts"
         ]
+    if GFX1250 and kind == "MuseSpark1xMxfp4Experts":
+        return _gfx1250_expert_reasons(experts, i)
     E, what = LOCAL_EXPERTS, f"layer {i} experts"
     if kind == "MuseSpark1xNativeExperts":
         return _tensor_reasons(
@@ -366,12 +427,19 @@ def _effective_norm_weight(module, i: int, what: str, copies: dict) -> torch.Ten
 def _gate_coefficients(
     gate, i: int, what: str, copies: dict
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """A residual gate's (alpha, beta) fp32 [HIDDEN]: the precomputed ones, else a copy."""
-    if gate._alpha is not None and gate._beta is not None:
-        return gate._alpha.reshape(-1).float().contiguous(), gate._beta.reshape(
-            -1
-        ).float().contiguous()
+    """A residual gate's (alpha, beta) fp32 [HIDDEN]: the precomputed ones (read in place when they
+    are contiguous fp32, as SGLang precomputes them), else a copy kept in ``copies``."""
     keys = (("residual gate", i, what, "alpha"), ("residual gate", i, what, "beta"))
+    if gate._alpha is not None and gate._beta is not None:
+        out = []
+        for key, t in zip(keys, (gate._alpha, gate._beta)):
+            v = t.reshape(-1).float().contiguous()
+            if (
+                v.data_ptr() != t.data_ptr()
+            ):  # a conversion made a new tensor: logged with the copies
+                v = copies.setdefault(key, v)
+            out.append(v)
+        return out[0], out[1]
     if keys[0] not in copies:
         with torch.no_grad():
             alpha, beta = gate._coefficients(
@@ -444,8 +512,8 @@ class LayerViews(msgspec.Struct, frozen=True):
     alpha: torch.Tensor  # fp32 [HIDDEN]: the post-attention residual gate
     beta: torch.Tensor
     pre_w: torch.Tensor  # bf16 [HIDDEN]: pre_feedforward_layernorm (+1)
-    gate_hi: torch.Tensor  # bf16 [EXPERTS, HIDDEN]
-    gate_lo: torch.Tensor
+    gate_hi: object  # bf16 [EXPERTS, HIDDEN]: the router's hi / lo split (gfx950; None on gfx1250)
+    gate_lo: object
     bias: torch.Tensor  # fp32 [EXPERTS]
     w_pool: torch.Tensor  # bf16 [MOE_HIDDEN, HIDDEN]
     xn_w: torch.Tensor  # bf16 [MOE_HIDDEN]: pre_expert_norm (+1)
@@ -464,13 +532,17 @@ class LayerViews(msgspec.Struct, frozen=True):
     quantized: bool = False  # bf16 experts quantized online (kind is then "mxfp4")
     w_pool_fp8: object = None  # packed FP8 copy of w_pool (``pack_fp8_rows``), or None
     w_unpool_fp8: object = None  # packed FP8 copy of w_unpool, or None
+    w_router: object = None  # gfx1250: fp32 [HIDDEN, EXPERTS], the model's own router weight (no split, no copy)
 
     @staticmethod
     def build(layer, i: int, next_pre_norm, copies: dict) -> LayerViews:
         attn, moe, experts = layer.self_attn, layer.mlp, layer.mlp.experts
         kind = expert_kind(layer)
-        quantized = kind == "bf16" and QUANT_BF16
-        if quantized:
+        quantized = kind == "bf16" and QUANT_BF16 and not GFX1250
+        if kind == "mxfp4" and GFX1250:
+            # aiter's gfx1250 layout, read in place (``_gfx1250_expert_reasons``)
+            w13, w2, s13, s2 = gfx1250_packed_experts(experts)
+        elif quantized:
             w13, s13, w2, s2 = _quantized_experts(experts, i, copies)
             kind = "mxfp4"
         elif kind == "mxfp4":
@@ -483,7 +555,11 @@ class LayerViews(msgspec.Struct, frozen=True):
         alpha2, beta2 = _gate_coefficients(
             layer.post_feedforward_residual_gate, i, "post_feedforward", copies
         )
-        hi, lo = _router_hi_lo(moe, i, copies)
+        if GFX1250:
+            # the kernels read the model's fp32 router itself ([HIDDEN][EXPERTS]): no split, no copy
+            hi = lo = None
+        else:
+            hi, lo = _router_hi_lo(moe, i, copies)
         return LayerViews(
             layer_id=i,
             kind=kind,
@@ -524,12 +600,14 @@ class LayerViews(msgspec.Struct, frozen=True):
             beta2=beta2,
             npw=_effective_norm_weight(next_pre_norm, i, "next pre_attn_norm", copies),
             quantized=quantized,
+            # (never on gfx1250: no dense weight copies there)
             w_pool_fp8=_fp8_dense(moe.pre_expert_proj.weight, i, "pooler", copies)
-            if FP8_DENSE
+            if FP8_DENSE and not GFX1250
             else None,
             w_unpool_fp8=_fp8_dense(moe.post_expert_proj.weight, i, "unpooler", copies)
-            if FP8_DENSE
+            if FP8_DENSE and not GFX1250
             else None,
+            w_router=moe.router.weight.data if GFX1250 else None,
         )
 
 

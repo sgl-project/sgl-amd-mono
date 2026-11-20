@@ -23,17 +23,38 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
+from sgl_amd_mono.common.arch import GFX1250, WAVE
 from sgl_amd_mono.common.plan import THREADS, WAVES
 
-# gfx95x cache policy bits: SC1 = device scope, SC0 | SC1 = system scope (peers over XGMI)
-CM_DEV = 16
+if GFX1250:
+    # gfx12 CPol: SCOPE in bits 4:3 (2 = device, 3 = system), TH in bits 2:0 (1 = NT)
+    CM_DEV = 2 << 3
+    CM_SYS = 3 << 3
+    CM_NT = 1
+else:
+    # gfx95x cache policy bits: SC1 = device scope, SC0 | SC1 = system scope (peers over XGMI)
+    CM_DEV = 16
+    CM_SYS = 17
+    # NT = 2: nontemporal, for weights a layer reads once
+    CM_NT = 2
 
 
-CM_SYS = 17
+def wait_vmem():
+    """Wait for this wave's vector memory loads and stores (gfx950 ``vmcnt(0)``;
+    gfx1250 counts loads and stores apart)."""
+    if GFX1250:
+        rocdl.s_wait_loadcnt(0)
+        rocdl.s_wait_storecnt(0)
+    else:
+        rocdl.s_waitcnt(vmcnt=0)
 
 
-# NT = 2: nontemporal, for weights a layer reads once
-CM_NT = 2
+def wait_stores():
+    """Wait for this wave's vector memory stores (gfx950: all of ``vmcnt``)."""
+    if GFX1250:
+        rocdl.s_wait_storecnt(0)
+    else:
+        rocdl.s_waitcnt(vmcnt=0)
 
 
 def rsrc(addr, nbytes=None):
@@ -42,6 +63,7 @@ def rsrc(addr, nbytes=None):
 
 def permlane_swap(off, x, y):
     """v_permlane{32,16}_swap on registers (x, y); returns (x', y')."""
+    assert off == 16 or WAVE == 64, off
     swap = rocdl.permlane32_swap if off == 32 else rocdl.permlane16_swap
     pr = swap(
         llvm.StructType.get_literal([T.i32, T.i32]),
@@ -161,9 +183,9 @@ def div_rn(x, d, r):
 
 def xshfl(v, off):
     """Return the value of lane ``lane ^ off`` (power-of-two offsets only)."""
-    assert off in (1, 2, 4, 8, 16, 32), off
+    assert off in (1, 2, 4, 8, 16, 32) and off < WAVE, off
     if off >= 16:
-        return v.shuffle_xor(off, 64)
+        return v.shuffle_xor(off, WAVE)
     is_f = isinstance(v, fx.Float32)
     x = v.bitcast(fx.Int32) if is_f else fx.Int32(v)
     if off == 8:
@@ -203,12 +225,12 @@ def butterfly(v, offsets, op=_add):
 
 
 def wave_max(v):
-    return fx.coop.warp_reduce(v, fx.ReductionOp.MAX, width=64)
+    return fx.coop.warp_reduce(v, fx.ReductionOp.MAX, width=WAVE)
 
 
 def wave_umax(v):
     """Unsigned wave maximum, returned as i32 bits for packed routing keys."""
-    return fx.Int32(fx.coop.warp_reduce(fx.Uint32(v), fx.ReductionOp.MAX, width=64))
+    return fx.Int32(fx.coop.warp_reduce(fx.Uint32(v), fx.ReductionOp.MAX, width=WAVE))
 
 
 def global_ptr(addr, words=1):
@@ -219,8 +241,12 @@ def global_ptr(addr, words=1):
     )
 
 
+# the butterfly offsets of a whole-wave reduction, widest first
+WAVE_OFFSETS = (32, 16, 8, 4, 2, 1) if WAVE == 64 else (16, 8, 4, 2, 1)
+
+
 def wave_sum(v):
-    return butterfly(v, (32, 16, 8, 4, 2, 1))
+    return butterfly(v, WAVE_OFFSETS)
 
 
 def _xpartner(v, off, lane):
@@ -235,7 +261,7 @@ def _xpartner(v, off, lane):
 def wave_incl_scan(v, lane):
     """Inclusive prefix sum of an Int32 over the wave, in lane order."""
     blk = v
-    for off in (1, 2, 4, 8, 16, 32):
+    for off in WAVE_OFFSETS[::-1]:
         o = _xpartner(blk, off, lane)
         v = v + ((lane & off) != 0).select(o, 0)
         blk = blk + o
@@ -248,7 +274,7 @@ def block_excl_scan(v, lane, wave, buf):
     needs WAVES words."""
     incl = wave_incl_scan(v, lane)
     gpu.barrier()
-    if lane == 63:
+    if lane == WAVE - 1:
         fx.ptr_store(incl, buf + wave)
     gpu.barrier()
     off = fx.Int32(0)
@@ -306,6 +332,18 @@ def mfma_bf16(a, b, c):
     return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
 
 
+def wmma_bf16(a, b, c):
+    """gfx1250 ``v_wmma_f32_16x16x32_bf16``: a, b = 16 bf16 a lane (lane % 16 = M or N,
+    lanes 16-31 the other half of K), c = 8 fp32 a lane (element r of lane l is
+    M = r + 8 (l / 16), N = l % 16). The K a (lane half, element) holds is the caller's
+    choice as long as a and b agree: the sum runs over all 32."""
+    return fx.Vector(
+        rocdl.wmma_f32_16x16x32_bf16_(
+            T.vec(8, T.f32), as_ir_value(a), as_ir_value(b), as_ir_value(c)
+        )
+    )
+
+
 def row_sum(red, r, t, waves=None):
     """Return row r, token t of the waves' MFMA accumulators, summed in wave order."""
     tot = fx.Float32(0.0)
@@ -314,8 +352,20 @@ def row_sum(red, r, t, waves=None):
     return tot
 
 
+def wmma_row_sum(red, r, t, waves=None):
+    """Row r, token t of the waves' WMMA accumulators in LDS, summed in wave order:
+    wave w's tile at ``red + w * WAVE * 8``, lane l's 8 floats contiguous
+    (``fx.ptr_store(acc, red + (w * WAVE + l) * 8)``)."""
+    tot = fx.Float32(0.0)
+    for w in waves if waves is not None else range(WAVES):
+        tot = tot + fx.ptr_load(red + ((w * WAVE + 16 * (r // 8) + t) * 8 + r % 8))
+    return tot
+
+
 def ballot(pred):
-    """The wave's lanes where ``pred`` holds, a bit a lane."""
+    """The wave's lanes where ``pred`` holds, a bit a lane (wave32: the low 32 bits)."""
+    if GFX1250:
+        return fx.Int64(fx.Uint32(rocdl.ballot(T.i32, pred)))
     return fx.Int64(rocdl.ballot(T.i64, pred))
 
 
@@ -370,7 +420,13 @@ def fp8_pack4(a, b, c, d):
 
 # ---------------------------------------------------------------- TP ranks
 def peer_bases(peers, tp):
-    """Load every rank's peer buffer base from the ``peers`` table once."""
+    """Load every rank's peer buffer base from the ``peers`` table once.
+
+    gfx1250: scalar loads. LLVM rematerializes the bases at each push rather than keep
+    them live; a scalar reload waits on ``kmcnt`` only, where a vector reload's
+    ``s_wait_loadcnt 0`` would also drain every weight load in flight."""
+    if GFX1250:
+        return [sload64(fx.Int64(peers) + fx.Int64(8 * p)) for p in range(tp)]
     return [load_ptr64(peers, p) for p in range(tp)]
 
 
@@ -416,8 +472,11 @@ def bpermute_i32(byte_offset, value):
 
 
 def clock():
-    """Read the device-wide 64-bit realtime counter."""
-
+    """Read the device-wide 64-bit realtime counter (100 MHz)."""
+    if GFX1250:  # no s_memrealtime: the steady counter is the same 100 MHz clock
+        return fx.Int64(
+            llvm.call_intrinsic(T.i64, "llvm.readsteadycounter", [], [], [])
+        )
     return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
 
 
@@ -438,6 +497,9 @@ def f8_word(k):
 
 def fp8_to_bf16x8(word0, word1):
     """Convert two dwords of eight FP8 values to a BF16 vector."""
+    if GFX1250:
+        # no cvt_scalef32_pk_bf16_fp8 there: v_cvt_f32_fp8 a byte (exact), then bf16 (exact for E4M3)
+        return fp8_words_to_bf16([word0, word1])
 
     one = as_ir_value(fx.Float32(1.0))
     parts = []
@@ -450,6 +512,26 @@ def fp8_to_bf16x8(word0, word1):
             )
             parts += [pair[0], pair[1]]
     return fx.Vector.from_elements(parts, fx.BFloat16)
+
+
+def fp8_words_to_bf16(words):
+    """The FP8 E4M3 bytes of ``words`` (i32, little-endian byte order) as one bf16 vector
+    (gfx1250: ``v_cvt_f32_fp8`` a byte, exact, then bf16, exact for three mantissa bits)."""
+    vals = []
+    for w in words:
+        for b in range_constexpr(4):
+            vals.append(
+                fx.Float32(
+                    llvm.call_intrinsic(
+                        T.f32,
+                        "llvm.amdgcn.cvt.f32.fp8",
+                        [as_ir_value(fx.Int32(w)), as_ir_value(fx.Int32(b))],
+                        [],
+                        [],
+                    )
+                )
+            )
+    return fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16)
 
 
 def mxfp4_to_bf16x8(word, scale):
