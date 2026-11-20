@@ -11,10 +11,10 @@ the tail (79 launches); ``model`` its MoE layers 3 to 77 (18 indexer and 57 shar
 launches); ``embed`` layer 0 alone and ``head`` the tail alone; ``shared``, ``index``
 and ``dense`` run ``--layers`` launches of one kind; ``nextn_index`` and ``nextn_shared``
 one NextN launch a step (``check_nextn.py``'s draft layer; the spec serves the first at
-4 and 8 rows, the second at 2, 4 and 8). The rows are those of the served decode
+4 to 16 rows, the second at 2 and 4). The rows are those of the served decode
 points at ``--pos``: one request and a pad row at 2 rows (one request without MTP),
-one request's 4 verify rows at 4 (MTP, one request), two requests' at 8 (MTP, two
-requests). After an eager step and 20 warm-up replays, each of ``--trials`` trials
+and at 4, 8, 12 and 16 rows the 4 verify rows of each of 1 to 4 requests (MTP).
+After an eager step and 20 warm-up replays, each of ``--trials`` trials
 replays the graph ``--reps`` times; rank 0 prints per-launch microseconds (trial
 time / (reps x launches)): the median, minimum and maximum over trials, the slowest
 rank's median, and whether every error word stayed clean."""

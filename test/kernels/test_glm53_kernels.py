@@ -2,11 +2,12 @@
 #43949), under torchrun at TP4 and TP8 (``glm53/check_layer.py``), at every width the
 spec builds at that TP size: each launch kind finishes on every rank with no error
 word and the same output, on the bf16 and the E4M3 MLA cache, and writes exactly its
-live rows' cache rows (none of a pad row's); a graph of the model order's first
-launches, and of layer 0, the dense layers, the first MoE layers and the tail,
-replays the eager step bitwise, for one request a row and for verify rows; every
-selected token of a row past 2048 keys is a pair tagged with its indexer launch's
-tag that holds the slot the launch publishes; a dense layer's MLP and the tail's
+live rows' cache rows (none of a pad row's); a step of 2 to 4 requests' verify rows
+equals a 4-row launch of each request (FP8 and MXFP4 MLPs); a graph of the model
+order's first launches, and of layer 0, the dense layers, the first MoE layers and
+the tail, replays the eager step bitwise, for one request a row and for verify rows;
+every selected token of a row past 2048 keys is a pair tagged with its indexer
+launch's tag that holds the slot the launch publishes; a dense layer's MLP and the tail's
 logits are within the spec's bounds against f32 references, and fail them with a
 scale or the final norm off; layer 0 from the token ids equals the dense launch fed
 the gathered embedding rows; every indexer row's list is the exact top-k of the
@@ -41,7 +42,7 @@ TOPK = Path(__file__).with_name("glm53") / "check_topk.py"
 NEXTN = Path(__file__).with_name("glm53") / "check_nextn.py"
 MXFP4 = Path(__file__).with_name("glm53") / "check_mxfp4.py"
 # the widths the spec builds at each TP size
-WIDTHS = {4: "2,4,8", 8: "2,4,8"}
+WIDTHS = {4: "2,4,8,12", 8: "2,4,8,12,16"}
 
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
@@ -87,6 +88,25 @@ class TestMonoGlm53Kernels(CustomTestCase):
         self._check(
             "--kind", "full", "--launches", "7", "--replays", "20", "--rowsets", "p1,v4"
         )
+
+    def test_a_wide_step_s_rows_equal_4_row_launches_on_them(self):
+        # each request's 4 verify rows of a step of 2 to 4 requests (the widths past
+        # 4 rows) against a 4-row launch of that request, bitwise, on FP8 and MXFP4
+        # MLPs
+        for mlp in ((), ("--mxfp4",)):
+            self._check(
+                "--kind",
+                "model",
+                "--launches",
+                "4",
+                "--rowsets",
+                "v4",
+                "--kv",
+                "fp8",
+                "--split-check",
+                "4",
+                *mlp,
+            )
 
     def test_dense_mlp_within_its_bounds(self):
         for kv in ("bf16", "fp8"):

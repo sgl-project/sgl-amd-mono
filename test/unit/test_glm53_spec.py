@@ -112,7 +112,29 @@ KINDS = ("embed", "dense", "index", "shared", "head")
 
 def test_a_step_runs_at_the_next_width():
     # a one-row launch never completes on gfx950: one row runs at width 2
-    assert [glm53._width(r) for r in glm53.ROWS] == [2, 2, 4, 4, 8, 8, 8, 8]
+    assert [glm53._width(r) for r in glm53.ROWS] == (
+        [2, 2, 4, 4] + [8] * 4 + [12] * 4 + [16] * 4
+    )
+
+
+def test_tp4_launches_take_12_rows_and_a_wider_step_runs_the_model_s_forward():
+    # TP4's 16 heads a rank: a 16-row launch outgrows the LDS
+    assert glm53.tp_widths(4) == (2, 4, 8, 12) and glm53.tp_widths(8) == glm53.WIDTHS
+    assert [glm53._width(r, glm53.tp_widths(4)) for r in range(1, 13)] == (
+        [2, 2, 4, 4] + [8] * 4 + [12] * 4
+    )
+    lm = _Lm()
+    runtimes = {(w, k): None for w in glm53.tp_widths(4) for k in KINDS}
+    built = _built(lm, {}, runtimes)
+    assert built.widths == (2, 4, 8, 12) and built.max_rows == 12
+    # 4 requests' MTP3 verify rows, and a decode step of 13 requests
+    for mode, requests, tokens in (("target_verify", 4, 4), ("decode", 13, 1)):
+        key = registry.ShapeKey(
+            forward_mode=mode, batch_size=requests, tokens_per_request=tokens
+        )
+        out = built.forward(registry.Plan(key=key), "ids", "positions", "batch")
+        assert out == "the model's forward"
+    assert len(lm.ran) == 2
 
 
 def test_a_step_from_embeddings_runs_the_model_s_forward():

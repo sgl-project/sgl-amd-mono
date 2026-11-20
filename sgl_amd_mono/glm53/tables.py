@@ -43,13 +43,15 @@ def _step_rows(
     S,
     max_position,
     W: tl.constexpr,
+    WP: tl.constexpr,
     K: tl.constexpr,
     IDS: tl.constexpr,
     SEED: tl.constexpr,
     SEED_BY_POSITION: tl.constexpr,
 ):
     s = tl.program_id(0)
-    r = tl.arange(0, W)
+    # tl.arange takes a power of two: rows W ..< WP are past the step
+    r = tl.arange(0, WP)
     in_step = r < S
     slot = tl.load(loc + r * loc_stride, mask=in_step, other=0).to(tl.int64)
     live = in_step & (slot != 0)
@@ -78,7 +80,7 @@ def _step_rows(
         tl.store(ids + r, tl.where(in_step, tok, -1).to(tl.int32), mask=mine)
     if s == 0:
         tl.store(indptr, 0)
-        tl.store(indptr + 1 + r, ends)
+        tl.store(indptr + 1 + r, ends, mask=r < W)
     if SEED:
         j = tl.arange(0, K)
         row_live = tl.sum(tl.where(mine, live.to(tl.int32), 0), axis=0) > 0
@@ -139,6 +141,7 @@ def step_rows(
         S,
         max_position,
         W=W,
+        WP=triton.next_power_of_2(W),
         K=TOPK,
         IDS=ids is not None,
         SEED=seed is not None,
