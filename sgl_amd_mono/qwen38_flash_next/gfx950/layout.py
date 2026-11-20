@@ -173,6 +173,13 @@ P_IP_S, P_OUT_S, P_BA_S = 32, 33, 34
 # QSA: SGLang keeps qkv_proj and indexer.index_qk_proj as separate FP8 params (rows
 # [0, 832 * 16) / the rest of QP)
 P_IP2, P_IP2_S = 35, 36
+# QSA: nonzero in the one QSA layer of a step that stores the batch's index-key RoPE
+# positions (G_ROPEPOS is one buffer for all layers, SGLang's layer-independent
+# qsa_rope_position_buffer): with a ring of <= L + 2 slots a request (SGLang's 4),
+# a batch token's store lands in the start slot of a group that completes in the
+# batch, which a later QSA layer of the step would read (the verify's last QSA
+# layer; the draft's layer)
+P_RP_STORE = 37
 QP_RG_QKV = (24 * 512 + 512 + 512) // 16  # 832
 BA_ROWS = 128  # SGLang pads in_proj_ba (96 rows) to 128 for AITER's CK GEMM
 # global row (index n_layers of the table)
