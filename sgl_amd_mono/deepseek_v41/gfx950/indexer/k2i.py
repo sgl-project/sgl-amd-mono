@@ -25,11 +25,11 @@ _STREAM = fx.Stream(None)
 MAX_ROWS = 48  # a step's rows at most (8 DSpark requests of 6)
 
 
-def build_k2i(tokens: int):
-    """K2i for a step of ``tokens`` rows."""
+def build_k2i(tokens: int, page8: bool = False):
+    """K2i for a step of ``tokens`` rows; ``page8``: on a page8 pool's plane (``score_fp4``)."""
     assert 0 < tokens <= MAX_ROWS, tokens
-    name = kernel_symbol("dsv41_mono_k2i", s=tokens)
-    keyed = (("tokens", tokens), ("sources", SOURCES))
+    name = kernel_symbol("dsv41_mono_k2i", s=tokens, **({"p8": 1} if page8 else {}))
+    keyed = (("tokens", tokens), ("page8", page8), ("sources", SOURCES))
 
     @fx.struct
     class RowsLds:
@@ -55,7 +55,7 @@ def build_k2i(tokens: int):
         }  # fmt: skip
         c = {
             "tid": tid, "lane": tid % 64, "wave": tid // 64, "args": args,
-            "rows_lds": lds.rows.ptr,
+            "rows_lds": lds.rows.ptr, "page8": page8,
         }  # fmt: skip
         run_scores4(c, tokens, fx.block_idx.x)
 
