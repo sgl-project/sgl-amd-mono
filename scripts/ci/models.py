@@ -41,6 +41,7 @@ CHECKPOINTS = [
         "Inferact/MiniMax-M3-EAGLE3-GQA",
         "MiniMaxAI/MiniMax-M3.1-Flash",
         "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+        "amd/Qwen3.8-Flash-Next-Quark-MXFP4",
         "amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8",
         "amd/Qwen3.8-2.4T-A95B-Quark-MXFP4",
         "amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4",
@@ -347,6 +348,27 @@ MODELS = {
         # NEXTN verify steps of 4 rows a request, up to 8 requests
         "concurrency": [1, 2, 4, 8, 16],
         "gate_concurrency": [1, 8],
+    },
+    "qwen38_flash_next_tp2": {
+        "name": "Qwen3.8-Flash-Next (MXFP4, TP2 decode)",
+        "packages": ["qwen38_flash_next"],
+        "tp": 2,
+        "paths": {
+            "QWEN38_FLASH_NEXT_MXFP4_MODEL_PATH": f"{HF}/amd/Qwen3.8-Flash-Next-Quark-MXFP4"
+        },
+        "recipe": ("qwen38_flash_next_decode_server", "ARGS"),
+        "kernel_tests": [
+            "test/kernels/test_qwen38_flash_next_wide_stages.py",
+            "test/kernels/test_qwen38_flash_next_wide_exchange.py",
+        ],
+        "e2e_tests": ["test/e2e/test_qwen38_flash_next_decode_server.py"],
+        "microbench": [
+            "torchrun --nproc-per-node 2 test/kernels/qwen38_flash_next/time_layers.py --kind model --rows 1,16,64,192"
+        ],
+        "evals": TEXT_EVALS,
+        # decode steps of 1 to 192 rows
+        "concurrency": [1, 4, 16, 64, 128, 192],
+        "gate_concurrency": [1, 64],
     },
     "muse_spark": {
         "name": "Muse-Spark",
