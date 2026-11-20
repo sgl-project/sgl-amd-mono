@@ -159,6 +159,7 @@ LATE0 = EARLY  # route from here
 H_CTA = LATE0 + 8  # the shared experts' SiTU
 SPARE0 = H_CTA + 8  # 196: CTAs with no early task run the shared down first
 SD_TASKS = HIDDEN // ROWS  # 448
+W_SD_BYTES = HIDDEN * SI * 2  # w_sd [HIDDEN, SI], as a resource bound
 UP_N = HIDDEN // TP  # 896 columns a rank up-projects
 UP_TASKS = UP_N // ROWS  # 56
 LN_TASKS = LAT // 128  # 28
@@ -169,6 +170,11 @@ UG_GROUPS = RI // 32  # 12
 W13_K = LAT  # 3584
 W13_STEPS = W13_K // 128  # 28
 W2_STEPS = RI // 128  # 3
+# the MXFP4 expert weights' exact sizes, as resource bounds: a dead slot (a
+# prefetch past the last task) reads past them, so the hardware returns zeros
+# with no memory request instead of re-reading the last live slot's tiles
+W13_BYTES = E * 2 * RI * W13_K // 2
+W2_BYTES = E * LAT * RI // 2
 DOWN_TASKS = LAT // ROWS  # 224
 DOWN_BATCH = 5  # a wave's experts whose w2 is in flight together
 MAX_U = 8 * TOPK
@@ -463,16 +469,18 @@ def early_loads(c, kind, i, q):
         row0 = c["rank"] * (LAT // TP) + i * 2 * ROWS
         return [
             gemv.loads(c["lane"], c["wave"], a["w_ld"], row0 + h * ROWS, klen,
-                       ldk=HIDDEN, k0=q * klen)
+                       ldk=HIDDEN, k0=q * klen, nbytes=LAT * HIDDEN * 2)
             for h in range(2)
         ]  # fmt: skip
     if kind == 0:
-        w, row0 = a["w_gate"], c["rank"] * (E // TP) + i * ROWS
+        w, row0, wb = a["w_gate"], c["rank"] * (E // TP) + i * ROWS, E * HIDDEN * 2
     elif kind == 1:
-        w, row0 = a["w_ld"], c["rank"] * (LAT // TP) + i * ROWS
+        w, row0, wb = a["w_ld"], c["rank"] * (LAT // TP) + i * ROWS, LAT * HIDDEN * 2
     else:
-        w, row0 = a["w_sgu"], i * ROWS
-    return gemv.loads(c["lane"], c["wave"], w, row0, klen, ldk=HIDDEN, k0=q * klen)
+        w, row0, wb = a["w_sgu"], i * ROWS, 2 * SI * HIDDEN * 2
+    return gemv.loads(
+        c["lane"], c["wave"], w, row0, klen, ldk=HIDDEN, k0=q * klen, nbytes=wb
+    )
 
 
 @flyc.jit
@@ -1091,9 +1099,11 @@ def ug_row_group(c, g, wave):
     return 2 * j + up if c["guint"] else up * (RI // ROWS) + j
 
 
-def ug_loads(c, task):
+def ug_loads(c, task, live=None):
     """Task ``task``'s w13 operands for this wave (its row group, its K half)
-    and their scale words: issued a task ahead (``stage_ug`` takes them)."""
+    and their scale words: issued a task ahead (``stage_ug`` takes them).
+    ``live``: false on the prefetch past the last task (the loop drops it) --
+    its tiles are then read past w13's bound, which costs no memory request."""
     lane, wave = c["lane"], c["wave"]
     a, rt = c["args"], c["rt"]
     slot = task // UG_GROUPS
@@ -1101,8 +1111,12 @@ def ug_loads(c, task):
     e = uniform(fx.ptr_load(rt["expert"] + slot))
     half = wave // 4
     rg = ug_row_group(c, g, wave)
-    r_w = rsrc(a["w13"])
+    r_w = rsrc(a["w13"], W13_BYTES)
     base = e * (2 * RI * W13_K // 8)
+    if live is not None:
+        # wave-uniform: the address stays scalar (a vector base costs more than
+        # the dead load it saves)
+        base = uniform(live.select(base, fx.Int32(W13_BYTES // 4)))
     steps = [half * (W13_STEPS // 2) + i for i in range(W13_STEPS // 2)]
     av = [fp4_tile_load(r_w, base, rg, W13_K, st, lane * 4) for st in steps]
     r_s = rsrc(a["w13s"])
@@ -1278,14 +1292,24 @@ def poll_inter(c, pick, kb):
 
 def down_loads(c, rgd, nu, b0):
     """The w2 tiles and scale codes of a wave's batch from slot b0 (slots b0,
-    b0 + 8, ...; past |U| the last slot's): flat, ``stage_down`` unpacks."""
+    b0 + 8, ...): flat, ``stage_down`` unpacks. ``b0`` is not clamped, so a slot
+    past |U| -- which ``stage_down`` never folds in -- reads past w2's bound and
+    makes no memory request, instead of re-reading the last slot's tiles."""
     lane = c["lane"]
-    r_w = rsrc(c["args"]["w2"])
+    r_w = rsrc(c["args"]["w2"], W2_BYTES)
     rt = c["rt"]
     slots = [fx.min(b0 + WAVES * j, nu - 1) for j in range(DOWN_BATCH)]
     es = [uniform(fx.ptr_load(rt["expert"] + sl)) for sl in slots]
+    bases = [
+        uniform(
+            ((b0 + WAVES * j) < nu).select(
+                es[j] * (LAT * RI // 8), fx.Int32(W2_BYTES // 4)
+            )
+        )
+        for j in range(DOWN_BATCH)
+    ]
     av = [
-        fp4_tile_load(r_w, es[j] * (LAT * RI // 8), rgd, RI, st, lane * 4)
+        fp4_tile_load(r_w, bases[j], rgd, RI, st, lane * 4)
         for j in range(DOWN_BATCH)
         for st in range(W2_STEPS)
     ]
@@ -1315,7 +1339,7 @@ def stage_down(c, rgd, nu, ops0):
     ops = ops0
     while b0 < nu:
         nb = b0 + WAVES * DOWN_BATCH
-        ops_n = down_loads(c, rgd, nu, fx.min(nb, nu - 1))
+        ops_n = down_loads(c, rgd, nu, nb)
         slots = [fx.min(b0 + WAVES * j, nu - 1) for j in range(DOWN_BATCH)]
         for j in range_constexpr(DOWN_BATCH):
             live = (b0 + WAVES * j) < nu
@@ -1477,7 +1501,10 @@ def run_sdown(c, bid, w_sd):
     if bid >= DOWN_TASKS:
         for k in range(bid - DOWN_TASKS, UP_TASKS, BLOCKS - DOWN_TASKS):
             j = (k + lo) % SD_TASKS
-            stage_sdown(c, j, gemv.loads(c["lane"], c["wave"], w_sd, j * ROWS, SI))
+            ops = gemv.loads(
+                c["lane"], c["wave"], w_sd, j * ROWS, SI, nbytes=W_SD_BYTES
+            )
+            stage_sdown(c, j, ops)
 
 
 @flyc.jit
@@ -1494,8 +1521,8 @@ def run_sdown_first(c, bid, w_sd):
         k1 = fx.min(k0 + nsd, UP_TASKS - 1)
         j0 = (k0 + lo) % SD_TASKS
         j1 = (k1 + lo) % SD_TASKS
-        ops0 = gemv.loads(c["lane"], c["wave"], w_sd, j0 * ROWS, SI)
-        ops1 = gemv.loads(c["lane"], c["wave"], w_sd, j1 * ROWS, SI)
+        ops0 = gemv.loads(c["lane"], c["wave"], w_sd, j0 * ROWS, SI, nbytes=W_SD_BYTES)
+        ops1 = gemv.loads(c["lane"], c["wave"], w_sd, j1 * ROWS, SI, nbytes=W_SD_BYTES)
         load_h(c)
         stage_sdown(c, j0, ops0)
         if k0 + nsd < UP_TASKS:
@@ -1513,7 +1540,10 @@ def run_sdown_rest(c, bid, w_sd):
         lo = c["rank"] * UP_TASKS
         for k in range(UP_TASKS + bid - r0, SD_TASKS, BLOCKS - r0):
             j = (k + lo) % SD_TASKS
-            stage_sdown(c, j, gemv.loads(c["lane"], c["wave"], w_sd, j * ROWS, SI))
+            ops = gemv.loads(
+                c["lane"], c["wave"], w_sd, j * ROWS, SI, nbytes=W_SD_BYTES
+            )
+            stage_sdown(c, j, ops)
 
 
 # ---------------------------------------------------------------- lnorm / up / reduce
@@ -1584,7 +1614,7 @@ def stage_up(c, j):
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
     row0 = c["rank"] * UP_N + j * ROWS  # the hidden column; w_up is the shard
-    ops = gemv.loads(lane, wave, a["w_up"], j * ROWS, LAT)
+    ops = gemv.loads(lane, wave, a["w_up"], j * ROWS, LAT, nbytes=UP_N * LAT * 2)
     if const_expr(c.get("batch", False)):
         # thread 0's two flags in one round trip
         if tid == 0:
@@ -1884,12 +1914,12 @@ def build(key: MoeBuild):
         # reversed placement: the round's leftover tasks go to the high CTAs,
         # whose early work ends first (the AttnRes / route CTAs start ug last)
         task = BLOCKS - 1 - bid
-        ops = ug_loads(c, fx.min(task, last))
+        ops = ug_loads(c, fx.min(task, last), task < total)
         while task < total:
             nxt = task + BLOCKS
             # the next task's weights in flight under this one's MFMAs and
-            # epilogue (past the end: the last task's, cache hits)
-            ops_n = ug_loads(c, fx.min(nxt, last))
+            # epilogue (past the end: a dead load, see ug_loads)
+            ops_n = ug_loads(c, fx.min(nxt, last), nxt < total)
             stage_ug(c, task, ops)
             task = nxt
             ops = ops_n
@@ -1899,7 +1929,7 @@ def build(key: MoeBuild):
             return
         if bid < DOWN_TASKS:
             # the first w2 batch in flight before INTER (every ug) is waited for
-            dops = down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
+            dops = down_loads(c, bid, nu, c["wave"])
             load_inter(c)
             stage_down(c, bid, nu, dops)
         run_sdown_rest(c, bid, w_sd)

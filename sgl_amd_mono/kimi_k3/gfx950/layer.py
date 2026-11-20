@@ -21,7 +21,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 import torch
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import const_expr
 from flydsl.expr.typing import Int32, Int64
 
 from sgl_amd_mono.common import guard
@@ -47,7 +47,6 @@ from sgl_amd_mono.kimi_k3.gfx950.stages import oproj as k2a
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HIDDEN, NA
 from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
     slice_loads,
-    stage_gate,
     stage_mix,
     stage_slice,
 )
@@ -60,10 +59,12 @@ from sgl_amd_mono.kimi_k3.gfx950.tag import step_tag
 
 SOURCES = kernel_sources(__name__)
 
-O0, O1 = NA, BLOCKS  # o_proj CTAs: every CTA past AttnRes's
+O0, O1 = NA, BLOCKS  # the early-task CTAs: every CTA past AttnRes's
 O_N = O1 - O0  # 200
 OTASKS = k2a.OTASKS  # 448
-O_ROUNDS = (OTASKS + O_N - 1) // O_N  # 5
+O_ROUNDS = 2  # o_proj on every CTA: 2 rounds of 256 (the AttnRes CTAs take one)
+O_SKIP = O_ROUNDS * BLOCKS - OTASKS  # 64: the CTAs with one task only
+assert NA <= O_SKIP < BLOCKS  # every AttnRes CTA in the light group
 E0 = 160  # router / latent CTAs (their weights in flight under their o_proj)
 H0 = 8  # the shared SiTU's CTAs (after their AttnRes work)
 SD0 = k2b.DOWN_TASKS  # 224: the shared down's CTAs
@@ -235,15 +236,22 @@ def scratch_bytes(key: K2Build) -> int:
 
 
 @flyc.jit
-def stage_oproj(c, gi):
-    """o_proj tasks gi, gi + 200, gi + 400 (< 448): every task's weights in
-    flight at once (one memory latency, not three), then the MFMAs."""
-    ops = [k2a.o_loads(c, fx.min(gi + O_N * j, OTASKS - 1)) for j in range(O_ROUNDS)]
+def stage_oproj(c, bid):
+    """o_proj tasks ``bid`` and ``bid + 192``, the second only on the CTAs past
+    O_SKIP: the 448 tasks over all 256 CTAs, each covered once. Both tasks'
+    weights are in flight at once (one memory latency, not two), then the MFMAs.
+    The light CTAs are 0 .. 63, which is where AttnRes's sit: they reach their
+    all-reduce poll after one task, not two."""
+    t0 = bid
+    # a light CTA repeats its own task in the dead slot: the lines are in cache,
+    # so no second pass over w_o rows (its MFMAs never run)
+    second = bid >= O_SKIP
+    t1 = second.select(bid + (BLOCKS - O_SKIP), bid)
+    ops = [k2a.o_loads(c, t0), k2a.o_loads(c, t1)]
     k2a.load_core(c)
-    for j in range_constexpr(O_ROUNDS):
-        t = gi + O_N * j
-        if t < OTASKS:
-            k2a.stage_o(c, t, ops[j])
+    k2a.stage_o(c, t0, ops[0])
+    if second:
+        k2a.stage_o(c, t1, ops[1])
 
 
 _BUILDS: dict = {}
@@ -403,7 +411,7 @@ def build(key: K2Build):
                 # its producers and pushed to every rank
                 "route_v": 2,
                 "latq_push": True,
-                "gate_local": False,
+                "gate_local": True,
                 "debug": False,
                 "eps": key.eps,
                 "out_eps": key.out_eps,
@@ -513,31 +521,34 @@ def build(key: K2Build):
             # o_proj first (every AttnRes CTA waits on the slowest partial; loads
             # retire in order), the early weights after: they land before x does
             if is_r:
-                stage_oproj(c, bid - O0)
+                stage_oproj(c, bid)
                 stamp(on, tls, tid, 1)
                 rops = k2b.early_loads(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS)
                 k2b.early_compute(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS, rops)
             if is_l:
-                stage_oproj(c, bid - O0)
+                stage_oproj(c, bid)
                 stamp(on, tls, tid, 1)
                 lops = k2b.early_loads(c, 3, lb // k2b.LQ_PARTS, lb % k2b.LQ_PARTS)
                 k2b.early_compute(c, 3, lb // k2b.LQ_PARTS, lb % k2b.LQ_PARTS, lops)
             if (bid >= O0) & ~is_r & ~is_l:
-                stage_oproj(c, bid - O0)
+                stage_oproj(c, bid)
                 stamp(on, tls, tid, 1)
                 gi = bid - O0
                 if gi < k2b.G_TASKS:
                     k2b.early_compute(c, 2, gi, 0, k2b.early_loads(c, 2, gi, 0))
             # ---- AttnRes: the reduced o_proj -> x; then route / SiTU
             if bid < NA:
+                # one o_proj task here too (these CTAs sit under O_SKIP): its
+                # LDS (the core rows) is done with before the seam's starts
+                stage_oproj(c, bid)
                 # PRELOAD: the slice's loads in flight across the o_proj poll
                 sld = slice_loads(c, bid) if key.opt & OPT_PRELOAD else None
                 k2a.stage_reduce(c, bid)
                 stamp(on, tls, tid, 1)
                 stage_slice(c, bid, sld)
                 stamp(on, tls, tid, 2)
-                if bid < s:
-                    stage_gate(c, bid)
+                # gate_local: every CTA computes the weights from PART itself
+                # (stage_gate's sums in its order), so no gate CTA and no WGT hop
                 stamp(on, tls, tid, 8)
                 stage_mix(c, bid)
                 if const_expr(key.opt & OPT_SENT):
@@ -564,16 +575,16 @@ def build(key: K2Build):
             # reversed placement: the round's leftover tasks go to the high CTAs,
             # whose early work ends first (the AttnRes / route CTAs start ug last)
             task = BLOCKS - 1 - bid
-            ops = k2b.ug_loads(c, fx.min(task, last))
+            ops = k2b.ug_loads(c, fx.min(task, last), task < total)
             while task < total:
                 nxt = task + BLOCKS
-                ops_n = k2b.ug_loads(c, fx.min(nxt, last))
+                ops_n = k2b.ug_loads(c, fx.min(nxt, last), nxt < total)
                 k2b.stage_ug(c, task, ops)
                 task = nxt
                 ops = ops_n
             stamp(on, tls, tid, 3)
             if bid < k2b.DOWN_TASKS:
-                dops = k2b.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
+                dops = k2b.down_loads(c, bid, nu, c["wave"])
                 k2b.load_inter(c)
                 stamp(on, tls, tid, 15)
                 k2b.stage_down(c, bid, nu, dops)
