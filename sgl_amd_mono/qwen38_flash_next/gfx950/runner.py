@@ -157,6 +157,16 @@ class _Base:
         # when the table grows, and a graph still reads the old one
         self._held: dict = {}
 
+    def _uncached_scratch(self, nbytes: int) -> torch.Tensor:
+        """The hand-off mailboxes, zeroed and uncached (a one-rank
+        ``common.peer.PeerBuffer``): a consumer's load is served at the line's home
+        memory, not through the producer XCD's L2. The buffer stays for the
+        runner's life (its address is baked into the pointer tables and graphs)."""
+        from sgl_amd_mono.common.peer import PeerBuffer
+
+        self._scratch_buf = PeerBuffer(nbytes, None, 0, 1, self.device)
+        return self._scratch_buf.bytes.view(torch.int32)
+
     def set_deadline(self, seconds: float) -> None:
         """Every wait's deadline (below the server's watchdog timeout)."""
         ticks = guard.deadline_ticks(seconds)
@@ -305,7 +315,7 @@ class VerifyRunner(_Base):
             LY.scratch_layout(4 + 2, r * self.L, r)[1]
             for r in range(1, self.max_reqs + 1)
         )
-        self.scratch = torch.zeros(nbytes // 4, dtype=torch.int32, device=device)
+        self.scratch = self._uncached_scratch(nbytes)
         bf16 = dict(dtype=torch.bfloat16, device=device)
         self.h_bufs = [torch.empty(S, HC_DIM, **bf16) for _ in range(2)]
         self.ssq_bufs = [
@@ -504,13 +514,22 @@ class VerifyRunner(_Base):
         frow[LY.P_HCA_UP] = self.final["up"].data_ptr()
         frow[LY.P_HCA_INJ] = last["hca"]["inj"].data_ptr()  # its combine gate is unused
         iconv = issm_row = ple_ist_row = ssm_bf16 = None
+        # the RoPE positions' one store of the step: the last QSA layer (every QSA
+        # layer reads the pre-step positions; layout.P_RP_STORE)
+        rp_layer = max(i for i, k in enumerate(self.kinds) if k == "qsa")
         tables = []
         for li, (_, layer_ids) in enumerate(self.plans):
             rows = []
             for layer_id in layer_ids:
                 t = self.layers[layer_id]
                 if self.kinds[layer_id] == "qsa":
-                    rows.append(packing.qsa_ptr_row(t, *_qsa_buffers(kvp, layer_id)))
+                    rows.append(
+                        packing.qsa_ptr_row(
+                            t,
+                            *_qsa_buffers(kvp, layer_id),
+                            rp_store=layer_id == rp_layer,
+                        )
+                    )
                     continue
                 cache = gdn_cache(kvp, layer_id)
                 conv, ssm = cache.conv[0], cache.temporal
@@ -606,7 +625,7 @@ class DraftRunner(_Base):
             for r in range(1, self.max_reqs + 1)
             for t in (1, self.L_ext)
         )
-        self.scratch = torch.zeros(nbytes // 4, dtype=torch.int32, device=device)
+        self.scratch = self._uncached_scratch(nbytes)
         bf16 = dict(dtype=torch.bfloat16, device=device)
         self.x_buf = torch.empty(S, HIDDEN, **bf16)
         # draft step i + 1 reads step i's output: a step writes the buffer its

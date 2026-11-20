@@ -555,3 +555,63 @@ def test_draft_step(draft, requests, rows):
         _check_moe(draft.runner, key, tag, draft.blocks)
 
     _run_step(draft, b, lambda: draft.runner.launch(b, hs), check)
+
+
+@pytest.mark.parametrize("requests", [2, 8], ids=["R=2", "R=8"])
+def test_verify_ring4(target, requests):
+    """SGLang's 4-slot index-key ring: a verify step of L = 4 rows a request rewrites
+    every ring slot, so the start slot of a group that completes in the batch
+    (contexts 1203, 70001, 32766, 140003: pos0 % 4 != 0) gets a batch token's key and
+    RoPE position. The RoPE positions are one buffer for all QSA layers; every QSA
+    layer must still compress the group at its start position: the step equals the
+    same step on an 8-slot ring holding the same pending members, bitwise (outputs,
+    every layer's compressed keys, the ring and RoPE rows written)."""
+    pools, runner = target.pools, target.runner
+    qsa = [i for i in pools.kv]
+    b = step_batch(requests, seed=requests)
+    rings8 = {i: pools.kv[i].ring for i in qsa}
+    rp8 = pools.qsa_rope_position_buffer
+    n_req = pools.qsa_num_request_slots
+    rings4 = {i: torch.zeros(n_req * 4, 1, 128, dtype=torch.bfloat16, device=DEV) for i in qsa}  # fmt: skip
+    rp4 = torch.zeros(n_req * 4, 3, dtype=torch.int64, device=DEV)
+
+    def use(rings, rp):
+        for i in qsa:
+            pools.kv[i].ring = rings[i]
+        pools.qsa_rope_position_buffer = rp
+        runner._tables.clear()  # the tables hold the ring / RoPE pointers
+
+    def run():
+        x, h = runner.launch(b, b.mrope_positions)
+        torch.cuda.synchronize()
+        return [x.clone(), h.clone()] + [pools.kv[i].comp.clone() for i in qsa]
+
+    pools.install()
+    try:
+        pools.restore(target.snap)
+        for r, c in enumerate(CONTEXTS):  # the last 4 positions' members
+            q = pools.reqs[r]
+            for p in range(c - 4, c):
+                rp4[q * 4 + p % 4] = rp8[q * 8 + p % 8]
+                for i in qsa:
+                    rings4[i][q * 4 + p % 4] = rings8[i][q * 8 + p % 8]
+        use(rings4, rp4)
+        precompile(runner.prepare_step(b, b.mrope_positions)[1])
+        got = run()
+        assert not any(err := _error_words(runner)), err
+        use(rings8, rp8)
+        pools.restore(target.snap)
+        want = run()
+        for name, g_, w_ in zip(["x", "h"] + [f"L{i}.comp" for i in qsa], got, want):
+            assert _same(g_, w_), f"ring 4 vs ring 8: {name} differs"
+        for r, c in enumerate(CONTEXTS[:requests]):
+            q = pools.reqs[r]
+            for p in range(c, c + L):
+                assert torch.equal(rp4[q * 4 + p % 4], rp8[q * 8 + p % 8]), "RoPE rows"
+                for i in qsa:
+                    assert _same(rings4[i][q * 4 + p % 4], rings8[i][q * 8 + p % 8]), (
+                        "ring"
+                    )
+    finally:
+        use(rings8, rp8)
+        pools.restore(target.snap)
