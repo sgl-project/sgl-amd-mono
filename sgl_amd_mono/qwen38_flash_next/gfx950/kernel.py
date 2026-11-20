@@ -58,6 +58,7 @@ from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    CM_NT,
     bf2_f32,
     bf16_pair,
 )
@@ -83,6 +84,7 @@ from sgl_amd_mono.common.ops import wave_umax as _wave_umax
 from sgl_amd_mono.common.ops import xred as _xred
 from sgl_amd_mono.common.ops import xshfl as _xshfl
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple
+from sgl_amd_mono.common.sync import _spin
 
 from . import layout as LY
 from .config import (
@@ -102,12 +104,16 @@ from .config import (
     TOPK,
     MonoBuild,
 )
-from .device import spin
 from .layout import scratch_layout
 
 SOURCES = kernel_sources(__name__)
 
 POLL_MAX = 24
+# Cache policy of the one-touch weight streams (CM_NT: nontemporal, so they do not evict the mailbox lines and
+# reused data from L2 / MALL): MoE MXFP4 experts (+ scales), FP8 projections (in_proj, out_proj, qsa proj, o_proj).
+W_CM_MOE = CM_NT
+W_CM_F8 = CM_NT
+W_CM_BF16 = 0  # mixers / router / PLE / MTP: several CTAs re-read them; CM_NT measured ~1.7% slower
 NEG_INF = -3.0e38
 LDS_WORDS = 40448  # 158 KB arena (gfx950: 160 KB per CU)
 RED_OFF = 0  # MFMA accumulator exchange: [tile][column tile][wave][lane][4] f32
@@ -459,7 +465,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     return bad
 
                 # under the guard: a deadline, checked every CHECK_POLLS polls
-                v = spin(load_all, pending)
+                v = _spin(load_all, pending)
                 res, e = [], 0
                 for sp, ok in zip(specs, oks):
                     vals = [v[e + 2 * q] for q in range(sp[2])]
@@ -505,7 +511,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     act_off + tcol(ct) * stride + k_word + (lane // 16) * 4
                 )
 
-            def unit_bf16(w_rsrc, rg, kc, NKC, b_word, coef=None, subs=(0, 1)):
+            def unit_bf16(
+                w_rsrc, rg, kc, NKC, b_word, coef=None, subs=(0, 1), cm=W_CM_BF16
+            ):
                 """16 rows x 64 K (chunk kc; subs: its 32-K halves to use) of a packed bf16 weight."""
                 wv = [
                     (
@@ -516,6 +524,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 (((rg * NKC + kc) * 2 + sp) * 64 + lane) * 4,
                                 vec_width=4,
                                 dtype=T.i32,
+                                cache_modifier=cm,
                             )
                         ),
                     )
@@ -537,6 +546,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             + (lane % 16) * 4,
                             vec_width=4,
                             dtype=T.i32,
+                            cache_modifier=W_CM_F8,
                         )
                     )
                     for h in range(2)
@@ -565,6 +575,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         ((((rg // 2) * D + d) * 4 + lane // 16) * 16 + lane % 16),
                         vec_width=1,
                         dtype=T.i32,
+                        cache_modifier=W_CM_MOE,
                     )
                 )
 
@@ -581,13 +592,22 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         ((rg * (K // 128) + kc) * 64 + lane) * 4,
                         vec_width=4,
                         dtype=T.i32,
+                        cache_modifier=W_CM_MOE,
                     )
                 )
                 D = (K // 32 + 7) // 8
                 dw = (((rg // 2) * D + kc // 2) * 4 + lane // 16) * 16 + lane % 16
                 # sdw: the dword preloaded by the task (mxfp4a_sdw)
                 if const_expr(sdw is None):
-                    sdw = fx.Int32(bo.buffer_load(s_rsrc, dw, vec_width=1, dtype=T.i32))
+                    sdw = fx.Int32(
+                        bo.buffer_load(
+                            s_rsrc,
+                            dw,
+                            vec_width=1,
+                            dtype=T.i32,
+                            cache_modifier=W_CM_MOE,
+                        )
+                    )
                 sw = sdw.shrui(
                     fx.Int32(8) * (fx.Int32(2) * (fx.Int32(kc) % 2) + fx.Int32(rg) % 2)
                 )
@@ -919,17 +939,26 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 r = lds_ld(xs, MIX_RSTD + t * 4 + k // HIDDEN)
                 return bf_round(hv * r * (fx.Float32(1.0) + wn))
 
+            def placed(base):
+                """Task index of this CTA in a stage placed at CTA ``base`` (task k on CTA (base + k) % G)."""
+                base = base % G
+                if const_expr(base == 0):
+                    return bid
+                return (bid + (G - base)) % G
+
             # ---- hyper-connection mix
-            def stage_mix(layer, hc, src, p_norm, p_down, p_up, x_out=None):
+            def stage_mix(layer, hc, src, p_norm, p_down, p_up, x_out=None, base=0):
                 """x[t] = mean_b sigmoid(W_up silu(W_down Hn[t] / HC))_b * Hn[t]_b -> mailbox mixx [T][2560];
-                combine-gate partials (per K-slice; the gate's rows are the last tile of the down weight) -> injp."""
+                combine-gate partials (per K-slice; the gate's rows are the last tile of the down weight) -> injp.
+                Down tasks start at CTA ``base``, up tasks right after them (on the CTAs the down leaves idle)."""
                 NKC_D = HC_DIM // 64
                 CPT = NKC_D // LY.MIX_KSPLIT  # 16 chunks = 1024 K per slice
                 CPW = CPT // WAVES
-                is_dn = bid < LY.MIX_DOWN_TASKS
+                dtask = placed(base)
+                is_dn = dtask < LY.MIX_DOWN_TASKS
                 r_wd = _rsrc(ptr(layer, p_down))
-                rg_d = fx.min(bid, LY.MIX_DOWN_TASKS - 1) // LY.MIX_KSPLIT
-                ks_d = fx.min(bid, LY.MIX_DOWN_TASKS - 1) % LY.MIX_KSPLIT
+                rg_d = fx.min(dtask, LY.MIX_DOWN_TASKS - 1) // LY.MIX_KSPLIT
+                ks_d = fx.min(dtask, LY.MIX_DOWN_TASKS - 1) % LY.MIX_KSPLIT
                 k0 = ks_d * (CPT * 64)
                 dunits = [
                     unit_bf16(
@@ -1058,9 +1087,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             )
                 # ---- up + branch mean: task u covers outputs [16u, 16u+16) of all 4 branches, all tokens
                 NKC_U = HC_LOWRANK // 64
-                is_up = bid < LY.MIX_UP_TASKS
+                utask = placed(base + LY.MIX_DOWN_TASKS)
+                is_up = utask < LY.MIX_UP_TASKS
                 r_wu = rsrc_if(ptr(layer, p_up), is_up, HC_DIM * HC_LOWRANK * 2)
-                u = fx.min(bid, LY.MIX_UP_TASKS - 1)
+                u = fx.min(utask, LY.MIX_UP_TASKS - 1)
                 b = wave // 2
                 h = wave % 2
                 pre = []
@@ -2059,8 +2089,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 """W8A8 out_proj (GDN) / o_proj (QSA) + combine. The activation (GDN: the gated-RMS-normalized og, QSA: the
                 merged attention output) is quantized per row with the scale from the producers' max |og| partials;
                 output = acc x weight row scale x activation scale."""
-                is_op = bid < LY.OUT_RG
-                rg = fx.min(bid, LY.OUT_RG - 1)
+                optask = placed(LY.op_base(kind, NT))
+                is_op = optask < LY.OUT_RG
+                rg = fx.min(optask, LY.OUT_RG - 1)
                 r_w = rsrc_if(ptr(layer, LY.P_OUT), is_op, HIDDEN * GDN_VAL_DIM)
                 r_ws = _rsrc(ptr(layer, LY.P_OUT_S))
                 NKC = GDN_VAL_DIM // 128  # 48 chunks of 128 K
@@ -2225,8 +2256,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     gpu.barrier()
 
             # ---- MoE
-            def stage_router(layer):
-                if bid < LY.ROUTER_RG:
+            def stage_router(layer, base=0):
+                rtask = placed(base)
+                if rtask < LY.ROUTER_RG:
                     logit = mb(layer, "logit")
 
                     def emit(i, rg):
@@ -2243,7 +2275,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         stage_mb_phase(mb(layer, "m.mixx")),
                         _rsrc(ptr(layer, LY.P_ROUTER)),
                         1,
-                        lambda i: bid,
+                        lambda i: rtask,
                         emit,
                     )
 
@@ -2798,7 +2830,16 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
             def rope_elem(x, e, p3, r_cos):
                 """Neox rope of element e (< 64, lanes = elements within one wave) with partner x[e ^ 32].
                 p3: callable axis -> position."""
+                return rope_apply(x, e, rope_cs(e, p3, r_cos))
+
+            def rope_apply(x, e, cs):
+                """rope_elem with the (cos, sin) of rope_cs (loaded ahead of the producer poll)."""
                 partner = _xshfl(x, 32)
+                c, sn = cs
+                return (e < 32).select(x * c - partner * sn, x * c + partner * sn)
+
+            def rope_cs(e, p3, r_cos):
+                """(cos, sin) of rope element e at the position p3 (callable axis -> position)."""
                 i = e % 32
                 ax = rope_axis(i)
                 p = (ax == 0).select(p3(0), (ax == 1).select(p3(1), p3(2)))
@@ -2814,7 +2855,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         )
                     )
                 )
-                return (e < 32).select(x * c - partner * sn, x * c + partner * sn)
+                return c, sn
 
             def tok_p3(t):
                 return lambda a: lds_ld(xi, POS3 + a * NT + t)
@@ -2850,7 +2891,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 )
 
             def heads_norm_rope(
-                qp, base_of, n, w_addr, r_cos, rope, out_off, ntok_heads
+                qp, base_of, n, w_addr, r_cos, rope, out_off, ntok_heads, extra=()
             ):
                 """Elements of ntok_heads (token, head) rows of width n (one per 256- or 128-thread group):
                 bf16(gemma_rmsnorm) then (e < 64) neox rope -> LDS bf16 at out_off + row * n/2 words.
@@ -2864,7 +2905,23 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     rowc = fx.min(row, ntok_heads - 1)
                     t, base = base_of(rowc)
                     passes.append((row, rowc, t, base))
-                xv = qp_elems(qp, [(t, base + e) for _, _, t, base in passes])
+                # norm weight and rope (cos, sin) addresses are known before the payload: issued ahead of the poll
+                wv = fx.Float32(
+                    fx.BFloat16(
+                        bo.buffer_load(_rsrc(w_addr), e, vec_width=1, dtype=T.bf16)
+                    )
+                )
+                css = (
+                    [rope_cs(e, tok_p3(t), r_cos) for _, _, t, _ in passes]
+                    if const_expr(rope)
+                    else []
+                )
+                # extra [(t, e)] payload elements of the caller share the poll round
+                xall = qp_elems(
+                    qp, [(t, base + e) for _, _, t, base in passes] + list(extra)
+                )
+                xv = xall[: len(passes)]
+                xext = xall[len(passes) :]
                 xx = [
                     (passes[i][0] < ntok_heads).select(xv[i], fx.Float32(0.0))
                     for i in range(len(passes))
@@ -2876,11 +2933,6 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     if lane == 0:
                         lds_st(red, i * WAVES + wave, ws)
                 gpu.barrier()
-                wv = fx.Float32(
-                    fx.BFloat16(
-                        bo.buffer_load(_rsrc(w_addr), e, vec_width=1, dtype=T.bf16)
-                    )
-                )
                 w0 = (wave // WPR) * WPR
                 for i in range_constexpr(len(passes)):
                     row, rowc, t, base = passes[i]
@@ -2890,19 +2942,21 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     rstd = _rsq(tsel * (1.0 / n) + EPS)
                     y = bf_round(xx[i] * rstd * (fx.Float32(1.0) + wv))
                     if const_expr(rope):
-                        yr = bf_round(rope_elem(y, e, tok_p3(t), r_cos))
+                        yr = bf_round(rope_apply(y, e, css[i]))
                         y = (e < 64).select(yr, y)
                     if row < ntok_heads:
                         fx.ptr_store(
                             y.to(fx.BFloat16), xb + (out_off * 2 + rowc * n + e)
                         )
                 gpu.barrier()
+                return xext
 
             def stage_qsa_prep(layer):
                 qp = mb(layer, "qp")
                 r_cos = _rsrc(ptr(GI, LY.G_COS))
-                if bid < LY.PREP_Q_TASKS:
-                    h = bid
+                ptask = placed(LY.PREP_BASE)
+                if ptask < LY.PREP_Q_TASKS:
+                    h = ptask
                     heads_norm_rope(
                         qp,
                         lambda row: (row, h * 512),
@@ -2924,9 +2978,27 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 lds_ld(xi, PREP_OFF + q),
                             )
                     gpu.barrier()
-                if (bid >= LY.PREP_K_CTA) & (bid < LY.PREP_K_CTA + 2):
-                    kvh = bid - LY.PREP_K_CTA
-                    heads_norm_rope(
+                if (ptask >= LY.PREP_K_CTA) & (ptask < LY.PREP_K_CTA + 2):
+                    kvh = ptask - LY.PREP_K_CTA
+                    kvnew = mb(layer, "kvnew")
+                    r_loc = _rsrc(ptr(GI, LY.G_LOC))
+                    NW = NT * 128
+                    NIW = (NW + THREADS - 1) // THREADS
+                    qcs = [fx.min(tid + i * THREADS, NW - 1) for i in range(NIW)]
+                    # 128 threads (2 waves) per token: the KV row base is wave-uniform -> 64-bit descriptor base
+                    # (the cache slots are loaded ahead of the poll)
+                    locs = [
+                        _uniform(
+                            fx.Int32(
+                                bo.buffer_load(
+                                    r_loc, (qc // 128) * 2, vec_width=1, dtype=T.i32
+                                )
+                            )
+                        )
+                        for qc in qcs
+                    ]
+                    # v shares the k poll round
+                    vall = heads_norm_rope(
                         qp,
                         lambda row: (row, LY.QP_K_OFF + kvh * 256),
                         256,
@@ -2935,15 +3007,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         True,
                         PREP_OFF,
                         NT,
-                    )
-                    kvnew = mb(layer, "kvnew")
-                    r_loc = _rsrc(ptr(GI, LY.G_LOC))
-                    NW = NT * 128
-                    NIW = (NW + THREADS - 1) // THREADS
-                    qcs = [fx.min(tid + i * THREADS, NW - 1) for i in range(NIW)]
-                    vall = qp_elems(
-                        qp,
-                        [
+                        extra=[
                             (qc // 128, LY.QP_V_OFF + kvh * 256 + 2 * (qc % 128) + d_)
                             for qc in qcs
                             for d_ in range(2)
@@ -2955,12 +3019,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         t = qc // 128
                         e = qc % 128
                         v = vall[2 * i : 2 * i + 2]
-                        # 128 threads (2 waves) per token: the KV row base is wave-uniform -> 64-bit descriptor base
-                        loc = _uniform(
-                            fx.Int32(
-                                bo.buffer_load(r_loc, t * 2, vec_width=1, dtype=T.i32)
-                            )
-                        )
+                        loc = locs[i]
                         r_k = _rsrc(
                             ptr(layer, LY.P_KBUF)
                             + fx.Int64(loc) * 1024
@@ -2979,14 +3038,96 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             bo.buffer_store(kw, r_k, e)
                             bo.buffer_store(vw, r_v, e)
                     gpu.barrier()
-                if (bid >= LY.PREP_IDX_CTA0) & (bid < LY.PREP_IDX_CTA0 + R):
+                if (ptask >= LY.PREP_IDX_CTA0) & (ptask < LY.PREP_IDX_CTA0 + R):
                     # request r: index q (4 heads x 128) of its L tokens, then its index-key ring / compression
-                    r = bid - LY.PREP_IDX_CTA0
+                    r = ptask - LY.PREP_IDX_CTA0
                     tok0 = r * L
                     pos0 = req_p0(r)
                     req = _uniform(lds_ld(xi, RQ_REQ + r))
                     rtt_row = rtt_row_of(r)
-                    heads_norm_rope(
+                    r_ring = _rsrc(ptr(layer, LY.P_RING))
+                    r_rp = _rsrc(ptr(GI, LY.G_ROPEPOS))
+                    # The RoPE positions are one buffer for all layers. With ring <= L + 2 a batch token's
+                    # position lands in the start slot of a group that completes in the batch, which a later
+                    # QSA layer of the step reads: only the step's last QSA layer stores them, so every layer
+                    # reads the positions as they were before the step (layout.P_RP_STORE).
+                    rp_flag = (
+                        ptr(layer, LY.P_RP_STORE) if const_expr(ring <= L + 2) else None
+                    )
+                    gfirst = pos0 // 4  # first group that can complete in these tokens
+                    # Everything of the group compression except the batch payload is addressed by positions known at
+                    # stage start: the older ring members, the group's rope position, its (cos, sin), its
+                    # req_to_token slot and the norm weight are loaded ahead of the poll (a ring slot read here is
+                    # never one this stage's ring stores of tokens <= the group's last token write: a 4-token window).
+                    # Loads of tokens whose group does not complete are clamped in range and unused.
+                    tidk = tid % 128
+                    wk = fx.Float32(
+                        fx.BFloat16(
+                            bo.buffer_load(
+                                _rsrc(ptr(layer, LY.P_IKNORM)),
+                                tidk,
+                                vec_width=1,
+                                dtype=T.bf16,
+                            )
+                        )
+                    )
+                    pre = []
+                    for j in range_constexpr(L):
+                        pos = pos0 + j
+                        ps = pos - 3  # group start: rope position of the first member
+                        psc = fx.max(ps, fx.Int32(0))
+                        rmem = [
+                            fx.Float32(
+                                fx.BFloat16(
+                                    bo.buffer_load(
+                                        r_ring,
+                                        (
+                                            req * ring
+                                            + fx.max(pos - 3 + g, fx.Int32(0)) % ring
+                                        )
+                                        * 128
+                                        + tidk,
+                                        vec_width=1,
+                                        dtype=T.bf16,
+                                    )
+                                )
+                            )
+                            for g in range(4)
+                        ]
+                        tsb = ps - pos0
+                        rp_buf = [
+                            _uniform(
+                                fx.Int32(
+                                    bo.buffer_load(
+                                        r_rp,
+                                        ((req * ring + psc % ring) * 3 + a) * 2,
+                                        vec_width=1,
+                                        dtype=T.i32,
+                                    )
+                                )
+                            )
+                            for a in range(3)
+                        ]
+
+                        done = (pos + 1) % 4 == 0
+
+                        def sp3(a, tsb=tsb, rp_buf=rp_buf, done=done):
+                            from_lds = lds_ld(
+                                xi, POS3 + a * NT + tok0 + fx.max(tsb, fx.Int32(0))
+                            )
+                            # a token whose group does not complete: position 0 (its ring slot may be unwritten)
+                            return done.select(
+                                (tsb >= 0).select(from_lds, rp_buf[a]), fx.Int32(0)
+                            )
+
+                        cs = rope_cs(tid, sp3, r_cos)
+                        cslot = rtt_at(rtt_row, psc) // 4
+                        pre.append((rmem, cs, cslot))
+                    # index k of every token shares the index q poll round
+                    NK = L * 128
+                    NIK = (NK + THREADS - 1) // THREADS
+                    qks = [fx.min(tid + i * THREADS, NK - 1) for i in range(NIK)]
+                    kall = heads_norm_rope(
                         qp,
                         lambda row: (tok0 + row // 4, LY.QP_IDX_OFF + (row % 4) * 128),
                         128,
@@ -2995,6 +3136,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         True,
                         PREP_OFF,
                         4 * L,
+                        extra=[
+                            (tok0 + q // 128, LY.QP_IDX_OFF + 512 + q % 128)
+                            for q in qks
+                        ],
                     )
                     NW = L * 256
                     for i in range_constexpr((NW + THREADS - 1) // THREADS):
@@ -3005,35 +3150,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 tok0 * 256 + q,
                                 lds_ld(xi, PREP_OFF + q),
                             )
-                    gpu.barrier()
                     # index k of every token -> LDS (f32) and the pending ring; in token order, a completed group
                     # (pos % 4 == 3) is compressed from its 4 members (batch members from LDS, older ones from the ring)
-                    r_ring = _rsrc(ptr(layer, LY.P_RING))
-                    r_rp = _rsrc(ptr(GI, LY.G_ROPEPOS))
-                    NK = L * 128
-                    NIK = (NK + THREADS - 1) // THREADS
-                    qks = [fx.min(tid + i * THREADS, NK - 1) for i in range(NIK)]
-                    kall = qp_elems(
-                        qp,
-                        [(tok0 + q // 128, LY.QP_IDX_OFF + 512 + q % 128) for q in qks],
-                    )
                     for i in range_constexpr(NIK):
                         if tid + i * THREADS < NK:
                             lds_st(xs, PREP_KEYS + qks[i], kall[i])
                     gpu.barrier()
-                    wk = fx.Float32(
-                        fx.BFloat16(
-                            bo.buffer_load(
-                                _rsrc(ptr(layer, LY.P_IKNORM)),
-                                tid % 128,
-                                vec_width=1,
-                                dtype=T.bf16,
-                            )
-                        )
-                    )
-                    gfirst = pos0 // 4  # first group that can complete in these tokens
                     for j in range_constexpr(L):
                         pos = pos0 + j
+                        rmem, cs, cslot = pre[j]
                         if tid < 128:
                             bo.buffer_store(
                                 fx.Float32(lds_ld(xs, PREP_KEYS + j * 128 + tid)).to(
@@ -3042,7 +3167,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 r_ring,
                                 (req * ring + pos % ring) * 128 + tid,
                             )
-                        if tid < 3:
+                        rp_on = tid < 3
+                        if const_expr(rp_flag is not None):
+                            rp_on = rp_on & (rp_flag != fx.Int64(0))
+                        if rp_on:
                             bo.buffer_store(
                                 fx.Vector.from_elements(
                                     [
@@ -3064,53 +3192,19 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     from_lds = bf_round(
                                         lds_ld(xs, PREP_KEYS + tb * 128 + tid)
                                     )
-                                    from_ring = fx.Float32(
-                                        fx.BFloat16(
-                                            bo.buffer_load(
-                                                r_ring,
-                                                (req * ring + (pos - 3 + g) % ring)
-                                                * 128
-                                                + tid,
-                                                vec_width=1,
-                                                dtype=T.bf16,
-                                            )
-                                        )
-                                    )
-                                    acc = acc + src_batch.select(from_lds, from_ring)
+                                    acc = acc + src_batch.select(from_lds, rmem[g])
                             m = bf_round(acc * 0.25)
                             mm = (tid < 128).select(m, fx.Float32(0.0))
                             ss = block_sums([mm * mm])[0]
                             rstd = _rsq(ss * (1.0 / 128) + EPS)
                             yk = bf_round(mm * rstd * (fx.Float32(1.0) + wk))
-                            ps = (
-                                pos - 3
-                            )  # group start: rope position of the first member
-                            tsb = ps - pos0
-
-                            def sp3(a, tsb=tsb, ps=ps):
-                                from_lds = lds_ld(
-                                    xi, POS3 + a * NT + tok0 + fx.max(tsb, fx.Int32(0))
-                                )
-                                from_buf = _uniform(
-                                    fx.Int32(
-                                        bo.buffer_load(
-                                            r_rp,
-                                            ((req * ring + ps % ring) * 3 + a) * 2,
-                                            vec_width=1,
-                                            dtype=T.i32,
-                                        )
-                                    )
-                                )
-                                return (tsb >= 0).select(from_lds, from_buf)
-
-                            ykr = bf_round(rope_elem(yk, tid, sp3, r_cos))
+                            ykr = bf_round(rope_apply(yk, tid, cs))
                             yk = (tid < 64).select(ykr, yk)
                             if tid < 128:
                                 fx.ptr_store(
                                     yk.to(fx.BFloat16), xb + (PREP_OFF * 2 + tid)
                                 )
                             gpu.barrier()
-                            cslot = rtt_at(rtt_row, ps) // 4
                             if tid < 64:
                                 w = lds_ld(xi, PREP_OFF + tid)
                                 put(
@@ -3129,35 +3223,20 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 """Index logits of every complete block for every row: ilog[t][b] for b < nb_t = (pos_t + 1) // 4.
                 Work item = (request r, tile of 16 blocks of its context), handled by the global wave item % (256 * 8).
                 MFMA: A = index q rows (row, head) of request r from LDS, B = 16 compressed keys (blocks), k = 128 dims;
-                a lane's 4 accumulator rows are the 4 heads of one row -> logit = sum relu / sqrt(128) in-lane."""
+                a lane's 4 accumulator rows are the 4 heads of one row -> logit = sum relu / sqrt(128) in-lane.
+                The first item's req_to_token / compressed-key loads are issued before the qi poll, and its in-batch
+                keys (cnew) share the qi poll round."""
                 ntile = _uniform(lds_ld(xi, SC_PFX + R))
-                if bid * WAVES < ntile:
+                stask = placed(LY.SCORES_BASE)
+                if stask * WAVES < ntile:
                     qi = mb(layer, "qi")
-                    NW = 256 * NT
-                    NIW = (NW + THREADS - 1) // THREADS
-                    qv = poll(
-                        [(qi, fx.min(tid + i * THREADS, NW - 1), 1) for i in range(NIW)]
-                    )
-                    for i in range_constexpr(NIW):
-                        w_ = tid + i * THREADS
-                        # word w_ of row t = w_ // 256: head (w_ % 256) // 64, word w_ % 64
-                        if w_ < NW:
-                            lds_st(
-                                xi,
-                                QI_OFF
-                                + ((w_ // 256) * 4 + (w_ % 256) // 64) * QS
-                                + w_ % 64,
-                                qv[i][0],
-                            )
-                    gpu.barrier()
-                    gw = bid * WAVES + wave
+                    gw = stask * WAVES + wave
                     nloop = (ntile - gw + G * WAVES - 1) // (G * WAVES)
                     r_comp = _rsrc(ptr(layer, LY.P_COMP))
                     cnew = mb(layer, "cnew")
                     ilog = mb(layer, "ilog")
-                    for it, _c in range(fx.Int32(0), nloop, 1, init=[fx.Int32(0)]):
-                        it = fx.Int32(it)
-                        item = gw + it * (G * WAVES)
+
+                    def item_setup(item):
                         r = _uniform(find_bucket(SC_PFX, R, item))
                         tl = item - lds_ld(xi, SC_PFX + r)
                         pos0 = req_p0(r)
@@ -3165,7 +3244,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         gfirst = pos0 // 4
                         rtt_row = rtt_row_of(r)
                         blk = tl * 16 + lane % 16
-                        bc = fx.min(blk, nb_all - 1)
+                        # (>= 0 only matters for a wave without an item, whose loads must stay in range)
+                        bc = fx.max(fx.min(blk, nb_all - 1), fx.Int32(0))
                         cslot = rtt_at(rtt_row, bc * 4) // 4
                         kb = [
                             fx.Vector(
@@ -3178,29 +3258,24 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             )
                             for ks in range(4)
                         ]
-                        if (
-                            bc >= gfirst
-                        ):  # compressed inside this batch: from the mailbox
-                            v = poll(
-                                [
-                                    (
-                                        cnew,
-                                        (r * CN + bc - gfirst) * 64
-                                        + ks * 16
-                                        + (lane // 16) * 4
-                                        + 2 * hf,
-                                        2,
-                                    )
-                                    for ks in range(4)
-                                    for hf in range(2)
-                                ]
+                        return r, pos0, gfirst, blk, bc, kb
+
+                    def cnew_specs(r, gfirst, bc, ok):
+                        return [
+                            (
+                                cnew,
+                                (r * CN + fx.max(bc - gfirst, fx.Int32(0))) * 64
+                                + ks * 16
+                                + (lane // 16) * 4
+                                + 2 * hf,
+                                2,
+                                ok,
                             )
-                            kb = [
-                                fx.Vector.from_elements(
-                                    v[2 * ks] + v[2 * ks + 1], fx.Int32
-                                )
-                                for ks in range(4)
-                            ]
+                            for ks in range(4)
+                            for hf in range(2)
+                        ]
+
+                    def item_finish(r, pos0, blk, kb, live):
                         for rt in range_constexpr((4 * L + 15) // 16):
                             row = r * (4 * L) + fx.min(rt * 16 + lane % 16, 4 * L - 1)
                             cacc = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -3221,12 +3296,64 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             for e in range_constexpr(4):
                                 logit = logit + fx.max(cacc[e], fx.Float32(0.0))
                             nb_t = (pos0 + j + 1) // 4
-                            if (j < L) & (blk < nb_t):
+                            if live & (j < L) & (blk < nb_t):
                                 put(
                                     ilog,
                                     (r * L + j) * LY.MAX_BLOCKS + blk,
                                     logit * (1.0 / (128**0.5)),
                                 )
+
+                    # item 0 of this wave (it may have none: nloop == 0 -> nothing is put)
+                    live0 = gw < ntile
+                    r0, p00, gf0, blk0, bc0, kb0 = item_setup(gw)
+                    inb0 = live0 & (
+                        bc0 >= gf0
+                    )  # compressed inside this batch: from the mailbox
+                    NW = 256 * NT
+                    NIW = (NW + THREADS - 1) // THREADS
+                    qv = poll(
+                        [(qi, fx.min(tid + i * THREADS, NW - 1), 1) for i in range(NIW)]
+                        + cnew_specs(r0, gf0, bc0, inb0)
+                    )
+                    for i in range_constexpr(NIW):
+                        w_ = tid + i * THREADS
+                        # word w_ of row t = w_ // 256: head (w_ % 256) // 64, word w_ % 64
+                        if w_ < NW:
+                            lds_st(
+                                xi,
+                                QI_OFF
+                                + ((w_ // 256) * 4 + (w_ % 256) // 64) * QS
+                                + w_ % 64,
+                                qv[i][0],
+                            )
+                    cv = qv[NIW:]
+                    kb0 = [
+                        fx.Vector.from_elements(
+                            [
+                                inb0.select(x, kb0[ks][e])
+                                for e, x in enumerate(cv[2 * ks] + cv[2 * ks + 1])
+                            ],
+                            fx.Int32,
+                        )
+                        for ks in range(4)
+                    ]
+                    gpu.barrier()
+                    item_finish(r0, p00, blk0, kb0, live0)
+                    for it, _c in range(fx.Int32(1), nloop, 1, init=[fx.Int32(0)]):
+                        it = fx.Int32(it)
+                        item = gw + it * (G * WAVES)
+                        r, pos0, gfirst, blk, bc, kb = item_setup(item)
+                        if (
+                            bc >= gfirst
+                        ):  # compressed inside this batch: from the mailbox
+                            v = poll(cnew_specs(r, gfirst, bc, None))
+                            kb = [
+                                fx.Vector.from_elements(
+                                    v[2 * ks] + v[2 * ks + 1], fx.Int32
+                                )
+                                for ks in range(4)
+                            ]
+                        item_finish(r, pos0, blk, kb, live0)
                         _ = yield [fx.Int32(0)]
                     gpu.barrier()
 
@@ -3487,262 +3614,268 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             put(sel, 1024, fx.Int32(512))
                         gpu.barrier()
 
-            def stage_qsa_attn(layer):
-                """Split flash-decode on MFMA: task (token t, chunk of 64 selected tokens) -> partial (o, m, l) of all
-                24 heads; waves [4 kvh, 4 kvh + 4) serve kv head kvh. Batch tokens of the row's request (pos >= pos0 of the
-                request) read K/V from kvnew."""
-                NTASK = NT * LY.ATT_TASKS
-                nloop = (NTASK - bid + G - 1) // G
-                for it, _c in range(fx.Int32(0), nloop, 1, init=[fx.Int32(0)]):
-                    it = fx.Int32(it)
-                    task = bid + it * G
-                    t = task // LY.ATT_TASKS
-                    c = task % LY.ATT_TASKS
-                    r = t // L
-                    pos0 = req_p0(r)
-                    rtt_row = rtt_row_of(r)
-                    pos = pos0 + t % L
-                    seq = pos + 1
-                    sel = mb(layer, "sel") + fx.Int64(t) * (LY.SEL_STRIDE * 8)
-                    j = tid // 8
-                    ch = tid % 8
-                    qmb = mb(layer, "q")
-                    got = poll(
-                        [(qmb, t * (24 * 128) + tid + i * THREADS, 1) for i in range(6)]
-                        + [(sel, 1024, 1)]
-                    )
-                    for i in range_constexpr(6):
-                        pq = tid + i * THREADS
-                        hd = pq // 128
-                        lds_st(
-                            xi,
-                            ATT_Q_OFF + ((hd // 12) * 16 + hd % 12) * ATT_KS + pq % 128,
-                            got[i][0],
-                        )
-                    for i in range_constexpr(2):
-                        z = tid + i * THREADS
-                        lds_st(
-                            xi,
-                            ATT_Q_OFF
-                            + ((z // 512) * 16 + 12 + (z % 512) // 128) * ATT_KS
-                            + z % 128,
-                            fx.Int32(0),
-                        )
-                    nsel = got[6][0]
-                    tail_start = (seq // 4) * 4
-                    is_blk = c < LY.ATT_CHUNKS - 1
+            def attn_task(layer, t, c, task, is_blk):
+                """Split flash-decode on MFMA: task (token t, chunk c of 64 selected tokens) -> partial (o, m, l) of all
+                24 heads in part slot ``task``; waves [4 kvh, 4 kvh + 4) serve kv head kvh. Batch tokens of the row's
+                request (pos >= pos0 of the request) read K/V from kvnew. ``is_blk`` (trace time): a chunk of 16
+                selected blocks; else the tail chunk (the <= 3 tokens of the incomplete last block, c = 32)."""
+                r = t // L
+                pos0 = req_p0(r)
+                rtt_row = rtt_row_of(r)
+                pos = pos0 + t % L
+                seq = pos + 1
+                sel = mb(layer, "sel") + fx.Int64(t) * (LY.SEL_STRIDE * 8)
+                j = tid // 8
+                ch = tid % 8
+                qmb = mb(layer, "q")
+                # the selection count is min(512, nb) (single segment: min(512, nbs), nbs = nb <= 8192; merged
+                # segments: 512 < nb) -> computed here, so q and this thread's (block, loc) share one poll round
+                nsel = fx.min(fx.Int32(512), seq // 4)
+                qspec = [(qmb, t * (24 * 128) + tid + i * THREADS, 1) for i in range(6)]
+                if const_expr(is_blk):
                     si = c * 16 + j // 4
-                    blk = fx.Int32(0)
-                    locb = fx.Int32(0)
-                    if is_blk & (si < nsel):
-                        bl = poll([(sel, fx.min(si, 511) * 2, 2)])[0]
-                        blk = bl[0]
-                        locb = bl[1]
-                    tok_t = tail_start + j
-                    tok = is_blk.select(blk * 4 + j % 4, tok_t)
-                    valid = is_blk.select(si < nsel, tok_t < seq)
-                    tokc = fx.min(fx.max(tok, fx.Int32(0)), seq - 1)
-                    loc_t = rtt_at(rtt_row, fx.min(tok_t, seq - 1))
-                    locv = is_blk.select(locb + j % 4, loc_t)
-                    # thread ch holds the 16 B chunks ch + 8 q (dims 8 (ch + 8 q) .. + 8) of its K/V rows; 64-bit
-                    # addresses: the KV pools may exceed 4 GB
-                    rowk = ptr(layer, LY.P_KBUF) + fx.Int64(locv) * 1024
-                    rowv = ptr(layer, LY.P_VBUF) + fx.Int64(locv) * 1024
-                    kw = [
-                        [
-                            fx.Vector(
-                                global_load(rowk + (kvh * 512 + (ch + 8 * q) * 16), 4)
-                            )
-                            for q in range(4)
-                        ]
-                        for kvh in range(2)
-                    ]
-                    vw = [
-                        [
-                            fx.Vector(
-                                global_load(rowv + (kvh * 512 + (ch + 8 * q) * 16), 4)
-                            )
-                            for q in range(4)
-                        ]
-                        for kvh in range(2)
-                    ]
-                    if valid & (tokc >= pos0):
-                        kvnew = mb(layer, "kvnew")
-                        tb = r * L + tokc - pos0
-                        for kvh in range_constexpr(2):
-                            kn = poll(
-                                [
-                                    (
-                                        kvnew,
-                                        tb * 512
-                                        + kvh * 128
-                                        + (ch + 8 * q) * 4
-                                        + 2 * hf,
-                                        2,
-                                    )
-                                    for q in range(4)
-                                    for hf in range(2)
-                                ]
-                            )
-                            vn = poll(
-                                [
-                                    (
-                                        kvnew,
-                                        tb * 512
-                                        + 256
-                                        + kvh * 128
-                                        + (ch + 8 * q) * 4
-                                        + 2 * hf,
-                                        2,
-                                    )
-                                    for q in range(4)
-                                    for hf in range(2)
-                                ]
-                            )
-                            kw[kvh] = [
-                                fx.Vector.from_elements(
-                                    kn[2 * q] + kn[2 * q + 1], fx.Int32
-                                )
-                                for q in range(4)
-                            ]
-                            vw[kvh] = [
-                                fx.Vector.from_elements(
-                                    vn[2 * q] + vn[2 * q + 1], fx.Int32
-                                )
-                                for q in range(4)
-                            ]
-                    for kvh in range_constexpr(2):
-                        for q in range_constexpr(4):
-                            for e in range_constexpr(4):
-                                lds_st(
-                                    xi,
-                                    ATT_OFF
-                                    + kvh * ATT_KV_WORDS
-                                    + j * ATT_KS
-                                    + (ch + 8 * q) * 4
-                                    + e,
-                                    kw[kvh][q][e],
-                                )
-                    if ch == 0:
-                        lds_st(
-                            xi,
-                            ATT_M_OFF + 64 + j,
-                            valid.select(fx.Int32(1), fx.Int32(0)),
+                    got = poll(qspec + [(sel, fx.min(si, 511) * 2, 2, si < nsel)])
+                else:
+                    # the tail chunk does not read the selection: q only
+                    got = poll(qspec)
+                for i in range_constexpr(6):
+                    pq = tid + i * THREADS
+                    hd = pq // 128
+                    lds_st(
+                        xi,
+                        ATT_Q_OFF + ((hd // 12) * 16 + hd % 12) * ATT_KS + pq % 128,
+                        got[i][0],
+                    )
+                for i in range_constexpr(2):
+                    z = tid + i * THREADS
+                    lds_st(
+                        xi,
+                        ATT_Q_OFF
+                        + ((z // 512) * 16 + 12 + (z % 512) // 128) * ATT_KS
+                        + z % 128,
+                        fx.Int32(0),
+                    )
+                if const_expr(is_blk):
+                    tok = got[6][0] * 4 + j % 4
+                    valid = si < nsel
+                    locv = got[6][1] + j % 4
+                else:
+                    # the incomplete last block: tokens [(seq // 4) * 4, seq)
+                    tok = (seq // 4) * 4 + j
+                    valid = tok < seq
+                    locv = rtt_at(rtt_row, fx.min(tok, seq - 1))
+                tokc = fx.min(fx.max(tok, fx.Int32(0)), seq - 1)
+                # thread ch holds the 16 B chunks ch + 8 q (dims 8 (ch + 8 q) .. + 8) of its K/V rows; 64-bit
+                # addresses: the KV pools may exceed 4 GB
+                rowk = ptr(layer, LY.P_KBUF) + fx.Int64(locv) * 1024
+                rowv = ptr(layer, LY.P_VBUF) + fx.Int64(locv) * 1024
+                kw = [
+                    [
+                        fx.Vector(
+                            global_load(rowk + (kvh * 512 + (ch + 8 * q) * 16), 4)
                         )
-                    gpu.barrier()
-                    # ---- S = Q K^T (MFMA): wave -> (kv head, 16-token tile), full 256 dims
-                    kvw = wave // 4
-                    nt_ = wave % 4
-                    cacc = fx.Vector.filled(4, 0.0, fx.Float32)
-                    for ks in range_constexpr(8):
-                        dw = ks * 16 + (lane // 16) * 4
+                        for q in range(4)
+                    ]
+                    for kvh in range(2)
+                ]
+                vw = [
+                    [
+                        fx.Vector(
+                            global_load(rowv + (kvh * 512 + (ch + 8 * q) * 16), 4)
+                        )
+                        for q in range(4)
+                    ]
+                    for kvh in range(2)
+                ]
+                if valid & (tokc >= pos0):
+                    kvnew = mb(layer, "kvnew")
+                    tb = r * L + tokc - pos0
+                    for kvh in range_constexpr(2):
+                        kn = poll(
+                            [
+                                (
+                                    kvnew,
+                                    tb * 512 + kvh * 128 + (ch + 8 * q) * 4 + 2 * hf,
+                                    2,
+                                )
+                                for q in range(4)
+                                for hf in range(2)
+                            ]
+                        )
+                        vn = poll(
+                            [
+                                (
+                                    kvnew,
+                                    tb * 512
+                                    + 256
+                                    + kvh * 128
+                                    + (ch + 8 * q) * 4
+                                    + 2 * hf,
+                                    2,
+                                )
+                                for q in range(4)
+                                for hf in range(2)
+                            ]
+                        )
+                        kw[kvh] = [
+                            fx.Vector.from_elements(kn[2 * q] + kn[2 * q + 1], fx.Int32)
+                            for q in range(4)
+                        ]
+                        vw[kvh] = [
+                            fx.Vector.from_elements(vn[2 * q] + vn[2 * q + 1], fx.Int32)
+                            for q in range(4)
+                        ]
+                for kvh in range_constexpr(2):
+                    for q in range_constexpr(4):
+                        for e in range_constexpr(4):
+                            lds_st(
+                                xi,
+                                ATT_OFF
+                                + kvh * ATT_KV_WORDS
+                                + j * ATT_KS
+                                + (ch + 8 * q) * 4
+                                + e,
+                                kw[kvh][q][e],
+                            )
+                if ch == 0:
+                    lds_st(
+                        xi,
+                        ATT_M_OFF + 64 + j,
+                        valid.select(fx.Int32(1), fx.Int32(0)),
+                    )
+                gpu.barrier()
+                # ---- S = Q K^T (MFMA): wave -> (kv head, 16-token tile), full 256 dims
+                kvw = wave // 4
+                nt_ = wave % 4
+                cacc = fx.Vector.filled(4, 0.0, fx.Float32)
+                for ks in range_constexpr(8):
+                    dw = ks * 16 + (lane // 16) * 4
+                    a = fx.ptr_load(
+                        xs + (ATT_Q_OFF + (kvw * 16 + lane % 16) * ATT_KS + dw),
+                        result_type=v4f,
+                    ).bitcast(fx.BFloat16)
+                    bk = fx.ptr_load(
+                        xs
+                        + (
+                            ATT_OFF
+                            + kvw * ATT_KV_WORDS
+                            + (nt_ * 16 + lane % 16) * ATT_KS
+                            + dw
+                        ),
+                        result_type=v4f,
+                    ).bitcast(fx.BFloat16)
+                    cacc = fx.Vector(
+                        rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, bk, cacc])
+                    )
+                for i in range_constexpr(4):
+                    lds_st(
+                        xs,
+                        ATT_S_OFF
+                        + kvw * 1024
+                        + (4 * (lane // 16) + i) * 64
+                        + nt_ * 16
+                        + lane % 16,
+                        cacc[i],
+                    )
+                gpu.barrier()
+                # ---- V^T into the K regions (K is dead), softmax of the 2 x 16 (padded) head rows -> P (bf16)
+                for kvh in range_constexpr(2):
+                    for q in range_constexpr(4):
+                        vv = vw[kvh][q].bitcast(fx.BFloat16)
+                        for e in range_constexpr(8):
+                            fx.ptr_store(
+                                vv[e],
+                                xb
+                                + (
+                                    (ATT_OFF + kvh * ATT_KV_WORDS) * 2
+                                    + ((ch + 8 * q) * 8 + e) * ATT_VS
+                                    + j
+                                ),
+                            )
+                okv = lds_ld(xi, ATT_M_OFF + 64 + lane) != 0
+                for r in range_constexpr(4):
+                    row = wave + 8 * r  # (kvh, head) row: kvh = row // 16
+                    hl = row % 16
+                    sv = lds_ld(xs, ATT_S_OFF + row * 64 + lane) * (1.0 / 16.0)
+                    live = okv & (hl < 12)
+                    sv = live.select(sv, fx.Float32(NEG_INF))
+                    mx = sv
+                    for off in (32, 16, 8, 4, 2, 1):
+                        mx = _xred(mx, off, fx.max)
+                    pv = live.select(_exp(sv - mx), fx.Float32(0.0))
+                    sm = wave_sum(pv)
+                    fx.ptr_store(
+                        pv.to(fx.BFloat16),
+                        xb + (ATT_P_OFF * 2 + row * ATT_VS + lane),
+                    )
+                    if (lane == 0) & (hl < 12):
+                        hh = (row // 16) * 12 + hl
+                        lds_st(xs, ATT_M_OFF + hh, mx)
+                        lds_st(xs, ATT_M_OFF + 24 + hh, sm)
+                gpu.barrier()
+                # ---- O = P V (MFMA): wave -> (kv head, 64 dims)
+                part = mb(layer, "part")
+                pbase = task * LY.PART_STRIDE
+                for t2 in range_constexpr(4):
+                    n0 = nt_ * 64 + t2 * 16
+                    oacc = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for ks in range_constexpr(2):
+                        ke = ks * 32 + (lane // 16) * 8
                         a = fx.ptr_load(
-                            xs + (ATT_Q_OFF + (kvw * 16 + lane % 16) * ATT_KS + dw),
+                            xs
+                            + (ATT_P_OFF + ((kvw * 16 + lane % 16) * ATT_VS + ke) // 2),
                             result_type=v4f,
                         ).bitcast(fx.BFloat16)
-                        bk = fx.ptr_load(
+                        bv = fx.ptr_load(
                             xs
                             + (
                                 ATT_OFF
                                 + kvw * ATT_KV_WORDS
-                                + (nt_ * 16 + lane % 16) * ATT_KS
-                                + dw
+                                + ((n0 + lane % 16) * ATT_VS + ke) // 2
                             ),
                             result_type=v4f,
                         ).bitcast(fx.BFloat16)
-                        cacc = fx.Vector(
-                            rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, bk, cacc])
+                        oacc = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, bv, oacc])
                         )
-                    for i in range_constexpr(4):
-                        lds_st(
-                            xs,
-                            ATT_S_OFF
-                            + kvw * 1024
-                            + (4 * (lane // 16) + i) * 64
-                            + nt_ * 16
-                            + lane % 16,
-                            cacc[i],
-                        )
-                    gpu.barrier()
-                    # ---- V^T into the K regions (K is dead), softmax of the 2 x 16 (padded) head rows -> P (bf16)
-                    for kvh in range_constexpr(2):
-                        for q in range_constexpr(4):
-                            vv = vw[kvh][q].bitcast(fx.BFloat16)
-                            for e in range_constexpr(8):
-                                fx.ptr_store(
-                                    vv[e],
-                                    xb
-                                    + (
-                                        (ATT_OFF + kvh * ATT_KV_WORDS) * 2
-                                        + ((ch + 8 * q) * 8 + e) * ATT_VS
-                                        + j
-                                    ),
-                                )
-                    okv = lds_ld(xi, ATT_M_OFF + 64 + lane) != 0
-                    for r in range_constexpr(4):
-                        row = wave + 8 * r  # (kvh, head) row: kvh = row // 16
-                        hl = row % 16
-                        sv = lds_ld(xs, ATT_S_OFF + row * 64 + lane) * (1.0 / 16.0)
-                        live = okv & (hl < 12)
-                        sv = live.select(sv, fx.Float32(NEG_INF))
-                        mx = sv
-                        for off in (32, 16, 8, 4, 2, 1):
-                            mx = _xred(mx, off, fx.max)
-                        pv = live.select(_exp(sv - mx), fx.Float32(0.0))
-                        sm = wave_sum(pv)
-                        fx.ptr_store(
-                            pv.to(fx.BFloat16),
-                            xb + (ATT_P_OFF * 2 + row * ATT_VS + lane),
-                        )
-                        if (lane == 0) & (hl < 12):
-                            hh = (row // 16) * 12 + hl
-                            lds_st(xs, ATT_M_OFF + hh, mx)
-                            lds_st(xs, ATT_M_OFF + 24 + hh, sm)
-                    gpu.barrier()
-                    # ---- O = P V (MFMA): wave -> (kv head, 64 dims)
-                    part = mb(layer, "part")
-                    pbase = task * LY.PART_STRIDE
-                    for t2 in range_constexpr(4):
-                        n0 = nt_ * 64 + t2 * 16
-                        oacc = fx.Vector.filled(4, 0.0, fx.Float32)
-                        for ks in range_constexpr(2):
-                            ke = ks * 32 + (lane // 16) * 8
-                            a = fx.ptr_load(
-                                xs
-                                + (
-                                    ATT_P_OFF
-                                    + ((kvw * 16 + lane % 16) * ATT_VS + ke) // 2
-                                ),
-                                result_type=v4f,
-                            ).bitcast(fx.BFloat16)
-                            bv = fx.ptr_load(
-                                xs
-                                + (
-                                    ATT_OFF
-                                    + kvw * ATT_KV_WORDS
-                                    + ((n0 + lane % 16) * ATT_VS + ke) // 2
-                                ),
-                                result_type=v4f,
-                            ).bitcast(fx.BFloat16)
-                            oacc = fx.Vector(
-                                rocdl.mfma_f32_16x16x32_bf16(
-                                    T.vec(4, T.f32), [a, bv, oacc]
-                                )
+                    if lane < 48:  # rows (heads) 4 (lane // 16) + i < 12
+                        for i in range_constexpr(4):
+                            put(
+                                part,
+                                pbase
+                                + (kvw * 12 + 4 * (lane // 16) + i) * 256
+                                + n0
+                                + lane % 16,
+                                oacc[i],
                             )
-                        if lane < 48:  # rows (heads) 4 (lane // 16) + i < 12
-                            for i in range_constexpr(4):
-                                put(
-                                    part,
-                                    pbase
-                                    + (kvw * 12 + 4 * (lane // 16) + i) * 256
-                                    + n0
-                                    + lane % 16,
-                                    oacc[i],
-                                )
-                    if tid < 48:
-                        put(part, pbase + 24 * 256 + tid, lds_ld(xs, ATT_M_OFF + tid))
-                    gpu.barrier()
+                if tid < 48:
+                    put(part, pbase + 24 * 256 + tid, lds_ld(xs, ATT_M_OFF + tid))
+                gpu.barrier()
+
+            def stage_qsa_attn(layer):
+                """The 32 block chunks of every token (task (t, c) -> part slot t * ATT_TASKS + c)."""
+                NTASK = NT * LY.ATT_BLK_TASKS
+                nloop = (NTASK - bid + G - 1) // G
+                for it, _c in range(fx.Int32(0), nloop, 1, init=[fx.Int32(0)]):
+                    it = fx.Int32(it)
+                    task = bid + it * G
+                    t = task // LY.ATT_BLK_TASKS
+                    c = task % LY.ATT_BLK_TASKS
+                    attn_task(layer, t, c, t * LY.ATT_TASKS + c, True)
                     _ = yield [fx.Int32(0)]
+
+            def stage_qsa_tail(layer):
+                """The tail chunk of token t (part slot t * ATT_TASKS + 32) on CTA tail_base + t: it needs only q and
+                kvnew / the KV cache (prep), not the selection, so it runs while scores and select run elsewhere."""
+                tt = placed(LY.tail_base(R, NT))
+                if tt < NT:
+                    attn_task(
+                        layer,
+                        tt,
+                        LY.ATT_BLK_TASKS,
+                        tt * LY.ATT_TASKS + LY.ATT_BLK_TASKS,
+                        False,
+                    )
 
             def stage_qsa_merge(layer):
                 """Task (token, head): combine the chunk partials, sigmoid gate -> og."""
@@ -4531,7 +4664,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 src = ("mb", mb(0, "ple_h"), "mb", mb(0, "ple_ssq"), LY.PLE_PARTS)
             for li in range_constexpr(n_layers):
                 kind = plan[li]
-                stage_mix(li, "a", src, LY.P_HCA_NORM, LY.P_HCA_DOWN, LY.P_HCA_UP)
+                stage_mix(
+                    li,
+                    "a",
+                    src,
+                    LY.P_HCA_NORM,
+                    LY.P_HCA_DOWN,
+                    LY.P_HCA_UP,
+                    base=LY.MIXA_BASE,
+                )
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
@@ -4550,6 +4691,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     lane = tid % 64
                     wave = tid // 64
                     stage_qsa_prep(li)
+                    tid = fresh(tid0)
+                    lane = tid % 64
+                    wave = tid // 64
+                    stage_qsa_tail(li)
                     tid = fresh(tid0)
                     lane = tid % 64
                     wave = tid // 64
@@ -4578,11 +4723,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 lane = tid % 64
                 wave = tid // 64
                 h1 = ("mb", mb(li, "h1"), "mb", mb(li, "h1ssq"), LY.NPART)
-                stage_mix(li, "m", h1, LY.P_HCM_NORM, LY.P_HCM_DOWN, LY.P_HCM_UP)
+                mbase = LY.mixm_base(kind, NT)
+                stage_mix(
+                    li, "m", h1, LY.P_HCM_NORM, LY.P_HCM_DOWN, LY.P_HCM_UP, base=mbase
+                )
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
-                stage_router(li)
+                # past the mix-m up tasks
+                stage_router(li, mbase + LY.MIX_DOWN_TASKS + LY.MIX_UP_TASKS)
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
@@ -4605,6 +4754,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     LY.P_HCA_DOWN,
                     LY.P_HCA_UP,
                     x_out=ptr(GI, LY.G_FIN_OUT),
+                    base=LY.MIXA_BASE,
                 )
 
     @flyc.jit
