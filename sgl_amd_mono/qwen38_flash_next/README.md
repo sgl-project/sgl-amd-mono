@@ -78,7 +78,11 @@ combine-gate partials.
 2. `stage_qsa_prep`: q / k norms and partial RoPE (64 of 256 dims, interleaved MRoPE sections); writes the new
    tokens' K / V into SGLang's KV cache at `out_cache_loc`, the indexer keys and their RoPE positions into the
    request's index-key ring (SGLang's QSA pool: 4 slots a request, or 8 with sgl-project/sglang#47051) and, when a
-   4-token group completes, its compressed key.
+   4-token group completes, its compressed key, roped at the group's first position. A group that started before the
+   batch reads its older members and that position from the ring before any of the batch's stores. The RoPE
+   positions are one buffer for all layers (SGLang's layer-independent `qsa_rope_position_buffer`). With a 4-slot
+   ring a batch token's position lands in such a group's start slot, so only the step's last QSA layer stores them
+   (`layout.P_RP_STORE`); with 8 slots every QSA layer does.
 3. `stage_qsa_scores`: index logits of every complete 4-token block of the context for every row (MFMA over
    compressed keys, ReLU-sum over the 4 indexer heads).
 4. `stage_qsa_select` / `stage_qsa_merge_select`: exact top-512 blocks per row: a radix select per 8192-block
@@ -246,7 +250,9 @@ a warmup builds are the ones its graph capture finds.
   draft extend and decode) at 1 and 8 requests and 7 padded to 8, verify steps on MRoPE positions. Each step leaves
   the error words zero, writes only its own pool rows, also from a CUDA graph, which replays an unpadded step bitwise
   and a padded one's layer 0-3 states but KV slot 0 (see Limitations); the prelude's n-gram embedding and context are
-  bitwise a torch reference's; every MoE block matches an f32 router and an a16w4 torch MoE.
+  bitwise a torch reference's; every MoE block matches an f32 router and an a16w4 torch MoE. A verify step on
+  SGLang's 4-slot index-key ring equals, bitwise, the same step on an 8-slot ring holding the same pending
+  members (every QSA layer compresses a group that straddles the batch at its start position).
   The GDN and QSA layers are covered by check mode.
 - **Check mode** (`SGLANG_AMD_MONO_CHECK=1`): at build, the weights the launches read of layers 0, 1 and 3 (and
   experts 0, 255, 511 and the shared expert) are compared exactly against the checkpoint's safetensors. Then
