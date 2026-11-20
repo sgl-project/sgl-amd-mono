@@ -115,6 +115,28 @@ def test_a_step_runs_at_the_next_width():
     assert [glm53._width(r) for r in glm53.ROWS] == [2, 2, 4, 4, 8, 8, 8, 8]
 
 
+def test_tp2_runs_steps_of_up_to_four_rows_at_width_four():
+    # TP2 builds width 4 only (its 2-row indexer launch faults); TP4 and TP8 keep WIDTHS
+    assert glm53.tp_widths(2) == (4,)
+    assert glm53.tp_widths(4) == glm53.tp_widths(8) == glm53.WIDTHS
+    assert [glm53._width(r, glm53.tp_widths(2)) for r in (1, 2, 3, 4)] == [4] * 4
+
+
+@pytest.mark.parametrize(
+    "R, tokens", [(5, 1), (8, 1), (2, 4)], ids=["5 decode", "8 decode", "2x4 verify"]
+)
+def test_a_step_past_the_built_widths_runs_the_model_s_forward(R, tokens):
+    # a width-4 build (TP2): SGLang still routes up to 8 rows, and a wider step runs
+    # SGLang's forward
+    lm = _Lm()
+    built = _built(lm, {}, {(4, k): None for k in KINDS})
+    assert built.widths == (4,) and built.max_rows == 4
+    mode = "decode" if tokens == 1 else "target_verify"
+    key = registry.ShapeKey(forward_mode=mode, batch_size=R, tokens_per_request=tokens)
+    out = built.forward(registry.Plan(key=key), "ids", "positions", "batch")
+    assert out == "the model's forward" and len(lm.ran) == 1
+
+
 def test_a_step_from_embeddings_runs_the_model_s_forward():
     # layer 0's launch reads the step's tokens; given embeddings, SGLang's path runs
     lm = _Lm()

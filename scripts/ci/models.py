@@ -226,6 +226,24 @@ MODELS = {
         "concurrency": [1, 2, 4, 8, 16],
         "gate_concurrency": [1, 8],
     },
+    "glm53_mxfp4_tp2": {
+        "name": "GLM-5.3 (MXFP4), TP2",
+        "packages": ["glm53"],
+        "tp": 2,
+        "paths": {"GLM_53_MODEL_PATH": f"{HF}/amd/GLM-5.3-Quark-MXFP4-AttnFP8"},
+        "recipe": ("glm53_server", "TP2_ARGS"),
+        # test_glm53_kernels.py, its TP2 cases included, runs under glm53; the
+        # serving test's recipe is TP8
+        "kernel_tests": [],
+        "e2e_tests": [],
+        "microbench": [
+            "torchrun --nproc-per-node 2 test/kernels/glm53/time_layers.py --kind model --rows 4 --mxfp4"
+        ],
+        "evals": TEXT_EVALS,
+        # decode steps of up to 4 rows (width 4 only at TP2); 8 shows the fallback
+        "concurrency": [1, 2, 4, 8],
+        "gate_concurrency": [1, 4],
+    },
     "glm53_flash": {
         "name": "GLM-5.3-Flash",
         # Phase 1 of the nightly

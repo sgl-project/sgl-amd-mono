@@ -140,14 +140,18 @@ def head_weights(rank: int, tp: int, device):
     return Glm53HeadWeights(g_norm=g_norm, w_head=w.bfloat16())
 
 
-def layer_weights(layer: int, rank: int, tp: int, device, kind: str, mxfp4=False):
+def layer_weights(
+    layer: int, rank: int, tp: int, device, kind: str, mxfp4=False, raw=True
+):
     """Layer ``layer``'s random tensors as this rank's shard (every rank draws the
     same): block-FP8 projections and experts read in place, W_UK / W_UV, the router
     and the indexer's weights_proj packed; the shared expert is slot 256. A dense
     layer's MLP: its intermediates as expert-shaped slices, no router read; layer 0
     (``embed``) reads this rank's embedding rows in the router's place. ``mxfp4``:
     the experts (or the dense MLP) MXFP4 as SGLang holds an MXFP4 checkpoint's, the
-    raw tensors in ``keep[-4:]``."""
+    raw tensors in ``keep[-4:]``. ``raw=False`` drops the experts' raw tensors (the
+    references only ``check_mxfp4.py`` reads): kept, the 75 MoE layers' experts are
+    held twice and do not fit a GPU at TP2."""
     from sgl_amd_mono.glm53.gfx950.packing import pack_bf16, pack_fp8
     from sgl_amd_mono.glm53.gfx950.runner import Glm53Weights
 
@@ -211,7 +215,8 @@ def layer_weights(layer: int, rank: int, tp: int, device, kind: str, mxfp4=False
         g4 = _gen(1000 * layer + 11 + rank, device)
         raw_ug, raw_sug, w_ug, s_ug = _mxfp4(g4, E, 2 * inter, HIDDEN, 119, device)
         raw_dn, raw_sdn, w_dn, s_dn = _mxfp4(g4, E, HIDDEN, inter, 121, device)
-        keep = (*keep, raw_ug, raw_sug, raw_dn, raw_sdn)
+        if raw:
+            keep = (*keep, raw_ug, raw_sug, raw_dn, raw_sdn)
     return Glm53Weights(
         g_in=_norm(g, HIDDEN, device),
         g_q=_norm(g, Q_LORA, device),
@@ -359,6 +364,7 @@ class Model:
         head=False,
         first=None,
         similar=0.0,
+        raw=True,
     ):
         from sgl_amd_mono.glm53.gfx950.runner import (
             Glm53Build,
@@ -380,7 +386,7 @@ class Model:
         self.step_tables, self.topk0 = make_step(positions, requests, pages, device)
         mxfp4 = getattr(args, "mxfp4", False)
         self.weights = [
-            layer_weights(first + i, rank, tp, device, k, mxfp4)
+            layer_weights(first + i, rank, tp, device, k, mxfp4, raw)
             for i, k in enumerate(kinds)
         ]
         vocab_rows = VOCAB // tp
@@ -866,7 +872,6 @@ def main() -> int:
     ap.add_argument(
         "--positions", default="", help="comma-separated live-row positions"
     )
-    ap.add_argument("--mxfp4", action="store_true", help="MXFP4 (A4W4) MoE experts")
     ap.add_argument(
         "--native-fp4", action="store_true", help="MXFP8 x MXFP4 MFMA (with --mxfp4)"
     )
