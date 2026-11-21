@@ -33,16 +33,17 @@ def layout(weight: torch.Tensor, scale: torch.Tensor):
     return w, s.contiguous()
 
 
-def weight_loads(w, row_group, k, st0, steps, cm=CM_NT):
+def weight_loads(w, row_group, k, st0, steps, cm=CM_NT, nbytes=None):
     """The lane's two 16-byte words of each step ``st0 ..`` of 16-row group
-    ``row_group``; loads only."""
+    ``row_group``; loads only. ``nbytes``: the buffer's size (0: zeros, nothing
+    read)."""
     lane = fx.thread_idx.x % 64
     per_group = k // STEP
     return [
         [
             fx.Vector(
                 bo.buffer_load(
-                    rsrc(w),
+                    rsrc(w, nbytes),
                     ((row_group * per_group + st0 + i) * 64 + lane) * LANE_DWORDS
                     + 4 * h,
                     vec_width=4,
@@ -56,14 +57,14 @@ def weight_loads(w, row_group, k, st0, steps, cm=CM_NT):
     ]
 
 
-def scale_loads(ws, row_group, k, st0, steps, cm=CM_NT):
+def scale_loads(ws, row_group, k, st0, steps, cm=CM_NT, nbytes=None):
     """The lane's f32 scale of each step ``st0 ..``."""
     lane = fx.thread_idx.x % 64
     per_group = k // STEP
     return [
         fx.Float32(
             bo.buffer_load(
-                rsrc(ws),
+                rsrc(ws, nbytes),
                 (row_group * per_group + st0 + i) * 64 + lane,
                 vec_width=1,
                 dtype=T.f32,
