@@ -132,8 +132,6 @@ class Run:
             "accuracy": {},
             "routing": {},
         }
-        self.installed = None  # the checkout install() last installed
-        self.install_failed = {}  # checkout -> why its install failed
         for k, v in self.m.get("paths", {}).items():
             os.environ[k] = v
 
@@ -177,25 +175,20 @@ class Run:
         return rc
 
     def install(self, src):
-        """Make ``src`` the installed sgl-amd-mono, with its own kernel cache. A
-        no-op when ``src`` is already installed (the base tests, then the base
-        side)."""
+        """Make ``src`` the installed sgl-amd-mono, with its own kernel cache.
+        Always runs pip, even for the checkout installed last: a test or step may
+        have reinstalled or removed the package since, and an editable
+        ``--no-deps`` install takes seconds. A failed install is retried by the
+        next call rather than remembered: what failed it may be transient."""
         side = Path(src).name
         os.environ["SGLANG_AMD_MONO_CACHE_DIR"] = f"/tmp/sgl-amd-mono-cache-{side}"
-        if self.installed == str(src):
-            return
-        if str(src) in self.install_failed:  # the same pip run would fail again
-            raise RuntimeError(self.install_failed[str(src)])
-        self.installed = None
         rc = self.sh(
             "pip uninstall -y -q sgl-amd-mono; "
             f"pip install -q --no-deps --no-build-isolation -e {shlex.quote(str(src))}",
             f"install-{side}",
         )
         if rc:
-            self.install_failed[str(src)] = f"installing {src} failed"
-            raise RuntimeError(self.install_failed[str(src)])
-        self.installed = str(src)
+            raise RuntimeError(f"installing {src} failed")
 
     # -- tests ----------------------------------------------------------------
 
