@@ -127,6 +127,7 @@ class K1Build(msgspec.Struct, frozen=True):
     norm_eps: float = 1e-6  # the gated norm
     state_bf16: bool = False  # bf16 recurrent state: fp32 math, rounded on store
     qq: bool = False  # in_proj_qkvz MXFP4 (ASM FP4 GEMM layout)
+    qh: bool = False  # in_proj_qkvz rotated by Hadamard-32 (sgl-project/sglang#46059)
     # SGLANG_AMD_MONO_FAULT_INJECT: the wait this rank stalls at (0: none), once
     # fault_after steps have run
     fault_site: int = 0
@@ -609,6 +610,7 @@ def build(key: K1Build):
         return _BUILDS[key]
     s = key.tokens
     need(1 <= s <= L.MAX_TOKENS, f"{s} rows, the kernels take 1..{L.MAX_TOKENS}")
+    need(key.qq or not key.qh, "qh rotates the MXFP4 in_proj_qkvz: it needs qq")
     lay = scratch_layout(key)
     nr = -(-s * GTASKS // BLOCKS)  # GDN rounds: each its own LDS
 
@@ -636,6 +638,7 @@ def build(key: K1Build):
     keyed = key_tuple(key, SOURCES)
     name = (
         f"qwen38_mono_k1_s{s}_f{int(key.first)}_b{int(key.state_bf16)}_q{int(key.qq)}"
+        f"{'_h1' if key.qh else ''}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -683,6 +686,7 @@ def build(key: K1Build):
             mb = Mailbox(step_tag(epoch, layer))
             c = {
                 "qq": key.qq,
+                "qh": key.qh,
                 "goff": gdn_offset(key),
                 "rs": lds.rs.ptr,
                 "S": s,
@@ -748,18 +752,18 @@ def build(key: K1Build):
                     rg2 = 2 * BLOCKS - 1 - bid
                     ops2 = qkvz_fp4_loads(c, rg2)
                     local_x(c)
-                    quant_x(c)
+                    quant_x(c, h32=c["qh"])
                     stage_proj(c, rg, ops, fp4=True)
                     stage_proj(c, rg2, ops2, fp4=True)
                 if bid < BA_TASKS:
                     bops = ba_loads(c, bid)
                     local_x(c)
                     stage_ba(c, bid, bops)
-                    quant_x(c)
+                    quant_x(c, h32=c["qh"])
                     stage_proj(c, rg, ops, fp4=True)
                 if (bid >= BA_TASKS) & (bid < 2 * BLOCKS - QKVZ_TASKS):
                     local_x(c)
-                    quant_x(c)
+                    quant_x(c, h32=c["qh"])
                     stage_proj(c, rg, ops, fp4=True)
             gdn_tasks(c)
 

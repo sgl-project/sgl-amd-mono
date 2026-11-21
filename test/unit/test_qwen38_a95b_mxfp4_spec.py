@@ -26,6 +26,9 @@ except RuntimeError:  # the module needs a GPU at import; the spec checks only t
     )
 
 QWEN = SimpleNamespace(**HF_CONFIG, num_hidden_layers=8)
+# SGLang's quant method of the MXFP4 GDN projections: the spec checks its class name
+_Online = type("AiterMxfp4OnlineLinearMethod", (SimpleNamespace,), {})
+ROTATED = {"hadamard": True, "quant_kwargs": {"hadamard_rotate": True}}
 
 
 def test_the_plugin_registers_the_spec():
@@ -35,7 +38,8 @@ def test_the_plugin_registers_the_spec():
         backend=sgl_amd_mono.BACKEND, architectures=arch, isa="gfx950"
     )
     assert found is qwen.SPEC, why
-    assert found.devices["gfx950"].widths == tuple(range(1, 9))
+    # K1 and K2 at 1 to 8 rows, layer_block at 16
+    assert found.devices["gfx950"].widths == (*range(1, 9), 16)
     found, why = registry.find_spec(
         backend=sgl_amd_mono.BACKEND, architectures=arch, isa="gfx942"
     )
@@ -130,12 +134,12 @@ def _layer(i, gdn=True, fse=False, mxfp4=False, eps=1e-6):
         out = SimpleNamespace(
             weight=_meta(8192, 1024, dtype=torch.uint8),
             weight_scale=_meta(8192, 64, dtype=torch.uint8),
-            quant_method=SimpleNamespace(),
+            quant_method=_Online(),
         )
         qkvz = SimpleNamespace(
             weight=_meta(4608, 4096, dtype=torch.uint8),
             weight_scale=_meta(4608, 256, dtype=torch.uint8),
-            quant_method=SimpleNamespace(),
+            quant_method=_Online(),
         )
     layer.linear_attn = SimpleNamespace(
         layer_id=i,
@@ -176,24 +180,45 @@ def test_model_reasons(kw):
 
 @pytest.mark.parametrize("proj", ["in_proj_qkvz", "out_proj"])
 @pytest.mark.parametrize(
-    "state, refused",
+    "state, fmt",
     [
-        ({}, False),
-        ({"hadamard": False, "quant_kwargs": {}}, False),
-        ({"hadamard": True, "quant_kwargs": {"hadamard_rotate": True}}, True),
-        ({"quant_kwargs": {"hadamard_rotate": True}}, True),
+        ({}, (True, False)),
+        ({"hadamard": False, "quant_kwargs": {}}, (True, False)),
+        (ROTATED, (True, True)),
+        ({"hadamard": True, "quant_kwargs": {}}, None),
+        ({"quant_kwargs": {"hadamard_rotate": True}}, None),
+        ({"rotate": True, "quant_kwargs": {"hadamard_rotate": True}}, None),
     ],
 )
-def test_mxfp4_gdn_projections_have_no_rotation(proj, state, refused):
-    # sgl-project/sglang#46059 rotates the weight and the activation; K1 and K2 do not
+def test_mxfp4_gdn_projection_states(proj, state, fmt):
+    # SGLang before sgl-project/sglang#46059, with its rotation off and with its
+    # default rotation; the kernels refuse a state they do not know
     layers = [_layer(i, gdn=i % 4 != 3, mxfp4=True) for i in range(8)]
-    getattr(layers[1].linear_attn, proj).quant_method = SimpleNamespace(**state)
+    linear = getattr(layers[1].linear_attn, proj)
+    linear.quant_method = _Online(**state)
     reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
-    if refused:
+    if fmt is None:
         assert len(reasons) == 1 and reasons[0].startswith("layer 1:"), reasons
-        assert "SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0" in reasons[0], reasons
+        assert "sgl-project/sglang#46059" in reasons[0], reasons
     else:
         assert reasons == [], reasons
+        assert qwen._format(linear) == fmt
+
+
+def test_another_quant_method_is_refused():
+    layers = [_layer(i, gdn=i % 4 != 3, mxfp4=True) for i in range(8)]
+    layers[2].linear_attn.out_proj.quant_method = SimpleNamespace()
+    reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
+    assert len(reasons) == 1 and reasons[0].startswith("layer 2:"), reasons
+
+
+def test_each_layer_gets_its_own_format():
+    layers = [_layer(i, gdn=i % 4 != 3, mxfp4=i > 0) for i in range(8)]
+    layers[2].linear_attn.out_proj.quant_method = _Online(**ROTATED)
+    reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
+    assert reasons == [], reasons
+    got = [qwen._format(layers[i].linear_attn.out_proj) for i in range(3)]
+    assert got == [(False, False), (True, False), (True, True)]
 
 
 def test_the_shared_expert_is_unfused_or_expert_512():
