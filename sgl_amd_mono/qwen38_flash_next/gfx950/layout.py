@@ -5,6 +5,9 @@ launch, kept free of FlyDSL so it is testable without a GPU.
 A launch serves R requests x L verify tokens = S rows (S <= 32). Every activation
 mailbox is row-major [S][n], row t = request t // L, draft step t % L."""
 
+import dataclasses
+import functools
+
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, padded
 
 from .config import (
@@ -123,6 +126,8 @@ MAX_CTX = MAX_BLOCKS * 4  # 294912 >= max_position_embeddings (262144) + verify 
 ATT_CHUNK = 64  # tokens per attention split
 ATT_CHUNKS = 2048 // ATT_CHUNK + 1  # 32 block chunks + 1 tail chunk
 ATT_TASKS = ATT_CHUNKS  # per token; one task covers both kv heads
+# the block chunks (stage qsa_attn); the tail chunk runs in qsa_tail
+ATT_BLK_TASKS = ATT_CHUNKS - 1
 PART_STRIDE = 24 * 256 + 2 * 24  # per task: o[24][256], m[24], l[24]
 MERGE_TASKS = 24  # one per (token, head)
 PREP_Q_TASKS = 24  # CTAs [0, 24): one attention q head each (all tokens)
@@ -132,9 +137,138 @@ PREP_K_CTA = 24  # CTAs 24, 25: k head (norm+rope) + v -> KV cache
 PREP_IDX_CTA0 = 26
 
 
+# Stage placement: task k of a placed stage runs on CTA (base + k) % 256, so the CTAs
+# a stage leaves idle issue the next stage's weights while it runs (every CTA still
+# walks the stages in order: deadlock-free, outputs unchanged).
+MIXA_BASE = DN_RG  # mix-a down past the MoE combine's CTAs [0, 160)
+
+
+def op_base(kind, T):
+    """out_proj / o_proj base: past the GDN core's CTAs [0, C_TASKS) (192) for T > 4
+    (at T = 4, CTA 0 measured faster), or past the QSA merge's last round."""
+    if kind == "gdn":
+        return GDN_HV * core_split(T) if T > 4 else 0
+    return (T * MERGE_TASKS) % 256
+
+
+def mixm_base(kind, T):
+    """mix-m down base: past out_proj."""
+    return (op_base(kind, T) + OUT_RG) % 256
+
+
+# QSA prep tasks start at CTA PREP_BASE (past the CTAs [0, 104) with a 4th qsa_proj
+# tile: 872 = 3 x 256 + 104), the index scores right after them
+PREP_BASE = QP_RG % 256
+SCORES_BASE = PREP_BASE + PREP_IDX_CTA0 + 8  # + MAX_R
+
+
 def sel2_cta0(T):
     """CTAs [256 - T, 256): merge of the segment top-512s of row t (long contexts)."""
     return 256 - T
+
+
+def _tail_ctas(base, T):
+    return {(base + t) % 256 for t in range(T)}
+
+
+def scores_ctas(R):
+    """CTAs of the index scores at an ~8k context: 2048 + 1 compressed blocks -> 129 tiles of 16 per request,
+    8 tiles per CTA (the 129th, the newest block, gates the select of the request's last rows)."""
+    return (R * (2048 // 16 + 1) + 7) // 8
+
+
+def tail_base(R, T):
+    """QSA attention tail chunk of row t on CTA tail_base + t (stage qsa_tail): past the index scores' CTAs, or,
+    if that reaches the select CTAs, just below the prep CTAs. Placement only: the tail polls prep outputs
+    alone, so any CTA range is deadlock-free."""
+    base = (SCORES_BASE + scores_ctas(R)) % 256
+    if _tail_ctas(base, T) & set(range(sel2_cta0(T), 256)):
+        base = PREP_BASE - T
+    return base
+
+
+def _check_tail_base():
+    for R in range(1, 9):
+        for L in range(1, 32 // R + 1):
+            T = R * L
+            tail = _tail_ctas(tail_base(R, T), T)
+            prep = {(PREP_BASE + k) % 256 for k in range(PREP_IDX_CTA0 + R)}
+            scores = {(SCORES_BASE + k) % 256 for k in range(scores_ctas(R))}
+            sel = set(range(sel2_cta0(T), 256))
+            assert not tail & (prep | scores | sel), (R, L)
+
+
+_check_tail_base()
+
+
+# QSA index-chain hoist: qsa_proj runs its task n on tile (n + k0) % QP_RG, k0 = the
+# first KV tile (QP_K_OFF / 16), so round 0 (tasks [0, 256)) holds the KV and the
+# index tiles. The index chain (index prep, scores, select, merge-select) runs on the
+# contiguous "chain" CTAs [ch0, 256) right after their round-0 tile: the index prep
+# of request r on CTA pidx + r, the scores on [sbase, 256 - T), select from CTA 255
+# down (as before). The tiles past round 0 go to the CTAs [0, ch0) only (tile 256 + m
+# on CTA m % ch0), after the chain in program order. Enabled only when those rounds
+# are no more than the plain order's.
+@dataclasses.dataclass(frozen=True)
+class QsaHoist:
+    ch0: int  # first chain CTA
+    pidx: int  # index prep of request r on CTA pidx + r (inline: qsa_idx_writes base)
+    sbase: int  # index scores base CTA
+    k0: int  # tile of task 0
+    nti: int  # rounds past round 0 (tiles of the CTAs [0, ch0) after the chain)
+    tail: int  # QSA attention tail chunk of row t on CTA tail + t
+
+
+def qsa_inline(T: int) -> bool:
+    """Index prep inlined into the index scores: every scores CTA normalizes / ropes
+    the index q rows itself and compresses the groups completed inside the batch; the
+    ring / rope-position / compressed-key stores run in stage qsa_idx_writes after the
+    selection (no separate index-prep stage, so one CTA-to-CTA hand-off less)."""
+    return T <= 8
+
+
+@functools.cache
+def qsa_hoist(R: int, L: int):
+    """The QsaHoist geometry of R requests x L rows, or None (plain qsa_proj order).
+    With the inline index prep there is no index-prep stage in the chain: pidx is then
+    the base of qsa_idx_writes (the scores CTAs)."""
+    T = R * L
+    sbase = BLOCKS - T - scores_ctas(R)
+    pidx = sbase if qsa_inline(T) else sbase - R
+    ch0 = min(pidx, sbase)
+    extra = QP_RG - BLOCKS
+    nti_plain = (QP_RG + BLOCKS - 1) // BLOCKS - 1
+    if ch0 < T + PREP_IDX_CTA0 or extra <= 0:
+        return None
+    nti = (extra + ch0 - 1) // ch0
+    if nti > nti_plain:
+        return None
+    prep = set(range(PREP_BASE, PREP_BASE + PREP_IDX_CTA0))
+    tail = ch0 - T
+    if {(tail + t) % BLOCKS for t in range(T)} & prep:
+        tail = (PREP_BASE - T) % BLOCKS
+    assert all(0 <= (tail + t) % BLOCKS < ch0 for t in range(T)), (R, L)
+    return QsaHoist(
+        ch0=ch0, pidx=pidx, sbase=sbase, k0=QP_K_OFF // 16, nti=nti, tail=tail
+    )
+
+
+def _check_qsa_hoist():
+    for R in range(1, 9):
+        for L in range(1, 32 // R + 1):
+            h = qsa_hoist(R, L)
+            if h is None:
+                continue
+            # round 0 holds every KV and index tile; the later tiles are a permutation
+            # over the CTAs [0, ch0)
+            r0 = {(n + h.k0) % QP_RG for n in range(BLOCKS)}
+            assert set(range(QP_K_OFF // 16, QP_RG)) <= r0, (R, L)
+            later = [(BLOCKS + m + h.k0) % QP_RG for m in range(QP_RG - BLOCKS)]
+            assert sorted(list(r0) + later) == list(range(QP_RG)), (R, L)
+            assert (QP_RG - BLOCKS + h.ch0 - 1) // h.ch0 == h.nti
+
+
+_check_qsa_hoist()
 
 
 SEL_STRIDE = 1026  # pairs per token: (block, loc) as 2 pairs each, count at pair 1024
@@ -173,6 +307,13 @@ P_IP_S, P_OUT_S, P_BA_S = 32, 33, 34
 # QSA: SGLang keeps qkv_proj and indexer.index_qk_proj as separate FP8 params (rows
 # [0, 832 * 16) / the rest of QP)
 P_IP2, P_IP2_S = 35, 36
+# QSA: nonzero in the one QSA layer of a step that stores the batch's index-key RoPE
+# positions (G_ROPEPOS is one buffer for all layers, SGLang's layer-independent
+# qsa_rope_position_buffer): with a ring of <= L + 2 slots a request (SGLang's 4),
+# a batch token's store lands in the start slot of a group that completes in the
+# batch, which a later QSA layer of the step would read (the verify's last QSA
+# layer; the draft's layer)
+P_RP_STORE = 37
 QP_RG_QKV = (24 * 512 + 512 + 512) // 16  # 832
 BA_ROWS = 128  # SGLang pads in_proj_ba (96 rows) to 128 for AITER's CK GEMM
 # global row (index n_layers of the table)

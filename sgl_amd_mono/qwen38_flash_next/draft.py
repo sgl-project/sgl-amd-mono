@@ -33,12 +33,21 @@ weights are SGLang's, read in place, except the copies logged at startup: the
 hyper-connection mixers, router and input-fusion projections packed for the MFMA
 tiles, and the FP8 projections SGLang keeps row-major, zero-padded in AITER's
 shuffle.
+
+The draft's vocab projection reads an FP8 copy of the lm_head (``_DraftHead``,
+``gfx950/draft_head``): the draft's logits only pick its proposals, so the copy
+halves the bytes each draft step's lm_head reads (1.27 GB in bf16) and only the
+acceptance sees it; the target verifies with the bf16 lm_head. SGLang hands the
+draft the target's lm_head after the build (``set_lm_head_from_target``), so the
+spec wraps that and requantizes when the weight changes (+0.64 GB).
+``SGLANG_AMD_MONO_QWEN38_DRAFT_HEAD_FP8=0`` keeps the bf16 lm_head.
 """
 
 from __future__ import annotations
 
 import functools
 import logging
+import os
 from typing import Optional
 
 try:
@@ -82,11 +91,23 @@ SGLANG_READS = {
         "forward(input_embeds)",
     ),
     "srt/models/qwen3_5.py": ("layers", "embed_tokens", "rotary_emb"),
+    # the draft worker hands the draft the target's lm_head after the build
+    "srt/models/qwen3_5_mtp.py": ("set_embed_and_head", "set_lm_head_from_target"),
     "srt/layers/radix_attention.py": ("layer_id",),
     "srt/model_executor/forward_batch_info.py": (
         "spec_info",
         "forward_mode",
         "batch_size",
+        "next_token_logits_buffer",
+    ),
+    # the FP8 draft head enters _compute_lm_head's quant-method branch; the
+    # logits are returned as is when they are the logits buffer
+    "srt/layers/logits_processor.py": (
+        "should_apply_lm_head_quant_method",
+        "_UNQUANTIZED_LM_HEAD_METHODS",
+        "_compute_lm_head",
+        "_copy_logits_to_buffer",
+        "next_token_logits_buffer",
     ),
     # ForwardMode and CaptureHiddenMode, in forward_batch_info.py before forward_mode.py
     "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
@@ -164,6 +185,98 @@ def _turn_off_mtp_index_share(hf_config) -> None:
     )
 
 
+DRAFT_HEAD_FP8_ENV = "SGLANG_AMD_MONO_QWEN38_DRAFT_HEAD_FP8"
+
+
+class _Fp8HeadMethod:
+    """The quant method SGLang's ``_compute_lm_head`` applies to ``_DraftHead``
+    (any method outside its unquantized set)."""
+
+    def apply(self, layer, x, bias=None):
+        assert bias is None
+        return layer.project(x)
+
+
+class _DraftHead:
+    """The lm_head a launched draft step passes SGLang's logits processor: an e4m3
+    copy of the model's lm_head with a scale a vocab row (see the module
+    docstring). It writes fp32 logits, into the step's logits buffer when the
+    shapes match (the processor then returns them as they are)."""
+
+    def __init__(self, lm):
+        self.lm = lm
+        self.quant_method = _Fp8HeadMethod()
+        self.weight = self.scale = None
+        self.source = None
+        self.out = None
+        self.warned = False
+
+    @staticmethod
+    def _key(w):
+        return (w.data_ptr(), tuple(w.shape), w.dtype, w.device)
+
+    def refresh(self) -> None:
+        """(Re)quantize the model's current lm_head weight if it changed."""
+        import torch
+
+        from sgl_amd_mono.qwen38_flash_next.gfx950 import draft_head
+
+        w = getattr(self.lm.lm_head, "weight", None)
+        if w is None or w.dtype != torch.bfloat16 or w.dim() != 2:
+            self.weight = self.scale = self.source = None
+            return
+        key = self._key(w)
+        if key == self.source:
+            return
+        self.weight = self.scale = None
+        with torch.no_grad():
+            self.weight, self.scale = draft_head.quantize_rows(w.detach())
+        self.source = key
+        logger.info(
+            "monokernel qwen38_flash_next MTP draft: FP8 lm_head copy %s (%.2f GB) "
+            "for the draft's proposals; the target verifies with the bf16 lm_head",
+            tuple(self.weight.shape),
+            self.weight.numel() / 2**30,
+        )
+
+    def current(self) -> bool:
+        """Whether the copy is the model's current lm_head; refreshes it outside
+        graph capture, else (a capture with a stale copy) the step uses bf16."""
+        import torch
+
+        w = getattr(self.lm.lm_head, "weight", None)
+        if w is not None and self.source == self._key(w):
+            return True
+        if not torch.cuda.is_current_stream_capturing():
+            self.refresh()
+            return self.weight is not None
+        if not self.warned:
+            self.warned = True
+            logger.warning(
+                "monokernel qwen38_flash_next MTP draft: lm_head changed before a "
+                "graph capture without a refresh; this graph runs the bf16 lm_head"
+            )
+        return False
+
+    def project(self, x):
+        import torch
+
+        from sgl_amd_mono.qwen38_flash_next.gfx950 import draft_head
+
+        out, self.out = self.out, None
+        n = self.weight.shape[0]
+        if (
+            out is None
+            or out.dtype != torch.float32
+            or tuple(out.shape) != (x.shape[0], n)
+            or not out.is_contiguous()
+        ):
+            out = None
+        return draft_head.gemv(
+            x.to(torch.bfloat16), self.weight, self.scale, torch.float32, out=out
+        )
+
+
 class _Draft:
     """The draft's launch and its forward."""
 
@@ -171,6 +284,8 @@ class _Draft:
         self.lm, self.runner = lm, runner
         self.seen: set = set()
         self.backend_checked: set = set()
+        on = os.environ.get(DRAFT_HEAD_FP8_ENV, "1") == "1"
+        self.head = _DraftHead(lm) if on else None
 
     def takes(self, forward_batch, input_embeds=None) -> bool:
         """Whether the launch runs this step: static properties of the step only
@@ -239,7 +354,11 @@ class _Draft:
             self.seen.add(key)
             logger.info("monokernel qwen38_flash_next MTP draft runs %s", key)
         x, hc = self.runner.launch(fb, fb.spec_info.hidden_states)
-        out = lm.logits_processor(input_ids, x, lm.lm_head, fb)
+        head = lm.lm_head
+        if self.head is not None and self.head.current():
+            head = self.head
+            head.out = getattr(fb, "next_token_logits_buffer", None)
+        out = lm.logits_processor(input_ids, x, head, fb)
         lm._set_hc_logits_hidden_states(out, hc, fb)
         return out
 
@@ -277,6 +396,24 @@ def _route_draft_steps(model, draft: _Draft) -> None:
     model.forward = forward
 
 
+def _refresh_head_on_share(model, draft: _Draft) -> None:
+    """Requantize the FP8 draft head after SGLang hands the draft the target's
+    lm_head (after the build, before the draft's graphs are captured)."""
+    if draft.head is None:
+        return
+    for name in ("set_embed_and_head", "set_lm_head_from_target"):
+        standard = getattr(model, name, None)
+        if standard is None:
+            continue
+
+        def share(*args, _standard=standard, **kwargs):
+            result = _standard(*args, **kwargs)
+            draft.head.refresh()
+            return result
+
+        setattr(model, name, functools.wraps(standard)(share))
+
+
 def _build(model, hf_config, ctx) -> _Draft:
     import torch
 
@@ -304,6 +441,7 @@ def _build(model, hf_config, ctx) -> _Draft:
     runner.set_deadline(ctx.deadline_s)
     draft = _Draft(model, runner)
     _route_draft_steps(model, draft)
+    _refresh_head_on_share(model, draft)
     logger.info(
         "monokernel qwen38_flash_next MTP draft: draft extend steps of up to %d x %d "
         "rows and draft decode steps of up to %d x 1 are routed by the spec's "
