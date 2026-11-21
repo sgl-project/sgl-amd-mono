@@ -6,7 +6,7 @@ import os
 MODEL = os.environ.get("GLM_53_MODEL_PATH", "zai-org/GLM-5.3")
 ENV = {"SGLANG_USE_AITER": "1", "AITER_ONLINE_TUNE": "0"}
 # The cookbook's MI355X low-latency cell without MTP, capped at 64 running requests.
-# Without --monokernel-backend, so a test can launch the normal path too.
+# Without --enable-amd-monokernel, so a test can launch the normal path too.
 ARGS = [
     "--trust-remote-code",
     "--tp-size",

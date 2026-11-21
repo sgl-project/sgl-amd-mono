@@ -1,4 +1,4 @@
-"""Qwen3.8 MoE with --monokernel-backend amd on MI355X, TP8, across the switch
+"""Qwen3.8 MoE with --enable-amd-monokernel on MI355X, TP8, across the switch
 points: decode steps of 1 to 8 rows run K1 and K2, wider ones the normal path, and
 requests join and leave a running batch that steps past 8 rows and back (a short
 GSM8K run, for gross failures); NEXTN verify steps of up to 8 rows run K2; the
@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import requests
 from qwen38_a95b_mxfp4_server import ARGS, ENV, MODEL, NEXTN
+from sglang.kernels.plugin_kernels.amd.spec import FLAG
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
 )
@@ -28,8 +29,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
-
-from sgl_amd_mono import BACKEND
 
 LAUNCH_TIMEOUT = 3600
 # For gross failures: the normal path scores about 0.95 or more (thinking on)
@@ -44,7 +43,7 @@ def _launch(extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + ["--monokernel-backend", BACKEND, *extra_args],
+        other_args=ARGS + [FLAG, *extra_args],
         env=env,
         return_stdout_stderr=log,
     )

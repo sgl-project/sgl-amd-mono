@@ -233,7 +233,7 @@ a warmup builds are the ones its graph capture finds.
 - **CUDA graphs**: every captured batch size 1-8 runs the launches; larger batches and eager steps the launches do
   not take run SGLang's forward.
 - **No SGLang changes**: the plugin uses SGLang's monokernel interface and the SGLang names each module declares in
-  `SGLANG_READS`; it runs with `--monokernel-backend amd` (`--enable-amd-monokernel` after sgl-project/sglang#45389).
+  `SGLANG_READS`; it runs with `--enable-amd-monokernel` (`--monokernel-backend amd` before sgl-project/sglang#45389).
 
 ## 8. Correctness checks
 

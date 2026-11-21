@@ -7,8 +7,8 @@ MODEL = os.environ.get("GLM_53_FLASH_MODEL_PATH", "amd/GLM-5.3-Flash-Quark-MXFP4
 ENV = {"SGLANG_USE_AITER": "1", "AITER_ONLINE_TUNE": "0"}
 # The cookbook's MI355X high-throughput MXFP4 cell, except: a checkpoint whose shared
 # expert is MXFP4 (SGLang fuses it into the routed experts), EP 1 (the kernels shard
-# every expert by TP) and a bf16 KV cache. Without --monokernel-backend, so a test can
-# launch the normal path too.
+# every expert by TP) and a bf16 KV cache. Without --enable-amd-monokernel, so a test
+# can launch the normal path too.
 ARGS = [
     "--trust-remote-code",
     "--quantization",

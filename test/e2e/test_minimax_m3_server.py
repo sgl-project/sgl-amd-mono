@@ -1,4 +1,4 @@
-"""MiniMax-M3 with --monokernel-backend amd on MI35x, TP4, across the switch points.
+"""MiniMax-M3 with --enable-amd-monokernel on MI35x, TP4, across the switch points.
 
 Verify steps with EAGLE3 (4 requests of 4 rows at the largest width) and decode steps
 without it (16 rows, with HiCache): each server's startup line shows its tested batches
@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import requests
 from minimax_m3_server import ARGS, DECODE_ARGS, ENV, MODEL
+from sglang.kernels.plugin_kernels.amd.spec import FLAG
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.kl_test_utils import (
     get_input_ids,
@@ -33,7 +34,6 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-from sgl_amd_mono import BACKEND
 from sgl_amd_mono.minimax_m3.spec import NUMERICS
 
 LAUNCH_TIMEOUT = 3600
@@ -54,7 +54,7 @@ def _launch(args=ARGS, extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=args + ["--monokernel-backend", BACKEND, *extra_args],
+        other_args=args + [FLAG, *extra_args],
         env=env,
         return_stdout_stderr=log,
     )

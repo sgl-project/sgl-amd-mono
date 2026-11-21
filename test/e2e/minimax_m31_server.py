@@ -16,7 +16,7 @@ COMMON = [
     "--mem-fraction-static",
     "0.8",
 ]
-# Without --monokernel-backend, so a test can launch the normal path too.
+# Without --enable-amd-monokernel, so a test can launch the normal path too.
 # DSpark: verify steps of 8 rows a request, 2 requests at the largest width (16 rows)
 ARGS = COMMON + [
     "--speculative-algorithm",

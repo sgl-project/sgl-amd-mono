@@ -21,7 +21,7 @@ ENV = {
     # --mem-fraction-static means what it says
     "SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION": "1",
 }
-# Without --monokernel-backend, so a test can launch the normal path too.
+# Without --enable-amd-monokernel, so a test can launch the normal path too.
 ARGS = [
     "--trust-remote-code",
     "--tp",
