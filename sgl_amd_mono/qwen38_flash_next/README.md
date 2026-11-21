@@ -6,16 +6,22 @@ interface is the one of RFC sgl-project/sglang#43949.
 
 ## 1. Scope
 
-| | target verify (`spec.py`) | MTP draft (`draft.py`) |
-| --- | --- | --- |
-| model class | `Qwen4ExpForConditionalGeneration` | `Qwen4ExpForCausalLMMTP` |
-| SGLang step | NEXTN `TARGET_VERIFY`: topk 1, 3 draft steps, 4 draft tokens | `DRAFT_EXTEND_V2` and the draft `DECODE` steps |
-| rows | R <= 8 requests x L = 4 tokens (<= 32 rows) | extend: R x 4 rows; decode: R x 1 |
-| launches per step | 13 | 1 |
-| other steps | SGLang's forward | SGLang's forward |
+| | target verify (`spec.py`) | MTP draft (`draft.py`) | decode (`decode/`) |
+| --- | --- | --- | --- |
+| model class | `Qwen4ExpForConditionalGeneration` | `Qwen4ExpForCausalLMMTP` | `Qwen4ExpForConditionalGeneration` |
+| SGLang step | NEXTN `TARGET_VERIFY`: topk 1, 3 draft steps, 4 draft tokens | `DRAFT_EXTEND_V2` and the draft `DECODE` steps | `DECODE`, no speculative decoding |
+| TP | 1 | 1 | 1 or 2 |
+| checkpoint | `amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8` | (its MTP head) | `amd/Qwen3.8-Flash-Next-Quark-MXFP4` |
+| rows | R <= 8 requests x L = 4 tokens (<= 32 rows) | extend: R x 4 rows; decode: R x 1 | 1 to 64 at TP1, 1 to 192 at TP2 |
+| launches per step | 13 | 1 | 60 (one a GDN layer, two a QSA layer) |
+| other steps | SGLang's forward | SGLang's forward | SGLang's forward |
 
-GPU: gfx950 (MI355X), TP 1 only. Weights: the Quark checkpoint `amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8`
-(MXFP4 experts, W8A8 FP8 attention / GDN projections, FP8 PLE n-gram table).
+GPU: gfx950 (MI355X). The verify and draft launches run at TP1 with NEXTN on the Quark checkpoint
+`amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8` (MXFP4 experts, W8A8 FP8 attention / GDN projections, FP8 PLE
+n-gram table). TP1 without speculative decoding, and TP2, route the same spec to the decode path in `decode/`
+instead (`spec._route`): plain decode of `amd/Qwen3.8-Flash-Next-Quark-MXFP4` (BF16 attention / GDN projections) on
+the wide kernels of vllm-project/vllm#65188 with vllm-project/vllm#67706's TP1 changes (`decode/README.md`). Each path
+refuses the other checkpoint at startup. This document covers the TP1 verify monokernel.
 
 | file | contents |
 | --- | --- |
@@ -29,6 +35,7 @@ GPU: gfx950 (MI355X), TP 1 only. Weights: the Quark checkpoint `amd/Qwen3.8-Flas
 | `gfx950/weights.py` | the layer views of SGLang's params and what the kernel assumes of them |
 | `gfx950/packing.py` | the bf16 tile packing and the pointer-table rows |
 | `gfx950/runner.py` | the buffers, pointer tables and launch sequence (`VerifyRunner`, `DraftRunner`) |
+| `decode/` | the TP1 and TP2 decode path (`decode/README.md`) |
 
 ## 2. The target verify step
 

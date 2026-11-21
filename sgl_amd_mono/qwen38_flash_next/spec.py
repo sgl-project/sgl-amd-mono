@@ -27,6 +27,17 @@ every verify scratch. A graph's pad rows write KV slot 0, the reserved dummy slo
 against the checkpoint at build, then runs SGLang's own forward of every eager
 routed step first and logs the differences of the launches' logits and hidden
 states (``check.py``); the bounds in ``NUMERICS`` come from these runs.
+
+The spec also serves plain decode of the MXFP4 checkpoint (BF16 attention and GDN
+projections), 1 to 192 rows a step at TP2 and 1 to 64 at TP1, on the wide kernels
+of vllm-project/vllm#65188 with vllm-project/vllm#67706's TP1 changes
+(``decode``): both checkpoints have the same architecture and model type, and
+SGLang holds one spec for them, so ``SPEC`` declares both paths' TP sizes and
+widths, and the TP size and speculative decoding select the path's refusals and
+build (``_route``): TP1 with speculative decoding runs the NEXTN verify path, TP1
+without it and TP2 the decode path. There ``SGLANG_AMD_MONO_CHECK=1`` compares each
+layer's launches with SGLang's layer instead (``decode/check.py``, bounds in
+``decode.BOUNDS``).
 """
 
 from __future__ import annotations
@@ -34,6 +45,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+from typing import Callable, NamedTuple, Optional
 
 import torch
 
@@ -62,7 +74,9 @@ from sgl_amd_mono.qwen38_flash_next import (
     INDEXER_CONFIG,
     LAYER_PATTERN,
     MAX_CTX,
+    projection_dtypes,
 )
+from sgl_amd_mono.qwen38_flash_next.decode import spec as decode
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +110,7 @@ SGLANG_READS = {
         '"target_verify"',
     ),
     "srt/arg_groups/fields/*.py": (
+        "tp_size",
         "speculative_algorithm",
         "speculative_eagle_topk",
         "speculative_num_steps",
@@ -156,7 +171,9 @@ SGLANG_READS = {
     ),
     "srt/runtime_context.py": (
         "get_parallel",
+        "get_spec",
         "process_model_config",
+        '"spec"',
         '"tp_size"',
         '"pp_size"',
         '"attn_cp_size"',
@@ -263,6 +280,12 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         reasons.append(
             f"needs the Quark checkpoint (MXFP4 experts, FP8 attention and GDN "
             f"projections, FP8 PLE table), got {quant.get('quant_method')!r}"
+        )
+    elif (dtypes := projection_dtypes(hf_config)) != {"fp8_e4m3"}:
+        reasons.append(
+            f"GDN and attention projections {sorted(dtypes)}: the verify launches "
+            "read the FP8 ones of amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8 "
+            "(the MXFP4 checkpoint runs TP1 without speculative decoding)"
         )
     dtypes = mamba2_state_dtype(hf_config)
     if dtypes.conv != torch.bfloat16 or dtypes.temporal not in SSM_DTYPES:
@@ -426,12 +449,90 @@ def _build(model, hf_config, ctx) -> _Built:
     return built
 
 
+# The NEXTN verify path's server arguments, past the ones ``SPEC.requires`` holds
+# for both paths
+VERIFY_SERVER_ARGS = {
+    # NEXTN (SGLang resolves it to EAGLE): verify steps of one draft chain
+    # of 3 steps, 4 rows a request
+    "speculative_algorithm": frozenset({"EAGLE"}),
+    "speculative_eagle_topk": frozenset({1}),
+    "speculative_num_steps": frozenset({3}),
+    "speculative_num_draft_tokens": frozenset({4}),
+}
+
+
+def _decode_config_disable_reasons(cfg, hf_config) -> list[str]:
+    reasons = decode.config_disable_reasons(cfg, hf_config)
+    return reasons if _has_flydsl() else reasons + ["needs FlyDSL"]
+
+
+class _Path(NamedTuple):
+    server_args: dict
+    config_disable_reasons: Callable
+    model_disable_reasons: Callable
+    build: Callable
+
+
+_VERIFY = _Path(
+    VERIFY_SERVER_ARGS, _config_disable_reasons, _model_disable_reasons, _build
+)
+_DECODE = _Path(
+    decode.SERVER_ARGS,
+    _decode_config_disable_reasons,
+    decode.model_disable_reasons,
+    decode.build,
+)
+
+
+def _route(tp: int, speculative_algorithm) -> Optional[_Path]:
+    """The path a server runs: at TP1 the NEXTN verify path with speculative
+    decoding (the FP8-projection checkpoint) and the decode path without it (the
+    MXFP4 checkpoint); at TP2 the decode path, which refuses speculative decoding;
+    None at another TP size."""
+    if tp == TP and speculative_algorithm is not None:
+        return _VERIFY
+    return _DECODE if tp in decode.TP_SIZES else None
+
+
+def _path() -> _Path:
+    from sglang.srt.runtime_context import get_parallel, get_spec
+
+    return _route(get_parallel().tp_size, get_spec().speculative_algorithm)
+
+
+def _routed_config_disable_reasons(cfg, hf_config) -> list[str]:
+    """The path's server arguments, in SGLang's words for ``requires.server_args``,
+    then its own refusals; none at another TP size, which SGLang refuses itself."""
+    path = _route(cfg.tp_size, cfg.speculative_algorithm)
+    if path is None:
+        return []
+    reasons = [
+        f"{arg} {getattr(cfg, arg)!r} is not one of {sorted(map(str, ok))}"
+        for arg, ok in path.server_args.items()
+        if getattr(cfg, arg) not in ok
+    ]
+    return reasons + path.config_disable_reasons(cfg, hf_config)
+
+
+def _routed_model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
+    return _path().model_disable_reasons(model, hf_config, copies)
+
+
+def _routed_build(model, hf_config, ctx):
+    return _path().build(model, hf_config, ctx)
+
+
 SPEC = MonoSpec(
     name="qwen38_flash_next_hip",
     devices={
-        "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS)
+        "gfx950": DeviceLimits(
+            widths=tuple(sorted({*WIDTHS, *decode.WIDTHS})),
+            tp_sizes=tuple(sorted({TP, *decode.TP_SIZES})),
+            resident_blocks=BLOCKS,
+        )
     },
-    # the launches serve NEXTN target verify steps only
+    # the verify launches serve NEXTN target verify steps only; the decode path
+    # refuses speculative decoding (decode.SERVER_ARGS)
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
@@ -440,14 +541,9 @@ SPEC = MonoSpec(
         # hybrid for the rest
         attention_backends=frozenset({"triton", "aiter"}),
         server_args={
-            # NEXTN (SGLang resolves it to EAGLE): verify steps of one draft chain
-            # of 3 steps, 4 rows a request
-            "speculative_algorithm": frozenset({"EAGLE"}),
-            "speculative_eagle_topk": frozenset({1}),
-            "speculative_num_steps": frozenset({3}),
-            "speculative_num_draft_tokens": frozenset({4}),
-            # the launches read the committed GDN state and write every draft
-            # token's state to the verify scratch; ReplaySSM keeps neither
+            # the verify launches read the committed GDN state and write every
+            # draft token's state to the verify scratch, the decode launches update
+            # it in place; ReplaySSM keeps neither
             "enable_linear_replayssm": frozenset({False}),
             "enable_linear_replayssm_spec": frozenset({False}),
             # the prelude gathers the PLE n-gram table on the GPU
@@ -478,8 +574,8 @@ SPEC = MonoSpec(
         },
     ),
     numerics=NUMERICS,
-    model_disable_reasons=_model_disable_reasons,
-    build=_build,
+    model_disable_reasons=_routed_model_disable_reasons,
+    build=_routed_build,
     api_version=1,  # SGLang's MONOKERNEL_API_VERSION
-    config_disable_reasons=_config_disable_reasons,
+    config_disable_reasons=_routed_config_disable_reasons,
 )
