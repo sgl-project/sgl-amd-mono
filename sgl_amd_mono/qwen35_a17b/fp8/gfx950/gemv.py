@@ -38,6 +38,12 @@ WG_SPLIT = 8
 WG_ROWS = 16
 WG_MAX_ROWS = 32
 WG_WARPS = 4
+# Triton 3.8 cannot lower the pipelined preshuffle load (LLVM translation of
+# unrealized_conversion_cast) and miscompiles the unpipelined loop for M > 16
+# under static_range; Triton 3.7 miscompiles num_stages=1 for M > 16.
+WG_STAGES = tl.constexpr(
+    2 if tuple(int(v) for v in triton.__version__.split(".")[:2]) < (3, 8) else 1
+)
 
 
 def _shuffled(weight: torch.Tensor) -> bool:
@@ -107,7 +113,7 @@ def wg_dot(
     # [n // 16, k // 32, k // 16 % 2, n % 16, k % 16] of [N/16, K/32, 2, 16, 16]
     w_row = (pid * (BN // 16) + nn // 16) * (K * 16) + (nn % 16) * 16
     acc = tl.zeros([S, ROWS, BN], dtype=tl.float32)
-    for step in tl.range(0, K // S // GROUP, num_stages=2):
+    for step in tl.range(0, K // S // GROUP, num_stages=WG_STAGES):
         kb = s * (K // S // GROUP) + step
         k = kb[:, None] * GROUP + kk[None, :]
         x = tl.load(
