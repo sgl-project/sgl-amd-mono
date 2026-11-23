@@ -2,6 +2,10 @@
 """The Kimi-K3.1 spec routes one request's verify steps to Kimi-K3's launches and
 wider ones to the wide launch."""
 
+from types import SimpleNamespace
+
+import pytest
+
 import sgl_amd_mono
 from sgl_amd_mono.kimi_k3 import MAX_ROWS
 from sgl_amd_mono.kimi_k31 import spec as k31
@@ -39,3 +43,23 @@ def test_the_launches_name_their_server_args():
     server_args = k31.SPEC.requires.server_args
     assert server_args["enable_linear_replayssm_spec"] == frozenset({True})
     assert server_args["speculative_algorithm"] == frozenset({"DSPARK", "DFLASH"})
+
+
+def test_wide_capture_stream_and_variant():
+    assert wide._capture_stream(SimpleNamespace()) == "attn_res"
+    assert (
+        wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="attn_res"))
+        == "attn_res"
+    )
+    assert (
+        wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="prefix"))
+        == "prefix"
+    )
+    with pytest.raises(ValueError, match="unsupported dspark_aux_hidden_stream"):
+        wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="unknown"))
+
+    pk = SimpleNamespace(i=76, nvb=7, write=False, t1=True)
+    w = object.__new__(wide.Wide)
+    assert w._variant(pk, 48, 6, {75}, "prefix")["capture"] == "prefix"
+    assert w._variant(pk, 48, 6, {75}, "attn_res")["capture"] == "attn_res"
+    assert w._variant(pk, 48, 6, {79}, "prefix")["capture"] is False

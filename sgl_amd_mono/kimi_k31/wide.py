@@ -36,6 +36,7 @@ SGLANG_READS = {
         "KimiK3MoE",
         "AuxHiddenStateList",
         "_cdiv",
+        "dspark_aux_hidden_stream",
         # the routed experts the launch's top-k / sort feed (_routed, _experts)
         "_forward_routed",
         "_route_quant_fuse_eligible",
@@ -453,6 +454,13 @@ def _front_weight(moe, rank):
     return torch.cat([p.to(torch.bfloat16) for p in parts]).contiguous(), None
 
 
+def _capture_stream(bb) -> str:
+    stream = getattr(bb, "dspark_aux_hidden_stream", "attn_res")
+    if stream not in ("attn_res", "prefix"):
+        raise ValueError(f"unsupported dspark_aux_hidden_stream: {stream!r}")
+    return stream
+
+
 def _is_covered(layer) -> bool:
     from sglang.srt.models.kimi_k3 import KimiK3MoE
 
@@ -547,8 +555,8 @@ class Wide:
             *(Gemm(*(int(v) for v in c.split(":"))) for c in cfg_rows(b, self.L))
         )
 
-    def _variant(self, pk, b, L, captures):
-        cap = (pk.i - 1) in captures
+    def _variant(self, pk, b, L, captures, capture_stream="attn_res"):
+        cap = capture_stream if (pk.i - 1) in captures else False
         return dict(
             nvb_a=pk.nvb,
             nvb_m=pk.nvb + int(pk.write),
@@ -922,12 +930,16 @@ class Wide:
         rows = hidden.shape[0]
         L = int(fb.spec_info.draft_token_num)
         assert L == self.L and rows % L == 0, (rows, L, self.L)
+        captures = set(m.dspark_layers_to_capture or ())
+        capture_stream = _capture_stream(m) if captures else "attn_res"
         if not getattr(self, "_said", False):
             self._said = True
-            _say(f"first wide step: rows {rows}, L {L}")
+            _say(
+                f"first wide step: rows {rows}, L {L}, "
+                f"captures {sorted(captures)} ({capture_stream})"
+            )
         R = rows // L
         b = next(x for x in self.buckets if x >= rows)
-        captures = set(m.dspark_layers_to_capture or ())
         bufs = self._ensure(b, L, captures)
         cfg = bufs["cfg"]
         start(fb)
@@ -994,7 +1006,7 @@ class Wide:
                 i += 1
             for n, li in enumerate(run):
                 pk = self.layers[li]
-                v = self._variant(pk, b, L, captures)
+                v = self._variant(pk, b, L, captures, capture_stream)
                 assert v["t1"] == (n > 0 or (li - 1) in self.entry)
                 assert res.num_valid_blocks == pk.nvb, (
                     li,
