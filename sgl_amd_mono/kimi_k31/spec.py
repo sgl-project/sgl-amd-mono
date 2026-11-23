@@ -16,6 +16,8 @@ attention hands o_proj the same TP-local 12-head core as without it.
 
 from __future__ import annotations
 
+import os
+
 import msgspec
 import torch
 
@@ -115,6 +117,24 @@ class _Built(k3._Built):
             raise
 
 
+def _agree_xgmi_enabled() -> bool:
+    """Agree on SGLANG_AMD_MONO_K31_XGMI across TP ranks before importing xgmi."""
+    enabled = int(os.environ.get("SGLANG_AMD_MONO_K31_XGMI", "0") == "1")
+    if torch.distributed.is_initialized():
+        from sglang.srt.runtime_context import get_parallel
+
+        tp_group = get_parallel().tp_group.cpu_group
+        if tp_group is not None:
+            vote = torch.tensor([enabled, -enabled], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                vote, op=torch.distributed.ReduceOp.MIN, group=tp_group
+            )
+            if vote[0].item() == 0 and vote[1].item() == -1:
+                raise RuntimeError("SGLANG_AMD_MONO_K31_XGMI disagrees across TP ranks")
+            return vote[0].item() == 1
+    return bool(enabled)
+
+
 def _build(model, hf_config, ctx):
     """Kimi-K3's launches at the narrow widths, then the wide launches of every
     bucket, compiled by running each once (``warmup``) before graph capture."""
@@ -124,6 +144,11 @@ def _build(model, hf_config, ctx):
     narrow = k3.SPEC.build(
         model, hf_config, msgspec.structs.replace(ctx, widths=narrow_widths)
     )
+    if _agree_xgmi_enabled():
+        from sgl_amd_mono.kimi_k31.xgmi import maybe_install_xgmi_hooks
+
+        maybe_install_xgmi_hooks(model, log_fn=wide._say)
+
     if not any(w > wide.NARROW for w in ctx.widths):
         return narrow
 
