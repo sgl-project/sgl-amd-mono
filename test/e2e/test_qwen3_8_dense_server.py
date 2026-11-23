@@ -1,4 +1,4 @@
-"""Qwen3.8-27B with --monokernel-backend amd on MI35x at TP1 and TP2 (the OOB
+"""Qwen3.8-27B with --enable-amd-monokernel on MI35x at TP1 and TP2 (the OOB
 recipe), against the same server without it. Decode steps up to the row cap
 (TP1 4 rows, TP2 8) run the monokernels, wider ones the normal path. Each
 server's startup line shows the capped widths run the monokernels; GSM8K past the
@@ -36,8 +36,6 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-from sgl_amd_mono import BACKEND
-
 URL = DEFAULT_URL_FOR_TEST
 LAUNCH_TIMEOUT = 3600
 SPEC = "qwen3_8_dense_hip"
@@ -56,7 +54,7 @@ DECODE_TOKENS = 256
 
 
 def _launch(tp, *, mono, log=None, extra_env=None, extra_args=()):
-    backend = ["--monokernel-backend", BACKEND] if mono else []
+    backend = ["--enable-amd-monokernel"] if mono else []
     return popen_launch_server(
         MODEL,
         URL,
@@ -331,7 +329,11 @@ class TestMonokernelCheck(CustomTestCase):
                         "SGLANG_AMD_MONO_CHECK": "1",
                         "SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM": "0",
                     },
-                    extra_args=["--disable-cuda-graph", *_TRITON_FP4_GEMM],
+                    extra_args=[
+                        "--disable-decode-cuda-graph",
+                        "--disable-prefill-cuda-graph",
+                        *_TRITON_FP4_GEMM,
+                    ],
                 )
                 try:
                     for n in (1, cap):

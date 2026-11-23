@@ -13,7 +13,7 @@ ROW_CAP = {1: 4, 2: 8}
 
 
 def args(tp: int) -> list:
-    """The OOB config's server args at ``tp``, without --monokernel-backend, so a
+    """The OOB config's server args at ``tp``, without --enable-amd-monokernel, so a
     test can launch the normal path too."""
     return [
         "--trust-remote-code",
