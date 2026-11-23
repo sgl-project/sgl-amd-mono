@@ -12,7 +12,9 @@ import torch.distributed as dist
 
 from sgl_amd_mono.kimi_k31.xgmi.heap import (
     DEFAULT_DEADLINE_S,
+    PREFILL_AG_HALF_BYTES,
     PREFILL_MAX_ROWS,
+    TP,
     XgmiConfig,
     XgmiHeap,
     get_global_heap,
@@ -125,19 +127,33 @@ def _gather_normed_all(
     normed: torch.Tensor,
     need_normed_all: bool,
     overlap_normed: bool,
-) -> Optional[torch.Tensor]:
+) -> tuple[Optional[torch.Tensor], tuple[torch.Tensor, ...]]:
     if not need_normed_all:
-        return None
+        return None, ()
     if not overlap_normed:
-        return row_allgather(heap, normed)
-    main_stream = torch.cuda.current_stream(normed.device)
+        return row_allgather(heap, normed), ()
+    # Allocate out_all/tmp on main_stream and keep inputs live until wait_stream(comm_stream)
+    # to avoid cross-stream CUDACachingAllocator pools and record_stream fragmentation.
+    normed_c = normed.contiguous()
+    rows, cols = normed_c.shape
+    out_all = normed_c.new_empty(rows * TP, cols)
+    max_rows_per_rank = PREFILL_AG_HALF_BYTES // (TP * cols * 2)
+    tmp = (
+        normed_c.new_empty(max_rows_per_rank * TP, cols)
+        if rows > max_rows_per_rank
+        else None
+    )
+    main_stream = torch.cuda.current_stream(normed_c.device)
     comm_stream = heap.streams.comm
     comm_stream.wait_stream(main_stream)
-    normed.record_stream(comm_stream)
-    with torch.cuda.stream(comm_stream):
-        gathered = row_allgather(heap, normed)
-    gathered.record_stream(main_stream)
-    return gathered
+    try:
+        with torch.cuda.stream(comm_stream):
+            row_allgather(heap, normed_c, out_all=out_all, tmp=tmp)
+    except BaseException:
+        main_stream.wait_stream(comm_stream)
+        raise
+    keep = (normed_c, tmp) if tmp is not None else (normed_c,)
+    return out_all, keep
 
 
 def _make_shard_front(
@@ -171,7 +187,7 @@ def _make_shard_front(
 
         overlap_normed = need_normed_all and num_tokens <= PREFILL_MAX_ROWS
         with heap.overlap_guard():
-            normed_all = _gather_normed_all(
+            normed_all, comm_keep = _gather_normed_all(
                 heap, normed, need_normed_all, overlap_normed
             )
 
@@ -188,6 +204,7 @@ def _make_shard_front(
                     torch.cuda.current_stream(normed.device).wait_stream(
                         heap.streams.comm
                     )
+                comm_keep = ()
 
             q_all, s_all, ids_all, w_all = fp4_pack_allgather(
                 heap,
