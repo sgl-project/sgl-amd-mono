@@ -101,6 +101,34 @@ def test_gemv_32_rows_matches_aiter_block_scale_gemm(device, rows):
         assert rel < 5e-3, (n, k, rel.item())
 
 
+def test_wg_stage_probe_keeps_a_correct_loop(device):
+    from sgl_amd_mono.qwen35_a17b.fp8.gfx950.gemv import (
+        WG_STAGE_CANDIDATES,
+        _probe,
+        select_wg_stages,
+    )
+
+    stages = select_wg_stages(device)
+    assert stages in WG_STAGE_CANDIDATES
+    assert _probe(stages, device) is None
+
+
+@pytest.mark.parametrize(
+    "triton_minor, bad_stages", [("3.7.", 1), ("3.8.", 2)], ids=["3.7", "3.8"]
+)
+def test_wg_stage_probe_rejects_the_loop_this_triton_gets_wrong(
+    device, triton_minor, bad_stages
+):
+    """3.7 computes M > 16 wrongly with one stage, and 3.8 cannot compile two."""
+    import triton
+
+    from sgl_amd_mono.qwen35_a17b.fp8.gfx950.gemv import _probe
+
+    if not triton.__version__.startswith(triton_minor):
+        pytest.skip(f"Triton {triton.__version__}")
+    assert _probe(bad_stages, device) is not None
+
+
 def _gdn(gen, device):
     hv, head = TP4.gdn_v_heads, TP4.gdn_head
     w, s = _block_fp8(TP4.qkvz_n, TP4.hidden, gen, device)
