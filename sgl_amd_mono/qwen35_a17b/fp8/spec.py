@@ -502,6 +502,7 @@ def _build(model, hf_config, ctx):
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.qwen35_a17b.fp8.gfx950.barrier import PhaseRuntime
+    from sgl_amd_mono.qwen35_a17b.fp8.gfx950.gemv import wg_stages
 
     if ctx.isa != "gfx950":
         raise ValueError(f"Qwen3.5 block-FP8 monokernel is gfx950 only, got {ctx.isa}")
@@ -514,6 +515,8 @@ def _build(model, hf_config, ctx):
     _install_block_fp8_linear()
     layout = for_tp(tp)
     device = model.model.embed_tokens.weight.device
+    # Picks the GEMV loop now: its compile check cannot run under graph capture
+    wg_stages()
     runtime = PhaseRuntime(
         int(parallel.tp_rank),
         parallel.tp_group.cpu_group,

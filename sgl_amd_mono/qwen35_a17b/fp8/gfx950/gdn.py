@@ -34,6 +34,7 @@ from sgl_amd_mono.qwen35_a17b.fp8.gfx950.gemv import (
     block_fp8_gemv_q,
     wg_dot,
     wg_fits,
+    wg_stages,
 )
 from sgl_amd_mono.qwen35_a17b.fp8.gfx950.layout import (
     BA_N,
@@ -83,6 +84,7 @@ def _proj_conv_kernel(
     BN: tl.constexpr,
     ROWS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    STAGES: tl.constexpr,
 ):
     pid = tl.program_id(0)
     m = tl.arange(0, ROWS)
@@ -124,6 +126,7 @@ def _proj_conv_kernel(
         GROUP=GROUP,
         BN=BN,
         ROWS=ROWS,
+        STAGES=STAGES,
     ).to(mixed_ptr.dtype.element_ty)
     if is_conv:
         acc = s0.to(tl.float32) * w0[None, :] + s1.to(tl.float32) * w1[None, :]
@@ -356,6 +359,7 @@ def gdn_core(mod, hidden, hidden_q, conv, ssm, idx, rows: int, layout=None):
             BN=WG_BN,
             ROWS=WG_ROWS,
             HAS_BIAS=bias is not None,
+            STAGES=wg_stages(),
             num_warps=WG_WARPS,
         )
     else:
