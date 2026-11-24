@@ -2,7 +2,8 @@
 
 A PR runs the entries whose ``packages`` it touches; a change to ``common/``,
 ``sgl_amd_mono/__init__.py`` or ``pyproject.toml`` runs all of them. The nightly
-runs the entries marked ``nightly`` on main. Each entry
+runs the entries marked ``nightly`` on main, and the weekly run (Saturdays)
+those and the ones marked ``weekly``. Each entry
 names the server its accuracy and speed tests launch (a recipe module under
 ``test/e2e`` and its argument list, or ``env`` / ``args`` given here), the
 checkpoints on the CI nodes, its kernel and serving tests, its kernel-only
@@ -329,8 +330,8 @@ MODELS = {
     },
     "qwen35_a17b_fp8": {
         "name": "Qwen3.5-397B-A17B (FP8)",
-        # Phase 1 of the nightly
-        "nightly": True,
+        # the weekly run only (Saturdays), to keep the nightly's two nodes free
+        "weekly": True,
         # set from the first weekly report
         "baseline": {},
         "packages": ["qwen35_a17b"],
@@ -407,11 +408,16 @@ if __name__ == "__main__":
     # `python3 models.py checkpoints`: every supported checkpoint, one a line
     elif sys.argv[1:] == ["checkpoints"]:
         print("\n".join(CHECKPOINTS))
-    # `python3 models.py nightly` (the weekly run's too): the nightly's matrix, as JSON
-    elif sys.argv[1:] == ["nightly"]:
+    # `python3 models.py nightly|weekly`: the run's matrix, as JSON. The weekly run
+    # has the nightly's models and those marked ``weekly`` (weekly run only).
+    elif sys.argv[1:] in (["nightly"], ["weekly"]):
         import json
 
-        keys = ["common", *(k for k, m in MODELS.items() if m.get("nightly"))]
+        keys = ["common"] + [
+            k
+            for k, m in MODELS.items()
+            if m.get("nightly") or (sys.argv[1] == "weekly" and m.get("weekly"))
+        ]
         print(json.dumps([{"model": k, "tier": "full"} for k in keys]))
     else:
-        sys.exit("usage: models.py paths MODEL | checkpoints | nightly")
+        sys.exit("usage: models.py paths MODEL | checkpoints | nightly | weekly")
