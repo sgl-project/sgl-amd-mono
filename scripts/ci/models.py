@@ -234,8 +234,6 @@ MODELS = {
         "baseline": {},
         "packages": ["glm53_flash"],
         "tp": 4,
-        # amd/GLM-5.3-Flash-Quark-MXFP4: not on shared storage; downloaded by hand
-        # into both nodes' mirror
         "paths": {"GLM_53_FLASH_MODEL_PATH": f"{HF}/amd/GLM-5.3-Flash-Quark-MXFP4"},
         "recipe": ("glm53_flash_server", "ARGS"),
         "kernel_tests": ["test/kernels/test_glm53_flash_kernels.py"],
@@ -334,8 +332,6 @@ MODELS = {
         "baseline": {},
         "packages": ["qwen38_flash_next"],
         "tp": 1,
-        # amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8: not on shared storage;
-        # downloaded by hand into both nodes' mirror
         "paths": {
             "QWEN38_FLASH_NEXT_MODEL_PATH": f"{HF}/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8"
         },
