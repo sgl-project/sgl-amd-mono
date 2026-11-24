@@ -3,16 +3,16 @@ name: PR Test (AMD)
 # The PR test of the review guideline: per model the PR touches, its unit, kernel and
 # serving tests, accuracy (sgl-eval) and InferenceX fixed-length speed against the
 # base branch, and the kernel-only timing scripts, on dedicated MI355X nodes. A run
-# takes hours, so a maintainer starts it: add the `run-ci` label (removed again when
-# the run starts, so a later push needs a maintainer again), or run this workflow
-# with a PR number. `run-ci-extra` runs the same and adds GPQA, which catches the
-# long-context losses GSM8K cannot (a PR that touches attention, the KV cache or
-# long sequences should get it). The result is the "AMD PR test" status on the PR's head commit
+# takes hours, so a maintainer starts it: add the `run-ci` label, or run this workflow
+# with a PR number. The label stays: every later push to the PR runs the test again,
+# until a maintainer removes it. `run-ci-extra` runs the same and adds GPQA, which
+# catches the long-context losses GSM8K cannot (a PR that touches attention, the KV
+# cache or long sequences should get it). The result is the "AMD PR test" status on the PR's head commit
 # and a sticky PR comment; see scripts/ci/README.md.
 
 on:
   pull_request_target:
-    types: [labeled]
+    types: [labeled, synchronize]
   workflow_dispatch:
     inputs:
       pr:
@@ -33,10 +33,14 @@ permissions:
   contents: read
 
 concurrency:
-  # Only runs that test: other label events must not cancel one.
+  # Only runs that test: other label events, and pushes to a PR without the label,
+  # must not cancel one. A new push cancels the run on the PR's previous head.
   group: >-
     ${{ (github.event_name == 'workflow_dispatch'
-         || github.event.label.name == 'run-ci' || github.event.label.name == 'run-ci-extra')
+         || github.event.label.name == 'run-ci' || github.event.label.name == 'run-ci-extra'
+         || github.event.action == 'synchronize'
+            && (contains(github.event.pull_request.labels.*.name, 'run-ci')
+                || contains(github.event.pull_request.labels.*.name, 'run-ci-extra')))
         && format('pr-test-amd-{0}', github.event.pull_request.number || inputs.pr)
         || github.run_id }}
   cancel-in-progress: true
@@ -49,6 +53,9 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch'
       || github.event.label.name == 'run-ci' || github.event.label.name == 'run-ci-extra'
+      || github.event.action == 'synchronize'
+         && (contains(github.event.pull_request.labels.*.name, 'run-ci')
+             || contains(github.event.pull_request.labels.*.name, 'run-ci-extra'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -61,7 +68,7 @@ jobs:
       pr_sha: ${{ steps.pr.outputs.pr_sha }}
       base_sha: ${{ steps.pr.outputs.base_sha }}
       image: ${{ steps.image.outputs.image }}
-      extra: ${{ github.event.label.name == 'run-ci-extra' || inputs.extra || false }}
+      extra: ${{ contains(github.event.pull_request.labels.*.name, 'run-ci-extra') || inputs.extra || false }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,7 +81,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number || inputs.pr }}
-          # On a label event, the head the maintainer saw when labelling.
+          # On a label or push event, the head the event carries.
           EVENT_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           gh api "repos/$REPO/pulls/$PR" > pr.json
@@ -93,13 +100,6 @@ jobs:
             echo "base_sha=$base_sha"
           } >> "$GITHUB_OUTPUT"
           echo "PR #$PR head $pr_sha, base $base_ref at $base_sha: $(cat title.txt)"
-
-      - name: Remove the label that started the run
-        if: github.event_name == 'pull_request_target'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LABEL: ${{ github.event.label.name }}
-        run: gh api -X DELETE "repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/labels/$LABEL" || true
 
       # Read only: scope.py looks for model READMEs; nothing from the PR runs here.
       - uses: actions/checkout@v4
@@ -206,7 +206,7 @@ jobs:
 
   report:
     needs: [plan, test]
-    # Not on a cancelled run: a newer run (a new label) has taken over the status.
+    # Not on a cancelled run: a newer run (a new label or push) has taken over the status.
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:

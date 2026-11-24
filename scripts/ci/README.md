@@ -17,8 +17,11 @@ nodes:
 
 ## Running it
 
-- Add the `run-ci` label to the PR. The run removes the label when it starts, so a
-  later push needs a maintainer again.
+- Add the `run-ci` label to the PR. The label stays, and every later push to the PR
+  runs the test again (cancelling the run on the previous head) until a maintainer
+  removes it. Only people with triage access or more can add a label, so read a
+  fork PR's code before labelling it, and remove the label if a later push needs a
+  second look.
 - `run-ci-extra` runs the same and adds GPQA (or tick `extra` when running the
   workflow by hand). GSM8K's short answers cannot show a loss at long context;
   GPQA's long ones can. Use it for a PR that touches attention, the KV cache or
