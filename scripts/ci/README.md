@@ -39,12 +39,20 @@ to the run's summary.
 
 `scope.py` maps a PR's changed files to models (`models.py`):
 
-- a model whose own package (`sgl_amd_mono/<pkg>/`, or its tests) changed runs
-  the **full** tier;
+- a model whose own package code (`sgl_amd_mono/<pkg>/`) changed runs the
+  **full** tier;
 - a change to `sgl_amd_mono/common/`, `sgl_amd_mono/__init__.py` or
   `pyproject.toml` runs every other model's **smoke** tier, and `common`;
+- a model whose tests changed (`test/...`) but not its package code runs the
+  **tests** tier: its unit, kernel and serving tests, with no base side, speed
+  test or accuracy benchmark, since the served kernels are the base branch's;
 - a PR that changes no model runs `common`: the unit tests and the common kernel
   tests.
+
+A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
+checks representative widths only (DeepSeek-V4.1's K1, K2 and FFN launch at both
+edges and each side of their switch points; GLM-5.3's at TP8 only). The nightly
+and the weekly run sweep every width.
 
 Every server is the model's recipe under `test/e2e`, from the PR. `run_model.py`
 installs each checkout in turn over the image's sgl-amd-mono and serves it on
