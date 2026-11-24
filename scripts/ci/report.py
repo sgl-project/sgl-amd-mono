@@ -267,12 +267,51 @@ def compare_base(r, name, c):
         if len(x.get("failed_ids", [])) != x["failed"]:
             return None, f"no per-test results on {side}"
     pr, base = _msgs(c), _msgs(b)
-    return sorted(i for i in pr if pr[i] is None or pr[i] != base.get(i)), None
+    return sorted(i for i in pr if not _same_failure(pr[i], base.get(i))), None
 
 
 def _msgs(c):
     msgs = c.get("failed_msgs", {})
     return {i: msgs.get(i) for i in c["failed_ids"]}
+
+
+CUT_TENSOR = "tensor(?"
+
+
+def _same_failure(a, b):
+    """Whether two signatures are the same failure, a tensor's values aside."""
+    if a is None or b is None:
+        return False
+    a, b = _mask_tensors(a), _mask_tensors(b)
+    if a == b:
+        return True
+    # run_model.py cuts a signature at 1000 characters, inside a tensor whose
+    # values print longer in one run than in the other
+    return any(
+        x.endswith(CUT_TENSOR)
+        and len(x) > len(CUT_TENSOR)
+        and y.startswith(x[: -len(CUT_TENSOR)])
+        for x, y in ((a, b), (b, a))
+    )
+
+
+def _mask_tensors(msg):
+    # A tensor's repr in an assertion message can show torch.empty or random
+    # values, which differ between two runs of the same failure; the cached base
+    # results were signed before this mask, so it applies here, not in run_model.py.
+    out, i = [], 0
+    while (j := msg.find("tensor(", i)) >= 0:
+        depth, k = 0, j + len("tensor")
+        while k < len(msg):
+            depth += {"(": 1, ")": -1}.get(msg[k], 0)
+            if depth == 0:
+                break
+            k += 1
+        if k == len(msg):  # cut inside the tensor
+            return "".join(out) + msg[i:j] + CUT_TENSOR
+        out.append(msg[i:j] + "tensor(?)")
+        i = k + 1
+    return "".join(out) + msg[i:]
 
 
 def _names(ids, n=3):
