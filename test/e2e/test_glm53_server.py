@@ -7,8 +7,9 @@ the normal prefill path (KL consistency); with MTP, verify steps of 1 and 2 requ
 its launches (GSM8K and the draft's accept length); each covered layer against the
 normal one, in decode and verify steps, and in verify steps on the E4M3 MLA cache,
 the dense layers' MLPs, the tail's logits and each MTP draft step against SGLang's
-NextN included; the hidden states a covered step returns; and a fault on one rank
-that stops the server before any token of the failed step is sent."""
+NextN included; the hidden states a covered step returns; with MTP under decode
+context parallelism over the TP group (DCP8), GSM8K and the accept length; and a
+fault on one rank that stops the server before any token of the failed step is sent."""
 
 import os
 import re
@@ -52,16 +53,30 @@ KL_BOUND = 0.12 if MXFP4 else 0.06
 MTP_ACCEPT_BOUND = 2.5
 
 
-def _launch(extra_env=None, extra_args=(), log=None):
+def _launch(extra_env=None, extra_args=(), log=None, args=ARGS):
     env = {**os.environ, **ENV, **(extra_env or {})}
     return popen_launch_server(
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + ["--monokernel-backend", BACKEND, *extra_args],
+        other_args=args + ["--monokernel-backend", BACKEND, *extra_args],
         env=env,
         return_stdout_stderr=log,
     )
+
+
+def _without_dsa_backends(args):
+    """``args`` less the DSA backends: under DCP SGLang picks its ROCm DCP backend."""
+    flags = ("--dsa-prefill-backend", "--dsa-decode-backend")
+    out, skip = [], False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg in flags:
+            skip = True
+        else:
+            out.append(arg)
+    return out
 
 
 def _gsm8k():
@@ -160,6 +175,40 @@ class TestMonokernelMtp(CustomTestCase):
         self.assertLessEqual(
             {("DRAFT_EXTEND_V2", "1", "4"), ("DRAFT_EXTEND_V2", "2", "8")}, set(steps)
         )
+
+
+class TestMonokernelDcp(CustomTestCase):
+    """--dcp-size 8 (the TP group) with MTP: verify steps of 1 and 2 requests run the
+    DCP launches, each rank attending the MLA rows it keeps; the NextN draft runs
+    SGLang's path."""
+
+    process = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.process = _launch(
+            extra_args=[*MTP, "--dcp-size", "8", "--watchdog-timeout", "1200"],
+            args=_without_dsa_backends(ARGS),
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
+
+    # SGLang's verify steps of 4 and 8 requests on the MXFP4 checkpoint, as above
+    @pytest.mark.xfail(
+        MXFP4, reason="https://github.com/ROCm/aiter/pull/7910", strict=False
+    )
+    def test_gsm8k_and_accept_length_past_the_largest_width(self):
+        # a rank that attends another rank's rows, or merges a head's partials
+        # wrong, lowers the accept length before the score
+        metrics = _gsm8k()
+        info = requests.get(DEFAULT_URL_FOR_TEST + "/get_server_info").json()
+        accept = info["internal_states"][0]["avg_spec_accept_length"]
+        print(f"{metrics=} {accept=}")
+        self.assertGreater(metrics["score"], GSM8K_BOUND)
+        self.assertGreater(accept, MTP_ACCEPT_BOUND)
 
 
 class TestMonokernelCheck(CustomTestCase):

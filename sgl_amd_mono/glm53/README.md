@@ -43,3 +43,21 @@ launch path, so `weights.py` copies each one to 128 x 128 block FP8 at build, ab
 `copies` for the startup log. In check mode this makes the launch and SGLang's forward read different weights on the
 dense layers and on the draft's entry, so `check.dense` takes SGLang's per-128 FP8 MLP on that copy as its stock side
 and `NUMERICS` carries the wider `draft.eh.rel`.
+
+## Decode context parallelism
+
+With `--dcp-size` equal to `--tp`, SGLang stores each request's MLA cache rows by position: rank r keeps the rows of
+slots s with s % tp == r, at row s // tp, and every rank keeps the whole index-K cache. A launch built with
+`Glm53Build.dcp` serves those caches:
+
+- q_b and W_UK project this rank's heads, as at TP, and every rank receives every head's absorbed query from the rank
+  that projects it (`qg_lat`, `qg_pe` in the peer buffer);
+- the indexer scores the whole sequence on every rank and selects the same top-2048; the `dcp_list` stage keeps, in
+  list order, the slots this rank holds, as its cache rows, and their count after the lists (`W * 2048 + 1 + s`), which
+  the launches that reuse the selection read;
+- the split attends this rank's keys for all heads, skipping the splits past its count; each head's partial (its
+  latent, max and sum) goes to the rank that projects the head, which merges the ranks' partials by their LSE and
+  applies W_UV;
+- a row's MLA row is written by the rank that keeps it; the index-K row by every rank.
+
+The NextN draft attends SGLang's replica of its cache and runs SGLang's path.

@@ -141,6 +141,7 @@ SGLANG_READS = {
         '"tp_rank"',
         '"tp_size"',
         '"tp_group"',
+        '"attn_dcp_size"',
     ),
     "srt/distributed/parallel_state.py": ("cpu_group",),
 }
@@ -184,6 +185,8 @@ def _standard_reasons(model, hf_config) -> list[str]:
         reasons.append("needs SGLang's gfx950 fused DSA indexer on the NextN layer")
     if get_parallel().tp_size not in target.TP_SIZES:
         reasons.append(f"TP{get_parallel().tp_size}")
+    if get_parallel().attn_dcp_size > 1:
+        reasons.append("decode context parallel: the draft's cache is SGLang's replica")
     # an MXFP4 checkpoint's eh_proj is an unquantized ReplicatedLinear
     eh = model.model.eh_proj
     method = type(getattr(eh, "quant_method", None)).__name__

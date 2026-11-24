@@ -39,10 +39,21 @@ GLM53 = SimpleNamespace(
     architectures=["GlmMoeDsaForCausalLM"],
 )
 # the server arguments the spec reads before load: no speculative decoding
-CFG = SimpleNamespace(page_size=None, speculative_algorithm=None)
+CFG = SimpleNamespace(
+    page_size=None,
+    speculative_algorithm=None,
+    tp_size=8,
+    dcp_size=1,
+    attn_cp_size=1,
+    enable_prefill_cp=False,
+)
 # MTP: SGLang's GLM-5.3 default draft chain (NEXTN resolves to EAGLE)
 MTP = SimpleNamespace(
     page_size=None,
+    tp_size=8,
+    dcp_size=1,
+    attn_cp_size=1,
+    enable_prefill_cp=False,
     speculative_algorithm="EAGLE",
     speculative_eagle_topk=1,
     speculative_num_steps=3,
@@ -289,6 +300,26 @@ def test_the_layer_check_poisons_only_this_steps_index_scales():
     assert torch.equal(pages[:, values], before[:, values])
 
 
+def test_dcp_is_served_only_over_the_tp_group():
+    """The launches split a request's keys over the ranks of the TP group: a DCP size
+    equal to the TP size is served (and the spec accepts SGLang's CONTEXT_PARALLEL),
+    any other size, attention CP and check mode under DCP each name themselves."""
+    assert glm53.Feature.CONTEXT_PARALLEL in glm53.SPEC.features
+    full = SimpleNamespace(**{**vars(CFG), "dcp_size": 8})
+    assert glm53._config_disable_reasons(full, GLM53) == []
+    for changes, needle in (
+        ({"dcp_size": 4}, "--dcp-size 4"),
+        ({"attn_cp_size": 2}, "attention context parallel"),
+        ({"enable_prefill_cp": True}, "attention context parallel"),
+    ):
+        cfg = SimpleNamespace(**{**vars(CFG), **changes})
+        assert needle in " ".join(glm53._config_disable_reasons(cfg, GLM53)), changes
+    with mock.patch.dict(glm53.os.environ, {"SGLANG_AMD_MONO_CHECK": "1"}):
+        assert "SGLANG_AMD_MONO_CHECK" in " ".join(
+            glm53._config_disable_reasons(full, GLM53)
+        )
+
+
 def test_config_reasons_name_each_mismatch():
     assert glm53._config_disable_reasons(CFG, GLM53) == []
     other = SimpleNamespace(
@@ -505,7 +536,7 @@ def tp8(monkeypatch):
     monkeypatch.setattr(
         runtime_context,
         "get_parallel",
-        lambda: SimpleNamespace(tp_size=8, tp_rank=0),
+        lambda: SimpleNamespace(tp_size=8, tp_rank=0, attn_dcp_size=1),
     )
     monkeypatch.setattr(weights, "head_weights", lambda *args: None)
     monkeypatch.setattr(weights, "embedding", lambda *args: None)

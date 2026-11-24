@@ -219,7 +219,8 @@ def glm5_tp_config(tp_size: int) -> LayerConfig:
 
 
 def glm5_attention_heads(tp_size: int, dcp_size: int = 1) -> int:
-    if dcp_size not in (1, 4) or tp_size % dcp_size:
+    """The heads a rank attends: its own, or under DCP over the TP group, all."""
+    if dcp_size not in (1, tp_size):
         raise ValueError(
             f"unsupported GLM-5 TP/DCP geometry: tp={tp_size}, dcp={dcp_size}"
         )

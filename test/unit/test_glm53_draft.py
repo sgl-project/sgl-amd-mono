@@ -372,7 +372,7 @@ def test_each_setting_the_launches_cannot_serve_keeps_the_draft_standard(
         mock.patch("sglang.srt.runtime_context.get_spec", return_value=spec_args),
         mock.patch(
             "sglang.srt.runtime_context.get_parallel",
-            return_value=SimpleNamespace(tp_size=tp),
+            return_value=SimpleNamespace(tp_size=tp, attn_dcp_size=1),
         ),
     ):
         reasons = mtp._standard_reasons(model, hf_config)
@@ -380,6 +380,22 @@ def test_each_setting_the_launches_cannot_serve_keeps_the_draft_standard(
         assert reasons == []
     else:
         assert len(reasons) == 1 and why in reasons[0], reasons
+
+
+def test_dcp_keeps_the_draft_standard():
+    """Under DCP SGLang's draft attends a replica of its cache that the NextN launches
+    do not address: the draft stays on SGLang's path and says why."""
+    model_config = SimpleNamespace(get_dsa_mtp_topk_width=lambda c: c.index_topk)
+    with (
+        mock.patch.dict(sys.modules, {"sglang.srt.configs.model_config": model_config}),
+        mock.patch("sglang.srt.runtime_context.get_spec", return_value=SPEC_ARGS),
+        mock.patch(
+            "sglang.srt.runtime_context.get_parallel",
+            return_value=SimpleNamespace(tp_size=8, attn_dcp_size=8),
+        ),
+    ):
+        reasons = mtp._standard_reasons(_nextn_model(), GLM53)
+    assert len(reasons) == 1 and "decode context parallel" in reasons[0], reasons
 
 
 class _Weights(msgspec.Struct, frozen=True):
@@ -449,7 +465,10 @@ def test_the_build_runs_the_nextn_launches_and_installs_the_wrapper(
         mock.patch(
             "sglang.srt.runtime_context.get_parallel",
             return_value=SimpleNamespace(
-                tp_size=tp, tp_rank=0, tp_group=SimpleNamespace(cpu_group=None)
+                tp_size=tp,
+                tp_rank=0,
+                tp_group=SimpleNamespace(cpu_group=None),
+                attn_dcp_size=1,
             ),
         ),
         mock.patch(

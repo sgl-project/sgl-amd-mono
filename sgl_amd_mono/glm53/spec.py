@@ -77,6 +77,9 @@ def _width(rows: int) -> int:
 SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
         "page_size",
+        "dcp_size",
+        "attn_cp_size",
+        "enable_prefill_cp",
         "enable_hisparse",
         "expert_distribution_recorder_mode",
         "kv_cache_dtype",
@@ -160,6 +163,7 @@ SGLANG_READS = {
         '"tp_rank"',
         '"tp_size"',
         '"tp_group"',
+        '"attn_dcp_size"',
     ),
 }
 
@@ -291,6 +295,13 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         reasons.append(f"RoPE {rope_type!r}: the kernel's softmax scale is unscaled")
     if cfg.page_size not in (None, PAGE_SIZE):
         reasons.append(f"--page-size {cfg.page_size}: the DSA caches need {PAGE_SIZE}")
+    # DCP splits a request's keys over the ranks that run its heads' TP all-reduces
+    if (cfg.dcp_size or 1) not in (1, cfg.tp_size):
+        reasons.append(f"--dcp-size {cfg.dcp_size}: the launches need it equal to --tp")
+    if (cfg.attn_cp_size or 1) > 1 or cfg.enable_prefill_cp:
+        reasons.append("attention context parallel: only --dcp-size is served")
+    if (cfg.dcp_size or 1) > 1 and os.environ.get("SGLANG_AMD_MONO_CHECK") == "1":
+        reasons.append("SGLANG_AMD_MONO_CHECK reads the cache by slot, not under DCP")
     # a verify row sees the keys up to its own position: one draft chain per request
     if cfg.speculative_algorithm is not None and (
         cfg.speculative_eagle_topk != 1
@@ -420,8 +431,9 @@ class _Built:
                 indptr=torch.zeros(w + 1, dtype=i32, device=device),
                 req_ids=torch.zeros(w, dtype=i32, device=device),
                 page_table=torch.zeros(w, 1, dtype=i32, device=device),
-                # the last entry takes the copies of a row's unused keys
-                topk=torch.zeros(w * TOPK + 1, dtype=i32, device=device),
+                # the entry past the lists takes the copies of a row's unused keys;
+                # under DCP each row's count of this rank's keys follows it
+                topk=torch.zeros(w * TOPK + 1 + w, dtype=i32, device=device),
             )
             # layer 0's input: the step's token ids, -1 for a pad row
             self.ids[w] = torch.full((w,), -1, dtype=i32, device=device)
@@ -606,6 +618,8 @@ def _build(model, hf_config, ctx) -> _Built:
 
     p = get_parallel()
     tp, rank = p.tp_size, p.tp_rank
+    # 1, or the TP size (_config_disable_reasons): the DCP group is the TP group
+    dcp = p.attn_dcp_size
     device = model.model.layers[0].input_layernorm.weight.device
     copies = ctx.copies
     covered = _covered_layers(hf_config)
@@ -704,6 +718,7 @@ def _build(model, hf_config, ctx) -> _Built:
                 # rows and 64K keys 69 us a shared layer, the bf16 rows' dequant
                 # path 106 us. The MXFP4 checkpoint's own MLPs run MXFP4 rows.
                 native_fp4=layers[ids[0]].w.mxfp4 and not dense_mxfp4,
+                dcp=dcp,
             )
             rt = runtime(key)
             runtimes[w, kind] = rt
@@ -748,7 +763,7 @@ SPEC = MonoSpec(
     devices={
         "gfx950": DeviceLimits(widths=ROWS, tp_sizes=TP_SIZES, resident_blocks=BLOCKS)
     },
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.CONTEXT_PARALLEL}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsa"}),

@@ -17,7 +17,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
 | DeepSeek-V4-Pro | MI355X (gfx950) | 8 | All 61 layers (one launch each) in decode steps of up to 8 rows, and DSpark verify steps of one request (5 to 8 tokens) |
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | All 45 layers (one launch each; layer 0 from the tokens, with the embedding) and the final norm, LM head and logits (one launch), in decode steps of up to 8 rows (4 at TP2) |
-| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows |
+| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows; with decode context parallelism over the TP group (`--dcp-size` equal to `--tp`) too |
 | GLM-5.2 (MXFP4 experts) | MI355X (gfx950) | 4, 8 | As GLM-5.3; the routed experts in MXFP4, on MXFP8 activations |
 | GLM-5.3 (MXFP4) | MI355X (gfx950) | 4, 8 | As GLM-5.3 |
 | Kimi-K3 | MI350X, MI355X (gfx950) | 8 | Every MoE layer in decode and DSpark verify steps of up to 8 rows |
@@ -91,6 +91,12 @@ SGLANG_USE_AITER=1 python -m sglang.launch_server \
 The MXFP4 checkpoint `amd/GLM-5.3-Quark-MXFP4-AttnFP8` serves with the same flags,
 and so does `amd/GLM-5.2-MXFP4` (MXFP4 routed experts, the rest bf16), whose bf16
 matrices the kernels copy to FP8 once at startup (`sgl_amd_mono/glm53/README.md`).
+
+With decode context parallelism over the TP group (`--dcp-size 4` at `--tp 4`, or 8
+at 8), each rank keeps the MLA cache rows of 1/4 (1/8) of every request's positions;
+at TP4 the cache holds about three times the tokens. The verify steps run the
+kernels; the NextN draft runs SGLang's path. Leave out the DSA backend flags: under
+DCP SGLang picks its ROCm DCP backend for the steps the kernels do not serve.
 
 MiniMax-M3, with an EAGLE3 draft:
 
