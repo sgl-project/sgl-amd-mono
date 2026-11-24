@@ -142,7 +142,10 @@ class TestMonokernelCheck(CustomTestCase):
         ):
             process = _launch(
                 extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
-                extra_args=["--disable-cuda-graph"],
+                extra_args=[
+                    "--disable-decode-cuda-graph",
+                    "--disable-prefill-cuda-graph",
+                ],
                 log=(out, err),
             )
             try:

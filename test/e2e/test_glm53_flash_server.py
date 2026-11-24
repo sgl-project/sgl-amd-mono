@@ -135,7 +135,13 @@ class TestMonokernelMtpEager(CustomTestCase):
         # the row for each of the request's rows (a graph replays unchecked). 4
         # requests of 2 to 11 pages, so the rows differ between requests
         para = "The river valley archive lists the flood height of every year. "
-        process = _launch(extra_args=[*MTP, "--disable-cuda-graph"])
+        process = _launch(
+            extra_args=[
+                *MTP,
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
+            ]
+        )
         try:
             r = requests.post(
                 DEFAULT_URL_FOR_TEST + "/generate",
@@ -167,7 +173,10 @@ class TestMonokernelCheck(CustomTestCase):
         ):
             process = _launch(
                 extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
-                extra_args=["--disable-cuda-graph"],
+                extra_args=[
+                    "--disable-decode-cuda-graph",
+                    "--disable-prefill-cuda-graph",
+                ],
                 log=(out, err),
             )
             try:

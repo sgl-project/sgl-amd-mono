@@ -215,7 +215,8 @@ class TestMonokernelCheck(CustomTestCase):
             process = _launch(
                 extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
                 extra_args=[
-                    "--disable-cuda-graph",
+                    "--disable-decode-cuda-graph",
+                    "--disable-prefill-cuda-graph",
                     "--watchdog-timeout",
                     "1200",
                     *extra_args,
