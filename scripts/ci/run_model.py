@@ -63,6 +63,7 @@ from models import (  # noqa: E402
     PR_EVALS,
     PROMPTS_PER_SLOT,
     RANGE_RATIO,
+    weekly_eval,
 )
 
 PORT = 31000
@@ -581,7 +582,7 @@ class Run:
                 evals = [
                     e
                     for e in self.m.get("evals", [])
-                    if a.mode == "weekly" or not EVALS[e].get("weekly")
+                    if a.mode == "weekly" or not weekly_eval(self.m, e)
                 ]
                 self.step("on", self.side, "on", True, evals=evals)
                 if a.mode == "weekly":

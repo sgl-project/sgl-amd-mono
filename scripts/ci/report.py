@@ -32,6 +32,7 @@ from models import (  # noqa: E402
     PERF_GAIN,
     PERF_LOSS,
     PR_EVALS,
+    weekly_eval,
 )
 
 PASS, WARN, FAIL = "pass", "warn", "fail"
@@ -79,7 +80,7 @@ def accuracy_check(key, r):
         wanted = PR_EVALS + (EXTRA_EVALS if r.get("extra") else [])
         names = [e for e in wanted if e in names]
     elif r.get("mode") == "nightly":
-        names = [e for e in names if not EVALS[e].get("weekly")]
+        names = [e for e in names if not weekly_eval(m, e)]
     if not names:
         return WARN, "no accuracy benchmarks for this model in CI yet"
     if r.get("skipped", {}).get("serving"):

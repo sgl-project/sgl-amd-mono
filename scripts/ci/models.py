@@ -99,6 +99,15 @@ EXTRA_EVALS = ["gpqa"]
 # ``BASELINE_MARGIN``) to copy into the model's entry.
 BASELINE_MARGIN = {"gsm8k": 0.015, "gpqa": 0.05, "aime26": 0.03, "mmmu_pro": 0.03}
 TEXT_EVALS = ["gsm8k", "gpqa", "aime26"]
+
+
+def weekly_eval(model: dict, name: str) -> bool:
+    """Whether benchmark ``name`` of ``model`` runs only in the weekly run: a
+    ``weekly`` benchmark, or one the model's ``weekly_evals`` lists (a benchmark
+    too slow for the nightly at the model's concurrency)."""
+    return bool(EVALS[name].get("weekly")) or name in model.get("weekly_evals", ())
+
+
 # One-sided significance level of the GSM8K test.
 ALPHA = 0.05
 
@@ -271,6 +280,9 @@ MODELS = {
             "torchrun --nproc-per-node 8 test/kernels/kimi_k3/time_k2.py --rows 8 --flush 1024"
         ],
         "evals": TEXT_EVALS + ["mmmu_pro"],
+        # one request at a time, MMMU-Pro takes ~8 h and held a CI node for most of
+        # the nightly; it runs in the weekly run only
+        "weekly_evals": ["mmmu_pro"],
         # the recipe runs one request a step (DSpark verify steps of 8 rows)
         "concurrency": [1],
         "gate_concurrency": [1],

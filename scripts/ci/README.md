@@ -8,7 +8,8 @@ nodes:
   branch.
 - `nightly-amd.yml`, the **nightly**: Sunday to Friday, on main and the newest
   SGLang ROCm image, the accuracy benchmarks (but the `weekly` ones: AIME26 x4,
-  the costliest) and the speed test with the monokernels on, for the models marked
+  the costliest, and a model's `weekly_evals`, such as Kimi-K3's MMMU-Pro, ~8 h
+  at one request at a time) and the speed test with the monokernels on, for the models marked
   `nightly` in `models.py`, held to each model's fixed `baseline`. Saturday's
   **weekly** run has every benchmark with the monokernels on and off; its off
   results are the reference the nightly and the PR test read until the next one.
