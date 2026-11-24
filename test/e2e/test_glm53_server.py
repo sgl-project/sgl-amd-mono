@@ -139,6 +139,14 @@ class TestMonokernelMtp(CustomTestCase):
     @pytest.mark.xfail(
         MXFP4, reason="https://github.com/ROCm/aiter/pull/7910", strict=False
     )
+    # SGLang 1.0 refuses a server when none of the captured draft decode graphs
+    # runs a spec's monokernels, and glm53_nextn_hip serves the draft extend only,
+    # so the server exits at startup (it fails on main too); expected to fail
+    # until the glm53 owners settle the NextN spec with SGLang's capture check
+    @pytest.mark.xfail(
+        reason="SGLang's capture check refuses glm53_nextn_hip's draft decode graphs",
+        strict=False,
+    )
     def test_gsm8k_and_accept_length_past_the_largest_width(self):
         # 12 requests at a time: verify steps of 1 and 2 requests run the kernels,
         # wider ones the normal path. A verify row that attends the wrong keys of
