@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3.8-Flash-Next monokernels (RFC #43949; SGLang's Qwen4-Exp): the spec and
-its SGLang glue in ``spec`` (target verify) and ``draft`` (the MTP draft), and the
-gfx950 kernel and host runner in ``gfx950``.
+its SGLang glue in ``spec`` (target verify) and ``draft`` (the MTP draft), the
+gfx950 kernel and host runner in ``gfx950``, and the TP2 decode path in ``decode``.
 """
 
 # Qwen3.8-Flash-Next's text config, which the kernel builds in

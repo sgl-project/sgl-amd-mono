@@ -88,13 +88,17 @@ def fault_injection(rank: int) -> Optional[tuple[int, int]]:
     return (int(site or 0), int(after or 0)) if int(r) == rank else None
 
 
-def stop_launch():
-    """Stop the launch with a volatile store to the null page.
+def stop_launch(page=0):
+    """Stop the launch with a volatile store to page ``page`` (address ``page << 12``;
+    the null page by default).
 
-    The fault at address 0x0 tells a deliberate stop apart from a real one, and the
-    runtime tears the queue down. Unlike ``llvm.trap`` it asks nothing of the kernel's
-    ABI, so a launch that never fails pays nothing for it."""
-    fx.generic_store(global_ptr(0), fx.Int32(1), volatile=True)
+    A deliberate stop faults in the first 16 pages, below 64 KiB, which nothing maps:
+    not the GPU's VM, which KFD starts at ``AMDGPU_VA_RESERVED_BOTTOM`` (64 KiB) on gfx9
+    and later, nor the process while ``vm.mmap_min_addr`` is 64 KiB (Ubuntu's). The fault
+    address tells it apart from a real fault, and ``page`` can name the kind of wait
+    that stopped it. The runtime tears the queue down. Unlike ``llvm.trap`` it asks
+    nothing of the kernel's ABI, so a launch that never fails pays nothing for it."""
+    fx.generic_store(global_ptr(page << 12), fx.Int32(1), volatile=True)
 
 
 class Guard:
