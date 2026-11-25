@@ -32,9 +32,13 @@ from models import (  # noqa: E402
     PERF_GAIN,
     PERF_LOSS,
     PR_EVALS,
+    weekly_eval,
 )
 
 PASS, WARN, FAIL = "pass", "warn", "fail"
+TESTS_TIER = (
+    "tests tier (only its tests changed): the served kernels are the base branch's"
+)
 ICON = {PASS: "✅", WARN: "⚠️", FAIL: "❌"}
 MARKER = "<!-- sgl-amd-mono-ci -->"
 
@@ -61,6 +65,9 @@ def scope_check(key, r):
         return WARN, f"serving not run: {r['skipped']['serving']}"
     if r.get("perf", {}).get("on", {}).get("error"):
         return FAIL, f"monokernel server: {r['perf']['on']['error']}"
+    if r.get("tier") == "tests":
+        # no speed-test server; the serving tests check which steps run the kernels
+        return PASS, f"TP{m.get('tp')} on {r.get('node', '?')}; {TESTS_TIER}"
     routes = r.get("routing", {}).get("on", [])
     if not routes:
         return (
@@ -79,11 +86,13 @@ def accuracy_check(key, r):
         wanted = PR_EVALS + (EXTRA_EVALS if r.get("extra") else [])
         names = [e for e in wanted if e in names]
     elif r.get("mode") == "nightly":
-        names = [e for e in names if not EVALS[e].get("weekly")]
+        names = [e for e in names if not weekly_eval(m, e)]
     if not names:
         return WARN, "no accuracy benchmarks for this model in CI yet"
     if r.get("skipped", {}).get("serving"):
         return WARN, "not run (no server here): author-provided results needed"
+    if r.get("tier") == "tests":
+        return PASS, "%s, so no accuracy benchmark" % TESTS_TIER
     if r.get("tier") == "smoke":
         if not m.get("e2e_tests"):
             return (
@@ -175,6 +184,8 @@ def perf_check(key, r, needs_gain):
             "not run (no server here): author-provided InferenceX results needed",
             [],
         )
+    if r.get("tier") == "tests":
+        return PASS, "%s, so no speed test" % TESTS_TIER, []
     perf = r.get("perf", {})
     base, new = perf.get("off" if nightly else "base", {}), perf.get("on", {})
     if "error" in new:
@@ -382,7 +393,13 @@ def micro_check(key, r):
     if r.get("mode") in ("nightly", "weekly"):
         sides = "main"
     else:
-        sides = "base and PR" if mb.get("base") else "PR (no base package)"
+        sides = (
+            "base and PR"
+            if mb.get("base")
+            else "PR (tests tier)"
+            if r.get("tier") == "tests"
+            else "PR (no base package)"
+        )
     return PASS, f"{len(pr)} script(s) on {sides}; output below"
 
 

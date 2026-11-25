@@ -8,7 +8,8 @@ nodes:
   branch.
 - `nightly-amd.yml`, the **nightly**: Sunday to Friday, on main and the newest
   SGLang ROCm image, the accuracy benchmarks (but the `weekly` ones: AIME26 x4,
-  the costliest) and the speed test with the monokernels on, for the models marked
+  the costliest, and a model's `weekly_evals`, such as Kimi-K3's MMMU-Pro, ~8 h
+  at one request at a time) and the speed test with the monokernels on, for the models marked
   `nightly` in `models.py`, held to each model's fixed `baseline`. Saturday's
   **weekly** run has every benchmark with the monokernels on and off; its off
   results are the reference the nightly and the PR test read until the next one.
@@ -39,12 +40,20 @@ to the run's summary.
 
 `scope.py` maps a PR's changed files to models (`models.py`):
 
-- a model whose own package (`sgl_amd_mono/<pkg>/`, or its tests) changed runs
-  the **full** tier;
+- a model whose own package code (`sgl_amd_mono/<pkg>/`) changed runs the
+  **full** tier;
 - a change to `sgl_amd_mono/common/`, `sgl_amd_mono/__init__.py` or
   `pyproject.toml` runs every other model's **smoke** tier, and `common`;
+- a model whose tests changed (`test/...`) but not its package code runs the
+  **tests** tier: its unit, kernel and serving tests, with no base side, speed
+  test or accuracy benchmark, since the served kernels are the base branch's;
 - a PR that changes no model runs `common`: the unit tests and the common kernel
   tests.
+
+A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
+checks representative widths only (DeepSeek-V4.1's K1, K2 and target FFN launch at
+both edges and each side of their switch points; GLM-5.3's at the first and last
+width of each TP size). The nightly and the weekly run sweep every width.
 
 Every server is the model's recipe under `test/e2e`, from the PR. `run_model.py`
 installs each checkout in turn over the image's sgl-amd-mono and serves it on
