@@ -39,6 +39,15 @@ comment up to date with the report. Each model's logs (servers, benchmarks,
 tests) are in the run's `mono-ci-<model>` artifact. The nightly writes its report
 to the run's summary.
 
+The PR test's GPU jobs share the two runners with the nightly and with each
+other, so a run can wait hours for one. While it waits or runs, its pending
+status says where it stands: `Waiting for a GPU runner: ~N jobs ahead. Will run
+...`, then `3/14 done; running <model>; 9 waiting, ~N jobs ahead`. The plan job
+sets it, and `queue-status.yml` (every 10 minutes, `queue_status.py`) keeps it
+current until the report sets the result. "Ahead" counts the GPU jobs running now
+and those queued by older runs; GitHub does not promise to hand queued jobs out
+oldest first, so it is an estimate.
+
 ## What runs
 
 `scope.py` maps a PR's changed files to models (`models.py`):
