@@ -564,11 +564,14 @@ def run(args, m, rank, dev, cpu):
         if cap:
             worst["cap"] = max(worst["cap"], rel(cap_view, s["ref"]["cap"]))
             if cap == "prefix":
-                # prefix capture emits the kernel's own mid slice unchanged (bit-exact)
+                # prefix capture emits the kernel's own mid slice unchanged; compare bits,
+                # since torch.equal treats +0 and -0 as equal
                 mid_parts = [torch.empty_like(mid) for _ in range(TP)]
                 dist.all_gather(mid_parts, mid.contiguous())
                 mid_full = torch.cat(mid_parts, dim=-1)
-                if not torch.equal(cap_view, mid_full):
+                if not torch.equal(
+                    cap_view.view(torch.int16), mid_full.view(torch.int16)
+                ):
                     worst["cap"] = float("inf")
             others = torch.cat(
                 [aux[..., : CAP_SLOT * H], aux[..., (CAP_SLOT + 1) * H :]], dim=-1

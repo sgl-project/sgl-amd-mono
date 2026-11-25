@@ -454,8 +454,8 @@ def _front_weight(moe, rank):
 
 
 def _capture_stream(bb) -> str:
-    # sgl-project/sglang#52503 adds dspark_aux_hidden_stream; SGLang without it
-    # captures attn_res. Read it directly, in SGLANG_READS, once the CI image has it.
+    # sgl-project/sglang#52503 adds dspark_aux_hidden_stream; older SGLang captures attn_res.
+    # Read it directly, and list it in SGLANG_READS, once the CI image has #52503.
     stream = getattr(bb, "dspark_aux_hidden_stream", "attn_res")
     if stream not in ("attn_res", "prefix"):
         raise ValueError(f"unsupported dspark_aux_hidden_stream: {stream!r}")
