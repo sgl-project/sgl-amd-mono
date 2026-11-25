@@ -63,6 +63,12 @@ COMMON_KERNEL_TESTS = [
 # Paths whose change runs every model.
 SHARED_PATHS = ("sgl_amd_mono/common/", "sgl_amd_mono/__init__.py", "pyproject.toml")
 
+# A PR whose own package code changes in more models than this (a refactor or an
+# API move across packages) runs each of them at the smoke tier, not the full one:
+# 14 full-tier jobs hold both GPU runners for most of a day. The nightly runs them
+# all in full; a maintainer can dispatch the PR test with `models` for a full run.
+FULL_TIER_MAX_MODELS = 3
+
 # The fixed-length speed test (InferenceX's): random prompts of 8k +/- 20% tokens
 # in, 1k +/- 20% out, 10 prompts a concurrency slot.
 ISL, OSL, RANGE_RATIO, PROMPTS_PER_SLOT = 8192, 1024, 0.8, 10

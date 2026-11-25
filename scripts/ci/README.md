@@ -52,6 +52,11 @@ to the run's summary.
   test or accuracy benchmark, since the served kernels are the base branch's;
 - a PR that changes no model runs `common`: the unit tests and the common kernel
   tests.
+- a PR whose package code changes in more than `FULL_TIER_MAX_MODELS` (3) models,
+  such as a refactor or an API move across packages, runs each of them at the
+  **smoke** tier instead of the full one, and `common` in full: fourteen full-tier
+  jobs would hold both GPU runners for most of a day. The nightly runs them in
+  full; to run a PR in full anyway, run the workflow by hand with `models`.
 
 A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
 checks representative widths only (DeepSeek-V4.1's K1, K2 and target FFN launch at

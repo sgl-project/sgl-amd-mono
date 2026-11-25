@@ -21,7 +21,7 @@ once), base, then the unit, kernel and timing tests, on and off (GSM8K only),
 then the model's serving tests. A model whose ``models.py`` entry merged before
 its package has no base package; its off side runs the speed test as its base.
 (A model new in the PR is not run at all: ``models.py`` comes from the base branch.) The smoke tier (a model that runs only
-because shared code changed) runs no accuracy benchmark, whose bound its serving
+because shared code, or code in many models, changed) runs no accuracy benchmark, whose bound its serving
 tests hold, and times only the gate concurrencies. The tests tier (only the model's
 tests changed) runs its unit, kernel and serving tests: no base side, speed test or
 accuracy benchmark. A PR's kernel tests run with MONO_CI_QUICK_KERNELS=1, at the
