@@ -103,7 +103,7 @@ def _close(got, ref, rtol, atol, what, bad_max=0.001, cos_min=0.9999):
     )
 
 
-@pytest.mark.parametrize("rows", [8, 16, 64])
+@pytest.mark.parametrize("rows", [8, 16])
 def test_dmlp_matches_the_draft_mlp(rows):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
@@ -172,9 +172,22 @@ def test_dmlp_matches_the_draft_mlp(rows):
         peers.close()
 
 
-@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+@pytest.mark.parametrize("rows", [8, 16])
 def test_widths_compile(rows):
     from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
     from sgl_amd_mono.muse_spark.gfx950.runner import compile_only
 
     compile_only(D.build_dmlp(D.DMLPBuild(tokens=rows, npes=8)))
+
+
+@pytest.mark.parametrize("rows", [32, 64])
+def test_wider_steps_are_refused(rows):
+    """Past 16 rows D-MLP's LDS does not fit: the build refuses it and the draft spec
+    does not offer the width."""
+    from sgl_amd_mono.muse_spark import draft
+    from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
+
+    assert D.dm_lds_bytes(rows) > D.LDS_BYTES
+    with pytest.raises(AssertionError, match="LDS"):
+        D.build_dmlp(D.DMLPBuild(tokens=rows, npes=8))
+    assert rows not in draft.DRAFT_WIDTHS

@@ -9,13 +9,15 @@ turns into the draft tokens. The draft is a dense Qwen3-style stack (5 sliding
 layers, hidden 8192, 64 / 8 heads of 128, intermediate 28672, a grouped two-tap
 convolution around each sublayer) with no head of its own.
 
-Stage 2 (the default): each layer runs as four launches, D-pre (the input norm's
+Stage 2 (the default): the five layers run as one launch, D-draft
+(``gfx950/draft_layer.py``), each layer's stages those of D-pre (the input norm's
 fused add, the attention convolution's coefficients and conv0, the qkv projection,
 the per-head q / k norm + table RoPE, q out and k / v into the fp8 cache), D-attn
 (the block attention over the compact windowed cache), D-post (the o projection,
 the TP sum, conv1) and D-MLP (the post norm's fused add, the convolutions, gate /
 up / down, the TP sum) — ``gfx950/draft_attn_half.py``, ``draft_attn.py``,
-``draft_mlp.py``. ``SGLANG_AMD_MONO_DRAFT_STAGE=1`` keeps the attention half on
+``draft_mlp.py``, which check mode runs as four launches a layer.
+``SGLANG_AMD_MONO_DRAFT_STAGE=1`` keeps the attention half on
 SGLang's modules; ``SGLANG_AMD_MONO_DRAFT_KERNELS=0`` (stage 0) runs the model's
 own forward, so the wiring (attach, widths, block rows, graph capture) can be
 exercised with an output identical to the normal path. Check mode
@@ -29,6 +31,8 @@ import logging
 import os
 
 import torch
+import triton
+import triton.language as tl
 
 try:
     from sglang.kernels.plugin_kernels.amd.spec import (
@@ -36,6 +40,7 @@ try:
         Feature,
         MonoSpec,
         Requirements,
+        StepMetadata,
     )
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels.spec import (
@@ -43,12 +48,17 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         Feature,
         MonoSpec,
         Requirements,
+        StepMetadata,
     )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.muse_spark import DRAFT_TOKENS, TP
 from sgl_amd_mono.muse_spark import spec as target
 from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS
+
+# D-MLP's LDS (its staged weight round included, ``draft_mlp.dm_lds_bytes``) holds 16
+# rows at most: wider steps run the draft model's own forward
+DRAFT_WIDTHS = tuple(w for w in WIDTHS if w <= 16)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +80,10 @@ DFLASH_CONFIG = dict(
     attention_mode="gqa",
 )
 
+# The paged attention's KV indices as a step metadata D-attn does not read; None on
+# an SGLang that builds them every step.
+_PAGED_KV_INDICES = getattr(StepMetadata, "PAGED_KV_INDICES", None)
+
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
@@ -78,6 +92,8 @@ SGLANG_READS = {
         "Feature",
         "MonoSpec",
         "Requirements",
+        "StepMetadata",
+        "unread_metadata",
     ),
     "srt/models/dflash.py": (
         "DFlash2DraftModel",
@@ -107,6 +123,10 @@ SGLANG_READS = {
         "hidden_states",
     ),
     "srt/runtime_context.py": ("get_parallel", "get_spec"),
+    "kernels/ops/gemm/bf16_tiled_small_m_gemm.py": (
+        "rowmajor_gemm",
+        "rowmajor_gemm_applies",
+    ),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "srt/layers/attention/triton_backend.py": ("token_to_kv_pool", "req_to_token_pool"),
     "srt/mem_cache/memory_pool.py": ("get_kv_buffer", "req_to_token"),
@@ -265,7 +285,20 @@ class DraftRunner:
             self._pre: dict = {}
             self._attn: dict = {}
             self._post: dict = {}
+            self._draft: dict = {}
             self._cache_checked = False
+            from sgl_amd_mono.muse_spark.gfx950 import draft_layer as DL
+
+            self.flags = torch.zeros(
+                scratch_bytes(DL.dl_flags_layout()), dtype=torch.uint8, device=dev
+            )
+            # D-draft's weight table: the layers' weights (bound for the server's life)
+            ptrs = [
+                {**self.aviews[i], **self.views[i]}[nm].data_ptr()
+                for i in range(len(layers))
+                for nm in DL.WEIGHTS
+            ]
+            self.wtab = torch.tensor(ptrs, dtype=torch.int64).to(dev)
 
     def set_deadline(self, seconds: float) -> None:
         from sgl_amd_mono.common import guard
@@ -296,13 +329,22 @@ class DraftRunner:
             )
         return self._pre[rows], self._attn[rows], self._post[rows]
 
+    def draft_kernel(self, rows: int):
+        if rows not in self._draft:
+            from sgl_amd_mono.muse_spark.gfx950 import draft_layer as DL
+
+            self._draft[rows] = DL.build_ddraft(
+                DL.DDraftBuild(tokens=rows, npes=self.npes)
+            )
+        return self._draft[rows]
+
     def precompile(self, rows: int) -> None:
         from sgl_amd_mono.muse_spark.gfx950.runner import compile_only
 
-        compile_only(self.kernel(rows))
         if STAGE >= 2:
-            for k in self.attn_kernels(rows):
-                compile_only(k)
+            compile_only(self.draft_kernel(rows))
+        else:
+            compile_only(self.kernel(rows))
 
     def _backend(self):
         """The draft's attention backend (the forward context's: the draft runner is forwarding),
@@ -401,6 +443,47 @@ class DraftRunner:
         )  # fmt: skip
         mark("D-post")
         return attn_out, res_pre
+
+    def launch_draft(self, rows: int, hidden, positions, forward_batch, stream):
+        """Every layer on ``rows`` rows as one D-draft launch: (out, the residual), bf16."""
+        from sgl_amd_mono.muse_spark.gfx950.runner import _f32_bits, _ptr
+
+        backend = self._backend()
+        if not self._cache_checked:
+            self._check_cache(backend)
+            for i, layer in enumerate(self.layers):
+                if self.aviews[i]["cos_sin"].data_ptr() != self.aviews[0]["cos_sin"].data_ptr() or float(layer.self_attn.attn.scaling) != float(self.layers[0].self_attn.attn.scaling):  # fmt: skip
+                    raise RuntimeError(f"Muse Spark draft layer {i}: its own rotary table or scale; D-draft takes the first layer's")  # fmt: skip
+        kv = [
+            _ptr(t)
+            for layer in self.layers
+            for t in backend.token_to_kv_pool.get_kv_buffer(
+                layer.self_attn.attn.layer_id
+            )
+        ]
+        attn = self.layers[0].self_attn.attn
+        slots = forward_batch.out_cache_loc
+        table = backend.req_to_token_pool.req_to_token
+        rpi = forward_batch.req_pool_indices
+        lens = forward_batch.seq_lens
+        if (
+            slots.numel() < rows
+            or positions.numel() < rows
+            or lens.numel() * DRAFT_TOKENS < rows
+        ):
+            raise RuntimeError(f"Muse Spark draft: slots {tuple(slots.shape)} positions {tuple(positions.shape)} seq_lens {tuple(lens.shape)} for {rows} rows")  # fmt: skip
+        res_out, out = self.res_out[:rows], self.out[:rows]
+        self.draft_kernel(rows)(
+            _ptr(self.wtab), *kv, _ptr(hidden), _ptr(self.aviews[0]["cos_sin"]), _ptr(positions),
+            int(positions.dtype == torch.int64), _ptr(slots), int(slots.dtype == torch.int64), _ptr(self.res_pre),
+            _ptr(self.q), _ptr(self.coef), _ptr(self.scratch_pre), _ptr(self.o), _ptr(table),
+            table.shape[1], table.numel() * 4, _ptr(rpi), int(rpi.dtype == torch.int64), _ptr(lens),
+            int(lens.dtype == torch.int64), _f32_bits(float(attn.scaling)), _ptr(self.scratch_attn), _ptr(self.attn_out),
+            _ptr(self.scratch_post), self.peers_post.local, _ptr(self.peers_post.addresses), _ptr(res_out), _ptr(out),
+            _ptr(self.scratch), self.peers.local, _ptr(self.peers.addresses), _ptr(self.flags), self.rank,
+            _ptr(self.epoch), stream=stream,
+        )  # fmt: skip
+        return out, res_out
 
     def launch(
         self, i: int, rows: int, attn_out: torch.Tensor, residual: torch.Tensor, stream
@@ -527,6 +610,13 @@ class _Draft:
             )
         stream = torch.cuda.current_stream()
         check = self.check and not torch.cuda.is_current_stream_capturing()
+        if STAGE >= 2 and not check:
+            hidden, residual = self.runner.launch_draft(
+                rows, hidden.contiguous(), positions, forward_batch, stream
+            )
+            self.runner.end_step()
+            hidden, _ = m.norm(hidden, residual)
+            return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden)
         for i, layer in enumerate(m.layers):
             if STAGE >= 2:
                 first = residual is None
@@ -609,20 +699,44 @@ def _log_check(i: int, got, ref) -> None:
         logger.info("monokernel check: draft layer %d %s: rel %.4f, cosine min %.5f mean %.5f", i, name, rel, cos.min().item(), cos.mean().item())  # fmt: skip
 
 
+@triton.jit
+def _gathered_rms_norm(G, W, OUT, rows, eps, N: tl.constexpr, H: tl.constexpr):
+    """Row t of the all-gathered parts ``G [TP, rows, N]`` (rank-major), read as the
+    whole ``[H]`` row, RMS-normed (fp32) with weight ``W`` -> ``OUT [rows, H]`` bf16."""
+    t = tl.program_id(0)
+    h = tl.arange(0, H)
+    x = tl.load(G + (h // N) * (rows * N) + t * N + (h % N)).to(tl.float32)
+    r = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / H + eps)
+    tl.store(OUT + t * H + h, (x * r * tl.load(W + h).to(tl.float32)).to(tl.bfloat16))
+
+
 def _shard_fc(model) -> bool:
     """Replace ``model.project_target_hidden`` with the TP-sharded projection: the rank's
     rows of ``fc.weight`` (a view: the loader's storage) against the replicated input,
-    the ranks' parts all-gathered in rank order, then ``hidden_norm`` as the model does.
-    The draft's context rows only (the target's distribution is the verify's); a call
-    that does not match (another TP size or shape) runs the model's own."""
+    the ranks' parts all-gathered in rank order, then ``hidden_norm``'s RMS norm read
+    straight from the gathered parts (no transposing copy). The draft's context rows
+    only (the target's distribution is the verify's); a call that does not match
+    (another TP size or shape) runs the model's own."""
+    from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
+        rowmajor_gemm,
+        rowmajor_gemm_applies,
+    )
+
     fc = getattr(model, "fc", None)
     w = getattr(fc, "weight", None)
+    norm = getattr(model, "hidden_norm", None)
     if (
         w is None
         or w.dtype != torch.bfloat16
         or w.dim() != 2
         or w.shape[0] % TP
         or getattr(fc, "bias", None) is not None
+    ):
+        return False
+    if (
+        getattr(norm, "weight", None) is None
+        or tuple(norm.weight.shape) != (w.shape[0],)
+        or w.shape[0] & (w.shape[0] - 1)
     ):
         return False
     original = model.project_target_hidden
@@ -638,10 +752,27 @@ def _shard_fc(model) -> bool:
         ):
             return original(target_hidden)
         n = w.shape[0] // TP
-        part = torch.nn.functional.linear(
-            target_hidden.to(w.dtype), w.narrow(0, p.tp_rank * n, n)
+        x, ws = target_hidden.to(w.dtype), w.narrow(0, p.tp_rank * n, n)
+        part = (
+            rowmajor_gemm(x, ws)
+            if rowmajor_gemm_applies(x, ws)
+            else torch.nn.functional.linear(x, ws)
         )
-        return model.hidden_norm(p.tp_group.all_gather(part, dim=-1))
+        gathered = p.tp_group.all_gather(part, dim=0)
+        out = torch.empty(
+            (x.shape[0], w.shape[0]), dtype=torch.bfloat16, device=x.device
+        )
+        _gathered_rms_norm[(x.shape[0],)](
+            gathered,
+            norm.weight,
+            out,
+            x.shape[0],
+            float(norm.variance_epsilon),
+            n,
+            w.shape[0],
+            num_warps=8,
+        )
+        return out
 
     model.project_target_hidden = project_target_hidden
     return True
@@ -678,7 +809,9 @@ def _build(model, hf_config, ctx) -> _Draft:
 SPEC = MonoSpec(
     name="muse_spark_dflash2_draft_hip",
     devices={
-        "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS)
+        "gfx950": DeviceLimits(
+            widths=DRAFT_WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS
+        )
     },
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     # the launcher checks the target's requirements; the draft's attention backend is
@@ -694,4 +827,11 @@ SPEC = MonoSpec(
     api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
     tokens_per_request=_tokens_per_request,
+    # D-attn reads the page table, the request rows and seq_lens itself (stage 2);
+    # an SGLang without the flag builds the paged KV indices anyway
+    unread_metadata=(
+        frozenset({_PAGED_KV_INDICES})
+        if _PAGED_KV_INDICES is not None and STAGE >= 2
+        else frozenset()
+    ),
 )

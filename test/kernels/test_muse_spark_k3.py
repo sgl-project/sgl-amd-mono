@@ -272,6 +272,7 @@ def test_k3_tpx_matches_the_compact_a4_math(rows, last):
         k3_scratch_layout,
         k3_sym_layout,
     )
+    from sgl_amd_mono.muse_spark.weights import tile_shuffle
 
     dev = torch.device("cuda")
     gen = torch.Generator(device=dev).manual_seed(700 + rows)
@@ -279,6 +280,8 @@ def test_k3_tpx_matches_the_compact_a4_math(rows, last):
     bf = torch.bfloat16
     w13, s13, dec13 = _fp4_weight(EXPERT_ROWS, 2 * INTER, MOE_HIDDEN, dev, gen)
     w2, s2, dec2 = _fp4_weight(EXPERT_ROWS, MOE_HIDDEN, INTER, dev, gen)
+    # the TP-expert slices are tile-shuffled (weights.tp_expert_copies)
+    w13, w2 = tile_shuffle(w13), tile_shuffle(w2)
     xin = (torch.randn(rows, MOE_HIDDEN, device=dev) * 0.5).to(bf)
     # slot 0: expert 0 for every token (its widest column set); the others distinct table experts
     ids = torch.empty(rows, TOP_K, dtype=torch.int32, device=dev)

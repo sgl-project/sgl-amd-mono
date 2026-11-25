@@ -32,9 +32,13 @@ from models import (  # noqa: E402
     PERF_GAIN,
     PERF_LOSS,
     PR_EVALS,
+    weekly_eval,
 )
 
 PASS, WARN, FAIL = "pass", "warn", "fail"
+TESTS_TIER = (
+    "tests tier (only its tests changed): the served kernels are the base branch's"
+)
 ICON = {PASS: "✅", WARN: "⚠️", FAIL: "❌"}
 MARKER = "<!-- sgl-amd-mono-ci -->"
 
@@ -61,6 +65,9 @@ def scope_check(key, r):
         return WARN, f"serving not run: {r['skipped']['serving']}"
     if r.get("perf", {}).get("on", {}).get("error"):
         return FAIL, f"monokernel server: {r['perf']['on']['error']}"
+    if r.get("tier") == "tests":
+        # no speed-test server; the serving tests check which steps run the kernels
+        return PASS, f"TP{m.get('tp')} on {r.get('node', '?')}; {TESTS_TIER}"
     routes = r.get("routing", {}).get("on", [])
     if not routes:
         return (
@@ -79,11 +86,13 @@ def accuracy_check(key, r):
         wanted = PR_EVALS + (EXTRA_EVALS if r.get("extra") else [])
         names = [e for e in wanted if e in names]
     elif r.get("mode") == "nightly":
-        names = [e for e in names if not EVALS[e].get("weekly")]
+        names = [e for e in names if not weekly_eval(m, e)]
     if not names:
         return WARN, "no accuracy benchmarks for this model in CI yet"
     if r.get("skipped", {}).get("serving"):
         return WARN, "not run (no server here): author-provided results needed"
+    if r.get("tier") == "tests":
+        return PASS, "%s, so no accuracy benchmark" % TESTS_TIER
     if r.get("tier") == "smoke":
         if not m.get("e2e_tests"):
             return (
@@ -175,6 +184,8 @@ def perf_check(key, r, needs_gain):
             "not run (no server here): author-provided InferenceX results needed",
             [],
         )
+    if r.get("tier") == "tests":
+        return PASS, "%s, so no speed test" % TESTS_TIER, []
     perf = r.get("perf", {})
     base, new = perf.get("off" if nightly else "base", {}), perf.get("on", {})
     if "error" in new:
@@ -239,6 +250,90 @@ def perf_check(key, r, needs_gain):
     )
 
 
+# pytest's exit codes whose junit XML holds every test: all passed (0) or some
+# failed (1). A file that does not import stops the run before any test (2), and
+# "no tests collected" is 5: matching those against the base proves nothing.
+COMPARABLE_RC = (0, 1)
+
+
+def compare_base(r, name, c):
+    """Hold the PR's failing ``name`` tests against the base branch's.
+
+    Returns ``(new, why)``: ``new`` lists the PR's failures the base branch does
+    not have, or has failing another way (another message: the same failure on
+    both prints the same exception and text, masked of paths and addresses by
+    run_model.py, so a PR that makes a failing test fail differently, such as a
+    new hash in a drift test or a worse value, is held to it). When the two
+    cannot be compared, ``new`` is None and ``why`` says why (None when the run
+    has no base tests at all: the nightly, or tests the base side does not run).
+    """
+    b = r.get("base_tests", {}).get(name)
+    if b is None:
+        return None, None
+    if b.get("error"):
+        return None, b["error"]
+    for side, x in (("this PR", c), ("the base branch", b)):
+        if x.get("rc") not in COMPARABLE_RC:
+            return None, f"pytest exited {x.get('rc')} on {side}"
+        if len(x.get("failed_ids", [])) != x["failed"]:
+            return None, f"no per-test results on {side}"
+    pr, base = _msgs(c), _msgs(b)
+    return sorted(i for i in pr if not _same_failure(pr[i], base.get(i))), None
+
+
+def _msgs(c):
+    msgs = c.get("failed_msgs", {})
+    return {i: msgs.get(i) for i in c["failed_ids"]}
+
+
+CUT_TENSOR = "tensor(?"
+
+
+def _same_failure(a, b):
+    """Whether two signatures are the same failure, a tensor's values aside."""
+    if a is None or b is None:
+        return False
+    a, b = _mask_tensors(a), _mask_tensors(b)
+    if a == b:
+        return True
+    # run_model.py cuts a signature at 1000 characters, inside a tensor whose
+    # values print longer in one run than in the other
+    return any(
+        x.endswith(CUT_TENSOR)
+        and len(x) > len(CUT_TENSOR)
+        and y.startswith(x[: -len(CUT_TENSOR)])
+        for x, y in ((a, b), (b, a))
+    )
+
+
+def _mask_tensors(msg):
+    # A tensor's repr in an assertion message can show torch.empty or random
+    # values, which differ between two runs of the same failure; the cached base
+    # results were signed before this mask, so it applies here, not in run_model.py.
+    out, i = [], 0
+    while (j := msg.find("tensor(", i)) >= 0:
+        depth, k = 0, j + len("tensor")
+        while k < len(msg):
+            depth += {"(": 1, ")": -1}.get(msg[k], 0)
+            if depth == 0:
+                break
+            k += 1
+        if k == len(msg):  # cut inside the tensor
+            return "".join(out) + msg[i:j] + CUT_TENSOR
+        out.append(msg[i:j] + "tensor(?)")
+        i = k + 1
+    return "".join(out) + msg[i:]
+
+
+def _names(ids, n=3):
+    # "test.unit.test_contract::test_x[...]" -> "test_contract::test_x[...]"
+    short = [
+        f"`{cls.rsplit('.', 1)[-1]}::{test}`"
+        for cls, _, test in (i.partition("::") for i in ids[:n])
+    ]
+    return ", ".join(short) + (f" and {len(ids) - n} more" if len(ids) > n else "")
+
+
 def tests_check(key, r):
     m = MODELS.get(key, {})
     t = r.get("tests", {})
@@ -254,12 +349,27 @@ def tests_check(key, r):
             states.append(FAIL)
             parts.append(f"{name}: did not run")
             continue
-        states.append(FAIL if c["failed"] else PASS)
         s = f"{name} {c['passed']} passed"
-        if c["failed"]:
+        new, why = compare_base(r, name, c) if c["failed"] else (None, None)
+        if new == []:
+            # every failure also fails on the base branch, with the same message: the
+            # PR's tests pass
+            states.append(WARN)
+            s += (
+                f", {c['failed']} failed, all also on the base branch"
+                f" (not this PR's): {_names(c['failed_ids'])}"
+            )
+        elif c["failed"]:
+            states.append(FAIL)
             s += f", **{c['failed']} failed**" + (
                 " (timed out)" if c.get("timeout") else ""
             )
+            if new is not None:
+                s += f" ({len(new)} new: {_names(new)})"
+            elif why:
+                s += f" (not compared with the base branch: {why})"
+        else:
+            states.append(PASS)
         if c["skipped"]:
             s += f", {c['skipped']} skipped"
         parts.append(s)
@@ -283,7 +393,13 @@ def micro_check(key, r):
     if r.get("mode") in ("nightly", "weekly"):
         sides = "main"
     else:
-        sides = "base and PR" if mb.get("base") else "PR (no base package)"
+        sides = (
+            "base and PR"
+            if mb.get("base")
+            else "PR (tests tier)"
+            if r.get("tier") == "tests"
+            else "PR (no base package)"
+        )
     return PASS, f"{len(pr)} script(s) on {sides}; output below"
 
 

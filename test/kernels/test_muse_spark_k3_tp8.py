@@ -83,6 +83,10 @@ def _worker(rank, rows, tpx, port, q):
                 w2[:, rank * CS : (rank + 1) * CS].contiguous(),
                 s2[:, rank * CS : (rank + 1) * CS].contiguous(),
             )
+            # tile-shuffled, as weights.tp_expert_copies lays the slices out
+            from sgl_amd_mono.muse_spark.weights import tile_shuffle
+
+            kw13, kw2 = tile_shuffle(kw13), tile_shuffle(kw2)
             local_start = 0
         else:
             lo = rank * E_RANK

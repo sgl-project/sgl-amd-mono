@@ -16,12 +16,16 @@ differ only in the package or in ``--enable-amd-monokernel``. Sides:
   is kept as the monokernel-off reference (``monokernel_off_ref``) and reused
   until the next weekly run.
 
-PR mode: base, then the unit, kernel and timing tests, on and off (GSM8K only),
+PR mode: the base branch's unit tests (kept per merge-base and image, so run
+once), base, then the unit, kernel and timing tests, on and off (GSM8K only),
 then the model's serving tests. A model whose ``models.py`` entry merged before
-its package has no base package; its off side runs the speed test as its base. (A
-model new in the PR is not run at all: ``models.py`` comes from the base branch.) The smoke tier (a model that runs only
+its package has no base package; its off side runs the speed test as its base.
+(A model new in the PR is not run at all: ``models.py`` comes from the base branch.) The smoke tier (a model that runs only
 because shared code changed) runs no accuracy benchmark, whose bound its serving
-tests hold, and times only the gate concurrencies.
+tests hold, and times only the gate concurrencies. The tests tier (only the model's
+tests changed) runs its unit, kernel and serving tests: no base side, speed test or
+accuracy benchmark. A PR's kernel tests run with MONO_CI_QUICK_KERNELS=1, at the
+widths each test picks as representative; the nightly and weekly run every width.
 
 Nightly mode (``--pr`` and ``--base`` both main): the tests, then the on side with
 the model's benchmarks but the weekly ones, and the speed test. It runs no off
@@ -62,6 +66,7 @@ from models import (  # noqa: E402
     PR_EVALS,
     PROMPTS_PER_SLOT,
     RANGE_RATIO,
+    weekly_eval,
 )
 
 PORT = 31000
@@ -94,6 +99,19 @@ def per_question(run_dir):
     return {q: right[q] / seen[q] for q in seen}
 
 
+def failure_signature(el, src):
+    """How a test failed, from its junit ``<failure>``/``<error>`` element: its
+    message (the exception and its text), with what changes between two runs of
+    the same failure masked: the checkout's path, pytest's tmp dirs, object
+    addresses. Two runs fail a test the same way when these match; a PR that makes
+    a failing test fail differently (another hash, file, value) changes it."""
+    msg = el.get("message") or el.tag
+    msg = msg.replace(str(src), "<checkout>")
+    msg = re.sub(r"/tmp/pytest-of-[^/\s]+/pytest-\d+", "<tmp>", msg)
+    msg = re.sub(r"\b0x[0-9a-fA-F]+\b", "0x?", msg)
+    return " ".join(msg.split())[:1000]
+
+
 class Run:
     def __init__(self, args):
         self.args = args
@@ -118,6 +136,8 @@ class Run:
             "accuracy": {},
             "routing": {},
         }
+        self.installed = None  # the checkout install() last installed
+        self.install_failed = {}  # checkout -> why its install failed
         for k, v in self.m.get("paths", {}).items():
             os.environ[k] = v
 
@@ -161,46 +181,73 @@ class Run:
         return rc
 
     def install(self, src):
-        """Make ``src`` the installed sgl-amd-mono, with its own kernel cache."""
+        """Make ``src`` the installed sgl-amd-mono, with its own kernel cache. A
+        no-op when ``src`` is already installed (the base tests, then the base
+        side)."""
         side = Path(src).name
         os.environ["SGLANG_AMD_MONO_CACHE_DIR"] = f"/tmp/sgl-amd-mono-cache-{side}"
+        if self.installed == str(src):
+            return
+        if str(src) in self.install_failed:  # the same pip run would fail again
+            raise RuntimeError(self.install_failed[str(src)])
+        self.installed = None
         rc = self.sh(
             "pip uninstall -y -q sgl-amd-mono; "
             f"pip install -q --no-deps --no-build-isolation -e {shlex.quote(str(src))}",
             f"install-{side}",
         )
         if rc:
-            raise RuntimeError(f"installing {src} failed")
+            self.install_failed[str(src)] = f"installing {src} failed"
+            raise RuntimeError(self.install_failed[str(src)])
+        self.installed = str(src)
 
     # -- tests ----------------------------------------------------------------
 
-    def pytest(self, name, files, timeout):
-        files = [f for f in files if (Path(self.args.pr) / f).exists()]
+    def pytest(self, name, files, timeout, src=None, into="tests"):
+        """Run ``files`` of the checkout ``src`` (default: the PR) and record the
+        counts, and which tests failed, as ``result[into][name]``."""
+        src = src or self.args.pr
+        files = [f for f in files if (Path(src) / f).exists()]
         if not files:
             return
-        xml = self.logs / f"{name}.xml"
+        log = name if into == "tests" else f"{into.split('_')[0]}-{name}"  # base-unit
+        xml = self.logs / f"{log}.xml"
         rc = self.sh(
             f"python3 -m pytest -v -rA --junitxml={xml} " + " ".join(files),
-            name,
-            cwd=self.args.pr,
+            log,
+            cwd=src,
             timeout=timeout,
         )
         counts = {"passed": 0, "failed": 0, "skipped": 0, "rc": rc}
+        sigs = {}
         if xml.exists():
+            # one state per test id: a test that fails and then errors in its
+            # teardown has two <testcase> entries, and counts once, as failed,
+            # the way its call failed
+            state = {}
             for case in ET.parse(xml).getroot().iter("testcase"):
-                tags = {c.tag for c in case}
-                if tags & {"failure", "error"}:
-                    counts["failed"] += 1
-                elif "skipped" in tags:
-                    counts["skipped"] += 1
+                tid = f"{case.get('classname')}::{case.get('name')}"
+                bad = [c for c in case if c.tag in ("failure", "error")]
+                if bad:
+                    state[tid] = "failed"
+                    sigs.setdefault(tid, failure_signature(bad[0], src))
+                elif any(c.tag == "skipped" for c in case):
+                    state.setdefault(tid, "skipped")
                 else:
-                    counts["passed"] += 1
+                    state.setdefault(tid, "passed")
+            for st in state.values():
+                counts[st] += 1
+            # every failure by id and how it failed, so the report can tell the
+            # PR's own from the base branch's (a run that failed whole has none:
+            # it judges by count)
+            counts["failed_ids"] = sorted(sigs)
+            counts["failed_msgs"] = sigs
         elif rc:
             counts["failed"] = 1  # collection or the run itself failed
         if rc == 124:
             counts["failed"] = max(counts["failed"], 1)
             counts["timeout"] = True
-        self.result["tests"][name] = counts
+        self.result.setdefault(into, {})[name] = counts
         self.save()
 
     # -- servers --------------------------------------------------------------
@@ -502,10 +549,14 @@ class Run:
             ):
                 self.write_monokernel_off_ref("perf", off)
 
+    def trust_checkouts(self):
+        # the checkouts belong to the job's user, not the container's root: git
+        # (and so pip's editable install) refuses them otherwise
+        self.sh("git config --global --add safe.directory '*'", "setup")
+
     def run(self):
         a = self.args
-        # the checkouts belong to the job's user, not the container's root
-        self.sh("git config --global --add safe.directory '*'", "setup")
+        self.trust_checkouts()
         self.sh(f"pip install -q {SGL_EVAL}", "setup")
         self.result["sglang"] = subprocess.run(
             "git -C /sgl-workspace/sglang log -1 --format='%h %cs %s'",
@@ -517,6 +568,9 @@ class Run:
         if a.mode in ("nightly", "weekly"):
             # first the sgl-amd-mono the image pins: what a user of this SGLang runs
             self.step("pinned", self.pinned, serve=self.key != "common" and not why)
+        if a.mode == "pr":
+            self.step("base-tests", self.base_tests)
+            os.environ["MONO_CI_QUICK_KERNELS"] = "1"
         if self.key == "common":
             self.install(a.pr)
             self.pytest("unit", ["test/unit"], 1800)
@@ -532,7 +586,7 @@ class Run:
                 evals = [
                     e
                     for e in self.m.get("evals", [])
-                    if a.mode == "weekly" or not EVALS[e].get("weekly")
+                    if a.mode == "weekly" or not weekly_eval(self.m, e)
                 ]
                 self.step("on", self.side, "on", True, evals=evals)
                 if a.mode == "weekly":
@@ -540,6 +594,13 @@ class Run:
                     self.step("off", self.side, "off", False, evals=evals, fresh=True)
                 else:
                     self.step("off", self.read_monokernel_off_ref, evals, perf=True)
+                self.step("e2e", self.e2e)
+            return
+
+        if a.tier == "tests":
+            self.install(a.pr)
+            self.step("tests", self.tests)
+            if not why:
                 self.step("e2e", self.e2e)
             return
 
@@ -645,6 +706,61 @@ class Run:
         if serve:
             self.side("base", True)
 
+    def base_tests_key(self):
+        """The base unit run's name in the cache: its merge-base and image. Every
+        model job of a PR, and every PR on that merge-base, runs the same base
+        tests in the same image, so one run serves them all. None outside the CI."""
+        sha, image = os.environ.get("CI_BASE_SHA", ""), os.environ.get("CI_IMAGE", "")
+        if not (re.fullmatch(r"[0-9a-f]{40}", sha) and image):
+            return None
+        return f"{sha}-{hashlib.sha256(image.encode()).hexdigest()[:12]}.json"
+
+    def base_tests(self):
+        """The base branch's unit tests, so the PR is held only to the failures it
+        adds: one that fails on the base too, the same way, is the base branch's,
+        not the PR's. Not installing the base, or not reading its results, turns
+        the comparison off rather than failing the PR, which may be the fix for
+        that install.
+
+        A whole run (pytest exit 0 or 1, its junit XML read) is kept under
+        ``base_tests_key()``. slurm_job.sh runs this step alone first
+        (``--base-tests-only``), before any of the PR's code, and copies what it
+        staged in ``out/base_tests`` to shared storage, which the container mounts
+        read-only at ``<cache>/base_tests``: the PR's code cannot write a base
+        result that a later PR would be held to. The staged copy is read too (this
+        job's own first step, before the PR's code), in case the copy failed."""
+        key = self.base_tests_key()
+        if key:
+            for d in (Path(self.args.cache) / "base_tests", self.out / "base_tests"):
+                try:
+                    kept = json.loads((d / key).read_text())
+                except (OSError, ValueError):
+                    continue
+                self.result.setdefault("base_tests", {})["unit"] = {**kept, "kept": key}
+                self.log(f"the base branch's unit tests: kept in {d / key}")
+                self.save()
+                return
+        try:
+            self.install(self.args.base)
+            self.pytest(
+                "unit", ["test/unit"], 1800, src=self.args.base, into="base_tests"
+            )
+        except (RuntimeError, ET.ParseError) as e:
+            why = str(e)
+            if isinstance(e, ET.ParseError):
+                why = f"the base branch's junit XML does not parse ({e})"
+            self.result.setdefault("base_tests", {})["unit"] = {"error": why}
+            self.log(f"{why}: the unit tests are not compared with the base branch")
+            self.save()
+            return
+        c = self.result.get("base_tests", {}).get("unit")
+        if key and c and c.get("rc") in (0, 1) and "failed_ids" in c:
+            stage = self.out / "base_tests"
+            stage.mkdir(exist_ok=True)
+            tmp = stage / f".{key}.tmp"
+            tmp.write_text(json.dumps(c, indent=2))
+            tmp.replace(stage / key)
+
     def step(self, name, fn, *args, **kwargs):
         """Run one step; an exception is recorded (the report fails on it) and the
         steps after it still run."""
@@ -680,12 +796,21 @@ def main():
         required=True,
         help="persistent: pip, datasets, the monokernel-off reference",
     )
-    ap.add_argument("--tier", choices=("full", "smoke"), default="full")
+    ap.add_argument("--tier", choices=("full", "smoke", "tests"), default="full")
     ap.add_argument("--mode", choices=("pr", "nightly", "weekly"), default="pr")
+    ap.add_argument(
+        "--base-tests-only",
+        action="store_true",
+        help="PR mode: run (or find kept) the base branch's unit tests and stop",
+    )
     args = ap.parse_args()
     if args.model != "common" and args.model not in MODELS:
         sys.exit(f"unknown model {args.model}")
     run = Run(args)
+    if args.base_tests_only:
+        run.trust_checkouts()
+        run.base_tests()
+        return
     try:
         run.run()
     except Exception as e:  # report what ran; the report marks the error

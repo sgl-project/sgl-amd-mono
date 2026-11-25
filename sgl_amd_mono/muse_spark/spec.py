@@ -25,6 +25,8 @@ import math
 import os
 
 import torch
+import triton
+import triton.language as tl
 
 try:
     from sglang.kernels.plugin_kernels.amd.spec import (
@@ -34,6 +36,7 @@ try:
         Numerics,
         NumericsKind,
         Requirements,
+        StepMetadata,
     )
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels.spec import (
@@ -43,6 +46,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         Numerics,
         NumericsKind,
         Requirements,
+        StepMetadata,
     )
 
 from sgl_amd_mono.common.plan import BLOCKS
@@ -50,6 +54,10 @@ from sgl_amd_mono.muse_spark import DRAFT_TOKENS, HF_CONFIG, TP
 from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS
 
 logger = logging.getLogger(__name__)
+
+# The unified verify's side tables (query indptr, key lengths, SWA write slots) as a
+# step metadata K-attn does not read; None on an SGLang that builds them every step.
+_VERIFY_SIDE_TABLES = getattr(StepMetadata, "VERIFY_SIDE_TABLES", None)
 
 # The SGLang names this glue reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
@@ -62,8 +70,10 @@ SGLANG_READS = {
         "Numerics",
         "NumericsKind",
         "Requirements",
+        "StepMetadata",
         "rows",
         "tokens_per_request",
+        "unread_metadata",
     ),
     "srt/kernel_plugins/amd/binding.py|srt/monokernels/runtime.py": (
         '"target_verify"',
@@ -94,6 +104,7 @@ SGLANG_READS = {
     ),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "srt/model_executor/forward_batch_info.py": (
+        "aux_hidden_states_buffer",
         "contains_mm_inputs",
         "forward_mode",
         "out_cache_loc",
@@ -109,6 +120,15 @@ SGLANG_READS = {
         "forward(forward_batch)",
         "forward(input_embeds)",
         "get_input_embeddings",
+        '"_embedding"',
+        '"_norm"',
+    ),
+    "srt/layers/vocab_parallel_embedding.py": (
+        "shard_indices",
+        "org_vocab_start_index",
+        "org_vocab_end_index",
+        "org_vocab_size",
+        "num_embeddings",
     ),
     "srt/rocm_muse_spark/model.py": (
         "MuseSpark1xModel",
@@ -214,6 +234,92 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     return reasons
 
 
+@triton.jit
+def _embed_norm_kernel(E, W, S, A, eps, H: tl.constexpr):
+    """Row t: the fp32 residual stream of the embedding E, and its RMS norm with weight
+    W in bf16 (``pre_attn_norm(stream).to(bfloat16)``: fp32 math, one rounding)."""
+    t = tl.program_id(0)
+    h = tl.arange(0, H)
+    x = tl.load(E + t * H + h).to(tl.float32)
+    tl.store(S + t * H + h, x)
+    r = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / H + eps)
+    tl.store(A + t * H + h, (x * r * tl.load(W + h).to(tl.float32)).to(tl.bfloat16))
+
+
+def _embed_norm(input_embeds: torch.Tensor, norm, residual_dtype):
+    """(fp32 stream, layer 0's bf16 attention input) of the embedded rows, one launch."""
+    rows, h = input_embeds.shape
+    plain = (
+        type(norm).__name__ == "MuseSpark1xRMSNorm"
+    )  # F.rms_norm with weight (no input scale)
+    weight = norm._get_effective_weight() if plain else None
+    if not (
+        residual_dtype == torch.float32
+        and input_embeds.is_contiguous()
+        and h & (h - 1) == 0
+        and weight is not None
+    ):
+        stream = input_embeds.to(residual_dtype).contiguous()
+        return stream, norm(stream).to(torch.bfloat16).contiguous()
+    stream = torch.empty((rows, h), dtype=torch.float32, device=input_embeds.device)
+    attn_input = torch.empty(
+        (rows, h), dtype=torch.bfloat16, device=input_embeds.device
+    )
+    _embed_norm_kernel[(rows,)](
+        input_embeds, weight, stream, attn_input, float(norm.eps), h, num_warps=8
+    )
+    return stream, attn_input
+
+
+def _replicate_embedding(module, group) -> None:
+    """The vocab-parallel input embedding's whole table on every rank, as the inner
+    embedding's ``replicated_weight`` (``embed`` then looks rows up without the
+    all-reduce). Built at bind, after SGLang sized the KV cache (~3.3 GB a rank)."""
+    import torch.distributed as dist
+
+    inner = getattr(module, "_embedding", module)
+    shard = getattr(inner, "shard_indices", None)
+    if (
+        shard is None
+        or getattr(inner, "replicated_weight", None) is not None
+        or group.world_size == 1
+    ):
+        return
+    if (
+        inner.num_embeddings != inner.org_vocab_size
+    ):  # added vocabulary: keep the module's lookup
+        return
+    spans = [None] * group.world_size
+    dist.all_gather_object(
+        spans,
+        (shard.org_vocab_start_index, shard.org_vocab_end_index),
+        group=group.cpu_group,
+    )
+    local = inner.weight.data
+    parts = [torch.empty_like(local) for _ in range(group.world_size)]
+    dist.all_gather(parts, local.contiguous(), group=group.device_group)
+    full = torch.empty(
+        (inner.org_vocab_size, local.shape[1]), dtype=local.dtype, device=local.device
+    )
+    for (start, end), part in zip(spans, parts):
+        full[start:end] = part[: end - start]
+    del parts
+    inner.replicated_weight = full
+
+
+def embed(module, input_ids: torch.Tensor) -> torch.Tensor:
+    """``module(input_ids)`` for the (normalized) vocab-parallel input embedding; with its
+    ``replicated_weight`` the rows are looked up whole (exact: one rank owns each row and
+    the all-reduce adds zeros to it), then the module's own norm."""
+    inner = getattr(module, "_embedding", module)
+    full = getattr(inner, "replicated_weight", None)
+    if full is None:
+        return module(input_ids)
+    x = torch.nn.functional.embedding(input_ids, full)
+    norm = getattr(module, "_norm", None)
+    return norm(x) if norm is not None else x
+
+
 class _Built:
     """One rank's monokernels: the runner, the layers, and the forward."""
 
@@ -245,7 +351,7 @@ class _Built:
                 input_ids, positions, forward_batch, input_embeds=input_embeds
             )
         if input_embeds is None:
-            input_embeds = lm.get_input_embeddings()(input_ids)
+            input_embeds = embed(lm.get_input_embeddings(), input_ids)
         hidden, aux = self._backbone(plan, positions, forward_batch, input_embeds)
         return lm.logits_processor(input_ids, hidden, lm.lm_head, forward_batch, aux)
 
@@ -256,9 +362,16 @@ class _Built:
         if r.backend is None:
             self._bind()
         rows, q_len = plan.key.rows, plan.key.tokens_per_request
-        stream = input_embeds.to(m.residual_dtype).contiguous()
-        attn_input = m.layers[0].self_attn_input_norm(stream).contiguous()
-        aux, last = [], len(m.layers) - 1
+        stream, attn_input = _embed_norm(
+            input_embeds, m.layers[0].self_attn.pre_attn_norm, m.residual_dtype
+        )
+        last = len(m.layers) - 1
+        aux = (
+            self._aux_buffer(forward_batch, stream.shape)
+            if self.lm.capture_aux_hidden_states
+            else None
+        )
+        captured = 0
         check = self.check and not torch.cuda.is_current_stream_capturing()
         live = forward_batch.out_cache_loc[:rows] > 0 if check else None
         for i in range(len(m.layers)):
@@ -276,10 +389,32 @@ class _Built:
                 _log_check(i, live, (stream, attn_input), ref)
                 _log_kv_check(i, live, self._kv_rows(i, forward_batch, rows), kv_ref)
                 self._attn_check(i, rows, q_len, forward_batch, q_i)
-            if i in m.layers_to_capture:  # set after attach: read per step
-                aux.append(stream.to(torch.bfloat16))
+            if (
+                aux is not None and i in m.layers_to_capture
+            ):  # set after attach: read per step
+                # packed as the list's concatenation would be, rounded to bf16 by the copy
+                aux[
+                    :, captured * stream.shape[1] : (captured + 1) * stream.shape[1]
+                ].copy_(stream)
+                captured += 1
         r.end_step()
-        return attn_input, (aux if self.lm.capture_aux_hidden_states else None)
+        return attn_input, aux
+
+    def _aux_buffer(self, forward_batch, shape):
+        """The packed DFlash aux [rows, captures x HIDDEN] bf16 (the captures' concatenation):
+        the graph runner's shared buffer when it fits, else a new one."""
+        want = (shape[0], len(self.model.layers_to_capture) * shape[1])
+        buf = forward_batch.aux_hidden_states_buffer
+        if (
+            buf is None
+            or buf.dtype != torch.bfloat16
+            or tuple(buf.shape) != want
+            or not buf.is_contiguous()
+        ):
+            buf = torch.empty(
+                want, dtype=torch.bfloat16, device=forward_batch.out_cache_loc.device
+            )
+        return buf
 
     def _attn_check(self, i, rows, q_len, forward_batch, q_i):
         """Check mode, full-attention layers, the first steps: the launch's attention
@@ -424,6 +559,7 @@ class _Built:
         if bad:
             raise ValueError("Muse Spark monokernels: " + "; ".join(bad))
         self.runner.bind(backend, pool)
+        _replicate_embedding(self.lm.get_input_embeddings(), group)
 
 
 def _log_check(lid: int, live: torch.Tensor, got, ref) -> None:
@@ -532,4 +668,14 @@ SPEC = MonoSpec(
     build=_build,
     api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
+    # K-attn reads the page tables and seq_lens; K1 translates its own SWA write slots.
+    # Every layer must run the kernels (runner.USE_KERNELS, runner.BF16_K2): SGLang's
+    # attention reads the side tables. An SGLang without the flag builds them anyway.
+    unread_metadata=(
+        frozenset({_VERIFY_SIDE_TABLES})
+        if _VERIFY_SIDE_TABLES is not None
+        and os.environ.get("SGLANG_AMD_MONO_MUSE_KERNELS", "1") == "1"
+        and os.environ.get("SGLANG_AMD_MONO_MUSE_BF16_K2", "1") == "1"
+        else frozenset()
+    ),
 )

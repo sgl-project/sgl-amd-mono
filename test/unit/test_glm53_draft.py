@@ -268,17 +268,50 @@ def test_a_routed_step_returns_the_tails_logits():
     assert lp._get_logits(rows[:2], None, meta).flatten().tolist() == [3, 7]
 
 
-class _ReplicatedLinear(torch.nn.Module):
-    """A quantized eh_proj, as SGLang builds it for a Quark checkpoint."""
+class UnquantizedLinearMethod:
+    pass
 
 
-def _nextn_model(fused=True, eh=None):
+class QuarkLinearMethod:
+    pass
+
+
+def _replicated(method):
+    # the draft spec reads SGLang's class names, so the fakes carry them
+    return type(
+        "ReplicatedLinear",
+        (torch.nn.Module,),
+        {"quant_method": method(), "bias": None},
+    )
+
+
+# a quantized eh_proj, as SGLang builds it for a Quark checkpoint
+_ReplicatedLinear = _replicated(QuarkLinearMethod)
+# an unquantized ReplicatedLinear eh_proj (GLM-5.2's Quark checkpoint)
+_UnquantizedReplicated = _replicated(UnquantizedLinearMethod)
+
+
+def _moe(dtype=torch.float8_e4m3fn):
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+    quant = SimpleNamespace(
+        runner=SimpleNamespace(runner_backend=MoeRunnerBackend.AITER)
+    )
+    return SimpleNamespace(
+        experts=SimpleNamespace(
+            w13_weight=torch.empty(257, 1, 1, dtype=dtype), quant_method=quant
+        )
+    )
+
+
+def _nextn_model(fused=True, eh=None, experts=torch.float8_e4m3fn):
     return SimpleNamespace(
         model=SimpleNamespace(
             decoder=SimpleNamespace(
                 self_attn=SimpleNamespace(
                     indexer=SimpleNamespace(use_gfx950_fused_indexer=fused)
-                )
+                ),
+                mlp=_moe(experts),
             ),
             eh_proj=torch.nn.Linear(2, 1, bias=False) if eh is None else eh,
         )
@@ -310,8 +343,30 @@ GLM53 = SimpleNamespace(index_topk=TOPK, index_share_for_mtp_iteration=True)
         (SPEC_ARGS, GLM53, _nextn_model(fused=False), 8, "fused DSA indexer"),
         (SPEC_ARGS, GLM53, _nextn_model(), 2, "TP2"),
         (SPEC_ARGS, GLM53, _nextn_model(eh=_ReplicatedLinear()), 8, "eh_proj is a"),
+        # GLM-5.2's MXFP4 checkpoint: bf16 NextN experts (copied as block FP8) and
+        # an unquantized ReplicatedLinear eh_proj
+        (SPEC_ARGS, GLM53, _nextn_model(experts=torch.bfloat16), 8, None),
+        (SPEC_ARGS, GLM53, _nextn_model(eh=_UnquantizedReplicated()), 8, None),
+        (
+            SPEC_ARGS,
+            GLM53,
+            _nextn_model(experts=torch.float16),
+            8,
+            "the NextN experts",
+        ),
     ],
-    ids=["served", "token map", "no index share", "seed width", "indexer", "tp", "eh"],
+    ids=[
+        "served",
+        "token map",
+        "no index share",
+        "seed width",
+        "indexer",
+        "tp",
+        "eh",
+        "bf16 experts",
+        "unquantized replicated eh",
+        "fp16 experts",
+    ],
 )
 def test_each_setting_the_launches_cannot_serve_keeps_the_draft_standard(
     spec_args, hf_config, model, tp, why
@@ -340,6 +395,7 @@ class _Weights(msgspec.Struct, frozen=True):
 
     shuffled: bool
     index: object = None
+    mxfp4: bool = False
 
 
 class _Runtime:
@@ -370,6 +426,7 @@ def test_the_build_runs_the_nextn_launches_and_installs_the_wrapper(
             indexer=SimpleNamespace(use_gfx950_fused_indexer=True),
         ),
         input_layernorm=SimpleNamespace(weight=torch.zeros(1)),
+        mlp=_moe(),
     )
     lm = _Lm()
     lm.model = SimpleNamespace(

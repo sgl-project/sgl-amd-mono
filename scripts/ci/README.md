@@ -8,7 +8,8 @@ nodes:
   branch.
 - `nightly-amd.yml`, the **nightly**: Sunday to Friday, on main and the newest
   SGLang ROCm image, the accuracy benchmarks (but the `weekly` ones: AIME26 x4,
-  the costliest) and the speed test with the monokernels on, for the models marked
+  the costliest, and a model's `weekly_evals`, such as Kimi-K3's MMMU-Pro, ~8 h
+  at one request at a time) and the speed test with the monokernels on, for the models marked
   `nightly` in `models.py`, held to each model's fixed `baseline`. Saturday's
   **weekly** run has every benchmark with the monokernels on and off; its off
   results are the reference the nightly and the PR test read until the next one.
@@ -17,8 +18,14 @@ nodes:
 
 ## Running it
 
-- Add the `run-ci` label to the PR. The run removes the label when it starts, so a
-  later push needs a maintainer again.
+- Add the `run-ci` label to the PR. The label stays, and every later push to the PR
+  runs the test again (cancelling the run on the previous head) until a maintainer
+  removes it. Only people with triage access or more can add a label, so read a
+  fork PR's code before labelling it, and remove the label if a later push needs a
+  second look. Until then each push sets `AMD PR test` to failed ("Not run"), from
+  a GitHub-hosted runner, so a PR cannot merge without the test once the branch
+  rules require it. Adding the label starts a new run; re-running a "Not run" one
+  does not test (the runners check the labels the run started with).
 - `run-ci-extra` runs the same and adds GPQA (or tick `extra` when running the
   workflow by hand). GSM8K's short answers cannot show a loss at long context;
   GPQA's long ones can. Use it for a PR that touches attention, the KV cache or
@@ -36,12 +43,20 @@ to the run's summary.
 
 `scope.py` maps a PR's changed files to models (`models.py`):
 
-- a model whose own package (`sgl_amd_mono/<pkg>/`, or its tests) changed runs
-  the **full** tier;
+- a model whose own package code (`sgl_amd_mono/<pkg>/`) changed runs the
+  **full** tier;
 - a change to `sgl_amd_mono/common/`, `sgl_amd_mono/__init__.py` or
   `pyproject.toml` runs every other model's **smoke** tier, and `common`;
+- a model whose tests changed (`test/...`) but not its package code runs the
+  **tests** tier: its unit, kernel and serving tests, with no base side, speed
+  test or accuracy benchmark, since the served kernels are the base branch's;
 - a PR that changes no model runs `common`: the unit tests and the common kernel
   tests.
+
+A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
+checks representative widths only (DeepSeek-V4.1's K1, K2 and target FFN launch at
+both edges and each side of their switch points; GLM-5.3's at the first and last
+width of each TP size). The nightly and the weekly run sweep every width.
 
 Every server is the model's recipe under `test/e2e`, from the PR. `run_model.py`
 installs each checkout in turn over the image's sgl-amd-mono and serves it on
@@ -62,7 +77,7 @@ these sides:
 
 | Check | PR test, full tier | PR test, smoke tier | Nightly | Weekly |
 | --- | --- | --- | --- | --- |
-| Tests | unit, the model's kernel tests and serving tests (`test/e2e`) | same | same | same |
+| Tests | unit (on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same | unit, kernel and serving tests | same |
 | Kernel microbenchmark | the model's timing scripts, base and PR | same | main | main |
 | Accuracy | sgl-eval GSM8K (1319 questions), on and off; GPQA too with `run-ci-extra` | the serving tests' GSM8K and KL bounds | GSM8K, GPQA Diamond (and MMMU-Pro for vision models), on | the nightly's and AIME26 x4, on and off |
 | E2E performance | InferenceX fixed length at the model's concurrencies, base and on | the gate concurrencies only | on (against the monokernel-off reference) | off and on |
@@ -87,7 +102,20 @@ package: its speed is compared against the off side.
 
 The PR test's status fails when:
 
-- a test fails, or a serving test, benchmark or server does not finish;
+- a test fails, or a serving test, benchmark or server does not finish. A unit
+  test that fails on the base branch too (its merge-base, run the same way) with
+  the same message (paths and addresses masked) is the base branch's: when every
+  unit failure is one, the Tests check warns and names them instead of failing.
+  A PR that makes a failing test fail differently (a new hash in a drift test, a
+  worse value) is held to it. The two sides are compared only when pytest ran
+  every test on both (exit code 0 or 1; a file that does not import stops the
+  run early), the base branch installed and its junit XML parsed; otherwise the
+  check says why and any failure fails, as in the nightly, which has no base.
+  The base run is kept per merge-base and image on shared storage
+  (`$CI_SHARED_DIR/base_tests`), so a PR's model jobs, and later PRs on the same
+  merge-base, run it once. Each job runs it first, before any of the PR's code
+  (`run_model.py --base-tests-only`), and the container reads the kept runs
+  read-only, so a PR cannot write a result another PR is held to;
 - the monokernel server logs no routing (every step ran SGLang's own path);
 - GSM8K (and GPQA, with `run-ci-extra`) loses significantly with the monokernels
   on: of the questions the on and off runs answer differently, the on run gets
@@ -139,6 +167,17 @@ and the reviewer verifies them. OCRBench and LiveCodeBench are not in the CI yet
   time and each job takes a whole node, whichever of the two is free, so the two
   nodes run two models at once and never two jobs on one node. The runner's
   `.env` holds no node setting.
+- Job-start hook: the repository is public, so a PR could add a workflow of its
+  own that names the runners' label. `job_started_hook.sh`, which `runner.sh`
+  copies next to the runners and sets as their `ACTIONS_RUNNER_HOOK_JOB_STARTED`,
+  refuses every job but `pr-test-amd.yml` and `nightly-amd.yml` as main has them,
+  on their own events (a dispatch may run from any branch), and a PR test of a PR
+  without `run-ci` or `run-ci-extra`.
+  After changing it, `bash runner.sh hook` on the runner host puts the new copy in
+  place (the runners read it at each job; no restart). Each verdict in a job's
+  log ends with `(hook <hash>)`, the copy's git blob hash: when it differs from
+  `git ls-tree origin/main scripts/ci/job_started_hook.sh`, the runners have an
+  old copy.
 - `slurm_launch.sh` (on the runner) submits `slurm_job.sh` as a whole-node job,
   streams its log and collects its results; `slurm_job.sh` (on the node) fetches
   the PR and base commits onto node-local disk, starts the SGLang ROCm container

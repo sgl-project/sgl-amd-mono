@@ -533,15 +533,51 @@ class LayerViews(msgspec.Struct, frozen=True):
         )
 
 
-def tp_expert_copies(views, modules, rank: int, npes: int, group) -> list:
+# The order a tile-shuffled tile stores a wave's 4 KB slab in, as the bits of (register
+# j1, j0, lane bit 5 .. 0): the ``mxfp4.FP4_LOAD_LAYOUT`` ("a8f") lane map's labels (r: the
+# tile's row bits, k: the 64 B chunk's, g: the 16 B piece's). ``ffn`` asserts the match.
+TILE_ORDER = ("k1", "r0", "g1", "k0", "r3", "r2", "r1", "g0")
+
+
+def tile_shuffle(t: torch.Tensor) -> torch.Tensor:
+    """Packed MXFP4 rows [E, rows, 2048 B] re-laid a 16-row tile at a time as [wave 8]
+    [register 4][lane 64][16 B] in ``TILE_ORDER``: the bytes a K3 lane loads into each
+    register (``ffn.fp4_tile_loads``, the FP4_LOAD_LAYOUT lane map) unchanged, a wave's
+    load of a register 1 KB contiguous instead of whole lines spread over the tile's rows
+    (#142 measured the contiguous form 18% faster streaming)."""
+    E, R, B = t.shape
+    assert R % 16 == 0 and B == 2048, (R, B)
+    # the row-major tile's dims: rows r3 .. r0, then wave, k1, k0, g1, g0, the 16 bytes
+    src = ("r3", "r2", "r1", "r0", "wave", "k1", "k0", "g1", "g0")
+    perm = [0, 1, 2 + src.index("wave")] + [2 + src.index(x) for x in TILE_ORDER] + [11]
+    return (
+        t.view(E, R // 16, 2, 2, 2, 2, 8, 2, 2, 2, 2, 16)
+        .permute(*perm)
+        .contiguous()
+        .view(E, R, B)
+    )
+
+
+def tp_expert_copies(
+    views,
+    modules,
+    rank: int,
+    npes: int,
+    group,
+    bf16: bool = False,
+    bf16_fp8: bool = False,
+) -> list:
     """TP experts (``K3Build.tpx``, ATOM's TP-sharded MoE): for every kernel layer, this
     rank's slices of every expert -- the gate and up rows of its INTER / TP
     intermediate columns and the down rows of its MOE_HIDDEN / TP output columns,
     with their scales -- as (w13, s13, w2, s2) [EXPERTS, rows, bytes] in global
-    expert order; None for a layer the kernels do not run. EP holds whole experts
+    expert order (w13 / w2 tile-shuffled: ``tile_shuffle``); None for a layer the
+    kernels do not run. EP holds whole experts
     a rank, so the slices come from every rank: one all-to-all a tensor over the TP
     device group (``group``). A copy: EXPERTS / TP x (INTER and MOE_HIDDEN slices)
-    is LOCAL_EXPERTS whole experts' bytes, ~0.8 GB a layer."""
+    is LOCAL_EXPERTS whole experts' bytes, ~0.8 GB a layer. With ``bf16``, the
+    bf16-expert layers' slices too, as (w13, w2) (``tpx_bf16``, ~3 GB a layer), or with
+    ``bf16_fp8`` as FP8 codes and scales (w13, s13, w2, s2) (``tpx_bf16.fp8_rows``, ~1.5 GB)."""
     import torch.distributed as dist
 
     RS, CS = INTER // npes, MOE_HIDDEN // npes
@@ -557,10 +593,17 @@ def tp_expert_copies(views, modules, rank: int, npes: int, group) -> list:
 
     with torch.no_grad():
         for i, L in enumerate(views):
-            if L.kind != "mxfp4" or L.w13 is None:
+            native = bf16 and L.kind == "bf16"
+            if not native and (L.kind != "mxfp4" or L.w13 is None):
                 out.append(None)
                 continue
-            E = L.w13.shape[0]
+            experts = modules[i].mlp.experts
+            src13, src2 = (
+                (experts.w13_weight.data, experts.w2_weight.data)
+                if native
+                else (L.w13, L.w2)
+            )
+            E = src13.shape[0]
             start = int(modules[i].mlp.local_expert_start)
             if E * npes != EXPERTS or start != rank * E:
                 raise ValueError(f"layer {i}: experts {E} a rank from {start} on rank {rank}: TP experts take EP's contiguous {EXPERTS // npes} a rank")  # fmt: skip
@@ -574,17 +617,27 @@ def tp_expert_copies(views, modules, rank: int, npes: int, group) -> list:
                     dim=1,
                 )
 
-            w13 = a2a([rows13(L.w13, d) for d in range(npes)]).reshape(
+            w13 = a2a([rows13(src13, d) for d in range(npes)]).reshape(
                 EXPERTS, 2 * RS, -1
             )
+            w2 = a2a([src2[:, d * CS : (d + 1) * CS] for d in range(npes)]).reshape(
+                EXPERTS, CS, -1
+            )
+            if native and bf16_fp8:
+                from sgl_amd_mono.muse_spark.tpx_bf16 import fp8_rows
+
+                (q13, s13), (q2, s2) = fp8_rows(w13), fp8_rows(w2)
+                del w13, w2
+                out.append((q13, s13, q2, s2))
+                continue
+            if native:
+                out.append((w13, w2))
+                continue
             s13 = a2a([rows13(L.s13, d) for d in range(npes)]).reshape(
                 EXPERTS, 2 * RS, -1
-            )
-            w2 = a2a([L.w2[:, d * CS : (d + 1) * CS] for d in range(npes)]).reshape(
-                EXPERTS, CS, -1
             )
             s2 = a2a([L.s2[:, d * CS : (d + 1) * CS] for d in range(npes)]).reshape(
                 EXPERTS, CS, -1
             )
-            out.append((w13, s13, w2, s2))
+            out.append((tile_shuffle(w13), s13, tile_shuffle(w2), s2))
     return out

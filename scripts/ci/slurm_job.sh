@@ -32,6 +32,11 @@ HF_TOKEN_FILE="${HF_TOKEN_FILE:-$HOME/.sgl_amd_mono_ci/hf_token}"
 MONOKERNEL_OFF_REF_SHARED="${CI_SHARED_DIR:-$HOME/.sgl_amd_mono_ci}/monokernel_off_ref"
 MONOKERNEL_OFF_REF_MOUNT=ro
 [[ "${CI_MODE:-pr}" == weekly ]] && MONOKERNEL_OFF_REF_MOUNT=rw
+# The base branch's unit results, one per merge-base and image (run_model.py's
+# base_tests): run once, then read by every model job of every PR on that
+# merge-base. Read-only in the container; this script writes it, from what the
+# --base-tests-only step staged before any of the PR's code ran.
+BASE_TESTS_SHARED="${CI_SHARED_DIR:-$HOME/.sgl_amd_mono_ci}/base_tests"
 
 echo "[mono-ci-job] start on $(hostname) job=$JOB_ID model=$CI_MODEL tier=${CI_TIER:-full} image=$CI_IMAGE $(date -u +%FT%TZ)"
 
@@ -104,7 +109,7 @@ done
 checkout "$WS/pr" "$CI_PR_SHA"
 checkout "$WS/base" "$CI_BASE_SHA"
 
-mkdir -p "$MONOKERNEL_OFF_REF_SHARED"
+mkdir -p "$MONOKERNEL_OFF_REF_SHARED" "$BASE_TESTS_SHARED"
 
 # This CI's containers from an earlier job that did not clean up. The node is
 # held whole, so nothing else of ours runs here.
@@ -127,6 +132,7 @@ docker run -d --name "$NAME" \
     --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
     --shm-size 64g --ulimit memlock=-1 --ulimit stack=67108864 \
     -v "$WS:/ci" -v "$CACHE:/cache" -v "$MONOKERNEL_OFF_REF_SHARED:/cache/monokernel_off_ref:$MONOKERNEL_OFF_REF_MOUNT" \
+    -v "$BASE_TESTS_SHARED:/cache/base_tests:ro" \
     -v "$MIRROR$CI_MODEL_ROOT:$CI_MODEL_ROOT:ro" \
     -e HF_HOME=/cache/hf -e PIP_CACHE_DIR=/cache/pip \
     -e CI_MODEL_ROOT="$CI_MODEL_ROOT" -e CI_IMAGE="$CI_IMAGE" -e CI_PR_SHA="$CI_PR_SHA" -e CI_BASE_SHA="$CI_BASE_SHA" \
@@ -140,5 +146,20 @@ if [[ -s "$HF_TOKEN_FILE" ]]; then
                  --model none --num-examples 1 --out-dir /tmp/warm >/dev/null 2>&1; true'
 fi
 
-docker exec "$NAME" python3 /ci/harness/scripts/ci/run_model.py \
-    --model "$CI_MODEL" --tier "${CI_TIER:-full}" --mode "${CI_MODE:-pr}" --pr /ci/pr --base /ci/base --out /ci/out --cache /cache
+RUN_MODEL=(python3 /ci/harness/scripts/ci/run_model.py
+    --model "$CI_MODEL" --tier "${CI_TIER:-full}" --mode "${CI_MODE:-pr}" --pr /ci/pr --base /ci/base --out /ci/out --cache /cache)
+
+if [[ "${CI_MODE:-pr}" == pr ]]; then
+    # The base branch's unit tests first, on their own, before any of the PR's
+    # code runs: what they stage is then the base's alone, and kept for the next
+    # job. A failure here only turns the comparison off (the main run retries).
+    docker exec "$NAME" "${RUN_MODEL[@]}" --base-tests-only || true
+    for f in "$WS/out/base_tests"/*.json; do
+        [[ -s "$f" && ! -e "$BASE_TESTS_SHARED/${f##*/}" ]] || continue
+        { cp "$f" "$BASE_TESTS_SHARED/.${f##*/}.$JOB_ID" \
+            && mv "$BASE_TESTS_SHARED/.${f##*/}.$JOB_ID" "$BASE_TESTS_SHARED/${f##*/}"; } \
+            || echo "[mono-ci-job] could not keep ${f##*/}"
+    done
+fi
+
+docker exec "$NAME" "${RUN_MODEL[@]}"
