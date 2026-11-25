@@ -50,9 +50,9 @@ to the run's summary.
   tests.
 
 A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
-checks representative widths only (DeepSeek-V4.1's K1, K2 and FFN launch at both
-edges and each side of their switch points; GLM-5.3's at TP8 only). The nightly
-and the weekly run sweep every width.
+checks representative widths only (DeepSeek-V4.1's K1, K2 and target FFN launch at
+both edges and each side of their switch points; GLM-5.3's at the first and last
+width of each TP size). The nightly and the weekly run sweep every width.
 
 Every server is the model's recipe under `test/e2e`, from the PR. `run_model.py`
 installs each checkout in turn over the image's sgl-amd-mono and serves it on

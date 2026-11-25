@@ -23,9 +23,10 @@ def _gfx950_gpus() -> int:
 
 
 CHECKS = Path(__file__).with_name("deepseek_v41")
-# The PR test (MONO_CI_QUICK_KERNELS=1) runs K1, K2 and the FFN launch at these
-# widths, not all 48: both edges, each side of the pad row (from 6) and of token
-# parallel (from 12), and a two-request verify step. The nightly runs every width.
+# The PR test (MONO_CI_QUICK_KERNELS=1) runs K1, K2 and the target FFN launch at
+# these widths, not all 48: both edges, each side of the pad row (from 6) and of
+# token parallel (from 12), and a two-request verify step. The draft route keeps
+# its own 8 widths (DRAFT_WIDTHS). The nightly runs every width.
 QUICK_WIDTHS = "1,2,5,6,7,11,12,13,24,47,48"
 
 
@@ -53,7 +54,7 @@ class TestMonoDeepseekV41Kernels(CustomTestCase):
         self._check("check_ffn", "--replays", "200", *_widths())
 
     def test_ffn_launch_draft_route(self):
-        self._check("check_ffn", "--replays", "100", "--draft", *_widths())
+        self._check("check_ffn", "--replays", "100", "--draft")
 
     def test_k1(self):
         self._check("check_k1", "--trials", "2", *_widths())
