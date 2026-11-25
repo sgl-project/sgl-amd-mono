@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3.8-Flash-Next monokernels (RFC #43949; SGLang's Qwen4-Exp): the spec and
-its SGLang glue in ``spec`` (target verify) and ``draft`` (the MTP draft), and the
-gfx950 kernel and host runner in ``gfx950``.
+its SGLang glue in ``spec`` (target verify) and ``draft`` (the MTP draft), the
+gfx950 kernel and host runner in ``gfx950``, and the TP1 and TP2 decode path in
+``decode``.
 """
+
+import fnmatch
+import re
 
 # Qwen3.8-Flash-Next's text config, which the kernel builds in
 # (amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8 config.json, text_config)
@@ -47,3 +51,36 @@ LAYER_PATTERN = ("linear_attention",) * 3 + ("full_attention",)
 # the tokens a request's context holds at most, verify tokens included: 9 index
 # segments of 8192 compressed blocks of 4 (``gfx950/layout.MAX_CTX``)
 MAX_CTX = 294912
+
+# A GDN and a QSA layer's projections, by the checkpoint's module names
+PROJECTIONS = (
+    "model.language_model.layers.0.linear_attn.in_proj_qkv",
+    "model.language_model.layers.3.self_attn.q_proj",
+)
+
+
+def projection_dtypes(hf_config) -> set[str]:
+    """The weight dtypes the checkpoint's Quark config gives the GDN and attention
+    projections (``PROJECTIONS``), by the steps of SGLang's Quark config the two
+    checkpoints use: bf16 when excluded (by name, or a ``re:`` pattern), else the
+    first matching ``layer_quant_config`` pattern's, else the global config's
+    (SGLang's ``layer_type_quant_config`` and requantization are not resolved; the
+    paths' weight checks after load decide those). amd/Qwen3.8-Flash-Next-Quark-MXFP4
+    gives {'bf16'}, its -AttnFP8-PLEFP8 variant {'fp8_e4m3'}."""
+    quant = getattr(hf_config, "quantization_config", None) or {}
+    exclude = quant.get("exclude") or ()
+    layers = quant.get("layer_quant_config") or {}
+    dtypes = set()
+    for name in PROJECTIONS:
+        if any(
+            name == p or (p.startswith("re:") and re.match(p[3:], name))
+            for p in exclude
+        ):
+            dtypes.add("bf16")
+            continue
+        config = next(
+            (c for p, c in layers.items() if fnmatch.fnmatch(name, p)),
+            quant.get("global_quant_config") or {},
+        )
+        dtypes.add(str((config.get("weight") or {}).get("dtype")))
+    return dtypes

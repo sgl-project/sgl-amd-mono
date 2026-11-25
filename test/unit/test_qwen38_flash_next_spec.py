@@ -14,6 +14,7 @@ from unittest import mock
 import pytest
 import sglang
 import torch
+from qwen38_flash_next_decode_fakes import quant_config
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 try:
@@ -58,7 +59,7 @@ TEXT = SimpleNamespace(
 VL = SimpleNamespace(
     text_config=TEXT,
     architectures=[TARGET],
-    quantization_config={"quant_method": "quark"},
+    quantization_config=quant_config(projections="fp8_e4m3"),
 )
 # the NEXTN recipe's server arguments the spec reads
 CFG = SimpleNamespace(context_length=None)
@@ -445,6 +446,8 @@ def test_the_recipe_is_accepted():
             True,
         ),
         (CFG, _replace(VL, quantization_config={"quant_method": "fp8"}), True),
+        # amd/Qwen3.8-Flash-Next-Quark-MXFP4: bf16 projections
+        (CFG, _replace(VL, quantization_config=quant_config()), True),
         (
             CFG,
             _replace(VL, text_config=_replace(TEXT, mamba_ssm_dtype="float16")),
@@ -459,6 +462,7 @@ def test_the_recipe_is_accepted():
         "index budget",
         "layer pattern",
         "quantization",
+        "bf16 projections",
         "ssm dtype",
         "context",
         "no flydsl",
@@ -475,16 +479,20 @@ def test_the_ple_layer_is_one_reason():
 
 
 def test_the_recipe_routes_verify_batches_of_one_to_eight():
-    # NEXTN, 3 steps: 4 verify rows a request, the 4- to 32-row launches
-    assert q38.SPEC.widths("gfx950") == tuple(range(4, 33, 4))
-    assert q38.SPEC.devices["gfx950"].tp_sizes == (1,)
+    # NEXTN, 3 steps: 4 verify rows a request, the 4- to 32-row launches (the
+    # spec's other widths are the TP2 decode path's, of one row a request)
+    assert q38.WIDTHS == tuple(range(4, 33, 4))
+    assert set(q38.WIDTHS) <= set(q38.SPEC.widths("gfx950"))
+    assert q38.TP in q38.SPEC.devices["gfx950"].tp_sizes
     assert covered_capture_sizes(
         widths=q38.SPEC.widths("gfx950"), tokens_per_request=4, sizes=[1, 2, 4, 8]
     ) == list(range(1, 9))
-    # above 8 requests the normal path, at the configured sizes
+    # above 8 requests the normal path; the TP2 widths 40, 48 and 56 add verify
+    # graphs of 10, 12 and 14 requests below a configured 16, which the forward
+    # hands to the model's own (test_a_step_the_launches_do_not_take_...)
     assert covered_capture_sizes(
         widths=q38.SPEC.widths("gfx950"), tokens_per_request=4, sizes=[1, 2, 4, 16]
-    ) == [*range(1, 9), 16]
+    ) == [*range(1, 9), 10, 12, 14, 16]
 
 
 def test_the_requirements_are_declared_sglang_reads():
@@ -493,9 +501,10 @@ def test_the_requirements_are_declared_sglang_reads():
     assert set(q38.SPEC.requires.server_args) <= set(
         reads["srt/arg_groups/fields/*.py"]
     )
+    assert set(q38.VERIFY_SERVER_ARGS) <= set(reads["srt/arg_groups/fields/*.py"])
     assert set(q38.SPEC.requires.env) <= set(reads["srt/environ.py"])
     # NEXTN resolves to EAGLE; the kernel verifies 4 rows a request of one chain
-    args = q38.SPEC.requires.server_args
+    args = {**q38.SPEC.requires.server_args, **q38.VERIFY_SERVER_ARGS}
     assert args["speculative_algorithm"] == {"EAGLE"}
     assert args["speculative_num_draft_tokens"] == {q38.TOKENS}
     assert args["enable_linear_replayssm_spec"] == {False}
