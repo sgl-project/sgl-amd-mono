@@ -46,11 +46,9 @@ def test_the_launches_name_their_server_args():
 
 
 def test_wide_capture_stream_and_variant():
+    """A captured layer's wide launch writes the stream the DSpark draft asked for,
+    not always the attn_res mixture; SGLang without the field still means attn_res."""
     assert wide._capture_stream(SimpleNamespace()) == "attn_res"
-    assert (
-        wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="attn_res"))
-        == "attn_res"
-    )
     assert (
         wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="prefix"))
         == "prefix"

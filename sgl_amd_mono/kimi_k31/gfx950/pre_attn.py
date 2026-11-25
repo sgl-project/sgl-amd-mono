@@ -573,8 +573,7 @@ def _seam(
         write,
         0,
         emit_mixed,
-        0,
-        emit_prefix,
+        emit_prefix=emit_prefix,
     )
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()

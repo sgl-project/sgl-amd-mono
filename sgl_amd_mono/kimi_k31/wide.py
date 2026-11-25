@@ -36,7 +36,6 @@ SGLANG_READS = {
         "KimiK3MoE",
         "AuxHiddenStateList",
         "_cdiv",
-        "dspark_aux_hidden_stream",
         # the routed experts the launch's top-k / sort feed (_routed, _experts)
         "_forward_routed",
         "_route_quant_fuse_eligible",
@@ -455,6 +454,8 @@ def _front_weight(moe, rank):
 
 
 def _capture_stream(bb) -> str:
+    # sgl-project/sglang#52503 adds dspark_aux_hidden_stream; SGLang without it
+    # captures attn_res. Read it directly, in SGLANG_READS, once the CI image has it.
     stream = getattr(bb, "dspark_aux_hidden_stream", "attn_res")
     if stream not in ("attn_res", "prefix"):
         raise ValueError(f"unsupported dspark_aux_hidden_stream: {stream!r}")
@@ -1006,7 +1007,7 @@ class Wide:
                 i += 1
             for n, li in enumerate(run):
                 pk = self.layers[li]
-                v = self._variant(pk, b, L, captures, capture_stream)
+                v = self._variant(pk, b, L, captures, capture_stream=capture_stream)
                 assert v["t1"] == (n > 0 or (li - 1) in self.entry)
                 assert res.num_valid_blocks == pk.nvb, (
                     li,
