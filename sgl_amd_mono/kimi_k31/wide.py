@@ -39,7 +39,23 @@ SGLANG_READS = {
         # the routed experts the launch's top-k / sort feed (_routed, _experts)
         "_forward_routed",
         "_route_quant_fuse_eligible",
+        # DSA layers stop before o_proj for dsa_post
+        "forward_pre_o_proj",
+        "use_output_gate",
+        "mlp_res_norm",
+        "mlp_res_proj",
+        "prev_valid_blocks",
     ),
+    "srt/layers/layer_boundary/__init__.py": (
+        "AttentionInputs",
+        "get_attn_tp_context",
+    ),
+    "srt/layers/layer_boundary/adapters/attention.py": (
+        "set_attn_inputs",
+        "clear_attn_inputs",
+    ),
+    "srt/models/deepseek_v2.py": ("prepare_qkv_latent",),
+    "srt/layers/activation.py": ("SituAndMul", "beta", "linear_beta"),
     # the new dev_amd moved KimiK3MoE's ROCm paths into kimi_k3_amd
     # NextAttnRead.max_tokens: the row cap of SGLang's column tail, which
     # _column_exit must not exceed
@@ -90,7 +106,7 @@ SGLANG_READS = {
     "srt/mem_cache/kv/router.py": ("view_layer_id",),
 }
 
-TP, H, SL, E, NF, LAT = 8, 7168, 896, 896, 2096, 3584
+TP, H, SL, E, NF, LAT, KO, SI = 8, 7168, 896, 896, 2096, 3584, 1536, 768
 REQ_BUCKETS = (
     2,
     4,
@@ -475,6 +491,102 @@ def _tail_fusable(layer) -> bool:
     )
 
 
+def _dsa_fusable(layer) -> bool:
+    """Whether a non-KDA (DSA) layer can run its post-attention chain in ``dsa_post``."""
+    if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_DSA_POST", "1") != "1":
+        return False
+    attn = layer.self_attn
+    if (
+        not _tail_fusable(layer)
+        or getattr(layer, "is_block_write_layer", False)
+        or getattr(layer, "all_reduce_fusion", False)
+        or not getattr(attn, "use_output_gate", False)
+        or not hasattr(attn, "forward_pre_o_proj")
+        or getattr(layer, "mlp_res_norm", None) is None
+        or getattr(layer, "mlp_res_proj", None) is None
+    ):
+        return False
+    wo = getattr(getattr(attn, "o_proj", None), "weight", None)
+    ln = getattr(layer, "post_attention_layernorm", None)
+    w_ln = getattr(ln, "weight", None)
+    res_norm = layer.mlp_res_norm
+    res_proj_w = getattr(layer.mlp_res_proj, "weight", None)
+    from sglang.srt.layers.activation import SituAndMul
+
+    shared = getattr(layer.mlp, "shared_experts", None)
+    act_fn = getattr(shared, "act_fn", None)
+    w_sd = getattr(getattr(shared, "down_proj", None), "weight", None)
+    return (
+        wo is not None
+        and getattr(attn.o_proj, "bias", None) is None
+        and wo.dtype == torch.bfloat16
+        and tuple(wo.shape) == (H, KO)
+        and wo.is_contiguous()
+        and w_ln is not None
+        and w_ln.dtype == torch.bfloat16
+        and tuple(w_ln.shape) == (H,)
+        and w_ln.is_contiguous()
+        and res_proj_w is not None
+        and res_proj_w.numel() == H
+        and getattr(res_norm, "variance_epsilon", None)
+        == getattr(ln, "variance_epsilon", None)
+        and isinstance(act_fn, SituAndMul)
+        and act_fn.beta == 4.0
+        and act_fn.linear_beta == 25.0
+        and w_sd is not None
+        and getattr(shared.down_proj, "bias", None) is None
+        and w_sd.dtype == torch.bfloat16
+        and tuple(w_sd.shape) == (H, SI)
+        and w_sd.is_contiguous()
+    )
+
+
+def _pre_o_proj(layer, x, positions, fb, zero_allocator):
+    """Run ``layer.self_attn`` up to the gated bf16 ``[rows, KO]`` input of ``o_proj``."""
+    from sglang.srt.layers.layer_boundary import (
+        AttentionInputs,
+        get_attn_tp_context,
+    )
+
+    attn = layer.self_attn
+    latent = getattr(attn, "prepare_qkv_latent", None)
+    if latent is not None:
+        get_attn_tp_context().set_attn_inputs(AttentionInputs(x, fb, latent))
+    try:
+        return attn.forward_pre_o_proj(
+            hidden_states=x,
+            positions=positions,
+            forward_batch=fb,
+            zero_allocator=zero_allocator,
+        )
+    finally:
+        if latent is not None:
+            get_attn_tp_context().clear_attn_inputs()
+
+
+class _DSALayer:
+    """A fusable DSA layer's weights as ``dsa_post`` reads them."""
+
+    def __init__(self, backbone, i, rank):
+        layer = backbone.layers[i]
+        attn, moe = layer.self_attn, layer.mlp
+        self.i, self.layer, self.moe = i, layer, moe
+        self.nvb = layer.prev_valid_blocks
+        self.eps = layer.post_attention_layernorm.variance_epsilon
+        self.w = dict(
+            wo=attn.o_proj.weight,
+            cw_m=(
+                layer.mlp_res_norm.weight.float()
+                * layer.mlp_res_proj.weight.view(H).float()
+            ).contiguous(),
+            w_ln=layer.post_attention_layernorm.weight,
+            bias=moe.gate.e_score_correction_bias.float().contiguous(),
+            w_sd=moe.shared_experts.down_proj.weight,
+        )
+        self.w["wf"], self.front_rows = _front_weight(moe, rank)
+        self.shared = {t.untyped_storage().data_ptr() for t in layer.parameters()}
+
+
 class Wide:
     def __init__(self, model, rank, group, device, L=8):
         from sgl_amd_mono.common import guard
@@ -497,12 +609,33 @@ class Wide:
             and i - 1 >= bb.start_layer
             and _tail_fusable(bb.layers[i - 1])
         }
+        local_dsa = {
+            i
+            for i in range(bb.start_layer, bb.end_layer)
+            if i not in cov and _dsa_fusable(bb.layers[i])
+        }
+        if group is not None and torch.distributed.is_initialized():
+            gathered = [None] * torch.distributed.get_world_size(group)
+            torch.distributed.all_gather_object(gathered, local_dsa, group=group)
+            dsa_idx = sorted(set.intersection(*gathered))
+        else:
+            dsa_idx = sorted(local_dsa)
         a0 = torch.cuda.memory_allocated()
         self.layers = {i: _Layer(bb, i, rank, cov | self.entry) for i in idx}
+        self.dsa_layers = {i: _DSALayer(bb, i, rank) for i in dsa_idx}
         a1 = torch.cuda.memory_allocated()
-        self.slots = {i: n for n, i in enumerate(idx)}  # a launch's slot in the step
+        for i in dsa_idx:
+            if i not in self.entry and (i + 1) in self.layers:
+                raise ValueError(f"non-entry DSA layer {i} precedes KDA layer {i + 1}")
+        self.slots = {
+            i: n for n, i in enumerate(idx)
+        }  # a KDA launch's slot in the step
+        self.slots_dsa = {
+            i: n for n, i in enumerate(dsa_idx)
+        }  # a DSA launch's slot in its own peer ring
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
+        self.peers_dsa, self.half_dsa = {}, {}
         self.buckets = buckets(L)
         self.tabs = {}  # (bucket, layer) -> KDA table: every pointer in it is fixed once built
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
@@ -517,14 +650,15 @@ class Wide:
         self.cols = slice(rank * SL, (rank + 1) * SL)
         self.kda_ready = False
         _say(
-            f"{len(idx)} covered layers ({idx[0]} .. {idx[-1]}), {L} tokens a request, buckets {self.buckets}, "
-            f"captures {sorted(caps)}, "
+            f"{len(idx)} covered layers ({idx[0]} .. {idx[-1]}), {len(dsa_idx)} dsa_post layers"
+            + (f" ({dsa_idx[0]} .. {dsa_idx[-1]})" if dsa_idx else "")
+            + f", {L} tokens a request, buckets {self.buckets}, captures {sorted(caps)}, "
             f"block-write {[i for i in idx if self.layers[i].write]}, tails into a run's first launch "
             f"{sorted(self.entry)}"
         )
         own, seen = {}, set()
-        for ly in self.layers.values():
-            for k, t in (*ly.w.items(), *ly.kda_w.items()):
+        for ly in (*self.layers.values(), *self.dsa_layers.values()):
+            for k, t in (*ly.w.items(), *getattr(ly, "kda_w", {}).items()):
                 st = t.untyped_storage()
                 if st.data_ptr() in ly.shared or st.data_ptr() in seen:
                     continue
@@ -565,10 +699,11 @@ class Wide:
         if b in self.bufs:
             return self.bufs[b]
         from sgl_amd_mono.common.peer import PeerBuffer
+        from sgl_amd_mono.kimi_k31.gfx950 import dsa_post as dp
         from sgl_amd_mono.kimi_k31.gfx950 import layer as lay
 
         cfg = self._cfg(b)
-        half, scratch = 0, 0
+        half, half_dsa, scratch, scratch_dsa = 0, 0, 0, 0
         for pk in self.layers.values():
             v = self._variant(pk, b, L, captures)
             for cap in (
@@ -580,6 +715,10 @@ class Wide:
                     max(half, pl.peer_offsets[1]),
                     max(scratch, pl.scratch_bytes()),
                 )
+        for pk in self.dsa_layers.values():
+            pl = dp.plan(b, cfg.oproj, cfg.front, cfg.sdown, NF, pk.nvb)[0]
+            half_dsa = max(half_dsa, pl.peer_offsets[1])
+            scratch_dsa = max(scratch_dsa, pl.scratch_bytes())
         from sgl_amd_mono.common import guard
 
         self.half[b] = (
@@ -588,6 +727,13 @@ class Wide:
         need = 2 * half + guard.FLAG_BYTES
         self.peers[b] = PeerBuffer(need, self.group, self.rank, TP, self.device)
         self.peers[b].bytes.zero_()
+        if self.dsa_layers:
+            # Dedicated peer ring for dsa_post so DSA mailbox flags never alias KDA raw BF16 payloads.
+            self.half_dsa[b] = half_dsa
+            self.peers_dsa[b] = PeerBuffer(
+                2 * half_dsa + guard.FLAG_BYTES, self.group, self.rank, TP, self.device
+            )
+            self.peers_dsa[b].bytes.zero_()
         dev, bf = self.device, torch.bfloat16
 
         def z(*shape, dt=bf):
@@ -603,6 +749,14 @@ class Wide:
         scr_pb = PeerBuffer(scratch, self.group, self.rank, 1, dev)
         scr = scr_pb.bytes
         scr.zero_()
+        scr_dsa_pb = (
+            PeerBuffer(max(scratch_dsa, 256), self.group, self.rank, 1, dev)
+            if self.dsa_layers
+            else None
+        )
+        scr_dsa = scr_dsa_pb.bytes if scr_dsa_pb is not None else None
+        if scr_dsa is not None:
+            scr_dsa.zero_()
         bufs = dict(
             cfg=cfg,
             mid=z(b, SL),
@@ -621,8 +775,19 @@ class Wide:
             acc_u=z(b, SL),
             acc_o=z(b * H),
             cnt=torch.zeros(lay.counters(b, cfg, NF), dtype=torch.int32, device=dev),
+            cnt_dsa=(
+                torch.zeros(
+                    dp.counters(b, cfg.oproj, cfg.front, NF),
+                    dtype=torch.int32,
+                    device=dev,
+                )
+                if self.dsa_layers
+                else None
+            ),
             scratch=scr,
             scratch_pb=scr_pb,
+            scratch_dsa=scr_dsa,
+            scratch_dsa_pb=scr_dsa_pb,
             st_idx=torch.full((b // L, L), -1, dtype=torch.int32, device=dev),
             num_acc=torch.ones(b // L, dtype=torch.int32, device=dev),
             win_row=torch.full((b // L,), -1, dtype=torch.int32, device=dev),
@@ -714,6 +879,83 @@ class Wide:
             sort=_launch_sort(b),
         )[0]
 
+    def _dsa_launch_args(self, pk, b, bufs, core, prefix, cur, slot):
+        w = pk.w
+        col0 = 2 * self.cols.start
+        rows = core.shape[0]
+        assert core.shape == (rows, KO), (core.shape, rows, KO)
+        assert bufs["core"].shape == (b, KO), bufs["core"].shape
+        assert bufs["pout"][cur].shape == (b, H), bufs["pout"][cur].shape
+        assert core.dtype == torch.bfloat16 and prefix.dtype == torch.bfloat16, (
+            core.dtype,
+            prefix.dtype,
+        )
+        if rows == b and core.stride() == (KO, 1):
+            core_ptr = core.data_ptr()
+        else:
+            bufs["core"][:rows].copy_(core)
+            if rows < b:
+                bufs["core"][rows:].zero_()
+            core_ptr = bufs["core"].data_ptr()
+        if prefix.stride() == (H, 1):
+            pre = prefix
+            pfx_bytes = pre.shape[0] * H * 2 - col0
+        else:
+            # attn_boundary.prepare already materialized the previous layer's stream on this stream.
+            pre = bufs["pout"][1 - cur]
+            pre[:rows, self.cols] = prefix[:, self.cols]
+            pfx_bytes = rows * H * 2 - col0
+        return (
+            core_ptr,
+            w["wo"].data_ptr(),
+            pre.data_ptr() + col0,
+            bufs["pout"][cur].data_ptr() + col0,
+            bufs["bank"].data_ptr(),
+            w["cw_m"].data_ptr(),
+            w["w_ln"].data_ptr(),
+            w["wf"].data_ptr(),
+            bufs["acc_o"].data_ptr(),
+            w["bias"].data_ptr(),
+            bufs["lat"].data_ptr(),
+            bufs["ids"].data_ptr(),
+            bufs["w"].data_ptr(),
+            w["w_sd"].data_ptr(),
+            bufs["sh"][cur].data_ptr(),
+            bufs["lat_p"][cur].data_ptr(),
+            bufs["logits"].data_ptr(),
+            bufs["cnt_dsa"].data_ptr(),
+            bufs["scratch_dsa"].data_ptr(),
+            self.peers_dsa[b].addresses.data_ptr(),
+            self.rank,
+            self.epoch.data_ptr(),
+            slot,
+            pfx_bytes,
+            bufs["sort"].data_ptr(),
+        )
+
+    def _dsa_variant(self, pk, b):
+        return dict(
+            nvb_m=pk.nvb,
+            nbk=8,
+            launches=len(self.dsa_layers),
+            eps=pk.eps,
+            half_bytes=self.half_dsa[b],
+            front_rows=pk.front_rows,
+            sort=_launch_sort(b),
+        )
+
+    def _build_dsa_launch(self, pk, b, cfg):
+        from sgl_amd_mono.kimi_k31.gfx950 import dsa_post as dp
+
+        return dp.dsa_post(
+            b,
+            cfg.oproj,
+            cfg.front,
+            cfg.sdown,
+            NF,
+            **self._dsa_variant(pk, b),
+        )[0]
+
     def warmup(self, buckets=None):
         """Compile every non-capture variant of every bucket by launching it once on
         the real weights and dummy activations, with no KDA state (every slot -1).
@@ -766,6 +1008,36 @@ class Wide:
                 self.epoch[0] += 1
                 self._build_launch(pk, b, L, v, bufs["cfg"])(
                     *self._launch_args(pk, b, bufs, tab, 0, self.slots[pk.i]),
+                    stream=torch.cuda.current_stream(),
+                )
+                n += 1
+            seen_dsa, need_dsa = set(), set()
+            for pk in self.dsa_layers.values():
+                bkey = (pk.nvb, pk.front_rows, pk.eps)
+                if bkey not in seen_dsa:
+                    seen_dsa.add(bkey)
+                    need_dsa.add(pk.i)
+            if self.group is not None and torch.distributed.is_initialized():
+                gathered = [None] * torch.distributed.get_world_size(self.group)
+                torch.distributed.all_gather_object(
+                    gathered, need_dsa, group=self.group
+                )
+                warm_ids = sorted(set().union(*gathered))
+            else:
+                warm_ids = sorted(need_dsa)
+            for idx in warm_ids:
+                pk = self.dsa_layers[idx]
+                self.epoch[0] += 1
+                self._build_dsa_launch(pk, b, bufs["cfg"])(
+                    *self._dsa_launch_args(
+                        pk,
+                        b,
+                        bufs,
+                        bufs["core"],
+                        bufs["pout"][0],
+                        1,
+                        self.slots_dsa[pk.i],
+                    ),
                     stream=torch.cuda.current_stream(),
                 )
                 n += 1
@@ -906,6 +1178,48 @@ class Wide:
         assert stream is not None
         return stream
 
+    def _exit_stream(self, moe, b, rows, bufs, ping):
+        """Leave column-sharded state to a full stream for the next standard layer or final norm."""
+        stream = self._column_exit(moe, b, rows, bufs, ping)
+        if stream is None:
+            # this rank's prefix columns ride in its columns of the shared partial, so
+            # the tail's all-reduce carries them (in place: no launch reads sh after)
+            sh = bufs["sh"][ping][:rows]
+            sh[:, self.cols] += bufs["pout"][ping][:rows, self.cols]
+            stream = moe._column_split_tail(
+                bufs["lat_p"][ping][:rows], sh, None, cols=self.cols
+            )
+        return stream
+
+    def _dsa_step(self, pk, hidden, positions, fb, zero_allocator, b, bufs, rows, ping):
+        """One fusable DSA layer: attention up to ``forward_pre_o_proj``, ``dsa_post`` launch,
+        then SGLang's routed experts onto ``lat_p[cur]``."""
+        from sglang.srt.layers.layer_boundary.residual.batch import written_residual
+
+        layer = pk.layer
+        h = layer.attn_boundary.prepare(hidden, fb, capture_gathered=None)
+        prefix = written_residual(fb)
+        assert prefix is not None and prefix.shape == (rows, H), (prefix, rows)
+        core = _pre_o_proj(layer, h, positions, fb, zero_allocator)
+        assert core.shape == (rows, KO), (core.shape, rows, KO)
+        cur = 1 - ping
+        self._build_dsa_launch(pk, b, bufs["cfg"])(
+            *self._dsa_launch_args(
+                pk, b, bufs, core, prefix, cur, self.slots_dsa[pk.i]
+            ),
+            stream=torch.cuda.current_stream(),
+        )
+        _routed(
+            pk.moe,
+            bufs["lat"][:rows],
+            bufs["logits"][:rows],
+            bufs["ids"][:rows],
+            bufs["w"][:rows],
+            bufs["lat_p"][cur][:rows],
+            sortv=bufs["sortv"] if rows == b else None,
+        )
+        return cur
+
     def backbone(self, built, input_ids, fb, input_embeds):
         from sglang.srt.distributed import tensor_model_parallel_all_gather
         from sglang.srt.layers.layer_boundary.residual.batch import (
@@ -944,8 +1258,41 @@ class Wide:
         i = m.start_layer
         ping = 0
         entry_prefix = None  # SGLang's prefix the next run's first launch reads (kept alive until it is enqueued)
-        bank_synced = False
+        bank_synced_nvb = 0
         while i < m.end_layer:
+            if i in self.dsa_layers:
+                res = m.attn_bank.require()
+                nvb = res.num_valid_blocks
+                if nvb > bank_synced_nvb:
+                    bufs["bank"][:rows, bank_synced_nvb:nvb] = res.block_residual[
+                        :rows, bank_synced_nvb:nvb, cols
+                    ]
+                    bank_synced_nvb = nvb
+                pk = self.dsa_layers[i]
+                assert nvb == pk.nvb, (i, nvb, pk.nvb)
+                ping = self._dsa_step(
+                    pk,
+                    hidden,
+                    built._positions,
+                    fb,
+                    zero_allocator,
+                    b,
+                    bufs,
+                    rows,
+                    ping,
+                )
+                # When i is in self.entry, the next KDA launch (i+1, t1=True) consumes
+                # pout[ping], sh[ping], and lat_p[ping] directly via entry_prefix=None
+                # (and performs DSpark capture of layer i if i is in captures).
+                entry_prefix = None
+                if i not in self.entry:
+                    hidden = set_written(
+                        self._exit_stream(pk.moe, b, rows, bufs, ping), fb
+                    )
+                    if i in captures:
+                        aux.append(m._dspark_capture_stream(i, hidden, fb))
+                i += 1
+                continue
             if i in self.entry:
                 prefix = self._tail_front(
                     m.layers[i],
@@ -985,9 +1332,11 @@ class Wide:
             # SGLang writes bank rows only before the first run (layer 0); the launches write the later ones
             # into bufs["bank"] themselves (then gathered into SGLang's bank), so one copy a step
             nvb = res.num_valid_blocks
-            if not bank_synced:
-                bufs["bank"][:rows, :nvb] = res.block_residual[:rows, :nvb, cols]
-                bank_synced = True
+            if nvb > bank_synced_nvb:
+                bufs["bank"][:rows, bank_synced_nvb:nvb] = res.block_residual[
+                    :rows, bank_synced_nvb:nvb, cols
+                ]
+                bank_synced_nvb = nvb
             run = []
             while i in self.layers:
                 run.append(i)
@@ -1018,6 +1367,7 @@ class Wide:
                             bufs["bank"][:rows, pk.nvb].contiguous(), dim=-1
                         )
                     )
+                    bank_synced_nvb = max(bank_synced_nvb, pk.nvb + 1)
                 lat_p = bufs["lat_p"][cur]
                 _routed(
                     pk.moe,
@@ -1032,16 +1382,7 @@ class Wide:
                 ping = cur
             # leave: the last layer's MoE tail on SGLang
             last = self.layers[run[-1]]
-            sh = bufs["sh"][ping][:rows]
-            stream = self._column_exit(last.moe, b, rows, bufs, ping)
-            if stream is None:
-                # this rank's prefix columns ride in its columns of the shared partial, so
-                # the tail's all-reduce carries them (in place: no launch reads sh after)
-                sh[:, cols] += bufs["pout"][ping][:rows, cols]
-                stream = last.moe._column_split_tail(
-                    bufs["lat_p"][ping][:rows], sh, None, cols=cols
-                )
-            hidden = set_written(stream, fb)
+            hidden = set_written(self._exit_stream(last.moe, b, rows, bufs, ping), fb)
             if run[-1] in captures:
                 aux.append(m._dspark_capture_stream(run[-1], hidden, fb))
         hidden = final_norm(hidden, fb, m._final_read, capture=None, skip_empty=True)

@@ -130,7 +130,9 @@ def _push_tile(c, acc, m, n, m0, rb, n0, bn, ks, mode, sl):
     part = mode == "part" and ks > 1
     got = []
     for i in range_constexpr((units + THREADS - 1) // THREADS):
-        it = fx.min(c["tid"] + i * THREADS, units - 1)
+        raw_it = c["tid"] + i * THREADS
+        live = raw_it < units
+        it = fx.min(raw_it, units - 1)
         row = m0 + it // q4
         rowc = fx.min(row, m - 1)
         col = n0 + 4 * (it % q4)
@@ -159,8 +161,8 @@ def _push_tile(c, acc, m, n, m0, rb, n0, bn, ks, mode, sl):
                     )
                 )
             ]
-        got.append((row, col, vs))
-    for row, col, vs in got:
+        got.append((live, row, col, vs))
+    for live, row, col, vs in got:
         if const_expr(part):
             s = [vs[0][e] for e in range(4)]
             for k in range_constexpr(1, ks):
@@ -171,7 +173,7 @@ def _push_tile(c, acc, m, n, m0, rb, n0, bn, ks, mode, sl):
             ]
         else:
             words = [vs[0][0], vs[0][1]]
-        if row < m:
+        if live & (row < m):
             c["put_words"](dst, (base + row * sl + col) // 2, words)
             if const_expr(not part and ks > 1):
                 bo.buffer_store(
@@ -194,7 +196,9 @@ def _push_band_flag(c, acc, m, n, m0, rb, n0, bn, ks, mode, sl, piece):
     part = mode == "part" and ks > 1
     got = []
     for i in range_constexpr((units + THREADS - 1) // THREADS):
-        it = fx.min(c["tid"] + i * THREADS, units - 1)
+        raw_it = c["tid"] + i * THREADS
+        live = raw_it < units
+        it = fx.min(raw_it, units - 1)
         row = m0 + it // q8
         rowc = fx.min(row, m - 1)
         col = n0 + 8 * (it % q8)
@@ -224,8 +228,8 @@ def _push_band_flag(c, acc, m, n, m0, rb, n0, bn, ks, mode, sl, piece):
                     )
                 )
             ]
-        got.append((row, col, vs))
-    for row, col, vs in got:
+        got.append((live, row, col, vs))
+    for live, row, col, vs in got:
         if const_expr(part):
             s = [vs[h][e] for h in range(2) for e in range(4)]
             for k in range_constexpr(1, ks):
@@ -237,7 +241,7 @@ def _push_band_flag(c, acc, m, n, m0, rb, n0, bn, ks, mode, sl, piece):
             ]
         else:
             words = [vs[0][e] for e in range(4)]
-        if row < m:
+        if live & (row < m):
             bo.buffer_store(
                 fx.Vector.from_elements(words, fx.Int32),
                 rsrc(dst.value),
