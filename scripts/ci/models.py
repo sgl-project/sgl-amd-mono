@@ -110,6 +110,50 @@ def weekly_eval(model: dict, name: str) -> bool:
     return bool(EVALS[name].get("weekly")) or name in model.get("weekly_evals", ())
 
 
+def run_evals(model: dict, mode: str, evals_only=()) -> list:
+    """The benchmarks a nightly or weekly job of ``model`` runs. The nightly runs
+    all but the weekly ones. The weekly run gives the model's ``weekly_evals`` a
+    job of their own (``evals_only``; ``weekly_jobs``), alongside its main job on
+    the other node, so that neither outgrows a job's time limit; the main job runs
+    the rest."""
+    evals = model.get("evals", [])
+    if evals_only:
+        return [e for e in evals if e in evals_only]
+    if mode == "weekly":
+        return [e for e in evals if e not in model.get("weekly_evals", ())]
+    return [e for e in evals if not weekly_eval(model, e)]
+
+
+def job_key(model: str, evals_only=()) -> str:
+    """A nightly or weekly job's name in the run (its artifact, results directory
+    and Slurm job): the model, and the benchmarks of an ``evals_only`` job
+    (``kimi_k3-mmmu_pro``). Model and benchmark names have no "-"."""
+    return "-".join([model, *evals_only])
+
+
+def parse_job(job: str):
+    """(model, evals_only) of a ``job_key``."""
+    model, *evals_only = job.split("-")
+    return model, evals_only
+
+
+def weekly_jobs(keys) -> list:
+    """The weekly run's matrix for the models ``keys``: a job a model, and one more
+    for each model's ``weekly_evals`` (``evals``), listed first: it is the run's
+    longest job (Kimi-K3's MMMU-Pro, ~8 h a side)."""
+    parts = [
+        {
+            "model": k,
+            "tier": "full",
+            "evals": ",".join(MODELS[k]["weekly_evals"]),
+            "job": job_key(k, MODELS[k]["weekly_evals"]),
+        }
+        for k in keys
+        if MODELS.get(k, {}).get("weekly_evals")
+    ]
+    return parts + [{"model": k, "tier": "full", "job": k} for k in keys]
+
+
 # One-sided significance level of the GSM8K test.
 ALPHA = 0.05
 
@@ -281,7 +325,8 @@ MODELS = {
         ],
         "evals": TEXT_EVALS + ["mmmu_pro"],
         # one request at a time, MMMU-Pro takes ~8 h and held a CI node for most of
-        # the nightly; it runs in the weekly run only
+        # the nightly; it runs in the weekly run only, in a job of its own: on and
+        # off, ~16 h, it would take the model's weekly job past its time limit
         "weekly_evals": ["mmmu_pro"],
         # the recipe runs one request a step (DSpark verify steps of 8 rows)
         "concurrency": [1],
@@ -416,16 +461,24 @@ if __name__ == "__main__":
     # `python3 models.py checkpoints`: every supported checkpoint, one a line
     elif sys.argv[1:] == ["checkpoints"]:
         print("\n".join(CHECKPOINTS))
-    # `python3 models.py nightly|weekly`: the run's matrix, as JSON. The weekly run
-    # has the nightly's models and those marked ``weekly`` (weekly run only).
-    elif sys.argv[1:] in (["nightly"], ["weekly"]):
+    # `python3 models.py nightly|weekly [MODELS]`: the run's matrix, as JSON. The
+    # weekly run has the nightly's models and those marked ``weekly`` (weekly run
+    # only), and a job for each one's ``weekly_evals``. MODELS (comma-separated)
+    # replaces the set.
+    elif len(sys.argv) in (2, 3) and sys.argv[1] in ("nightly", "weekly"):
         import json
 
-        keys = ["common"] + [
-            k
-            for k, m in MODELS.items()
-            if m.get("nightly") or (sys.argv[1] == "weekly" and m.get("weekly"))
-        ]
-        print(json.dumps([{"model": k, "tier": "full"} for k in keys]))
+        if len(sys.argv) == 3:
+            keys = [k.strip() for k in sys.argv[2].split(",") if k.strip()]
+        else:
+            keys = ["common"] + [
+                k
+                for k, m in MODELS.items()
+                if m.get("nightly") or (sys.argv[1] == "weekly" and m.get("weekly"))
+            ]
+        if sys.argv[1] == "weekly":
+            print(json.dumps(weekly_jobs(keys)))
+        else:
+            print(json.dumps([{"model": k, "tier": "full", "job": k} for k in keys]))
     else:
-        sys.exit("usage: models.py paths MODEL | checkpoints | nightly | weekly")
+        sys.exit("usage: models.py paths MODEL | checkpoints | nightly|weekly [MODELS]")

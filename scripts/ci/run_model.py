@@ -32,7 +32,10 @@ the model's benchmarks but the weekly ones, and the speed test. It runs no off
 side: the report holds the on scores to the model's fixed ``baseline`` and shows
 the monokernel-off reference. Weekly mode: on and off, every benchmark and the
 speed test on both sides; its off results become the monokernel-off reference
-until the next weekly run.
+until the next weekly run. A model's ``weekly_evals`` (Kimi-K3's MMMU-Pro, ~8 h a
+side) are a job of their own in the weekly run, on the other node
+(``--evals-only``): on, then off, those benchmarks alone, and no tests, speed
+test or pinned check, which the model's main job runs without them.
 
 Every step runs whatever an earlier one did; ``result.json`` (rewritten after each
 step) and ``logs/`` hold the outcome. ``report.py`` judges it.
@@ -66,7 +69,7 @@ from models import (  # noqa: E402
     PR_EVALS,
     PROMPTS_PER_SLOT,
     RANGE_RATIO,
-    weekly_eval,
+    run_evals,
 )
 
 PORT = 31000
@@ -136,6 +139,8 @@ class Run:
             "accuracy": {},
             "routing": {},
         }
+        if args.evals_only:
+            self.result["evals_only"] = args.evals_only
         self.installed = None  # the checkout install() last installed
         self.install_failed = {}  # checkout -> why its install failed
         for k, v in self.m.get("paths", {}).items():
@@ -565,6 +570,20 @@ class Run:
             text=True,
         ).stdout.strip()
         why = self.model_ready() if self.key != "common" else None
+        if a.evals_only:
+            # the weekly run's job for the model's weekly_evals; its main job runs
+            # the pinned check, the tests, the speed test and the other benchmarks
+            if why:
+                self.result["skipped"]["serving"] = why
+                return
+            evals = run_evals(self.m, a.mode, a.evals_only)
+            self.install(a.pr)
+            self.step("on", self.side, "on", True, perf=False, evals=evals)
+            # the reference the nightly and the PR test read until next week
+            self.step(
+                "off", self.side, "off", False, perf=False, evals=evals, fresh=True
+            )
+            return
         if a.mode in ("nightly", "weekly"):
             # first the sgl-amd-mono the image pins: what a user of this SGLang runs
             self.step("pinned", self.pinned, serve=self.key != "common" and not why)
@@ -583,11 +602,8 @@ class Run:
             self.install(a.pr)
             self.step("tests", self.tests)
             if not why:
-                evals = [
-                    e
-                    for e in self.m.get("evals", [])
-                    if a.mode == "weekly" or not weekly_eval(self.m, e)
-                ]
+                # the weekly run's weekly_evals are a job of their own (--evals-only)
+                evals = run_evals(self.m, a.mode)
                 self.step("on", self.side, "on", True, evals=evals)
                 if a.mode == "weekly":
                     # the reference the nightly and the PR test read until next week
@@ -803,9 +819,20 @@ def main():
         action="store_true",
         help="PR mode: run (or find kept) the base branch's unit tests and stop",
     )
+    ap.add_argument(
+        "--evals-only",
+        type=lambda v: [e for e in v.split(",") if e],
+        default=[],
+        help="weekly mode: only these benchmarks (comma-separated), on and off: "
+        "the model's weekly_evals, as a job of their own",
+    )
     args = ap.parse_args()
     if args.model != "common" and args.model not in MODELS:
         sys.exit(f"unknown model {args.model}")
+    if args.evals_only:
+        evals = MODELS.get(args.model, {}).get("evals", [])
+        if args.mode != "weekly" or not set(args.evals_only) <= set(evals):
+            sys.exit(f"--evals-only: weekly mode, and {args.model}'s benchmarks only")
     run = Run(args)
     if args.base_tests_only:
         run.trust_checkouts()

@@ -18,7 +18,9 @@
 # Job environment (the workflow): CI_IMAGE, CI_PR, CI_PR_SHA, CI_BASE_SHA (the PR's
 #   merge-base), CI_RESULTS (where to unpack the results; default
 #   $GITHUB_WORKSPACE/results/MODEL), CI_MODE (pr, the default; nightly or weekly:
-#   CI_PR_SHA = CI_BASE_SHA = main)
+#   CI_PR_SHA = CI_BASE_SHA = main), CI_JOB (the job's name in the run, default
+#   MODEL; models.py's job_key), CI_EVALS_ONLY (weekly: run only these benchmarks,
+#   comma-separated, on and off; a model's weekly_evals, as a job of their own)
 # Optional: TIME_LIMIT (default 16:00:00), CI_SHARED_DIR (default ~/.sgl_amd_mono_ci),
 #           SUBMIT_ATTEMPTS (default 3)
 #
@@ -51,8 +53,9 @@ fi
 SLURM_EXCLUDE=crsuse2-m2m-v3-010,crsuse2-m2m-v3-022,crsuse2-m2m-v3-025,crsuse2-m2m-v3-090
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# The workflow's cleanup step cancels by this name.
-JOB_NAME="sgl-amd-mono-ci-${GITHUB_RUN_ID:-0}-${MODEL}"
+# The workflow's cleanup step cancels by this name: one a job of the run (a model
+# can have two in the weekly run, one for its weekly_evals).
+JOB_NAME="sgl-amd-mono-ci-${GITHUB_RUN_ID:-0}-${CI_JOB:-$MODEL}"
 RUN_DIR="${CI_SHARED_DIR:-$HOME/.sgl_amd_mono_ci}/runs/${JOB_NAME}-${GITHUB_RUN_ATTEMPT:-1}"
 rm -rf "$RUN_DIR"
 mkdir -p "$RUN_DIR"
@@ -62,7 +65,7 @@ cp -r "$SCRIPT_DIR" "$RUN_DIR/ci"
 # Read by slurm_job.sh; sbatch exports the submitting environment.
 export CI_MODE="${CI_MODE:-pr}" CI_MODEL="$MODEL" CI_TIER="$TIER" CI_HARNESS="$RUN_DIR/ci" CI_RUN_DIR="$RUN_DIR"
 export CI_REPO="${CI_REPO:-${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-sgl-project/sgl-amd-mono}}"
-export CI_EXIT_FILE="$RUN_DIR/exit_code" CI_NODE_SCRATCH CI_PR="${CI_PR:-}"
+export CI_EXIT_FILE="$RUN_DIR/exit_code" CI_NODE_SCRATCH CI_PR="${CI_PR:-}" CI_EVALS_ONLY="${CI_EVALS_ONLY:-}"
 
 JOB_ID=""
 cleanup() {
@@ -122,7 +125,7 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
         -N1 --exclusive --gres=gpu:8 --exclude="$SLURM_EXCLUDE" -t "$TIME_LIMIT" \
         -J "$JOB_NAME" --output "$LOG" "$CI_HARNESS/slurm_job.sh")"
     JOB_ID="${JOB_ID%%;*}"
-    echo "Submitted job $JOB_ID (attempt $attempt/$SUBMIT_ATTEMPTS): model=$MODEL tier=$TIER image=$CI_IMAGE"
+    echo "Submitted job $JOB_ID (attempt $attempt/$SUBMIT_ATTEMPTS): model=$MODEL tier=$TIER${CI_EVALS_ONLY:+ evals-only=$CI_EVALS_ONLY} image=$CI_IMAGE"
 
     LOG_OFFSET=0
     misses=0

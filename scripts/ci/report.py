@@ -5,6 +5,10 @@ checks (rules, scope, accuracy, kernel microbenchmark, E2E performance, tests, d
     python scripts/ci/report.py --results results/ --model deepseek_v41   # one model
     python scripts/ci/report.py --nightly --results results/ --out report.md
 
+A nightly or weekly run's results are one directory a job (models.py's
+``job_key``): the model, or in the weekly run a model's ``weekly_evals`` job
+(``kimi_k3-mmmu_pro``), judged on those benchmarks alone.
+
 Exits 1 when a check fails. A check that could not run here (no checkpoint on the
 CI nodes, a gated dataset) is a warning: its numbers come from the author, as the
 guideline asks until the CI covers them.
@@ -32,7 +36,8 @@ from models import (  # noqa: E402
     PERF_GAIN,
     PERF_LOSS,
     PR_EVALS,
-    weekly_eval,
+    parse_job,
+    run_evals,
 )
 
 PASS, WARN, FAIL = "pass", "warn", "fail"
@@ -85,8 +90,9 @@ def accuracy_check(key, r):
     if r.get("mode", "pr") == "pr":
         wanted = PR_EVALS + (EXTRA_EVALS if r.get("extra") else [])
         names = [e for e in wanted if e in names]
-    elif r.get("mode") == "nightly":
-        names = [e for e in names if not weekly_eval(m, e)]
+    elif r.get("mode") in ("nightly", "weekly"):
+        # the weekly run's weekly_evals are a job of their own (evals_only)
+        names = run_evals(m, r["mode"], r.get("evals_only"))
     if not names:
         return WARN, "no accuracy benchmarks for this model in CI yet"
     if r.get("skipped", {}).get("serving"):
@@ -422,9 +428,16 @@ def pinned_check(r):
     return (FAIL if bad else PASS), " · ".join(parts)
 
 
-def model_section(key, r, needs_gain):
+def model_section(key, r, needs_gain, off=None):
+    """The model's checks; ``off`` (weekly: {benchmark: off result}) makes the
+    suggested ``baseline``, default the job's own off results."""
     checks = [("Scope", *scope_check(key, r))] if key != "common" else []
-    if key != "common":
+    part = r.get("evals_only")
+    if part:
+        # a weekly_evals job: its benchmarks only; the model's main job has the rest
+        checks.append(("Accuracy", *accuracy_check(key, r)))
+        rows = []
+    elif key != "common":
         checks += [
             ("Accuracy", *accuracy_check(key, r)),
             ("Kernel microbenchmark", *micro_check(key, r)),
@@ -433,15 +446,18 @@ def model_section(key, r, needs_gain):
         checks.append(("E2E performance", state, text))
     else:
         rows = []
-    checks.append(("Tests", *tests_check(key, r)))
-    if r.get("mode") in ("nightly", "weekly"):
+    if not part:
+        checks.append(("Tests", *tests_check(key, r)))
+    if r.get("mode") in ("nightly", "weekly") and not part:
         checks.append(("Pinned sgl-amd-mono on this SGLang", *pinned_check(r)))
     if r.get("error"):
         checks.append(("Run", FAIL, f"`{r['error']}`"))
     for name, err in r.get("step_errors", {}).items():
         checks.append((f"Step `{name}`", FAIL, f"`{err}`"))
     lines = [
-        f"### {r.get('name', key)} (`{key}`)",
+        f"### {r.get('name', key)} (`{key}`"
+        + (f", {', '.join(part)} only" if part else "")
+        + ")",
         "",
         f"Node `{r.get('node', '?')}` · baseline: {r.get('baseline', 'n/a')} · SGLang `{r.get('sglang', '?')}`",
         "",
@@ -450,7 +466,8 @@ def model_section(key, r, needs_gain):
     ]
     lines += [f"| {ICON[s]} | {n} | {t} |" for n, s, t in checks]
     if r.get("mode") == "weekly":
-        off = r.get("accuracy", {}).get("off", {})
+        if off is None:
+            off = r.get("accuracy", {}).get("off", {})
         floors = {
             name: round(v["score"] - BASELINE_MARGIN.get(name, 0), 4)
             for name, v in off.items()
@@ -510,11 +527,16 @@ def best_gain(key, r):
     return max(gains, default=None)
 
 
-def load(results: Path, key):
-    p = results / key / "result.json"
+def load(results: Path, job):
+    """The result of ``job`` (a model, or a model's weekly_evals job)."""
+    p = results / job / "result.json"
     if p.exists():
         return json.loads(p.read_text())
-    return {"model": key, "error": "no result.json: the job did not finish"}
+    model, evals_only = parse_job(job)
+    r = {"model": model, "error": "no result.json: the job did not finish"}
+    if evals_only:  # only the weekly run has these jobs
+        r.update(mode="weekly", evals_only=evals_only)
+    return r
 
 
 def main():
@@ -530,9 +552,12 @@ def main():
     ap.add_argument(
         "--expect",
         default="",
-        help="nightly: the models the run started, comma-separated (one without a result fails)",
+        help="nightly: the jobs the run started, comma-separated (one without a result fails)",
     )
-    ap.add_argument("--model", help="judge one model only (its job's status)")
+    ap.add_argument(
+        "--model",
+        help="judge one job only (its status): a model, or a model's weekly_evals job",
+    )
     ap.add_argument("--title-type", default="")
     ap.add_argument("--run-url", default="")
     ap.add_argument("--out")
@@ -541,7 +566,9 @@ def main():
 
     if args.model:
         state, text = model_section(
-            args.model, load(results, args.model), args.title_type in GAIN_TYPES
+            parse_job(args.model)[0],
+            load(results, args.model),
+            args.title_type in GAIN_TYPES,
         )
         print(text)
         sys.exit(1 if state == FAIL else 0)
@@ -554,9 +581,18 @@ def main():
             else set()
         )
         keys = sorted(found | {k for k in args.expect.split(",") if k})
+        runs = {job: load(results, job) for job in keys}
+        # weekly: one suggested baseline a model, from the off results of all its
+        # jobs (a model's weekly_evals run in a job of their own)
+        offs = {}
+        for job, r in runs.items():
+            offs.setdefault(parse_job(job)[0], {}).update(
+                r.get("accuracy", {}).get("off", {})
+            )
         states, sections = [], []
-        for key in keys:
-            s, text = model_section(key, load(results, key), False)
+        for job in keys:  # a model's main job sorts before its weekly_evals job
+            model = parse_job(job)[0]
+            s, text = model_section(model, runs[job], False, off=offs.pop(model, {}))
             states.append(s)
             sections.append(text)
         overall = worst(*states)

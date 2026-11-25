@@ -7,7 +7,8 @@ name: Nightly (AMD)
 # benchmarks (AIME26 x4) and holds the scores to each model's fixed `baseline`.
 # Saturday's weekly run has every benchmark with the monokernels on and off; its
 # off results become the monokernel-off reference (monokernel_off_ref) the nightly
-# and the PR test read until the next one. See scripts/ci/README.md.
+# and the PR test read until the next one. A model's `weekly_evals` (Kimi-K3's
+# MMMU-Pro) run in a job of their own, on the other node. See scripts/ci/README.md.
 
 on:
   schedule:
@@ -56,11 +57,9 @@ jobs:
         run: |
           mode=nightly; [[ "$WEEKLY" == true ]] && mode=weekly
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
-          if [[ -n "$MODELS" ]]; then
-            matrix="$(jq -cn --arg m "$MODELS" '$m | split(",") | map(gsub(" "; "")) | map(select(length > 0)) | map({model: ., tier: "full"})')"
-          else
-            matrix="$(python3 scripts/ci/models.py "$mode")"
-          fi
+          # a job a model ({model, tier, job}); the weekly run adds one for each
+          # model's weekly_evals ({..., evals}), named <model>-<evals> (job)
+          matrix="$(python3 scripts/ci/models.py "$mode" ${MODELS:+"$MODELS"})"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "matrix: $matrix"
@@ -82,7 +81,7 @@ jobs:
 
   test:
     needs: plan
-    name: ${{ needs.plan.outputs.mode }} (${{ matrix.model }})
+    name: ${{ needs.plan.outputs.mode }} (${{ matrix.job }})
     runs-on: [self-hosted, sgl-amd-mono-mi355x]
     timeout-minutes: 1440
     strategy:
@@ -94,7 +93,8 @@ jobs:
       CI_IMAGE: ${{ needs.plan.outputs.image }}
       CI_PR_SHA: ${{ needs.plan.outputs.sha }}
       CI_BASE_SHA: ${{ needs.plan.outputs.sha }}
-      # the weekly run has both sides and every benchmark: allow a day
+      # the weekly run has both sides and every benchmark: allow a day (a model's
+      # weekly_evals, ~8 h a side for Kimi-K3's MMMU-Pro, are a job of their own)
       TIME_LIMIT: "23:30:00"
       RESULTS: /tmp/sgl-amd-mono-ci/${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -107,14 +107,16 @@ jobs:
 
       - name: Run on the CI node
         env:
-          CI_RESULTS: ${{ env.RESULTS }}/${{ matrix.model }}
+          CI_RESULTS: ${{ env.RESULTS }}/${{ matrix.job }}
+          CI_JOB: ${{ matrix.job }}
+          CI_EVALS_ONLY: ${{ matrix.evals }}
         run: bash harness/scripts/ci/slurm_launch.sh "${{ matrix.model }}" "${{ matrix.tier }}"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mono-ci-${{ matrix.model }}
-          path: ${{ env.RESULTS }}/${{ matrix.model }}
+          name: mono-ci-${{ matrix.job }}
+          path: ${{ env.RESULTS }}/${{ matrix.job }}
           retention-days: 30
           if-no-files-found: warn
 
@@ -123,16 +125,16 @@ jobs:
         # the model's job instead of passing through tee's exit status
         shell: bash
         run: |
-          python3 harness/scripts/ci/report.py --results "$RESULTS" --model "${{ matrix.model }}" \
+          python3 harness/scripts/ci/report.py --results "$RESULTS" --model "${{ matrix.job }}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Cancel the cluster job
         if: cancelled()
-        run: scancel --name "sgl-amd-mono-ci-${{ github.run_id }}-${{ matrix.model }}" || true
+        run: scancel --name "sgl-amd-mono-ci-${{ github.run_id }}-${{ matrix.job }}" || true
 
       - name: Clean up
         if: always()
-        run: rm -rf "$RESULTS/${{ matrix.model }}"
+        run: rm -rf "$RESULTS/${{ matrix.job }}"
 
   report:
     needs: [plan, test]
@@ -152,13 +154,13 @@ jobs:
       - name: Report
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # the models the run started: one without a result is reported, not dropped
+          # the jobs the run started: one without a result is reported, not dropped
           MATRIX: ${{ needs.plan.outputs.matrix }}
         run: |
           mkdir -p results
           for d in artifacts/mono-ci-*; do [[ -d "$d" ]] && mv "$d" "results/${d#artifacts/mono-ci-}"; done
           rc=0
-          expect="$(jq -r 'map(.model) | join(",")' <<< "$MATRIX")"
+          expect="$(jq -r 'map(.job) | join(",")' <<< "$MATRIX")"
           python3 harness/scripts/ci/report.py --nightly --results results --expect "$expect" \
             --title "AMD ${{ needs.plan.outputs.mode }} (main)" \
             --run-url "$RUN_URL" --out report.md > /dev/null || rc=$?

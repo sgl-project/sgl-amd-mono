@@ -9,7 +9,7 @@
 #
 # Environment (exported by slurm_launch.sh): CI_MODEL CI_TIER CI_MODE CI_HARNESS CI_REPO
 # CI_PR CI_PR_SHA CI_BASE_SHA CI_IMAGE CI_NODE_SCRATCH CI_MODEL_ROOT CI_RUN_DIR
-# CI_EXIT_FILE
+# CI_EXIT_FILE CI_EVALS_ONLY
 
 exec 2>&1   # some schedulers' batch --output captures stdout only
 set -uo pipefail
@@ -38,7 +38,7 @@ MONOKERNEL_OFF_REF_MOUNT=ro
 # --base-tests-only step staged before any of the PR's code ran.
 BASE_TESTS_SHARED="${CI_SHARED_DIR:-$HOME/.sgl_amd_mono_ci}/base_tests"
 
-echo "[mono-ci-job] start on $(hostname) job=$JOB_ID model=$CI_MODEL tier=${CI_TIER:-full} image=$CI_IMAGE $(date -u +%FT%TZ)"
+echo "[mono-ci-job] start on $(hostname) job=$JOB_ID model=$CI_MODEL tier=${CI_TIER:-full}${CI_EVALS_ONLY:+ evals-only=$CI_EVALS_ONLY} image=$CI_IMAGE $(date -u +%FT%TZ)"
 
 finish() {
     local rc=$?
@@ -112,7 +112,8 @@ checkout "$WS/base" "$CI_BASE_SHA"
 mkdir -p "$MONOKERNEL_OFF_REF_SHARED" "$BASE_TESTS_SHARED"
 
 # This CI's containers from an earlier job that did not clean up. The node is
-# held whole, so nothing else of ours runs here.
+# held whole, so nothing else of ours runs here (a model's two weekly jobs run on
+# the two nodes, each with its own container, scratch and results).
 docker ps -aq --filter "name=^sgl-amd-mono-ci-" | xargs -r docker rm -f
 echo "[mono-ci-job] GPU use before start:"
 rocm-smi --showuse --showmemuse 2>/dev/null | grep -E '^GPU\[' || true
@@ -147,7 +148,8 @@ if [[ -s "$HF_TOKEN_FILE" ]]; then
 fi
 
 RUN_MODEL=(python3 /ci/harness/scripts/ci/run_model.py
-    --model "$CI_MODEL" --tier "${CI_TIER:-full}" --mode "${CI_MODE:-pr}" --pr /ci/pr --base /ci/base --out /ci/out --cache /cache)
+    --model "$CI_MODEL" --tier "${CI_TIER:-full}" --mode "${CI_MODE:-pr}" --pr /ci/pr --base /ci/base --out /ci/out --cache /cache
+    ${CI_EVALS_ONLY:+--evals-only "$CI_EVALS_ONLY"})
 
 if [[ "${CI_MODE:-pr}" == pr ]]; then
     # The base branch's unit tests first, on their own, before any of the PR's
