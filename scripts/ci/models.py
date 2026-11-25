@@ -331,7 +331,11 @@ MODELS = {
         # the launches cover MI350X only; the CI nodes are MI355X
         "gpus": ["mi350x"],
         "paths": {},
-        "kernel_tests": ["test/kernels/test_minimax_m31_ffn.py"],
+        "kernel_tests": [
+            "test/kernels/test_minimax_m31_ffn.py",
+            "test/kernels/test_minimax_m31_nvfp4.py",
+            "test/kernels/test_minimax_m31_attention.py",
+        ],
         "e2e_tests": ["test/e2e/test_minimax_m31_server.py"],
         "microbench": [],
         "evals": [],

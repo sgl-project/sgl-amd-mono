@@ -188,7 +188,10 @@ def _run(weights, s, seed=1):
     torch.cuda.synchronize()
     err = runner.epoch[list(guard.ERROR_WORDS)].tolist()
     assert not any(err), err
-    x = runner.region(s, "xn")[: s * H * 2].view(torch.bfloat16).view(s, H)
+    # XN in the up MFMA's B order (ffn.xn_at): chunk (step, d, g, t) of 8 columns
+    x = runner.region(s, "xn")[: ffn.MAX_TOKENS * H * 2].view(torch.bfloat16)
+    x = x.view(H // 128, 4, 4, ffn.MAX_TOKENS, 8).permute(3, 0, 2, 1, 4)
+    x = x.reshape(ffn.MAX_TOKENS, H)[:s]
     parts = _pairs(runner.region(s, "logit"), s * ffn.EXPERTS * ffn.ROUTER_PARTS)
     parts = parts.view(torch.float32).view(s, ffn.EXPERTS, ffn.ROUTER_PARTS)
     route = _pairs(runner.region(s, "route"), s * 2 * ffn.TOPK).view(s, 2 * ffn.TOPK)
@@ -239,16 +242,14 @@ def test_ffn_stages_match_native(weights, s):
 
 @pytest.mark.parametrize("s", [8, 16])
 def test_o_proj_is_sglangs_to_the_bit(weights, s):
-    """The launch's o_proj partial is SGLang's (AITER's per-token FP8 quant, then
-    ``smallm_fp8_gemm``) bit for bit, in both of that GEMM's wave splits."""
-    import aiter
+    """The launch's o_proj partial is SGLang's decode-sized o_proj on the rowwise-FP8
+    copy (``apply_fp8_ptpc_linear``) bit for bit."""
+    from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
 
-    smallm = pytest.importorskip("sglang.kernels.ops.gemm.smallm_fp8_gfx950")
-    if not smallm.smallm_fp8_gemm_enabled():
-        pytest.skip("smallm_fp8_gemm is off")
     r = _run(weights, s)
-    q, xs = aiter.per_token_quant_hip(r.attn, quant_dtype=aiter.dtypes.fp8)
-    want = smallm.smallm_fp8_gemm(q, weights.wo, xs, weights.wos, torch.bfloat16)
+    want = apply_fp8_ptpc_linear(
+        input=r.attn, weight=weights.wo, weight_scale=weights.wos, bias=None
+    )
     assert torch.equal(r.part, want)
 
 
