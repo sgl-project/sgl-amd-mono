@@ -4,6 +4,7 @@
 import math
 
 import pytest
+
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.kimi_k31 import wide
 
