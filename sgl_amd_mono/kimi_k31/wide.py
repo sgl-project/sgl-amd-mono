@@ -31,7 +31,8 @@ import torch
 
 # The SGLang names this module reads (test/unit/test_contract.py).
 SGLANG_READS = {
-    "srt/runtime_context.py": ("get_spec",),
+    "srt/runtime_context.py": ("get_spec", "get_parallel", '"dcp_enabled"'),
+    "srt/arg_groups/fields/parallel.py": ("dcp_replicate_q_proj",),
     "srt/models/kimi_k3.py": (
         "KimiK3MoE",
         "AuxHiddenStateList",
@@ -42,6 +43,8 @@ SGLANG_READS = {
         # DSA layers stop before o_proj for dsa_post
         "forward_pre_o_proj",
         "use_output_gate",
+        "g_proj",
+        '"_mono_pre"',
         "mlp_res_norm",
         "mlp_res_proj",
         "prev_valid_blocks",
@@ -54,7 +57,33 @@ SGLANG_READS = {
         "set_attn_inputs",
         "clear_attn_inputs",
     ),
-    "srt/models/deepseek_v2.py": ("prepare_qkv_latent",),
+    "srt/models/deepseek_v2.py": (
+        "prepare_qkv_latent",
+        "fused_qkv_a_proj_with_mqa",
+        "q_a_layernorm",
+        "kv_a_layernorm",
+        "q_b_proj",
+        "q_b_proj_qrep_weight",
+        "w_kc_qrep",
+        "use_deep_gemm_bmm",
+        "use_dsa",
+        "q_lora_rank",
+        "kv_lora_rank",
+        "qk_rope_head_dim",
+        "num_local_heads",
+        "dcp_size",
+        "qk_head_dim",
+        "indexer",
+    ),
+    "srt/models/deepseek_common/attention_forward_methods/forward_mla.py": (
+        "is_dcp_q_replicate_phase",
+    ),
+    "srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py": (
+        "forward_absorb_rocm_prepare",
+        '"_mono_pre"',
+    ),
+    "srt/layers/attention/dsa/dsa_indexer.py": ("wk", "weights_proj", "wq_b"),
+    "srt/layers/attention/dsa/indexer_prologue_hip.py": ('"_mono_pre"',),
     "srt/layers/activation.py": ("SituAndMul", "beta", "linear_beta"),
     # the new dev_amd moved KimiK3MoE's ROCm paths into kimi_k3_amd
     # NextAttnRead.max_tokens: the row cap of SGLang's column tail, which
@@ -564,8 +593,174 @@ def _pre_o_proj(layer, x, positions, fb, zero_allocator):
             get_attn_tp_context().clear_attn_inputs()
 
 
+def _sglang_mono_pre_caps(attn) -> tuple[bool, bool]:
+    """Return ``(supports_local, supports_qrep)`` for SGLang's ``_mono_pre`` handoff
+    in ``forward_absorb_rocm_prepare`` (local handoff vs full-head DCP q-replicate
+    from sgl-project/sglang#53130)."""
+    cached = getattr(attn, "_k31_mono_pre_caps", None)
+    if cached is not None:
+        return cached
+    fn = getattr(attn, "forward_absorb_rocm_prepare", None)
+    local_ok, qrep_ok = False, False
+    if fn is not None:
+        try:
+            import ast
+            import inspect
+            import textwrap
+
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            reads_mono_pre = any(
+                isinstance(n, ast.Constant) and n.value == "_mono_pre"
+                for n in ast.walk(tree)
+            )
+            if reads_mono_pre:
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.If):
+                        continue
+                    test_names = {
+                        n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
+                    }
+                    if "pre" not in test_names:
+                        continue
+                    body_attrs = {
+                        n.attr
+                        for stmt in node.body
+                        for n in ast.walk(stmt)
+                        if isinstance(n, ast.Attribute)
+                    }
+                    body_names = {
+                        n.id
+                        for stmt in node.body
+                        for n in ast.walk(stmt)
+                        if isinstance(n, ast.Name)
+                    }
+                    if "pre" in body_names and "view" in body_attrs:
+                        local_ok = True
+                        if (
+                            "dcp_size" in body_attrs
+                            and "q_replicate_active" in body_names
+                        ):
+                            qrep_ok = True
+                            break
+        except (OSError, TypeError, SyntaxError):
+            local_ok, qrep_ok = False, False
+    caps = (local_ok, qrep_ok)
+    attn._k31_mono_pre_caps = caps
+    return caps
+
+
+def _sglang_mono_pre_supports_local(attn) -> bool:
+    return _sglang_mono_pre_caps(attn)[0]
+
+
+def _sglang_mono_pre_supports_qrep(attn) -> bool:
+    return _sglang_mono_pre_caps(attn)[1]
+
+
+def _mla_max_rows(qb_rows: int) -> int:
+    from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mp
+
+    return mp.MAX_ROWS_QREP if qb_rows == mp.QB_QREP else mp.MAX_ROWS_LOCAL
+
+
+def _mla_verify_qb(layer, par) -> int | None:
+    """Target-verify ``q_b`` output width (``QB_LOCAL`` or ``QB_QREP``) that
+    ``mla_pre_wide`` can execute for ``layer``, or ``None`` if it must fall back."""
+    from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mp
+
+    attn = layer.self_attn
+    dcp_size = getattr(attn, "dcp_size", 1)
+    qrep_verify = bool(
+        getattr(par, "dcp_enabled", False)
+        and getattr(par, "dcp_replicate_q_proj", False)
+        and dcp_size > 1
+        and not getattr(attn, "use_deep_gemm_bmm", False)
+    )
+    if qrep_verify:
+        if (
+            _sglang_mono_pre_supports_qrep(attn)
+            and getattr(attn, "num_local_heads", 0)
+            * dcp_size
+            * getattr(attn, "qk_head_dim", 0)
+            == mp.QB_QREP
+        ):
+            return mp.QB_QREP
+        return None
+    if (
+        _sglang_mono_pre_supports_local(attn)
+        and getattr(attn, "num_local_heads", 0) * getattr(attn, "qk_head_dim", 0)
+        == mp.QB_LOCAL
+    ):
+        return mp.QB_LOCAL
+    return None
+
+
+def _valid_qb_weight(w, qb_rows: int) -> bool:
+    from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mp
+
+    return (
+        isinstance(w, torch.Tensor)
+        and w.dtype == torch.bfloat16
+        and w.is_contiguous()
+        and tuple(w.shape) == (qb_rows, mp.QL)
+    )
+
+
+def _mla_pre_fusable(layer) -> bool:
+    """Whether a DSA layer's attention projection front can run in ``mla_pre_wide``."""
+    if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE", "1") != "1":
+        return False
+    from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mp
+
+    attn = layer.self_attn
+    idx = getattr(attn, "indexer", None)
+    fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
+    if (
+        idx is None
+        or fused is None
+        or not _sglang_mono_pre_supports_local(attn)
+        or not getattr(attn, "use_dsa", False)
+        or not getattr(attn, "use_output_gate", False)
+        or getattr(attn, "q_lora_rank", None) != mp.QL
+        or getattr(attn, "kv_lora_rank", None) != mp.KV
+        or getattr(attn, "qk_rope_head_dim", None) != mp.ROPE
+        or getattr(attn, "qk_head_dim", None) != 192
+    ):
+        return False
+    mods = (
+        (fused, (mp.LATW, H)),
+        (getattr(attn, "g_proj", None), (mp.GATE, H)),
+        (getattr(idx, "wk", None), (mp.IK, H)),
+        (getattr(idx, "weights_proj", None), (mp.IW, H)),
+        (getattr(idx, "wq_b", None), (mp.IQ, mp.QL)),
+        (getattr(attn, "q_b_proj", None), (mp.QB_LOCAL, mp.QL)),
+    )
+    for mod, shp in mods:
+        w = getattr(mod, "weight", None)
+        if (
+            not isinstance(w, torch.Tensor)
+            or getattr(mod, "bias", None) is not None
+            or w.dtype != torch.bfloat16
+            or tuple(w.shape) != shp
+            or not w.is_contiguous()
+        ):
+            return False
+    for ln_name, dim in (("q_a_layernorm", mp.QL), ("kv_a_layernorm", mp.KV)):
+        ln = getattr(attn, ln_name, None)
+        nw = getattr(ln, "weight", None)
+        if (
+            not isinstance(nw, torch.Tensor)
+            or nw.dtype != torch.bfloat16
+            or tuple(nw.shape) != (dim,)
+            or not nw.is_contiguous()
+            or getattr(ln, "variance_epsilon", None) is None
+        ):
+            return False
+    return True
+
+
 class _DSALayer:
-    """A fusable DSA layer's weights as ``dsa_post`` reads them."""
+    """A fusable DSA layer's weights as ``dsa_post`` (and optionally ``mla_pre_wide``) reads them."""
 
     def __init__(self, backbone, i, rank):
         layer = backbone.layers[i]
@@ -573,6 +768,14 @@ class _DSALayer:
         self.i, self.layer, self.moe = i, layer, moe
         self.nvb = layer.prev_valid_blocks
         self.eps = layer.post_attention_layernorm.variance_epsilon
+        self.mla_pre = _mla_pre_fusable(layer)
+        self.mla_pre_qb = None
+        self.q_eps = (
+            float(attn.q_a_layernorm.variance_epsilon) if self.mla_pre else 1e-6
+        )
+        self.kv_eps = (
+            float(attn.kv_a_layernorm.variance_epsilon) if self.mla_pre else 1e-6
+        )
         self.w = dict(
             wo=attn.o_proj.weight,
             cw_m=(
@@ -633,6 +836,12 @@ class Wide:
         self.slots_dsa = {
             i: n for n, i in enumerate(dsa_idx)
         }  # a DSA launch's slot in its own peer ring
+        if any(pk.mla_pre for pk in self.dsa_layers.values()):
+            from sglang.srt.runtime_context import get_parallel
+
+            par = get_parallel()
+            for pk in self.dsa_layers.values():
+                pk.mla_pre_qb = _mla_verify_qb(pk.layer, par) if pk.mla_pre else None
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
         self.peers_dsa, self.half_dsa = {}, {}
@@ -649,9 +858,11 @@ class Wide:
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
         self.cols = slice(rank * SL, (rank + 1) * SL)
         self.kda_ready = False
+        n_mla = sum(1 for pk in self.dsa_layers.values() if pk.mla_pre_qb is not None)
         _say(
             f"{len(idx)} covered layers ({idx[0]} .. {idx[-1]}), {len(dsa_idx)} dsa_post layers"
             + (f" ({dsa_idx[0]} .. {dsa_idx[-1]})" if dsa_idx else "")
+            + f", {n_mla} mla_pre_wide layers"
             + f", {L} tokens a request, buckets {self.buckets}, captures {sorted(caps)}, "
             f"block-write {[i for i in idx if self.layers[i].write]}, tails into a run's first launch "
             f"{sorted(self.entry)}"
@@ -674,6 +885,29 @@ class Wide:
         )
 
     # ------------------------------------------------------------ per bucket
+    def _mla_bucket_specs(self, b: int) -> dict[int, int]:
+        """Map eligible ``qb_rows -> m_mla`` launch width for wide bucket ``b``.
+
+        A bucket ``b`` can receive verify steps with ``rows <= max_rows`` whenever the
+        previous bucket is strictly below ``max_rows`` (e.g., ``L=6`` rows 30 lands in
+        bucket 48 and runs ``mla_pre_wide`` at ``m_mla=32`` while rows 36..48 fall back).
+        """
+        buckets = getattr(self, "buckets", ())
+        if b in buckets:
+            idx = buckets.index(b)
+            prev_b = buckets[idx - 1] if idx > 0 else 0
+        else:
+            prev_b = b - 1
+        specs: dict[int, int] = {}
+        for pk in self.dsa_layers.values():
+            qb = pk.mla_pre_qb
+            if qb is None:
+                continue
+            lim = _mla_max_rows(qb)
+            if prev_b < lim:
+                specs[qb] = min(b, lim)
+        return specs
+
     def _cfg(self, b):
         from sgl_amd_mono.kimi_k31.gfx950 import layer as lay
         from sgl_amd_mono.kimi_k31.gfx950.chain import Gemm
@@ -805,6 +1039,36 @@ class Wide:
         else:
             bufs["sort"] = torch.zeros(256, dtype=torch.uint8, device=dev)
             bufs["sortv"] = None
+        from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mp
+
+        mla_specs = self._mla_bucket_specs(b)
+        if mla_specs:
+            max_m = max(mla_specs.values())
+            max_qb = max(mla_specs)
+            bufs["mla_specs"] = mla_specs
+            mla_state = {}
+            for qb, m_mla in mla_specs.items():
+                scr_pb = PeerBuffer(
+                    mp.scratch_layout(m_mla, qb)["nbytes"], None, 0, 1, dev
+                )
+                scr_pb.bytes.zero_()
+                mla_state[qb] = (
+                    scr_pb,
+                    scr_pb.bytes,
+                    torch.zeros(mp.counters(qb), dtype=torch.int32, device=dev),
+                )
+            bufs["mla_state"] = mla_state
+            bufs["mla_x"] = z(max_m, H)
+            bufs["mla_out"] = dict(
+                q=z(max_m * max_qb),
+                latent=z(max_m, mp.KV + mp.ROPE),
+                k_nope=z(max_m, mp.KV),
+                q_lora=z(max_m, mp.QL),
+                gate=z(max_m, mp.GATE),
+                idx_q=z(max_m, mp.IQ),
+                idx_k=z(max_m, mp.IK),
+                idx_w=z(max_m, mp.IW),
+            )
         self.bufs[b] = bufs
         _say(f"bucket {b}: peer {need / 1e6:.1f} MB, scratch {scratch / 1e6:.1f} MB")
         return bufs
@@ -1041,6 +1305,79 @@ class Wide:
                     stream=torch.cuda.current_stream(),
                 )
                 n += 1
+            from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mp
+
+            if "mla_out" in bufs:
+                # Keep self.epoch untouched during rank-local MLA warmup so all
+                # TP ranks stay aligned for subsequent collective launches; zero
+                # this bucket's private scratch afterwards to clear warmup tags.
+                mla_specs = bufs["mla_specs"]
+                mla_state = bufs["mla_state"]
+                warm_ep = self.epoch.clone()
+                warm_ep[0] = 0
+                dummy_qrep = None
+                seen_mla = set()
+                warmed_qbs = set()
+                for pk in self.dsa_layers.values():
+                    qb_rows = pk.mla_pre_qb
+                    if qb_rows not in mla_specs:
+                        continue
+                    m_mla = mla_specs[qb_rows]
+                    mkey = (m_mla, qb_rows, pk.q_eps, pk.kv_eps)
+                    if mkey in seen_mla:
+                        continue
+                    seen_mla.add(mkey)
+                    attn = pk.layer.self_attn
+                    idx_m = attn.indexer
+                    if qb_rows == mp.QB_QREP:
+                        cand = getattr(attn, "q_b_proj_qrep_weight", None)
+                        if _valid_qb_weight(cand, mp.QB_QREP):
+                            w_qb = cand
+                        else:
+                            if dummy_qrep is None:
+                                dummy_qrep = torch.zeros(
+                                    mp.QB_QREP, mp.QL, dtype=bf, device=dev
+                                )
+                            w_qb = dummy_qrep
+                    else:
+                        w_qb = attn.q_b_proj.weight
+                    mout = bufs["mla_out"]
+                    _, scr_mla, cnt_mla = mla_state[qb_rows]
+                    warm_ep[0] += 1
+                    mp.mla_pre_wide(
+                        m_mla,
+                        qb_rows,
+                        launches=len(self.dsa_layers),
+                        q_eps=pk.q_eps,
+                        kv_eps=pk.kv_eps,
+                    )[0](
+                        bufs["mla_x"].data_ptr(),
+                        attn.fused_qkv_a_proj_with_mqa.weight.data_ptr(),
+                        attn.g_proj.weight.data_ptr(),
+                        idx_m.wk.weight.data_ptr(),
+                        idx_m.weights_proj.weight.data_ptr(),
+                        attn.q_a_layernorm.weight.data_ptr(),
+                        attn.kv_a_layernorm.weight.data_ptr(),
+                        idx_m.wq_b.weight.data_ptr(),
+                        w_qb.data_ptr(),
+                        mout["q"].data_ptr(),
+                        mout["latent"].data_ptr(),
+                        mout["k_nope"].data_ptr(),
+                        mout["q_lora"].data_ptr(),
+                        mout["gate"].data_ptr(),
+                        mout["idx_q"].data_ptr(),
+                        mout["idx_k"].data_ptr(),
+                        mout["idx_w"].data_ptr(),
+                        cnt_mla.data_ptr(),
+                        scr_mla.data_ptr(),
+                        warm_ep.data_ptr(),
+                        self.slots_dsa[pk.i],
+                        stream=torch.cuda.current_stream(),
+                    )
+                    warmed_qbs.add(qb_rows)
+                    n += 1
+                for qb_rows in warmed_qbs:
+                    mla_state[qb_rows][1].zero_()
             torch.cuda.synchronize()
         _say(f"warmup: {n} launches compiled and run in {time.time() - t0:.0f} s")
 
@@ -1191,16 +1528,125 @@ class Wide:
             )
         return stream
 
+    def _run_mla_pre(self, pk, bufs, h, fb):
+        """Run ``mla_pre_wide`` for a fusable DSA layer; return ``(attn_pre, idx_pre)``
+        or ``None`` if this step should fall back to SGLang's standard projection front."""
+        from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mp
+
+        qb_want = pk.mla_pre_qb
+        mla_specs = bufs.get("mla_specs")
+        mla_state = bufs.get("mla_state")
+        if (
+            qb_want is None
+            or not mla_specs
+            or not mla_state
+            or qb_want not in mla_specs
+            or qb_want not in mla_state
+            or "mla_out" not in bufs
+            or h.ndim != 2
+            or h.shape[0] == 0
+            or h.shape[1] != H
+            or h.dtype != torch.bfloat16
+            or h.device != bufs["mla_x"].device
+        ):
+            return None
+        m_mla = mla_specs[qb_want]
+        rows = h.shape[0]
+        if rows > m_mla:
+            return None
+        attn = pk.layer.self_attn
+        q_replicate_active = (
+            attn.is_dcp_q_replicate_phase(fb)
+            and not attn.use_deep_gemm_bmm
+            and attn.w_kc_qrep is not None
+            and attn.q_b_proj_qrep_weight is not None
+        )
+        qb_rows = (
+            attn.num_local_heads * attn.dcp_size * attn.qk_head_dim
+            if q_replicate_active
+            else attn.num_local_heads * attn.qk_head_dim
+        )
+        if qb_rows != qb_want:
+            return None
+        w_qb = attn.q_b_proj_qrep_weight if q_replicate_active else attn.q_b_proj.weight
+        if not _valid_qb_weight(w_qb, qb_rows):
+            return None
+        if rows == m_mla and h.stride() == (H, 1):
+            x_ptr = h.data_ptr()
+        else:
+            bufs["mla_x"][:rows].copy_(h)
+            if rows < m_mla:
+                bufs["mla_x"][rows:m_mla].zero_()
+            x_ptr = bufs["mla_x"].data_ptr()
+        idx_m = attn.indexer
+        mout = bufs["mla_out"]
+        _, scr_mla, cnt_mla = mla_state[qb_rows]
+        mp.mla_pre_wide(
+            m_mla,
+            qb_rows,
+            launches=len(self.dsa_layers),
+            q_eps=pk.q_eps,
+            kv_eps=pk.kv_eps,
+        )[0](
+            x_ptr,
+            attn.fused_qkv_a_proj_with_mqa.weight.data_ptr(),
+            attn.g_proj.weight.data_ptr(),
+            idx_m.wk.weight.data_ptr(),
+            idx_m.weights_proj.weight.data_ptr(),
+            attn.q_a_layernorm.weight.data_ptr(),
+            attn.kv_a_layernorm.weight.data_ptr(),
+            idx_m.wq_b.weight.data_ptr(),
+            w_qb.data_ptr(),
+            mout["q"].data_ptr(),
+            mout["latent"].data_ptr(),
+            mout["k_nope"].data_ptr(),
+            mout["q_lora"].data_ptr(),
+            mout["gate"].data_ptr(),
+            mout["idx_q"].data_ptr(),
+            mout["idx_k"].data_ptr(),
+            mout["idx_w"].data_ptr(),
+            cnt_mla.data_ptr(),
+            scr_mla.data_ptr(),
+            self.epoch.data_ptr(),
+            self.slots_dsa[pk.i],
+            stream=torch.cuda.current_stream(),
+        )
+        q_view = mout["q"][: m_mla * qb_rows].view(m_mla, qb_rows)[:rows]
+        attn_pre = {
+            "q": q_view,
+            "latent": mout["latent"][:rows],
+            "k_nope": mout["k_nope"][:rows],
+            "q_lora": mout["q_lora"][:rows],
+            "gate": mout["gate"][:rows],
+            "q_nope_out": None,
+        }
+        idx_pre = {
+            "q": mout["idx_q"][:rows],
+            "k": mout["idx_k"][:rows],
+            "w": mout["idx_w"][:rows],
+        }
+        return attn_pre, idx_pre
+
     def _dsa_step(self, pk, hidden, positions, fb, zero_allocator, b, bufs, rows, ping):
-        """One fusable DSA layer: attention up to ``forward_pre_o_proj``, ``dsa_post`` launch,
-        then SGLang's routed experts onto ``lat_p[cur]``."""
+        """One fusable DSA layer: optional ``mla_pre_wide`` + attention up to ``forward_pre_o_proj``,
+        ``dsa_post`` launch, then SGLang's routed experts onto ``lat_p[cur]``."""
         from sglang.srt.layers.layer_boundary.residual.batch import written_residual
 
         layer = pk.layer
         h = layer.attn_boundary.prepare(hidden, fb, capture_gathered=None)
         prefix = written_residual(fb)
         assert prefix is not None and prefix.shape == (rows, H), (prefix, rows)
-        core = _pre_o_proj(layer, h, positions, fb, zero_allocator)
+        pre_pair = self._run_mla_pre(pk, bufs, h, fb)
+        if pre_pair is not None:
+            attn = layer.self_attn
+            attn.__dict__["_mono_pre"], attn.indexer.__dict__["_mono_pre"] = pre_pair
+            try:
+                core = _pre_o_proj(layer, h, positions, fb, zero_allocator)
+            finally:
+                attn.__dict__.pop("_mono_pre", None)
+                attn.indexer.__dict__.pop("_mono_pre", None)
+        else:
+            core = _pre_o_proj(layer, h, positions, fb, zero_allocator)
         assert core.shape == (rows, KO), (core.shape, rows, KO)
         cur = 1 - ping
         self._build_dsa_launch(pk, b, bufs["cfg"])(

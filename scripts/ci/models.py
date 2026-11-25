@@ -295,7 +295,10 @@ MODELS = {
         "tp": 8,
         # moonshotai/Kimi-K3.1; not on the CI nodes yet, and no serving recipe
         "paths": {},
-        "kernel_tests": ["test/kernels/test_kimi_k31_k1_ring.py"],
+        "kernel_tests": [
+            "test/kernels/test_kimi_k31_k1_ring.py",
+            "test/kernels/test_kimi_k31_mla_pre_wide_replay.py",
+        ],
         "e2e_tests": [],
         "microbench": [
             "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --rows 16,128"
