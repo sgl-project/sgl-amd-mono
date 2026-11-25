@@ -11,14 +11,12 @@ import torch
 import torch.distributed as dist
 
 from sgl_amd_mono.kimi_k31.xgmi.heap import (
-    DEFAULT_DEADLINE_S,
     PREFILL_AG_HALF_BYTES,
     PREFILL_MAX_ROWS,
     TP,
     XgmiConfig,
     XgmiHeap,
     get_global_heap,
-    validate_deadline_s,
 )
 from sgl_amd_mono.kimi_k31.xgmi.kernels import fp4_pack_allgather, row_allgather
 from sgl_amd_mono.kimi_k31.xgmi.prefill import (
@@ -32,7 +30,6 @@ SGLANG_READS = {
     "srt/models/kimi_k3.py": (
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
-        "KimiK3LinearModel",
         "KimiK3MoE",
         "_k3_bf16_gemm",
     ),
@@ -77,11 +74,6 @@ def _resolve_config() -> XgmiConfig:
             )
         ),
         use_fp4=use_fp4,
-        deadline_s=validate_deadline_s(
-            os.environ.get(
-                "SGLANG_AMD_MONO_K31_XGMI_DEADLINE_S", str(DEFAULT_DEADLINE_S)
-            )
-        ),
     )
 
 
@@ -89,15 +81,12 @@ def _unwrap_backbone(model):
     from sglang.srt.models.kimi_k3 import (
         KimiK3ForConditionalGeneration,
         KimiK3LinearForCausalLM,
-        KimiK3LinearModel,
     )
 
     if isinstance(model, KimiK3ForConditionalGeneration):
         model = model.language_model
     if isinstance(model, KimiK3LinearForCausalLM):
         model = model.model
-    if isinstance(model, KimiK3LinearModel):
-        return model
     return model
 
 
@@ -131,7 +120,7 @@ def _gather_normed_all(
     if not need_normed_all:
         return None, ()
     if not overlap_normed:
-        return row_allgather(heap, normed), ()
+        return row_allgather(heap=heap, x_shard=normed), ()
     # Allocate out_all/tmp on main_stream and keep inputs live until wait_stream(comm_stream)
     # to avoid cross-stream CUDACachingAllocator pools and record_stream fragmentation.
     normed_c = normed.contiguous()
@@ -148,7 +137,7 @@ def _gather_normed_all(
     comm_stream.wait_stream(main_stream)
     try:
         with torch.cuda.stream(comm_stream):
-            row_allgather(heap, normed_c, out_all=out_all, tmp=tmp)
+            row_allgather(heap=heap, x_shard=normed_c, out_all=out_all, tmp=tmp)
     except BaseException:
         main_stream.wait_stream(comm_stream)
         raise
@@ -188,7 +177,10 @@ def _make_shard_front(
         overlap_normed = need_normed_all and num_tokens <= PREFILL_MAX_ROWS
         with heap.overlap_guard():
             normed_all, comm_keep = _gather_normed_all(
-                heap, normed, need_normed_all, overlap_normed
+                heap=heap,
+                normed=normed,
+                need_normed_all=need_normed_all,
+                overlap_normed=overlap_normed,
             )
 
             try:
@@ -207,11 +199,11 @@ def _make_shard_front(
                 comm_keep = ()
 
             q_all, s_all, ids_all, w_all = fp4_pack_allgather(
-                heap,
-                q_data,
-                q_scale,
-                topk_out.topk_ids.to(torch.int32),
-                topk_out.topk_weights.to(torch.float32),
+                heap=heap,
+                q_data=q_data,
+                q_scale=q_scale,
+                topk_ids=topk_out.topk_ids.to(torch.int32),
+                topk_weights=topk_out.topk_weights.to(torch.float32),
             )
         mlp._row_front_out = (
             (q_all[:num_tokens], s_all[:num_tokens]),
@@ -244,8 +236,8 @@ def _make_row_sharded_tail(mlp, heap: XgmiHeap, takes_layer):
         if shared_rows.shape[0] > num_tokens:
             latent_rows[num_tokens:].zero_()
             shared_rows[num_tokens:].zero_()
-        latent = prefill_reduce_scatter_32cu(heap, latent_rows)
-        shared = prefill_reduce_scatter_32cu(heap, shared_rows)
+        latent = prefill_reduce_scatter_32cu(heap=heap, partial=latent_rows)
+        shared = prefill_reduce_scatter_32cu(heap=heap, partial=shared_rows)
         return mlp._row_tail(latent, shared, num_tokens, prefix_sum)
 
     return _xgmi_row_sharded_tail
@@ -314,13 +306,10 @@ def _prepare_moe_layer_hook(
     gemm_fn,
     row_shard_cls,
 ):
-    """Build all replacement hooks for one MoE layer without mutating the model.
+    """Build one MoE layer's replacement hooks without mutating the model.
 
-    Returns ``None`` if ``plan_entry`` marks this layer ineligible, or a tuple of
-    ``(mlp, attn_state, tail_elig, tail_fn, shard_front_fn, row_shard)`` ready
-    for infallible commit once all TP ranks pass the installation vote.
-    Runtime TP-lockstep invariant: SGLang's TP scheduler broadcasts identical
-    ``num_tokens`` and capture state per forward step across all TP8 ranks.
+    None when ``plan_entry`` marks the layer ineligible; the tuple is committed only
+    after every TP rank passes the installation vote.
     """
     rebound_ok, row_front_on, need_normed_all, min_tok, max_tok = plan_entry
     if not rebound_ok:
@@ -353,18 +342,18 @@ def _prepare_moe_layer_hook(
             return True
         return orig_elig(num_tokens, has_prefix)
 
-    tail_fn = _make_row_sharded_tail(mlp, heap, takes_layer)
+    tail_fn = _make_row_sharded_tail(mlp=mlp, heap=heap, takes_layer=takes_layer)
 
     def _takes_combined(num_tokens: int) -> bool:
         return takes_layer(num_tokens) or bool(orig_read.takes(num_tokens))
 
     shard_front_fn = _make_shard_front(
-        mlp,
-        heap,
-        cfg,
-        takes_layer,
-        gemm_fn,
-        orig_read.shard_front,
+        mlp=mlp,
+        heap=heap,
+        config=cfg,
+        takes_layer=takes_layer,
+        gemm_fn=gemm_fn,
+        orig_shard_front=orig_read.shard_front,
         need_normed_all=need_normed_all,
     )
     row_shard = row_shard_cls(
@@ -372,6 +361,72 @@ def _prepare_moe_layer_hook(
         shard_front=shard_front_fn,
     )
     return (mlp, attn_state, _tail_eligible, tail_fn, shard_front_fn, row_shard)
+
+
+def _collect_moe_plan(*, model, moe_cls) -> tuple[list, list]:
+    moe_targets = []
+    plan_entries = []
+    for layer in _unwrap_backbone(model).layers:
+        if not isinstance(layer.mlp, moe_cls) or not layer.mlp.use_latent_moe:
+            continue
+        attn_state, orig_read, entry = _layer_plan(layer)
+        moe_targets.append((layer, attn_state, orig_read))
+        plan_entries.append(entry)
+    return moe_targets, plan_entries
+
+
+def _prepare_all_hooks(
+    *,
+    moe_targets: list,
+    plan_entries: list,
+    heap: XgmiHeap,
+    cfg: XgmiConfig,
+    gemm_fn,
+    row_shard_cls,
+) -> Optional[list]:
+    """Every eligible layer's prepared hooks, or None if a layer drifted from its plan."""
+    prepared = []
+    for (layer, attn_state, orig_read), entry in zip(moe_targets, plan_entries):
+        if not _snapshot_still_matches(
+            layer, attn_state=attn_state, orig_read=orig_read, plan_entry=entry
+        ):
+            return None
+        item = _prepare_moe_layer_hook(
+            layer,
+            attn_state=attn_state,
+            orig_read=orig_read,
+            plan_entry=entry,
+            heap=heap,
+            cfg=cfg,
+            gemm_fn=gemm_fn,
+            row_shard_cls=row_shard_cls,
+        )
+        if item is not None:
+            prepared.append(item)
+    return prepared
+
+
+def _vote_install(
+    *,
+    heap: XgmiHeap,
+    local_valid: bool,
+    plans_match: bool,
+    local_error: Optional[Exception],
+) -> None:
+    if heap.cpu_group is not None and dist.is_initialized():
+        ok = torch.tensor([int(local_valid)], dtype=torch.int32)
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=heap.cpu_group)
+        if not ok.item():
+            reason = (
+                "TP ranks disagree on XGMI hook eligibility or _row_front_shared configuration"
+                if not plans_match
+                else "MoE layer dispatch fields or ffn_row_shard mutated during TP-agreed XGMI hook installation"
+            )
+            raise RuntimeError(reason) from local_error
+    elif not local_valid:
+        raise RuntimeError(
+            "MoE layer dispatch fields or ffn_row_shard mutated during XGMI hook installation"
+        ) from local_error
 
 
 def install_xgmi_hooks(
@@ -397,13 +452,7 @@ def install_xgmi_hooks(
     local_error: Optional[Exception] = None
     try:
         cfg = _resolve_config() if config is None else config
-        backbone = _unwrap_backbone(model)
-        for layer in backbone.layers:
-            if not isinstance(layer.mlp, KimiK3MoE) or not layer.mlp.use_latent_moe:
-                continue
-            attn_state, orig_read, entry = _layer_plan(layer)
-            moe_targets.append((layer, attn_state, orig_read))
-            plan_entries.append(entry)
+        moe_targets, plan_entries = _collect_moe_plan(model=model, moe_cls=KimiK3MoE)
         local_plan = (
             cfg.prefill_min_rows,
             cfg.prefill_max_rows,
@@ -428,40 +477,26 @@ def install_xgmi_hooks(
     if local_valid:
         assert cfg is not None
         try:
-            for (layer, attn_state, orig_read), entry in zip(moe_targets, plan_entries):
-                if not _snapshot_still_matches(layer, attn_state, orig_read, entry):
-                    local_valid = False
-                    break
-                item = _prepare_moe_layer_hook(
-                    layer,
-                    attn_state=attn_state,
-                    orig_read=orig_read,
-                    plan_entry=entry,
-                    heap=heap,
-                    cfg=cfg,
-                    gemm_fn=_k3_bf16_gemm,
-                    row_shard_cls=RowShardRead,
-                )
-                if item is not None:
-                    prepared.append(item)
+            prepared_or_none = _prepare_all_hooks(
+                moe_targets=moe_targets,
+                plan_entries=plan_entries,
+                heap=heap,
+                cfg=cfg,
+                gemm_fn=_k3_bf16_gemm,
+                row_shard_cls=RowShardRead,
+            )
+            local_valid = prepared_or_none is not None
+            prepared = prepared_or_none or []
         except Exception as err:
             local_error = err
             local_valid = False
 
-    if heap.cpu_group is not None and dist.is_initialized():
-        ok = torch.tensor([int(local_valid)], dtype=torch.int32)
-        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=heap.cpu_group)
-        if not ok.item():
-            reason = (
-                "TP ranks disagree on XGMI hook eligibility or _row_front_shared configuration"
-                if not plans_match
-                else "MoE layer dispatch fields or ffn_row_shard mutated during TP-agreed XGMI hook installation"
-            )
-            raise RuntimeError(reason) from local_error
-    elif not local_valid:
-        raise RuntimeError(
-            "MoE layer dispatch fields or ffn_row_shard mutated during XGMI hook installation"
-        ) from local_error
+    _vote_install(
+        heap=heap,
+        local_valid=local_valid,
+        plans_match=plans_match,
+        local_error=local_error,
+    )
 
     # Commit prepared replacements atomically on the quiescent model.
     for mlp, attn_state, tail_elig, tail_fn, shard_front_fn, row_shard in prepared:

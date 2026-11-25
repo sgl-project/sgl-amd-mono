@@ -25,7 +25,7 @@ def _default_gemm(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 def rms_norm_bf16(
     hidden: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
 ) -> torch.Tensor:
-    return fused_rmsnorm_bf16(hidden, weight, eps=eps)
+    return fused_rmsnorm_bf16(hidden=hidden, weight=weight, eps=eps)
 
 
 def slice_replicated_weight(
@@ -53,7 +53,9 @@ def latent_input_gather(
     gemm = _default_gemm if gemm_fn is None else gemm_fn
     router_slice = router_cols // TP
     local_slice = gemm(normed_hidden, router_down_weight_slice)
-    return lamport_allgather_split(heap, local_slice, router_slice)
+    return lamport_allgather_split(
+        heap=heap, x_slice=local_slice, split_cols=router_slice
+    )
 
 
 def latent_down_gather(
@@ -66,7 +68,7 @@ def latent_down_gather(
     """1/8 replicated latent_down_proj [448, 7168] + Lamport AG -> [M, 3584]."""
     assert 1 <= normed_hidden.shape[0] <= DECODE_MAX_ROWS
     gemm = _default_gemm if gemm_fn is None else gemm_fn
-    return lamport_allgather(heap, gemm(normed_hidden, down_weight_slice))
+    return lamport_allgather(heap=heap, x_slice=gemm(normed_hidden, down_weight_slice))
 
 
 def deferred_topk_ar(
@@ -81,10 +83,10 @@ def deferred_topk_ar(
     """Fused deferred top-k reduction + routed latent AR + shared RS/AR."""
     assert 1 <= topk_weights.shape[0] <= DECODE_MAX_ROWS
     return deferred_topk_lamport_ar(
-        heap,
-        expert_out,
-        topk_weights,
-        shared_partial,
+        heap=heap,
+        expert_out=expert_out,
+        topk_weights=topk_weights,
+        shared_partial=shared_partial,
         sorted_idx=sorted_idx,
         gather_full_shared=gather_full_shared,
     )
@@ -108,8 +110,13 @@ def moetail_gather(
     if latent_norm_fn is not None:
         normed = latent_norm_fn(latent)
     elif norm_weight is not None:
-        normed = rms_norm_bf16(latent, norm_weight, norm_eps)
+        normed = rms_norm_bf16(hidden=latent, weight=norm_weight, eps=norm_eps)
     else:
         normed = latent
     up_slice = gemm(normed, up_weight_slice)
-    return moetail_column_gather(heap, up_slice, shared_slice, prefix_slice)
+    return moetail_column_gather(
+        heap=heap,
+        up_slice=up_slice,
+        shared_slice=shared_slice,
+        prefix_slice=prefix_slice,
+    )

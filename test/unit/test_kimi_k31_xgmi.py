@@ -11,7 +11,6 @@ import torch
 
 from sgl_amd_mono.kimi_k31.xgmi import (
     DECODE_BLOCKS,
-    DEFAULT_DEADLINE_S,
     HEAP_BYTES,
     PREFILL_AG_BLOCKS,
     PREFILL_MAX_ROWS,
@@ -42,7 +41,6 @@ from sgl_amd_mono.kimi_k31.xgmi.heap import (
 def test_heap_budget_under_400mb():
     assert HEAP_BYTES <= int(0.4 * (1 << 30))
     assert HEAP_BYTES % (2 << 20) == 0
-    assert RS_FLAGS_BYTES == 32768 and AG_FLAGS_BYTES == 16384
     assert DECODE_REGION_OFF + DECODE_REGION_BYTES <= RS_REGION_OFF
     assert RS_REGION_OFF + RS_REGION_BYTES <= AG_REGION_OFF
     assert AG_REGION_OFF + AG_REGION_BYTES <= RS_FLAGS_OFF
@@ -53,7 +51,76 @@ def test_heap_budget_under_400mb():
     assert PREFILL_MAX_ROWS * (2112 * 2) <= PREFILL_AG_HALF_BYTES
     assert PREFILL_MAX_ROWS * 1792 * 2 <= RS_SLOT_BYTES
     assert EPOCH_TOTAL_WORDS == DECODE_BLOCKS + RS_BLOCKS + PREFILL_AG_BLOCKS
-    assert DEFAULT_DEADLINE_S >= 900.0
+
+
+# xgmi_ops.hip constexpr name -> heap.py name; both sides must describe one heap layout.
+_HIP_TO_PY_LAYOUT = {
+    "TP": "TP",
+    "DECODE_BLOCKS": "DECODE_BLOCKS",
+    "RS_BLOCKS": "RS_BLOCKS",
+    "RS_RING_SLOTS": "RS_RING_SLOTS",
+    "AG_BLOCKS": "PREFILL_AG_BLOCKS",
+    "DECODE_RS_BYTES": "DECODE_RS_BYTES",
+    "DECODE_AG_BYTES": "DECODE_AG_BYTES",
+    "DECODE_HALF_BYTES": "DECODE_HALF_BYTES",
+    "DECODE_REGION_OFF": "DECODE_REGION_OFF",
+    "DECODE_REGION_BYTES": "DECODE_REGION_BYTES",
+    "RS_SLOT_BYTES": "RS_SLOT_BYTES",
+    "RS_REGION_OFF": "RS_REGION_OFF",
+    "RS_REGION_BYTES": "RS_REGION_BYTES",
+    "AG_HALF_BYTES": "PREFILL_AG_HALF_BYTES",
+    "AG_REGION_OFF": "AG_REGION_OFF",
+    "AG_REGION_BYTES": "AG_REGION_BYTES",
+    "RS_FLAGS_OFF": "RS_FLAGS_OFF",
+    "RS_FLAGS_BYTES": "RS_FLAGS_BYTES",
+    "AG_FLAGS_OFF": "AG_FLAGS_OFF",
+    "AG_FLAGS_BYTES": "AG_FLAGS_BYTES",
+    "EPOCH_DECODE_OFF": "EPOCH_DECODE_OFF",
+    "EPOCH_RS_OFF": "EPOCH_RS_OFF",
+    "EPOCH_AG_OFF": "EPOCH_AG_OFF",
+    "EPOCH_TOTAL_WORDS": "EPOCH_TOTAL_WORDS",
+    "MIN_DEADLINE_S": "MIN_DEADLINE_S",
+    "MAX_DEADLINE_S": "MAX_DEADLINE_S",
+}
+# HIP-only constants: launch geometry, and the pre-granule heap size checked separately.
+_HIP_ONLY = {
+    "DECODE_THREADS",
+    "RS_THREADS",
+    "AG_THREADS",
+    "HEAP_MIN_BYTES",
+    "HEAP_GRANULE",
+}
+
+
+def _hip_layout_constants() -> dict:
+    import re
+    from pathlib import Path
+
+    import sgl_amd_mono.kimi_k31.xgmi as xgmi_pkg
+
+    src = (Path(xgmi_pkg.__file__).parent / "xgmi_ops.hip").read_text()
+    decl = re.compile(r"^constexpr (?:int|int64_t|double) (\w+) = ([^;{]+);$", re.M)
+    env = {"align_up_4k": lambda n: (n + 4095) & ~4095}
+    values = {}
+    for name, expr in decl.findall(src):
+        values[name] = env[name] = eval(re.sub(r"(\d)ll\b", r"\1", expr), {}, env)
+    return values
+
+
+def test_hip_heap_layout_matches_python():
+    import sgl_amd_mono.kimi_k31.xgmi.heap as heap_mod
+
+    hip = _hip_layout_constants()
+    assert set(hip) == set(_HIP_TO_PY_LAYOUT) | _HIP_ONLY
+    mismatched = {
+        name: (value, getattr(heap_mod, _HIP_TO_PY_LAYOUT[name]))
+        for name, value in hip.items()
+        if name in _HIP_TO_PY_LAYOUT
+        and value != getattr(heap_mod, _HIP_TO_PY_LAYOUT[name])
+    }
+    assert not mismatched, mismatched
+    granule = hip["HEAP_GRANULE"]
+    assert (hip["HEAP_MIN_BYTES"] + granule - 1) // granule * granule == HEAP_BYTES
 
 
 def test_zero_copy_weight_slice():
@@ -71,7 +138,27 @@ def test_xgmi_opt_in_default_off(monkeypatch):
     assert xgmi_enabled()
 
 
-def test_install_xgmi_hooks_unified_eligibility_and_fallback():
+def _dummy_heap(*, cpu_group=None, world_size: int = TP):
+    return types.SimpleNamespace(
+        cpu_group=cpu_group,
+        rank=0,
+        world_size=world_size,
+        heap_bytes=HEAP_BYTES,
+        heap_mib=HEAP_BYTES / (1 << 20),
+    )
+
+
+def _make_moe_layer(
+    *,
+    shard_front,
+    row_sharded_tail,
+    takes,
+    tail_eligible,
+    row_front_on: bool = True,
+    min_tok: int = 512,
+    norm_dtype: torch.dtype = torch.bfloat16,
+):
+    """A latent-MoE layer wired to an AttnBankState readout; returns (layer, bank_state)."""
     from sglang.srt.layers.layer_boundary.residual.attn_bank import (
         AttnBankState,
         _FfnReadout,
@@ -79,13 +166,59 @@ def test_install_xgmi_hooks_unified_eligibility_and_fallback():
     from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import RowShardRead
     from sglang.srt.models.kimi_k3 import KimiK3MoE
 
-    class DummyHeap:
-        cpu_group = None
-        rank = 0
-        world_size = TP
-        heap_bytes = HEAP_BYTES
-        heap_mib = HEAP_BYTES / (1 << 20)
+    mlp = object.__new__(KimiK3MoE)
+    mlp.use_latent_moe = True
+    mlp.routed_expert_up_proj = types.SimpleNamespace(
+        weight=torch.empty(7168, 3584, dtype=torch.bfloat16)
+    )
+    mlp._front_w = torch.empty(768 + 896 + 3584, 7168, dtype=torch.bfloat16)
+    mlp._front_sizes = (768, 896, 3584)
+    mlp._row_front_on = row_front_on
+    mlp._row_front_shared = None
+    mlp._row_stream = False
+    mlp._a8w4_moe_min_tokens = min_tok
+    mlp._a8w4_moe_max_tokens = 65536
+    mlp._row_sharded_tail_eligible = tail_eligible
+    mlp.shard_front = shard_front
+    mlp._row_sharded_tail = row_sharded_tail
+    mlp._row_tail = lambda *args: None
+    mlp._latent_norm = lambda tensor: tensor
 
+    bank_state = AttnBankState(
+        bank=None,
+        attn_score_proj=None,
+        attn_score_norm=None,
+        ffn_score_proj=None,
+        ffn_score_norm=None,
+        ffn_row_shard=RowShardRead(takes=takes, shard_front=shard_front),
+    )
+    readout = _FfnReadout(bank_state)
+    edge = types.SimpleNamespace(
+        incoming=types.SimpleNamespace(need=types.SimpleNamespace(read=readout))
+    )
+    boundary = types.SimpleNamespace(
+        plan=types.SimpleNamespace(edges={"default": edge}),
+        declaration=types.SimpleNamespace(read=readout),
+    )
+    layer = types.SimpleNamespace(
+        mlp=mlp,
+        ffn_boundary=boundary,
+        post_attention_layernorm=types.SimpleNamespace(
+            weight=torch.empty(7168, dtype=norm_dtype)
+        ),
+    )
+    return layer, bank_state
+
+
+def _tail_eligible_at_4096(num_tokens, has_prefix):
+    return num_tokens >= 4096 and has_prefix
+
+
+def _takes_at_4096(num_tokens):
+    return num_tokens >= 4096
+
+
+def test_install_xgmi_hooks_unified_eligibility_and_fallback():
     fallback_calls = []
 
     def orig_front(normed, num_tokens):
@@ -99,60 +232,16 @@ def test_install_xgmi_hooks_unified_eligibility_and_fallback():
         return latent_rows
 
     def make_layer(
-        row_front_on: bool,
-        min_tok: int,
-        *,
-        norm_dtype: torch.dtype = torch.bfloat16,
-        front_dtype: torch.dtype = torch.bfloat16,
-        up_dtype: torch.dtype = torch.bfloat16,
+        row_front_on: bool, min_tok: int, *, norm_dtype: torch.dtype = torch.bfloat16
     ):
-        mlp = object.__new__(KimiK3MoE)
-        mlp.use_latent_moe = True
-        mlp.routed_expert_up_proj = types.SimpleNamespace(
-            weight=torch.empty(7168, 3584, dtype=up_dtype)
-        )
-        mlp._front_w = torch.empty(768 + 896 + 3584, 7168, dtype=front_dtype)
-        mlp._front_sizes = (768, 896, 3584)
-        mlp._row_front_on = row_front_on
-        mlp._row_front_shared = None
-        mlp._row_stream = False
-        mlp._a8w4_moe_min_tokens = min_tok
-        mlp._a8w4_moe_max_tokens = 65536
-        mlp._row_sharded_tail_eligible = lambda num_tokens, has_prefix: (
-            num_tokens >= 4096 and has_prefix
-        )
-        mlp.shard_front = orig_front
-        mlp._row_sharded_tail = orig_tail
-        mlp._row_tail = lambda *args: None
-        mlp._latent_norm = lambda tensor: tensor
-
-        bank_state = AttnBankState(
-            bank=None,
-            attn_score_proj=None,
-            attn_score_norm=None,
-            ffn_score_proj=None,
-            ffn_score_norm=None,
-            ffn_row_shard=RowShardRead(
-                takes=lambda num_tokens: num_tokens >= 4096,
-                shard_front=orig_front,
-            ),
-        )
-        readout = _FfnReadout(bank_state)
-        edge = types.SimpleNamespace(
-            incoming=types.SimpleNamespace(need=types.SimpleNamespace(read=readout))
-        )
-        boundary = types.SimpleNamespace(
-            plan=types.SimpleNamespace(edges={"default": edge}),
-            declaration=types.SimpleNamespace(read=readout),
-        )
-        post_norm = types.SimpleNamespace(weight=torch.empty(7168, dtype=norm_dtype))
-        return (
-            types.SimpleNamespace(
-                mlp=mlp,
-                ffn_boundary=boundary,
-                post_attention_layernorm=post_norm,
-            ),
-            bank_state,
+        return _make_moe_layer(
+            shard_front=orig_front,
+            row_sharded_tail=orig_tail,
+            takes=_takes_at_4096,
+            tail_eligible=_tail_eligible_at_4096,
+            row_front_on=row_front_on,
+            min_tok=min_tok,
+            norm_dtype=norm_dtype,
         )
 
     active_layer, active_bank = make_layer(row_front_on=True, min_tok=768)
@@ -166,7 +255,7 @@ def test_install_xgmi_hooks_unified_eligibility_and_fallback():
     model = types.SimpleNamespace(
         layers=[active_layer, disabled_layer, fp16_norm_layer]
     )
-    summary = install_xgmi_hooks(model, heap=DummyHeap())
+    summary = install_xgmi_hooks(model, heap=_dummy_heap())
     assert isinstance(summary, XgmiHookSummary)
     assert summary.hooked_layers == 3
     assert summary.rebound_banks == 2
@@ -219,72 +308,18 @@ def test_install_xgmi_hooks_unified_eligibility_and_fallback():
 
 
 def test_install_xgmi_hooks_graph_capture_falls_back(monkeypatch):
-    from sglang.srt.layers.layer_boundary.residual.attn_bank import (
-        AttnBankState,
-        _FfnReadout,
-    )
-    from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import RowShardRead
-    from sglang.srt.models.kimi_k3 import KimiK3MoE
-
-    class DummyHeap:
-        cpu_group = None
-        rank = 0
-        world_size = TP
-        heap_bytes = HEAP_BYTES
-        heap_mib = HEAP_BYTES / (1 << 20)
-
     calls = []
-    mlp = object.__new__(KimiK3MoE)
-    mlp.use_latent_moe = True
-    mlp.routed_expert_up_proj = types.SimpleNamespace(
-        weight=torch.empty(7168, 3584, dtype=torch.bfloat16)
-    )
-    mlp._front_w = torch.empty(768 + 896 + 3584, 7168, dtype=torch.bfloat16)
-    mlp._front_sizes = (768, 896, 3584)
-    mlp._row_front_on = True
-    mlp._row_front_shared = None
-    mlp._row_stream = False
-    mlp._a8w4_moe_min_tokens = 512
-    mlp._a8w4_moe_max_tokens = 65536
-    mlp._row_sharded_tail_eligible = lambda num_tokens, has_prefix: (
-        num_tokens >= 4096 and has_prefix
-    )
-    mlp.shard_front = lambda normed, num_tokens: (
-        calls.append(("front", num_tokens)) or True
-    )
-    mlp._row_sharded_tail = lambda lat, sh, num_tokens, pref: (
-        calls.append(("tail", num_tokens)) or lat
-    )
-    mlp._row_tail = lambda *args: None
-    mlp._latent_norm = lambda tensor: tensor
-
-    bank_state = AttnBankState(
-        bank=None,
-        attn_score_proj=None,
-        attn_score_norm=None,
-        ffn_score_proj=None,
-        ffn_score_norm=None,
-        ffn_row_shard=RowShardRead(
-            takes=lambda num_tokens: num_tokens >= 4096,
-            shard_front=mlp.shard_front,
+    layer, bank_state = _make_moe_layer(
+        shard_front=lambda normed, num_tokens: (
+            calls.append(("front", num_tokens)) or True
         ),
-    )
-    readout = _FfnReadout(bank_state)
-    edge = types.SimpleNamespace(
-        incoming=types.SimpleNamespace(need=types.SimpleNamespace(read=readout))
-    )
-    boundary = types.SimpleNamespace(
-        plan=types.SimpleNamespace(edges={"default": edge}),
-        declaration=types.SimpleNamespace(read=readout),
-    )
-    layer = types.SimpleNamespace(
-        mlp=mlp,
-        ffn_boundary=boundary,
-        post_attention_layernorm=types.SimpleNamespace(
-            weight=torch.empty(7168, dtype=torch.bfloat16)
+        row_sharded_tail=lambda lat, sh, num_tokens, pref: (
+            calls.append(("tail", num_tokens)) or lat
         ),
+        takes=_takes_at_4096,
+        tail_eligible=_tail_eligible_at_4096,
     )
-    install_xgmi_hooks(types.SimpleNamespace(layers=[layer]), heap=DummyHeap())
+    install_xgmi_hooks(types.SimpleNamespace(layers=[layer]), heap=_dummy_heap())
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     assert not bank_state.ffn_row_shard.takes(1024)
@@ -304,64 +339,17 @@ def test_install_xgmi_hooks_graph_capture_falls_back(monkeypatch):
 
 def test_install_xgmi_hooks_tp_plan_agreement_and_immutability(monkeypatch):
     import torch.distributed as dist
-    from sglang.srt.layers.layer_boundary.residual.attn_bank import (
-        AttnBankState,
-        _FfnReadout,
-    )
-    from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import RowShardRead
-    from sglang.srt.models.kimi_k3 import KimiK3MoE
 
-    class DummyHeap:
-        cpu_group = object()
-        rank = 0
-        world_size = 2
-        heap_bytes = HEAP_BYTES
-        heap_mib = HEAP_BYTES / (1 << 20)
+    heap = _dummy_heap(cpu_group=object(), world_size=2)
 
     def build_layer():
-        m = object.__new__(KimiK3MoE)
-        m.use_latent_moe = True
-        m.routed_expert_up_proj = types.SimpleNamespace(
-            weight=torch.empty(7168, 3584, dtype=torch.bfloat16)
+        layer, bank = _make_moe_layer(
+            shard_front=lambda normed, num_tokens: False,
+            row_sharded_tail=lambda *args: None,
+            takes=lambda num_tokens: False,
+            tail_eligible=lambda num_tokens, has_prefix: False,
         )
-        m._front_w = torch.empty(768 + 896 + 3584, 7168, dtype=torch.bfloat16)
-        m._front_sizes = (768, 896, 3584)
-        m._row_front_on = True
-        m._row_front_shared = None
-        m._row_stream = False
-        m._a8w4_moe_min_tokens = 512
-        m._a8w4_moe_max_tokens = 65536
-        m._row_sharded_tail_eligible = lambda num_tokens, has_prefix: False
-        m.shard_front = lambda normed, num_tokens: False
-        m._row_sharded_tail = lambda *args: None
-        m._row_tail = lambda *args: None
-        m._latent_norm = lambda tensor: tensor
-
-        read = RowShardRead(takes=lambda num_tokens: False, shard_front=m.shard_front)
-        bs = AttnBankState(
-            bank=None,
-            attn_score_proj=None,
-            attn_score_norm=None,
-            ffn_score_proj=None,
-            ffn_score_norm=None,
-            ffn_row_shard=read,
-        )
-        ro = _FfnReadout(bs)
-        ed = types.SimpleNamespace(
-            incoming=types.SimpleNamespace(need=types.SimpleNamespace(read=ro))
-        )
-        bd = types.SimpleNamespace(
-            plan=types.SimpleNamespace(edges={"default": ed}),
-            declaration=types.SimpleNamespace(read=ro),
-        )
-        lyr = types.SimpleNamespace(
-            mlp=m,
-            ffn_boundary=bd,
-            post_attention_layernorm=types.SimpleNamespace(
-                weight=torch.empty(7168, dtype=torch.bfloat16)
-            ),
-        )
-        return lyr, m, bs, read
+        return layer, layer.mlp, bank, bank.ffn_row_shard
 
     layer0, mlp0, bank0, orig_read0 = build_layer()
     layer1, mlp1, bank1, orig_read1 = build_layer()
@@ -383,15 +371,8 @@ def test_install_xgmi_hooks_tp_plan_agreement_and_immutability(monkeypatch):
 
     monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_mismatch)
     with pytest.raises(RuntimeError, match="TP ranks disagree"):
-        install_xgmi_hooks(
-            types.SimpleNamespace(layers=[layer0, layer1]), heap=DummyHeap()
-        )
+        install_xgmi_hooks(types.SimpleNamespace(layers=[layer0, layer1]), heap=heap)
     assert bank0.ffn_row_shard is orig_read0 and bank1.ffn_row_shard is orig_read1
-
-    # Matching TP plans install cleanly, then runtime mutation of _row_front_shared/_row_front_on raises
-    def fake_all_gather_match(out_list, local_obj, group=None):
-        for idx in range(len(out_list)):
-            out_list[idx] = local_obj
 
     # Removing ffn_row_shard on layer 1 during all_gather_object leaves layer 0 untouched
     def fake_all_gather_clears_readout(out_list, local_obj, group=None):
@@ -401,9 +382,7 @@ def test_install_xgmi_hooks_tp_plan_agreement_and_immutability(monkeypatch):
 
     monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_clears_readout)
     with pytest.raises(RuntimeError, match="mutated during"):
-        install_xgmi_hooks(
-            types.SimpleNamespace(layers=[layer0, layer1]), heap=DummyHeap()
-        )
+        install_xgmi_hooks(types.SimpleNamespace(layers=[layer0, layer1]), heap=heap)
     assert bank0.ffn_row_shard is orig_read0 and bank1.ffn_row_shard is None
     bank1.ffn_row_shard = orig_read1
 
@@ -423,9 +402,7 @@ def test_install_xgmi_hooks_tp_plan_agreement_and_immutability(monkeypatch):
     monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_clears_front_w)
     monkeypatch.setattr(dist, "all_reduce", record_vote)
     with pytest.raises(RuntimeError, match="mutated during"):
-        install_xgmi_hooks(
-            types.SimpleNamespace(layers=[layer0, layer1]), heap=DummyHeap()
-        )
+        install_xgmi_hooks(types.SimpleNamespace(layers=[layer0, layer1]), heap=heap)
     assert votes == [0]
     assert bank0.ffn_row_shard is orig_read0 and bank1.ffn_row_shard is orig_read1
     mlp1._front_w = saved_front_w
@@ -441,9 +418,7 @@ def test_install_xgmi_hooks_tp_plan_agreement_and_immutability(monkeypatch):
 
     monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_breaks_sizes)
     with pytest.raises(RuntimeError, match="mutated during"):
-        install_xgmi_hooks(
-            types.SimpleNamespace(layers=[layer0, layer1]), heap=DummyHeap()
-        )
+        install_xgmi_hooks(types.SimpleNamespace(layers=[layer0, layer1]), heap=heap)
     assert votes == [0]
     assert bank0.ffn_row_shard is orig_read0 and bank1.ffn_row_shard is orig_read1
     mlp1._front_sizes = saved_sizes
@@ -460,27 +435,27 @@ def test_install_xgmi_hooks_tp_plan_agreement_and_immutability(monkeypatch):
     monkeypatch.setenv("SGLANG_AMD_MONO_K31_XGMI_PREFILL_MIN", "not_an_int")
     monkeypatch.setattr(dist, "all_gather_object", fake_gather_record)
     with pytest.raises(RuntimeError, match="TP ranks disagree"):
-        install_xgmi_hooks(
-            types.SimpleNamespace(layers=[layer0, layer1]), heap=DummyHeap()
-        )
+        install_xgmi_hooks(types.SimpleNamespace(layers=[layer0, layer1]), heap=heap)
     assert gathered_sentinels == [None] and votes == [0]
     assert bank0.ffn_row_shard is orig_read0 and bank1.ffn_row_shard is orig_read1
     monkeypatch.delenv("SGLANG_AMD_MONO_K31_XGMI_PREFILL_MIN", raising=False)
 
     # Remote rank failing validation (all_reduce MIN -> 0) leaves all local layers untouched
+    def fake_all_gather_match(out_list, local_obj, group=None):
+        for idx in range(len(out_list)):
+            out_list[idx] = local_obj
+
     monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_match)
     monkeypatch.setattr(
         dist, "all_reduce", lambda tensor, op=None, group=None: tensor.zero_()
     )
     with pytest.raises(RuntimeError, match="mutated during"):
-        install_xgmi_hooks(
-            types.SimpleNamespace(layers=[layer0, layer1]), heap=DummyHeap()
-        )
+        install_xgmi_hooks(types.SimpleNamespace(layers=[layer0, layer1]), heap=heap)
     assert bank0.ffn_row_shard is orig_read0 and bank1.ffn_row_shard is orig_read1
 
     # Matching TP agreement installs cleanly; runtime mutation of agreed fields raises
     monkeypatch.setattr(dist, "all_reduce", lambda tensor, op=None, group=None: None)
-    install_xgmi_hooks(types.SimpleNamespace(layers=[layer0, layer1]), heap=DummyHeap())
+    install_xgmi_hooks(types.SimpleNamespace(layers=[layer0, layer1]), heap=heap)
     mlp0._row_front_shared = object()
     with pytest.raises(RuntimeError, match="_row_front_shared mutated"):
         bank0.ffn_row_shard.shard_front(
@@ -677,7 +652,7 @@ def test_xgmi_heap_init_sync_failure_votes_zero_without_barrier(monkeypatch):
             trace.append(("unregister", heap_id))
 
     class FakeStreams:
-        def __init__(self, device, comm_cus=32):
+        def __init__(self, device):
             pass
 
         def close(self):
@@ -691,7 +666,7 @@ def test_xgmi_heap_init_sync_failure_votes_zero_without_barrier(monkeypatch):
         lambda _dev: types.SimpleNamespace(gcnArchName="gfx950"),
     )
     monkeypatch.setattr(kernels_mod, "ops", lambda: FakeOps())
-    monkeypatch.setattr(heap_mod, "CuMaskStreams", FakeStreams)
+    monkeypatch.setattr(heap_mod, "XgmiStreams", FakeStreams)
     monkeypatch.setattr(torch.cuda, "Event", lambda: object())
     monkeypatch.setattr(
         torch.cuda,
@@ -782,6 +757,16 @@ def test_xgmi_heap_rank_mismatch_and_invalid_deadline_and_chunks(monkeypatch):
             heap_mod.XgmiHeap(object(), 0, torch.device("cpu"), deadline_s=bad_deadline)
         assert isinstance(exc_info.value.__cause__, ValueError)
         assert trace == [("gather", (0, None)), ("reduce", 0)]
+
+    # A bad SGLANG_AMD_MONO_K31_XGMI_DEADLINE_S fails inside the guarded, collective setup
+    for bad_env in ("nan", "0", "not_a_float"):
+        trace.clear()
+        monkeypatch.setenv("SGLANG_AMD_MONO_K31_XGMI_DEADLINE_S", bad_env)
+        with pytest.raises(RuntimeError, match="handshake failed") as exc_info:
+            heap_mod.XgmiHeap(object(), 0, torch.device("cpu"))
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        assert trace == [("gather", (0, None)), ("reduce", 0)]
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_XGMI_DEADLINE_S")
 
     # current_device() failure via maybe_install_xgmi_hooks routes through gather + vote 0
     import sglang.srt.runtime_context as rc_mod

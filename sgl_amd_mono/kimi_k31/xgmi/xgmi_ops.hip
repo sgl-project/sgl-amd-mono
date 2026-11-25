@@ -6,7 +6,7 @@
 //   2. xgmi_deferred_topk_lamport_ar (Decode 1..192 rows: deferred top-k + routed AR + shared RS/AR)
 //   3. xgmi_moetail_column_gather   (Decode 1..192 rows: 1/8 up_slice + shared + prefix -> full stream)
 //   4. xgmi_fused_rmsnorm_bf16      (Decode 1..192 rows: 1-launch wave64 RMSNorm for latent [M, 3584])
-//   5. xgmi_rs_chunk_32cu / push / reduce (Prefill 200..8192 rows: 32-CU RS overlapped with 224-CU o_proj)
+//   5. xgmi_rs_chunk_32cu           (Prefill 200..8192 rows: 32-CU RS overlapped with 224-CU o_proj)
 //   6. xgmi_fp4_pack_allgather      (Prefill 200..8192 rows: fused E2M1 FP4 / FP8 + scale + topk AllGather)
 //   7. xgmi_row_allgather           (Prefill 200..8192 rows: 2112-dim qkv_a AG & chunked 7168 Attn AG)
 
@@ -909,10 +909,8 @@ __global__ __launch_bounds__(DECODE_THREADS) void xgmi_moetail_column_gather_ker
 }
 
 // ============================================================================
-// Kernel 4a: Prefill 32/64-block 7-Link-Parallel Chunked Reduce-Scatter
-// Supports BOTH row sub-chunking [row_off : row_off + sub_rows) AND zero-copy
-// column-chunked output placement out_shard[:, out_col_off : out_col_off + cols]
-// so N-chunked o_proj GEMMs overlap 100% with 7-link-parallel XGMI Reduce-Scatter!
+// Kernel 4: Prefill 7-link-parallel chunked Reduce-Scatter of rows [row_off, row_off + sub_rows)
+// into out_shard[:, out_col_off : out_col_off + cols], so N-chunked o_proj GEMMs can overlap it.
 // ============================================================================
 __global__ __launch_bounds__(RS_THREADS) void xgmi_rs_chunk_32cu_kernel(
     const bf16_t *__restrict__ partial,

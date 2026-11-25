@@ -22,8 +22,6 @@ accept incompatible payloads.
 from __future__ import annotations
 
 import contextlib
-import ctypes
-import functools
 import math
 import os
 import threading
@@ -32,8 +30,6 @@ from typing import Optional
 import msgspec
 import torch
 import torch.distributed as dist
-
-from sgl_amd_mono.common.peer import hip_runtime
 
 SGLANG_READS = {
     "srt/runtime_context.py": ("get_parallel",),
@@ -80,7 +76,7 @@ def _align_up(nbytes: int, alignment: int = _ALIGN) -> int:
     return (nbytes + alignment - 1) // alignment * alignment
 
 
-# Flag-ordered decode payload (2 B/bf16, no 2x inline Lamport tag overhead)
+# Lamport-tagged decode payload: each 16 B packet carries 4 bf16 plus 2 tags, so 4 B per bf16.
 DECODE_RS_BYTES = _align_up(DECODE_MAX_ROWS * DECODE_MAX_COLS * 4)
 DECODE_AG_BYTES = _align_up(DECODE_MAX_ROWS * DECODE_MAX_COLS * 4)
 DECODE_HALF_BYTES = _align_up(DECODE_RS_BYTES + DECODE_AG_BYTES)
@@ -112,100 +108,60 @@ EPOCH_TOTAL_WORDS = EPOCH_AG_OFF + PREFILL_AG_BLOCKS
 class XgmiConfig(msgspec.Struct, frozen=True):
     """Immutable runtime settings resolved once at hook installation."""
 
-    prefill_min_rows: int = 512
-    prefill_max_rows: int = 32768
-    use_fp4: bool = False
-    deadline_s: float = DEFAULT_DEADLINE_S
+    prefill_min_rows: int
+    prefill_max_rows: int
+    use_fp4: bool
 
 
-@functools.cache
-def _bind_cu_mask_api():
-    lib = hip_runtime()
-    try:
-        create_fn = lib.hipExtStreamCreateWithCUMask
-        destroy_fn = lib.hipStreamDestroy
-    except AttributeError:
-        return None
-    create_fn.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_uint32,
-        ctypes.POINTER(ctypes.c_uint32),
-    ]
-    create_fn.restype = ctypes.c_int
-    destroy_fn.argtypes = [ctypes.c_void_p]
-    destroy_fn.restype = ctypes.c_int
-    return create_fn, destroy_fn
+class XgmiStreams:
+    """Compute stream plus a high-priority XGMI comm stream."""
 
-
-class CuMaskStreams:
-    """Compute + high-priority XGMI comm streams on MI355X.
-
-    ``use_cu_mask`` defaults to False because ROCm 7.2 ``hipExtStreamCreateWithCUMask``
-    regresses hipBLASLt GEMM latency ~2x (81.5 -> 171.6 us at M=4096).
-    """
-
-    def __init__(
-        self,
-        device: torch.device,
-        *,
-        comm_cus: int = 32,
-        use_cu_mask: bool = False,
-    ):
+    def __init__(self, device: torch.device):
         self.device = device
-        self.comm_cus = comm_cus
-        self._raw_handles: list[int] = []
-        props = torch.cuda.get_device_properties(device)
-        total_cus = props.multi_processor_count
-        api = _bind_cu_mask_api()
-        if (
-            use_cu_mask
-            and api is not None
-            and total_cus >= comm_cus + 32
-            and total_cus % 32 == 0
-        ):
-            if self._init_masked(api, device, total_cus, comm_cus):
-                return
-        self.cu_masked = False
-        self.compute_cus = total_cus
+        # No CU masking: ROCm 7.2 hipExtStreamCreateWithCUMask regresses hipBLASLt GEMMs ~2x.
         self.compute = torch.cuda.Stream(device=device)
         self.comm = torch.cuda.Stream(device=device, priority=-1)
 
-    def _init_masked(
-        self, api, device: torch.device, total_cus: int, comm_cus: int
-    ) -> bool:
-        create_fn, destroy_fn = api
-        num_words = total_cus // 32
-        comm_per_word = max(1, comm_cus // num_words)
-        comm_bits = ((1 << comm_per_word) - 1) << (32 - comm_per_word)
-        comp_bits = 0xFFFFFFFF ^ comm_bits
-        compute_mask = (ctypes.c_uint32 * num_words)(*([comp_bits] * num_words))
-        comm_mask = (ctypes.c_uint32 * num_words)(*([comm_bits] * num_words))
-        with torch.cuda.device(device):
-            h_comp = ctypes.c_void_p()
-            h_comm = ctypes.c_void_p()
-            err1 = create_fn(ctypes.byref(h_comp), num_words, compute_mask)
-            err2 = create_fn(ctypes.byref(h_comm), num_words, comm_mask)
-            if err1 == 0 and err2 == 0:
-                self._raw_handles = [int(h_comp.value), int(h_comm.value)]
-                self.compute = torch.cuda.ExternalStream(
-                    int(h_comp.value), device=device
-                )
-                self.comm = torch.cuda.ExternalStream(int(h_comm.value), device=device)
-                self.cu_masked = True
-                self.compute_cus = total_cus - comm_cus
-                return True
-            if err1 == 0:
-                destroy_fn(h_comp)
-            if err2 == 0:
-                destroy_fn(h_comm)
-        return False
-
     def close(self) -> None:
-        api = _bind_cu_mask_api()
-        if api is not None:
-            for handle in self._raw_handles:
-                api[1](ctypes.c_void_p(handle))
-        self._raw_handles = []
+        pass
+
+
+def _open_peer_heaps(*, native, heap_id: int, handles: list, rank: int, device) -> None:
+    handle_rows: list[list[int]] = []
+    for peer_rank, (peer_bytes, peer_handle) in enumerate(handles):
+        if peer_bytes != HEAP_BYTES or peer_handle is None:
+            raise RuntimeError(
+                f"rank {peer_rank} local heap setup failed "
+                f"(bytes={peer_bytes}, expected={HEAP_BYTES})"
+            )
+        handle_rows.append(peer_handle)
+    peer_handles_cpu = torch.tensor(
+        handle_rows, dtype=torch.uint8, device="cpu"
+    ).contiguous()
+    native.open_peer_heaps(heap_id, peer_handles_cpu, rank)
+    # Synchronize local peer zeroing and epoch init before the TP vote so
+    # the all_reduce after it acts as the single collective barrier.
+    torch.cuda.synchronize(device)
+
+
+def _abort_handshake(
+    *,
+    failure: Optional[Exception],
+    native,
+    heap_id: Optional[int],
+    streams: Optional[XgmiStreams],
+) -> None:
+    cleanup_err: Optional[Exception] = None
+    if heap_id is not None and native is not None:
+        try:
+            native.unregister_heap(heap_id)
+        except Exception as err:
+            cleanup_err = err
+    if streams is not None and cleanup_err is None:
+        streams.close()
+    raise RuntimeError(
+        f"XgmiHeap peer IPC handshake failed on {'this' if failure else 'another'} rank"
+    ) from (failure if failure is not None else cleanup_err)
 
 
 class XgmiHeap:
@@ -217,7 +173,6 @@ class XgmiHeap:
         rank: int,
         device: torch.device,
         *,
-        comm_cus: int = 32,
         deadline_s: Optional[float] = None,
     ):
         actual_world = dist.get_world_size(group=cpu_group)
@@ -234,7 +189,7 @@ class XgmiHeap:
         heap_id: Optional[int] = None
         local_payload: tuple[int, Optional[list[int]]] = (0, None)
         local_failure: Optional[Exception] = None
-        streams: Optional[CuMaskStreams] = None
+        streams: Optional[XgmiStreams] = None
         chunk_events: list[torch.cuda.Event] = []
         try:
             if rank != actual_rank:
@@ -267,7 +222,7 @@ class XgmiHeap:
                 self.block_epoch, HEAP_BYTES
             )
             heap_id = int(raw_id)
-            streams = CuMaskStreams(device, comm_cus=comm_cus)
+            streams = XgmiStreams(device)
             chunk_events = [torch.cuda.Event() for _ in range(8)]
             local_payload = (HEAP_BYTES, local_handle.tolist())
         except Exception as err:
@@ -280,38 +235,22 @@ class XgmiHeap:
         failure: Optional[Exception] = local_failure
         if failure is None:
             try:
-                handle_rows: list[list[int]] = []
-                for peer_rank, (peer_bytes, peer_handle) in enumerate(handles):
-                    if peer_bytes != HEAP_BYTES or peer_handle is None:
-                        raise RuntimeError(
-                            f"rank {peer_rank} local heap setup failed "
-                            f"(bytes={peer_bytes}, expected={HEAP_BYTES})"
-                        )
-                    handle_rows.append(peer_handle)
-                peer_handles_cpu = torch.tensor(
-                    handle_rows, dtype=torch.uint8, device="cpu"
-                ).contiguous()
                 assert native is not None and heap_id is not None
-                native.open_peer_heaps(heap_id, peer_handles_cpu, actual_rank)
-                # Synchronize local peer zeroing and epoch init before the TP vote so
-                # the all_reduce below acts as the single collective barrier.
-                torch.cuda.synchronize(device)
+                _open_peer_heaps(
+                    native=native,
+                    heap_id=heap_id,
+                    handles=handles,
+                    rank=actual_rank,
+                    device=device,
+                )
             except Exception as err:
                 failure = err
         ok = torch.tensor([int(failure is None)], dtype=torch.int32)
         dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=cpu_group)
         if not ok.item():
-            cleanup_err: Optional[Exception] = None
-            if heap_id is not None and native is not None:
-                try:
-                    native.unregister_heap(heap_id)
-                except Exception as err:
-                    cleanup_err = err
-            if streams is not None and cleanup_err is None:
-                streams.close()
-            raise RuntimeError(
-                f"XgmiHeap peer IPC handshake failed on {'this' if failure else 'another'} rank"
-            ) from (failure if failure is not None else cleanup_err)
+            _abort_handshake(
+                failure=failure, native=native, heap_id=heap_id, streams=streams
+            )
         assert streams is not None
         self.streams = streams
         self.chunk_events = chunk_events
@@ -463,7 +402,9 @@ def get_global_heap(
         )
     if none_cached:
         _GLOBAL_HEAP = XgmiHeap(
-            cpu_group, actual_rank if rank is None else rank, device
+            cpu_group=cpu_group,
+            rank=actual_rank if rank is None else rank,
+            device=device,
         )
     else:
         assert _GLOBAL_HEAP is not None

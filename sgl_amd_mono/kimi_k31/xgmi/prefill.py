@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prefill (200..32768 rows) Row-Sharded Sequence-Parallel XGMI pipeline."""
+"""Row-sharded sequence-parallel XGMI prefill pipeline for Kimi-K3.1."""
 
 from __future__ import annotations
 
@@ -14,8 +14,6 @@ from sgl_amd_mono.kimi_k31.xgmi.kernels import (
     reduce_scatter_rows,
     row_allgather,
 )
-
-PREFILL_MIN_ROWS = 200
 
 
 def _default_gemm(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -45,7 +43,7 @@ def overlapped_o_proj_rs(
     in the 4097..8192 window where each chunk fits in one 28 MiB RS ring slot.
     """
     gemm = _default_gemm if gemm_fn is None else gemm_fn
-    x_pad, _ = pad_rows_to_tp(hidden, TP)
+    x_pad, _ = pad_rows_to_tp(hidden, tp=TP)
     padded_rows = x_pad.shape[0]
     rows_per_rank = padded_rows // TP
     out_cols = o_proj_weight.shape[0]
@@ -67,7 +65,7 @@ def overlapped_o_proj_rs(
 
     if n_chunks == 1:
         partial = gemm(x_pad, o_proj_weight)
-        return reduce_scatter_rows(heap, partial)
+        return reduce_scatter_rows(heap=heap, partial=partial)
 
     with heap.overlap_guard():
         out_shard = x_pad.new_empty(rows_per_rank, out_cols)
@@ -90,7 +88,10 @@ def overlapped_o_proj_rs(
                 with torch.cuda.stream(comm_stream):
                     comm_stream.wait_event(events[chunk_idx])
                     reduce_scatter_rows(
-                        heap, part_chunk, out_shard=out_shard, out_col_off=col_off
+                        heap=heap,
+                        partial=part_chunk,
+                        out_shard=out_shard,
+                        out_col_off=col_off,
                     )
         finally:
             main_stream.wait_stream(comm_stream)
@@ -117,7 +118,11 @@ def sharded_front_fp4_ag(
     topk_ids, topk_weights = topk_fn(normed_shard, router_logits)
     q_data, q_scale = _quant_routed_input(routed_input, use_fp4=use_fp4)
     q_all, s_all, ids_all, w_all = fp4_pack_allgather(
-        heap, q_data, q_scale, topk_ids, topk_weights
+        heap=heap,
+        q_data=q_data,
+        q_scale=q_scale,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
     )
     return (
         q_all[:num_tokens],
@@ -171,7 +176,7 @@ def moe_tail_mix_qkv_a(
     else:
         next_normed_shard, next_written = stream_shard, stream_shard
     qkv_a_shard = gemm(next_normed_shard, next_qkv_a_weight)
-    qkv_a_all = row_allgather(heap, qkv_a_shard)[:num_tokens]
+    qkv_a_all = row_allgather(heap=heap, x_shard=qkv_a_shard)[:num_tokens]
     return stream_shard, next_written, qkv_a_all
 
 
@@ -181,7 +186,7 @@ def prefill_reduce_scatter_32cu(
     *,
     out_shard: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    return reduce_scatter_rows(heap, partial, out_shard=out_shard)
+    return reduce_scatter_rows(heap=heap, partial=partial, out_shard=out_shard)
 
 
 def prefill_row_allgather(
@@ -189,4 +194,4 @@ def prefill_row_allgather(
     x_shard: torch.Tensor,
     num_tokens: int,
 ) -> torch.Tensor:
-    return row_allgather(heap, x_shard)[:num_tokens]
+    return row_allgather(heap=heap, x_shard=x_shard)[:num_tokens]
