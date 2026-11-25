@@ -39,6 +39,14 @@ PASS, WARN, FAIL = "pass", "warn", "fail"
 TESTS_TIER = (
     "tests tier (only its tests changed): the served kernels are the base branch's"
 )
+# The tiers that run no speed test or accuracy benchmark, and why not.
+LIGHT_TIERS = {
+    "tests": TESTS_TIER,
+    "smoke": "smoke tier: the speed test and GSM8K on/off run in the full tier "
+    "(the run-ci-extra label) and the nightly",
+    "serve": "not run in the serve tier (shared code or many models changed); "
+    "the nightly runs it",
+}
 ICON = {PASS: "✅", WARN: "⚠️", FAIL: "❌"}
 MARKER = "<!-- sgl-amd-mono-ci -->"
 
@@ -65,18 +73,22 @@ def scope_check(key, r):
         return WARN, f"serving not run: {r['skipped']['serving']}"
     if r.get("perf", {}).get("on", {}).get("error"):
         return FAIL, f"monokernel server: {r['perf']['on']['error']}"
-    if r.get("tier") == "tests":
+    if r.get("tier") in ("tests", "smoke"):
         # no speed-test server; the serving tests check which steps run the kernels
-        return PASS, f"TP{m.get('tp')} on {r.get('node', '?')}; {TESTS_TIER}"
+        note = LIGHT_TIERS[r["tier"]]
+        return PASS, f"TP{m.get('tp')} on {r.get('node', '?')}; {note}"
+    if r.get("tier") == "serve" and not str(r.get("served", "")).startswith("pass"):
+        return FAIL, f"served check: {r.get('served', 'did not run')}"
     routes = r.get("routing", {}).get("on", [])
     if not routes:
         return (
             FAIL,
             "the monokernel server logged no routing: every step ran SGLang's own path",
         )
+    served = f"; served check {r['served']}" if r.get("served") else ""
     return PASS, f"TP{m.get('tp')} on {r.get('node', '?')}; " + "; ".join(
         f"`{x}`" for x in routes
-    )
+    ) + served
 
 
 def accuracy_check(key, r):
@@ -93,15 +105,14 @@ def accuracy_check(key, r):
         return WARN, "not run (no server here): author-provided results needed"
     if r.get("tier") == "tests":
         return PASS, "%s, so no accuracy benchmark" % TESTS_TIER
+    if r.get("tier") == "serve":
+        return PASS, LIGHT_TIERS["serve"]
     if r.get("tier") == "smoke":
         if not m.get("e2e_tests"):
-            return (
-                WARN,
-                "smoke tier (shared code, or code in many models, changed): no accuracy check for this model",
-            )
+            return WARN, f"{LIGHT_TIERS['smoke']}; no serving test bounds GSM8K here"
         return (
             PASS,
-            "smoke tier (shared code, or code in many models, changed): the serving tests' GSM8K and KL bounds (Tests)",
+            f"the serving tests' GSM8K and KL bounds (Tests); {LIGHT_TIERS['smoke']}",
         )
     acc = r.get("accuracy", {})
     states, parts = [], []
@@ -184,15 +195,15 @@ def perf_check(key, r, needs_gain):
             "not run (no server here): author-provided InferenceX results needed",
             [],
         )
-    if r.get("tier") == "tests":
-        return PASS, "%s, so no speed test" % TESTS_TIER, []
+    if r.get("tier") in LIGHT_TIERS:
+        return PASS, LIGHT_TIERS[r["tier"]], []
     perf = r.get("perf", {})
     base, new = perf.get("off" if nightly else "base", {}), perf.get("on", {})
     if "error" in new:
         return FAIL, f"monokernels on: {new['error']}", []
     # rows: (conc, base TPOT, new TPOT, TPOT gain, base tok/s, new tok/s, note)
     rows, states, gate_gains = [], [], []
-    for c in m["gate_concurrency" if r.get("tier") == "smoke" else "concurrency"]:
+    for c in m["concurrency"]:
         p, b = new.get(str(c), {}), base.get(str(c), {})
         bt, pt = b.get("output_throughput"), p.get("output_throughput")
         if not p.get("median_tpot_ms"):
@@ -337,10 +348,11 @@ def _names(ids, n=3):
 def tests_check(key, r):
     m = MODELS.get(key, {})
     t = r.get("tests", {})
+    serve = r.get("tier") == "serve"
     expected = ["unit"] + (
-        ["kernels"] if key == "common" or m.get("kernel_tests") else []
+        ["kernels"] if key == "common" or (m.get("kernel_tests") and not serve) else []
     )
-    if m.get("e2e_tests") and not r.get("skipped", {}).get("e2e"):
+    if m.get("e2e_tests") and not serve and not r.get("skipped", {}).get("e2e"):
         expected.append("e2e")
     states, parts = [], []
     for name in expected:
@@ -383,6 +395,8 @@ def micro_check(key, r):
     m = MODELS.get(key, {})
     if not m.get("microbench"):
         return WARN, "no kernel-only timing script for this model in CI yet"
+    if r.get("tier") == "serve":
+        return PASS, LIGHT_TIERS["serve"]
     mb = r.get("microbench", {})
     pr = mb.get("pr", [])
     if not pr:
@@ -396,8 +410,8 @@ def micro_check(key, r):
         sides = (
             "base and PR"
             if mb.get("base")
-            else "PR (tests tier)"
-            if r.get("tier") == "tests"
+            else f"PR ({r.get('tier')} tier)"
+            if r.get("tier") in ("tests", "smoke")
             else "PR (no base package)"
         )
     return PASS, f"{len(pr)} script(s) on {sides}; output below"
@@ -594,7 +608,12 @@ def main():
             }
             if not gains:
                 rule_rows.append(
-                    ("Speed gain", WARN, "no model has a speed result to judge")
+                    (
+                        "Speed gain",
+                        WARN,
+                        "no model has a speed result to judge: the speed test runs "
+                        "in the full tier (add the run-ci-extra label)",
+                    )
                 )
             else:
                 k, g = max(gains.items(), key=lambda kv: kv[1])

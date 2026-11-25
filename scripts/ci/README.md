@@ -26,10 +26,12 @@ nodes:
   a GitHub-hosted runner, so a PR cannot merge without the test once the branch
   rules require it. Adding the label starts a new run; re-running a "Not run" one
   does not test (the runners check the labels the run started with).
-- `run-ci-extra` runs the same and adds GPQA (or tick `extra` when running the
-  workflow by hand). GSM8K's short answers cannot show a loss at long context;
-  GPQA's long ones can. Use it for a PR that touches attention, the KV cache or
-  long sequences.
+- `run-ci-extra` runs the **full** tier and adds GPQA (or tick `extra` when
+  running the workflow by hand): the speed test against the base branch (the
+  `[Perf]`/`[Feat]` gain) and GSM8K on and off. GSM8K's short answers cannot show
+  a loss at long context; GPQA's long ones can. Use it for a `[Perf]`/`[Feat]` PR
+  and for a PR that touches attention, the KV cache or long sequences; it takes
+  1-2.5 hours a model.
 - Or run the workflow (Actions, "PR Test (AMD)", "Run workflow") with the PR number.
   `models` runs the named models instead of the PR's scope (`common` for the unit
   and common kernel tests); `image` pins the SGLang image.
@@ -50,22 +52,31 @@ oldest first, so it is an estimate.
 
 ## What runs
 
-`scope.py` maps a PR's changed files to models (`models.py`):
+`scope.py` maps a PR's changed files to models (`models.py`). The budget is about
+an hour on the two GPU runners (two GPU hours) for any PR:
 
 - a model whose own package code (`sgl_amd_mono/<pkg>/`) changed runs the
-  **full** tier;
-- a change to `sgl_amd_mono/common/`, `sgl_amd_mono/__init__.py` or
-  `pyproject.toml` runs every other model's **smoke** tier, and `common`;
+  **smoke** tier: its unit, kernel and serving tests, with no base side, speed
+  test or accuracy benchmark. With `run-ci-extra` it runs the **full** tier;
 - a model whose tests changed (`test/...`) but not its package code runs the
-  **tests** tier: its unit, kernel and serving tests, with no base side, speed
-  test or accuracy benchmark, since the served kernels are the base branch's;
+  **tests** tier: the same tests as smoke, its served kernels being the base
+  branch's;
+- a change to `sgl_amd_mono/common/`, `sgl_amd_mono/__init__.py` or
+  `pyproject.toml`, or a PR that changes more than `SMOKE_MAX_MODELS` (3) models
+  (code or tests), runs every model concerned at the **serve** tier: the unit
+  tests and one served check (the server's routing and 8 requests), minutes a
+  model, and `common` in full. `run-ci-extra` does not lift this; the nightly
+  runs those models in full, or run the workflow by hand with `models`;
 - a PR that changes no model runs `common`: the unit tests and the common kernel
   tests.
-- a PR whose package code changes in more than `FULL_TIER_MAX_MODELS` (3) models,
-  such as a refactor or an API move across packages, runs each of them at the
-  **smoke** tier instead of the full one, and `common` in full: fourteen full-tier
-  jobs would hold both GPU runners for most of a day. The nightly runs them in
-  full; to run a PR in full anyway, run the workflow by hand with `models`.
+
+A PR's serving tests leave out the fault-injection ones (`PR_E2E_DESELECT`:
+`-k "not stalled"`), which wait out a watchdog timeout, 5-38 minutes a model; the
+full tier and the nightly run them.
+
+Roughly, from the runs of 2026-11-25: smoke takes 10-45 minutes a model
+(GLM-5.3, whose kernel tests take an hour even at quick widths, ~85), serve 5-10,
+`common` 15.
 
 A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
 checks representative widths only (DeepSeek-V4.1's K1, K2 and target FFN launch at
@@ -89,13 +100,13 @@ these sides:
   only, read-only in the PR test and the nightly. The weekly run hands the files
   it writes to the directory's owner (the runner account).
 
-| Check | PR test, full tier | PR test, smoke tier | Nightly | Weekly |
-| --- | --- | --- | --- | --- |
-| Tests | unit (on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same | unit, kernel and serving tests | same |
-| Kernel microbenchmark | the model's timing scripts, base and PR | same | main | main |
-| Accuracy | sgl-eval GSM8K (1319 questions), on and off; GPQA too with `run-ci-extra` | the serving tests' GSM8K and KL bounds | GSM8K, GPQA Diamond (and MMMU-Pro for vision models), on | the nightly's and AIME26 x4, on and off |
-| E2E performance | InferenceX fixed length at the model's concurrencies, base and on | the gate concurrencies only | on (against the monokernel-off reference) | off and on |
-| Scope | the server's startup lines that say which steps the launches serve | same | same | same |
+| Check | PR test, full tier (`run-ci-extra`) | PR test, smoke and tests tiers | PR test, serve tier | Nightly | Weekly |
+| --- | --- | --- | --- | --- | --- |
+| Tests | unit (on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same, without the fault-injection serving tests | unit | unit, kernel and serving tests | same |
+| Kernel microbenchmark | the model's timing scripts, base and PR | PR | – | main | main |
+| Accuracy | sgl-eval GSM8K (1319 questions), on and off; GPQA too | the serving tests' GSM8K and KL bounds | – | GSM8K, GPQA Diamond (and MMMU-Pro for vision models), on | the nightly's and AIME26 x4, on and off |
+| E2E performance | InferenceX fixed length at the model's concurrencies, base and on | – | – | on (against the monokernel-off reference) | off and on |
+| Scope | the server's startup lines that say which steps the launches serve | the serving tests | the server's startup lines and 8 requests | same as full | same |
 
 E2E performance is `sglang.benchmark.serving`: random 8k in / 1k out, range
 ratio 0.8, 10 prompts a slot. The report keeps median TPOT (p50), which gates, and

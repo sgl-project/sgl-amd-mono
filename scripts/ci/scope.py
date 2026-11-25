@@ -18,10 +18,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from models import (  # noqa: E402
-    FULL_TIER_MAX_MODELS,
     GAIN_TYPES,
     MODELS,
     SHARED_PATHS,
+    SMOKE_MAX_MODELS,
 )
 
 TITLE = re.compile(r"^\[(\w+)\] ")
@@ -48,17 +48,22 @@ def package_of(path: str):
     return None
 
 
-def models_for(files):
-    """The models a file list runs: {model: (why, tier)}. A model whose own package
-    code (``sgl_amd_mono/<pkg>/``) changed runs the full tier; shared code runs
-    every other model's smoke tier (its tests and the speed test at its gate
-    concurrencies; the serving tests hold a GSM8K bound) and ``common`` (the unit
-    and common kernel tests), which also runs when no model changed. A model whose
-    tests changed but not its code runs the tests tier: its unit, kernel and
-    serving tests, no speed test or accuracy benchmark, which would measure the
-    same kernels as the base branch. A PR whose code changes in more than
-    ``FULL_TIER_MAX_MODELS`` models runs them at the smoke tier, and ``common`` in
-    full: a change that broad is a refactor, and the nightly runs them in full."""
+def models_for(files, full=False):
+    """The models a file list runs: {model: (why, tier)}, within the PR test's
+    budget of about an hour on the two GPU runners.
+
+    * A model whose own package code (``sgl_amd_mono/<pkg>/``) changed runs the
+      smoke tier: its unit, kernel and serving tests, without the base side, the
+      speed test or GSM8K on/off. With ``full`` (the run-ci-extra label) it runs
+      the full tier instead.
+    * A model whose tests changed but not its code runs the tests tier: the same
+      tests, its served kernels being the base branch's.
+    * More than ``SMOKE_MAX_MODELS`` such models, or a change to shared code, and
+      every model concerned runs the serve tier: the unit tests and one served
+      check (routing and a few requests), with ``common`` (the unit and common
+      kernel tests) in full. ``full`` does not lift this: a broad change gets its
+      full run from the nightly, or from a dispatch with ``models``.
+    * A PR that changes no model runs ``common``."""
     changed = [f["filename"] for f in files]
     code = {
         p for f in changed if f.startswith("sgl_amd_mono/") and (p := package_of(f))
@@ -73,25 +78,23 @@ def models_for(files):
         for key, m in MODELS.items()
         if set(m["packages"]) & tests
     }
+    models.update(
+        {
+            key: (f"{changed_in(m, code)} changed", "full" if full else "smoke")
+            for key, m in MODELS.items()
+            if set(m["packages"]) & code
+        }
+    )
     shared = sorted({f for f in changed if f.startswith(SHARED_PATHS)})
     if shared:
         why = f"shared code changed ({', '.join(shared[:3])})"
-        models = {"common": (why, "full"), **{k: (why, "smoke") for k in MODELS}}
-    touched = {key: m for key, m in MODELS.items() if set(m["packages"]) & code}
-    if len(touched) > FULL_TIER_MAX_MODELS:
+        return {"common": (why, "full"), **{k: (why, "serve") for k in MODELS}}
+    if len(models) > SMOKE_MAX_MODELS:
         why = (
-            f"code changed in {len(touched)} models, more than "
-            f"{FULL_TIER_MAX_MODELS}; the nightly runs them in full"
+            f"{len(models)} models changed, more than {SMOKE_MAX_MODELS}; "
+            "the nightly runs them in full"
         )
-        models.setdefault("common", (why, "full"))
-        models.update({key: (why, "smoke") for key in touched})
-    else:
-        models.update(
-            {
-                key: (f"{changed_in(m, code)} changed", "full")
-                for key, m in touched.items()
-            }
-        )
+        return {"common": (why, "full"), **{k: (why, "serve") for k in models}}
     return models or {"common": ("no model package changed", "full")}
 
 
@@ -164,6 +167,9 @@ def main():
     ap.add_argument("--title", required=True)
     ap.add_argument("--pr-dir", required=True)
     ap.add_argument("--models", default="", help="comma-separated: run these instead")
+    ap.add_argument(
+        "--full", action="store_true", help="the full tier (the run-ci-extra label)"
+    )
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -175,7 +181,7 @@ def main():
             sys.exit(f"unknown models {unknown}; known: common, {sorted(MODELS)}")
         models = {k: ("requested", "full") for k in keys}
     else:
-        models = models_for(files)
+        models = models_for(files, args.full)
     models = {k: {"why": why, "tier": tier} for k, (why, tier) in models.items()}
     m = TITLE.match(args.title)
     title_type = m.group(1) if m else ""
