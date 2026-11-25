@@ -20,11 +20,14 @@ PR mode: the base branch's unit tests (kept per merge-base and image, so run
 once), base, then the unit, kernel and timing tests, on and off (GSM8K only),
 then the model's serving tests. A model whose ``models.py`` entry merged before
 its package has no base package; its off side runs the speed test as its base.
-(A model new in the PR is not run at all: ``models.py`` comes from the base branch.) The smoke tier (a model that runs only
-because shared code, or code in many models, changed) runs no accuracy benchmark, whose bound its serving
-tests hold, and times only the gate concurrencies. The tests tier (only the model's
-tests changed) runs its unit, kernel and serving tests: no base side, speed test or
-accuracy benchmark. A PR's kernel tests run with MONO_CI_QUICK_KERNELS=1, at the
+(A model new in the PR is not run at all: ``models.py`` comes from the base branch.)
+That is the full tier, which a PR gets only with the run-ci-extra label. The smoke
+tier (the default for a model whose code changed) and the tests tier (only the
+model's tests changed) run its unit, kernel and serving tests: no base side, speed
+test or accuracy benchmark, and the serving tests without the fault-injection
+ones (``PR_E2E_DESELECT``). The serve tier (shared code, or more than
+``SMOKE_MAX_MODELS`` models, changed) runs the unit tests and one served check:
+the server's routing and a few requests. A PR's kernel tests run with MONO_CI_QUICK_KERNELS=1, at the
 widths each test picks as representative; the nightly and weekly run every width.
 
 Nightly mode (``--pr`` and ``--base`` both main): the tests, then the on side with
@@ -63,9 +66,11 @@ from models import (  # noqa: E402
     ISL,
     MODELS,
     OSL,
+    PR_E2E_DESELECT,
     PR_EVALS,
     PROMPTS_PER_SLOT,
     RANGE_RATIO,
+    SERVE_REQUESTS,
     weekly_eval,
 )
 
@@ -203,7 +208,7 @@ class Run:
 
     # -- tests ----------------------------------------------------------------
 
-    def pytest(self, name, files, timeout, src=None, into="tests"):
+    def pytest(self, name, files, timeout, src=None, into="tests", select=""):
         """Run ``files`` of the checkout ``src`` (default: the PR) and record the
         counts, and which tests failed, as ``result[into][name]``."""
         src = src or self.args.pr
@@ -212,8 +217,9 @@ class Run:
             return
         log = name if into == "tests" else f"{into.split('_')[0]}-{name}"  # base-unit
         xml = self.logs / f"{log}.xml"
+        k = f"-k {shlex.quote(select)} " if select else ""
         rc = self.sh(
-            f"python3 -m pytest -v -rA --junitxml={xml} " + " ".join(files),
+            f"python3 -m pytest -v -rA --junitxml={xml} {k}" + " ".join(files),
             log,
             cwd=src,
             timeout=timeout,
@@ -342,8 +348,7 @@ class Run:
 
     def perf(self, side, model):
         res = self.result["perf"].setdefault(side, {})
-        smoke = self.args.tier == "smoke"
-        levels = self.m["gate_concurrency" if smoke else "concurrency"]
+        levels = self.m["concurrency"]
         if CONCURRENCY:
             levels = [int(c) for c in CONCURRENCY.split(",")]
         for c in levels:
@@ -597,7 +602,14 @@ class Run:
                 self.step("e2e", self.e2e)
             return
 
-        if a.tier == "tests":
+        if a.tier == "serve":
+            # shared code or many models changed: the unit tests and one served check
+            self.install(a.pr)
+            self.pytest("unit", ["test/unit"], 1800)
+            if not why:
+                self.step("serve", self.served)
+            return
+        if a.tier in ("tests", "smoke"):
             self.install(a.pr)
             self.step("tests", self.tests)
             if not why:
@@ -670,24 +682,7 @@ class Run:
             else:
                 try:
                     self.routing("pinned")
-                    bad = []
-                    for i in range(PINNED_REQUESTS):
-                        try:
-                            r = requests.post(
-                                f"http://127.0.0.1:{PORT}/generate",
-                                json={
-                                    "text": f"Question {i}: what is {i + 17} * 3? Answer:",
-                                    "sampling_params": {
-                                        "max_new_tokens": 64,
-                                        "temperature": 0,
-                                    },
-                                },
-                                timeout=600,
-                            )
-                            if not (r.ok and r.json().get("text")):
-                                bad.append(f"request {i}: HTTP {r.status_code}")
-                        except requests.RequestException as e:
-                            bad.append(f"request {i}: {type(e).__name__}")
+                    bad = self.send_requests(PINNED_REQUESTS)
                     routes = self.result["routing"].get("pinned", [])
                     if bad:
                         res["serve"] = "fail: " + "; ".join(bad[:3])
@@ -778,7 +773,53 @@ class Run:
         self.microbench("pr", self.args.pr)
 
     def e2e(self):
-        self.pytest("e2e", self.m.get("e2e_tests", []), 4 * 3600)
+        # A PR (but its full tier) leaves the fault-injection tests to the nightly.
+        light = self.args.mode == "pr" and self.args.tier != "full"
+        self.pytest(
+            "e2e",
+            self.m.get("e2e_tests", []),
+            4 * 3600,
+            select=PR_E2E_DESELECT if light else "",
+        )
+
+    def served(self):
+        """The serve tier: one monokernel server, its routing, and a few requests."""
+        p, _, _ = self.serve("on", mono=True)
+        if p is None:
+            self.result["perf"]["on"] = {"error": "server did not start"}
+            self.result["served"] = "fail: the server did not start"
+            self.save()
+            return
+        try:
+            self.routing("on")
+            bad = self.send_requests(SERVE_REQUESTS)
+            self.result["served"] = (
+                "fail: " + "; ".join(bad[:3])
+                if bad
+                else f"pass ({SERVE_REQUESTS} requests)"
+            )
+        finally:
+            self.stop(p)
+        self.save()
+
+    def send_requests(self, n):
+        """``n`` short greedy requests to the server; what went wrong with each."""
+        bad = []
+        for i in range(n):
+            try:
+                r = requests.post(
+                    f"http://127.0.0.1:{PORT}/generate",
+                    json={
+                        "text": f"Question {i}: what is {i + 17} * 3? Answer:",
+                        "sampling_params": {"max_new_tokens": 64, "temperature": 0},
+                    },
+                    timeout=600,
+                )
+                if not (r.ok and r.json().get("text")):
+                    bad.append(f"request {i}: HTTP {r.status_code}")
+            except requests.RequestException as e:
+                bad.append(f"request {i}: {type(e).__name__}")
+        return bad
 
     def skip_e2e(self, why):
         if self.m.get("e2e_tests"):

@@ -63,11 +63,20 @@ COMMON_KERNEL_TESTS = [
 # Paths whose change runs every model.
 SHARED_PATHS = ("sgl_amd_mono/common/", "sgl_amd_mono/__init__.py", "pyproject.toml")
 
-# A PR whose own package code changes in more models than this (a refactor or an
-# API move across packages) runs each of them at the smoke tier, not the full one:
-# 14 full-tier jobs hold both GPU runners for most of a day. The nightly runs them
-# all in full; a maintainer can dispatch the PR test with `models` for a full run.
-FULL_TIER_MAX_MODELS = 3
+# The PR test's budget: about an hour on the two GPU runners (two GPU hours) for
+# any PR. A model whose code changed runs the smoke tier (its tests and serving
+# tests, no base side, speed test or GSM8K on/off); the full tier is opt-in
+# (run-ci-extra, or a dispatch with `models`) and the nightly's. A PR that changes
+# more models than this (code or tests), or shared code, runs each model's serve
+# tier instead: the unit tests and one served check, minutes a model.
+SMOKE_MAX_MODELS = 3
+
+# Serving tests a PR does not run (pytest -k): the fault-injection tests wait out a
+# watchdog timeout (5-38 min a model). The full tier and the nightly run them.
+PR_E2E_DESELECT = "not stalled"
+
+# The serve tier's check: requests to one monokernel server, after its routing.
+SERVE_REQUESTS = 8
 
 # The fixed-length speed test (InferenceX's): random prompts of 8k +/- 20% tokens
 # in, 1k +/- 20% out, 10 prompts a concurrency slot.

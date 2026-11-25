@@ -9,9 +9,12 @@ run-name: "PR Test (AMD) #${{ github.event.pull_request.number || inputs.pr }}"
 # base branch, and the kernel-only timing scripts, on dedicated MI355X nodes. A run
 # takes hours, so a maintainer starts it: add the `run-ci` label, or run this workflow
 # with a PR number. The label stays: every later push to the PR runs the test again,
-# until a maintainer removes it. `run-ci-extra` runs the same and adds GPQA, which
-# catches the long-context losses GSM8K cannot (a PR that touches attention, the KV
-# cache or long sequences should get it). The result is the "AMD PR test" status on the PR's head commit
+# until a maintainer removes it. A run fits about an hour on the two runners: a
+# changed model's tests and serving tests (smoke tier), or for a broad change one
+# served check a model (serve tier). `run-ci-extra` runs the full tier (speed against
+# the base branch, GSM8K on and off) and adds GPQA, which catches the long-context
+# losses GSM8K cannot: for a [Perf]/[Feat] PR, or one that touches attention, the
+# KV cache or long sequences. The result is the "AMD PR test" status on the PR's head commit
 # and a sticky PR comment; see scripts/ci/README.md. A PR without either label
 # gets the status as failed ("add the run-ci label"), set from a GitHub-hosted
 # runner, so every PR has it and none merges without a maintainer starting the test.
@@ -31,7 +34,7 @@ on:
         description: "SGLang ROCm image (default: the newest rocm/sgl-dev v*-rocm10-mi35x-YYYYMMDD)"
         default: ""
       extra:
-        description: "Add GPQA, as the run-ci-extra label does"
+        description: "The full tier with GPQA, as the run-ci-extra label does"
         type: boolean
         default: false
 
@@ -163,9 +166,11 @@ jobs:
         id: scope
         env:
           MODELS: ${{ inputs.models }}
+          # run-ci-extra (or `extra` on a dispatch): the full tier, with GPQA
+          FULL: ${{ contains(github.event.pull_request.labels.*.name, 'run-ci-extra') || inputs.extra || false }}
         run: |
           python3 harness/scripts/ci/scope.py --files files.json --title "$(cat title.txt)" \
-            --pr-dir pr --models "$MODELS" --out scope.json
+            --pr-dir pr --models "$MODELS" --out scope.json $([[ "$FULL" == true ]] && echo --full)
 
       - name: Image
         id: image
