@@ -289,10 +289,8 @@ def test_k1_builds_for_replayssm_and_a_bf16_state(monkeypatch):
         runtime_context, "get_exec", lambda: SimpleNamespace(mamba=mamba)
     )
     assert k1._state_config() == (True, [])
-    assert k1._ring_mode()
-    mamba.mamba_ssm_dtype, mamba.enable_linear_replayssm_spec = "float32", False
+    mamba.mamba_ssm_dtype = "float32"
     assert k1._state_config() == (False, [])
-    assert not k1._ring_mode()
     mamba.mamba_ssm_dtype = "float16"
     assert "float32 or bfloat16" in k1._state_config()[1][0]
 
@@ -313,15 +311,28 @@ def test_the_separated_a4w4_expert_layout_is_not_refused(monkeypatch):
 
 
 def test_the_k3_aiter_switch_is_read_under_either_name(monkeypatch):
-    from sglang.srt.environ import envs
+    """The launch needs the K3 AITER switch whether SGLang reads it through its Envs
+    field or, before that field existed, through SGLANG_AITER_K3_OPT."""
+    from types import SimpleNamespace
 
-    field = getattr(envs, "SGLANG_OPT_HIP_K3_AITER", None)
-    name = "SGLANG_OPT_HIP_K3_AITER" if field is not None else "SGLANG_AITER_K3_OPT"
+    import sglang.srt.environ as environ
+
+    def blocked():
+        return any("K3_AITER" in r for r in k3._config_disable_reasons(None, K3))
+
     monkeypatch.delenv("SGLANG_AITER_K3_OPT", raising=False)
-    monkeypatch.delenv("SGLANG_OPT_HIP_K3_AITER", raising=False)
-    assert any("K3_AITER" in r for r in k3._config_disable_reasons(None, K3))
-    monkeypatch.setenv(name, "1")
-    assert not any("K3_AITER" in r for r in k3._config_disable_reasons(None, K3))
+    monkeypatch.setattr(environ, "envs", SimpleNamespace())
+    assert blocked()
+    monkeypatch.setenv("SGLANG_AITER_K3_OPT", "1")
+    assert not blocked()
+
+    monkeypatch.delenv("SGLANG_AITER_K3_OPT")
+    for on in (False, True):
+        field = SimpleNamespace(get=lambda on=on: on)
+        monkeypatch.setattr(
+            environ, "envs", SimpleNamespace(SGLANG_OPT_HIP_K3_AITER=field)
+        )
+        assert blocked() is not on
 
 
 def test_the_guard_flags_sit_past_every_width(monkeypatch):

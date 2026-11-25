@@ -137,9 +137,11 @@ def o_loads(c, rg):
     32 of its row's elements a chunk, 8 at k = 8 g + 32 q, q < 4 (``stage_o``
     reads the same k from LDS). bf16: 4 x 16 B of the row; FP8: 4 x 8 B."""
     lane, wave = c["lane"], c["wave"]
-    if _ofmt(c) != O_BF16:
+    if c["ofmt"] != O_BF16:
         chunks = (fx.min(wave + WAVES * i, OKCH - 1) for i in range(2))
-        return wfmt.fp8_loads(c["args"]["w_o"], _ofmt(c), lane, rg, chunks, OK)
+        return wfmt.fp8_loads(
+            w=c["args"]["w_o"], fmt=c["ofmt"], lane=lane, rg=rg, chunks=chunks, k=OK
+        )
     r_w = rsrc(c["args"]["w_o"])
     row = rg * ROWS + lane % ROWS
     g = lane // ROWS
@@ -164,16 +166,11 @@ def o_loads(c, rg):
     return out
 
 
-def _ofmt(c):
-    """o_proj's format; a launch that does not set one reads bf16."""
-    return c.get("ofmt", O_BF16)
-
-
 def o_scaled(c, row, v0, v1):
     """Rows ``row`` and ``row + 1``'s fp32 sums; an FP8 o_proj's per-channel
     scale applied, as its GEMM applies it. A plain function: under a traced
     ``if``, FlyDSL would carry ``c`` through the branch."""
-    if _ofmt(c) == O_BF16:
+    if c["ofmt"] == O_BF16:
         return v0, v1
     sc = fx.Vector(
         bo.buffer_load(rsrc(c["args"]["w_os"]), row, vec_width=2, dtype=T.f32)
@@ -225,7 +222,7 @@ def stage_o(c, rg, ops):
                 [live.select(xb[d], fx.Int32(0)) for d in range(4)], fx.Int32
             )
             acc = mfma_bf16(
-                wfmt.operand(_ofmt(c), ops[i][q]), xb.bitcast(fx.BFloat16), acc
+                wfmt.operand(fmt=c["ofmt"], w=ops[i][q]), xb.bitcast(fx.BFloat16), acc
             )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
@@ -234,9 +231,9 @@ def stage_o(c, rg, ops):
         rp = tid % (ROWS // 2)
         v0, v1 = o_scaled(
             c,
-            rg * ROWS + 2 * rp,
-            row_sum(red, 2 * rp, tt),
-            row_sum(red, 2 * rp + 1, tt),
+            row=rg * ROWS + 2 * rp,
+            v0=row_sum(red, 2 * rp, tt),
+            v1=row_sum(red, 2 * rp + 1, tt),
         )
         v0, v1 = bf16_round(v0), bf16_round(v1)
         if const_expr(sent_ar):
@@ -350,6 +347,7 @@ def build(key: AttnPostBuild):
             "debug": False,
             "eps": key.eps,
             "out_eps": key.out_eps,
+            "ofmt": O_BF16,
             "put": mb.put,
             "put_bf": mb.put_bf,
             "poll": mb.poll,

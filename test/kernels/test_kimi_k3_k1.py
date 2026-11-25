@@ -615,7 +615,7 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
         """
         case = K1Case(self.device, num_acc=QLEN, state_bf16=True).run()
         parts = {}
-        cos = _cos(case.core_out, _kda_reference(case, parts))
+        cos = _cos(case.core_out, _kda_reference(case, parts=parts))
         self.assertGreater(cos, COS_MIN, f"core_out on a bf16 state: cos {cos:.6f}")
         written = case.rstate[case.st_idx[0].long()].float()
         cos = _cos(written, parts["states"])
@@ -637,7 +637,7 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
             case.st_idx = torch.full_like(case.st_idx, slot)
             case.run()
             parts = {}
-            want = _kda_reference(case, parts)
+            want = _kda_reference(case, parts=parts)
             rk, rv, rg, rb = (t[slot, :, :QLEN] for t in case.ring)
             with self.subTest(state_bf16=state_bf16):
                 self.assertGreater(_cos(case.core_out, want), COS_MIN)
@@ -662,11 +662,11 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
                     touched, [0] * 4, "a ring row outside the step was written"
                 )
                 folded = _fold(
-                    case.rstate_in[slot, h].float(),
-                    rk[h].float(),
-                    rv[h].float(),
-                    rg[h],
-                    rb[h],
+                    state=case.rstate_in[slot, h].float(),
+                    raw_k=rk[h].float(),
+                    raw_v=rv[h].float(),
+                    gate=rg[h],
+                    beta=rb[h],
                 )
                 cos = _cos(folded, parts["states"][-1, h])
                 print(

@@ -50,8 +50,7 @@ KL_BOUND = 0.03
 # The startup line that says the routing is live. The runtime serves whole
 # requests only, so DSpark's 8 tokens a request leave batch size 1.
 RUNS = "runs target_verify steps of batch size [1] x 8 tokens"
-# (model, env, args) of the server: kimi_k3_server's. test_kimi_k3_quark_server
-# runs the same checks on the Quark checkpoint's recipe.
+# (model, env, args) of the server: kimi_k3_server's.
 RECIPE = (MODEL, ENV, ARGS)
 
 
@@ -86,7 +85,7 @@ class TestMonokernelKimiK3(CustomTestCase):
             tempfile.NamedTemporaryFile("w+", suffix=s) for s in (".out", ".err")
         )
         cls.process = _launch(
-            cls.recipe, extra_args=["--watchdog-timeout", "600"], log=cls.logs
+            recipe=cls.recipe, extra_args=["--watchdog-timeout", "600"], log=cls.logs
         )
 
     @classmethod

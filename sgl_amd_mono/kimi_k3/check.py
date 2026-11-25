@@ -52,13 +52,13 @@ def _kda_slices(built, packed):
     st = built._k1_state
     mi = packed.k1.mamba_idx
     row = st["row"]
-    if st.get("ring") is not None:
+    if st["ring"] is not None:
         # ReplaySSM writes no state; its ring rows are what the commit replays
         names = ("ring_k", "ring_v", "ring_g", "ring_b")
         pairs = [(n, t, (mi, st["slot"])) for n, t in zip(names, st["ring"])]
     else:
-        pairs = [("ssm", st.get("inter_ssm"), (mi, row))]
-    pairs.append(("window", st.get("inter_window"), (mi, row)))
+        pairs = [("ssm", st["inter_ssm"], (mi, row))]
+    pairs.append(("window", st["inter_window"], (mi, row)))
     return [(n, t, idx) for n, t, idx in pairs if t is not None]
 
 
@@ -132,7 +132,7 @@ def compare(built, i: int, core: torch.Tensor, ref, bank) -> None:
         got, want = t[idx], ref["state"][name]
         if got.shape == want.shape:
             outputs[name] = (got, want)
-    _report(i, outputs, ref["launch"])
+    _report(i=i, outputs=outputs, launch=ref["launch"])
     built._check_handoff.append((i, ref["slices"], ref["state"], ref["launch"]))
 
 
@@ -151,7 +151,7 @@ def compare_handoff(built) -> None:
                 continue
             got = t[idx]
             if got.shape == want[name].shape:
-                _report(i, {"window": (got, want[name])}, launch)
+                _report(i=i, outputs={"window": (got, want[name])}, launch=launch)
     built._check_handoff = []
 
 
@@ -224,5 +224,6 @@ def _report(i: int, outputs: dict, launch: str) -> None:
             missed.add(name.split(".")[1])
     # Once an output, however many of its metrics missed.
     for out in sorted(missed):
-        for line in _profile_lines(launch, out, *outputs[out]):
+        got, want = outputs[out]
+        for line in _profile_lines(launch=launch, name=out, got=got, want=want):
             logger.error("monokernel check violation: layer %d %s", i, line)

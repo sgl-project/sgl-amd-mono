@@ -184,9 +184,7 @@ def _covered_layers(hf_config) -> list[int]:
 
 def _k3_aiter_opt() -> bool:
     """SGLang's Kimi-K3 AITER switch, which keeps the experts at their native
-    384-wide intermediate: ``SGLANG_OPT_HIP_K3_AITER``, read through Envs (which
-    also takes the old ``SGLANG_AITER_K3_OPT``), or the old name before the
-    rename."""
+    384-wide intermediate; an SGLang without the Envs field reads the old name."""
     from sglang.srt.environ import envs
 
     field = getattr(envs, "SGLANG_OPT_HIP_K3_AITER", None)
@@ -244,9 +242,7 @@ def _quark_fp8_storage(linear, name: str):
 
     SGLang stores the weight transposed for its GEMM, so the storage is
     ``weight.t()``; it is preshuffled exactly when its own
-    ``use_aiter_bpreshuffle_gemm`` chose that at load. The launches widen it to
-    bf16 in registers and scale each row's fp32 sum, so they multiply the bf16
-    activation, not SGLang's per-token FP8 copy of it.
+    ``use_aiter_bpreshuffle_gemm`` chose that at load.
     """
     from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
     from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
@@ -260,7 +256,7 @@ def _quark_fp8_storage(linear, name: str):
     if storage.dim() != 2 or not storage.is_contiguous():
         raise ValueError(f"the FP8 {name} is not SGLang's transposed contiguous weight")
     rows = storage.shape[0]
-    scale = getattr(linear, "weight_scale", None)
+    scale = linear.weight_scale
     if not (
         isinstance(scale, torch.Tensor)
         and scale.dtype == torch.float32
@@ -290,7 +286,7 @@ def _o_proj_operands(o_proj):
         return oproj.O_BF16, weight, None
     if weight.dtype != torch.float8_e4m3fn:
         raise ValueError(f"o_proj is {weight.dtype}, not bf16 or Quark FP8 E4M3")
-    shuffled, storage, scale = _quark_fp8_storage(o_proj, "o_proj")
+    shuffled, storage, scale = _quark_fp8_storage(linear=o_proj, name="o_proj")
     if tuple(storage.shape) != (hidden, CORE):
         raise ValueError(
             f"the FP8 o_proj is {tuple(storage.shape)}, not [{hidden}, {CORE}]"

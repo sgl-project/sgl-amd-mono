@@ -53,7 +53,7 @@ def fp8_loads(w, fmt, lane, rg, chunks, k, rg_max=None):
                 fx.Vector(
                     bo.buffer_load(
                         r_w,
-                        fp8_byte(fmt, lane, rg, ch, q, k) // 4,
+                        fp8_byte(fmt=fmt, lane=lane, rg=rg, ch=ch, q=q, k=k) // 4,
                         vec_width=2,
                         dtype=T.i32,
                         cache_modifier=CM_NT,

@@ -721,7 +721,7 @@ def k2_launch(
         and core.is_contiguous()
         and prefix.is_contiguous()
     )
-    wfmt.check(key.ofmt, w_o, w_os, HIDDEN, k2a.OK)
+    wfmt.check(fmt=key.ofmt, w=w_o, scale=w_os, rows=HIDDEN, k=k2a.OK)
     assert w_up.shape == (k2b.UP_N, k2b.LAT) and w_up.is_contiguous()
     assert SENT_READY or not key.opt & OPT_SENTS, "OPT_SENTS without init_peer"
     assert not key.opt & OPT_TAG_X or scratch.numel() >= scratch_alloc_bytes(), (

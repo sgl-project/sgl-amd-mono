@@ -213,7 +213,7 @@ def main():
         w.update(ofmt=oproj.O_BF16, w_o_store=w["w_o"], w_os=None, o_scale=None)
     else:
         shuffled = args.o_proj == "fp8-shuffled"
-        q, store, scale = fp8_o_proj(w["w_o"], shuffled)
+        q, store, scale = fp8_o_proj(w_o=w["w_o"], shuffled=shuffled)
         w.update(
             ofmt=oproj.O_FP8_SHUFFLED if shuffled else oproj.O_FP8,
             w_o=q,
@@ -237,9 +237,15 @@ def main():
         xrow = scratch[off : off + nbytes].view(BF).view(ROWS, HIDDEN).clone()
         out, prefix = out.clone(), prefix.clone()
         ref_prefix, ref_x = seam_reference(
-            w["core"], w["w_o"], w["prefix"], w["blocks"], NVB, w, reset=reset,
+            core=w["core"],
+            w_o=w["w_o"],
+            prefix_in=w["prefix"],
+            blocks=w["blocks"],
+            nvb=NVB,
+            w=w,
+            reset=reset,
             o_scale=w["o_scale"],
-        )  # fmt: skip
+        )
         ref_moe = moe_reference(xrow, w, rank)
         gathered = [torch.empty_like(out) for _ in range(TP)]
         dist.all_gather(gathered, out.contiguous())

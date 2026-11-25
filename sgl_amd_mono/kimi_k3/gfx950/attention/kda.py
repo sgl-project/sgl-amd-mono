@@ -199,12 +199,12 @@ def gemv_loads(c, rg, chunks):
     lane, wave = c["lane"], c["wave"]
     if c["wfmt"] != W_BF16:
         return wfmt.fp8_loads(
-            c["args"]["w_in"],
-            c["wfmt"],
-            lane,
-            rg,
-            (wave + WAVES * i for i in chunks),
-            HIDDEN,
+            w=c["args"]["w_in"],
+            fmt=c["wfmt"],
+            lane=lane,
+            rg=rg,
+            chunks=(wave + WAVES * i for i in chunks),
+            k=HIDDEN,
             rg_max=GEMV_TASKS - 1,
         )
     r_w = rsrc(c["args"]["w_in"])
@@ -280,14 +280,14 @@ def stage_gemv(c, rg, ops):
                 )
             )
             acc = mfma_bf16(
-                wfmt.operand(c["wfmt"], ops[i][q]), xb.bitcast(fx.BFloat16), acc
+                wfmt.operand(fmt=c["wfmt"], w=ops[i][q]), xb.bitcast(fx.BFloat16), acc
             )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     if (tid < ROWS * s) & (rg < GEMV_TASKS):
         r = tid % ROWS
         tt = tid // ROWS
-        v = bf16r(w_scaled(c, rg, r, row_sum(red, r, tt)))
+        v = bf16r(w_scaled(c, rg=rg, r=r, v=row_sum(red, r, tt)))
         c["put"](c["proj"], tt * NPROJ + rg * ROWS + r, v)
         if const_expr(c["debug"]):
             bo.buffer_store(
@@ -309,7 +309,7 @@ def state_row(c, base, seq, slot):
 def store_state(c, slot, off, stv):
     """Four state entries of rstate row ``slot`` at ``off``, in the state's dtype."""
     a = c["args"]
-    dst = rsrc(state_row(c, a["rstate"], a["rs_seq"], slot))
+    dst = rsrc(state_row(c, base=a["rstate"], seq=a["rs_seq"], slot=slot))
     if c["state_bf16"]:
         bo.buffer_store(bf4_words(stv), dst, off // 2)
     else:
@@ -353,9 +353,9 @@ def kda_stage(c, req, h, ch):
     if const_expr(c["init_committed"]):
         # the committed state itself: nothing staged it into the scratch
         islot = uniform(ld_i32(a["init_slot"], req))
-        base0 = state_row(c, a["rstate0"], a["rs0_seq"], islot)
+        base0 = state_row(c, base=a["rstate0"], seq=a["rs0_seq"], slot=islot)
     else:
-        base0 = state_row(c, a["rstate"], a["rs_seq"], k["slot0"])
+        base0 = state_row(c, base=a["rstate"], seq=a["rs_seq"], slot=k["slot0"])
     if c["state_bf16"]:
         k["st"] = ld_bf4(base0, k["head_off"])
     else:
@@ -553,7 +553,7 @@ def kda_recur(c, k, req, h, ch):
         if const_expr(not c["ring"]):
             slot = k["slots"][j]
             if (slot >= 0) & live0:
-                store_state(c, slot, k["head_off"], stv)
+                store_state(c, slot=slot, off=k["head_off"], stv=stv)
         if lane % 32 == 0:
             fx.ptr_store(o, c["ol"] + (j * VCH + v))
     gpu.barrier()
@@ -974,7 +974,7 @@ def kda_pre(
             f"the block-write row is {key.write_idx}, past a bank of "
             f"{blocks.size(1)} rows {tuple(blocks.shape)}"
         )
-    wfmt.check(key.wfmt, w_in, w_in_scale, NPROJ, HIDDEN)
+    wfmt.check(fmt=key.wfmt, w=w_in, scale=w_in_scale, rows=NPROJ, k=HIDDEN)
     want = state_dtype(key)
     assert rstate.dtype == want and rstate[0].numel() == NH * HD * HD, rstate.dtype
     assert rstate[0].is_contiguous(), (

@@ -257,7 +257,7 @@ def _in_proj_operands(attn):
         )
     if getattr(attn, "_qkvgbfa_in_qkvg_proj", False):
         shuffled, w_in, scale = _quark_fp8_storage(
-            attn.fused_qkvg_proj, "KDA in-projection"
+            linear=attn.fused_qkvg_proj, name="KDA in-projection"
         )
         if w_in.shape[0] < kda.NPROJ or w_in.shape[1] != HIDDEN:
             raise ValueError(
@@ -265,7 +265,7 @@ def _in_proj_operands(attn):
                 f"[>= {kda.NPROJ}, {HIDDEN}]"
             )
         fmt = kda.W_FP8_SHUFFLED if shuffled else kda.W_FP8
-        w_fb = getattr(attn, "_bfa_f_b_w", None)
+        w_fb = attn._bfa_f_b_w
     else:
         merged = getattr(attn, "_qkvgbfa_layer", None)
         if merged is None:
