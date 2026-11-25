@@ -228,6 +228,11 @@ MODELS = {
     },
     "glm53_mxfp4": {
         "name": "GLM-5.3 (MXFP4)",
+        # Not in the PR test: its checkpoint is not on the CI nodes, so a PR job
+        # only re-ran the unit tests. Its MXFP4 kernel cases run under glm53. Set
+        # back to True once the checkpoint is staged; a dispatch with
+        # models=glm53_mxfp4 still runs it.
+        "pr": False,
         "packages": ["glm53"],
         "tp": 8,
         "paths": {"GLM_53_MODEL_PATH": f"{HF}/amd/GLM-5.3-Quark-MXFP4-AttnFP8"},

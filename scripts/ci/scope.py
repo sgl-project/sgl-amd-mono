@@ -25,6 +25,9 @@ from models import (  # noqa: E402
 )
 
 TITLE = re.compile(r"^\[(\w+)\] ")
+# The models a PR can run: an entry with "pr": False (models.py) runs only when
+# named, in a dispatch's `models`.
+PR_MODELS = {k: m for k, m in MODELS.items() if m.get("pr", True)}
 
 
 def package_of(path: str):
@@ -70,14 +73,14 @@ def models_for(files):
 
     models = {
         key: (f"{changed_in(m, tests)} tests changed", "tests")
-        for key, m in MODELS.items()
+        for key, m in PR_MODELS.items()
         if set(m["packages"]) & tests
     }
     shared = sorted({f for f in changed if f.startswith(SHARED_PATHS)})
     if shared:
         why = f"shared code changed ({', '.join(shared[:3])})"
-        models = {"common": (why, "full"), **{k: (why, "smoke") for k in MODELS}}
-    touched = {key: m for key, m in MODELS.items() if set(m["packages"]) & code}
+        models = {"common": (why, "full"), **{k: (why, "smoke") for k in PR_MODELS}}
+    touched = {key: m for key, m in PR_MODELS.items() if set(m["packages"]) & code}
     if len(touched) > FULL_TIER_MAX_MODELS:
         why = (
             f"code changed in {len(touched)} models, more than "
