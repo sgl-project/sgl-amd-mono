@@ -56,7 +56,7 @@ MIN_DEADLINE_S = 1e-8
 MAX_DEADLINE_S = 86400.0
 
 
-def validate_deadline_s(value: float) -> float:
+def _validate_deadline_s(value: float) -> float:
     deadline = float(value)
     if (
         not math.isfinite(deadline)
@@ -96,7 +96,7 @@ RS_FLAGS_BYTES = _align_up(RS_RING_SLOTS * RS_BLOCKS * TP * 16)
 AG_FLAGS_OFF = _align_up(RS_FLAGS_OFF + RS_FLAGS_BYTES)
 AG_FLAGS_BYTES = _align_up(2 * PREFILL_AG_BLOCKS * TP * 16)
 
-HEAP_BYTES = _align_up(AG_FLAGS_OFF + AG_FLAGS_BYTES, 2 << 20)
+HEAP_BYTES = _align_up(nbytes=AG_FLAGS_OFF + AG_FLAGS_BYTES, alignment=2 << 20)
 
 # Per-block monotonic epoch table offsets (each block updates only its own word).
 EPOCH_DECODE_OFF = 0
@@ -171,7 +171,7 @@ class XgmiHeap:
         self,
         cpu_group,
         rank: int,
-        device: torch.device,
+        device: Optional[torch.device] = None,
         *,
         deadline_s: Optional[float] = None,
     ):
@@ -197,14 +197,14 @@ class XgmiHeap:
                     f"XgmiHeap rank mismatch: passed {rank}, group rank is {actual_rank}"
                 )
             self.deadline_s = (
-                validate_deadline_s(
+                _validate_deadline_s(
                     os.environ.get(
                         "SGLANG_AMD_MONO_K31_XGMI_DEADLINE_S",
                         str(DEFAULT_DEADLINE_S),
                     )
                 )
                 if deadline_s is None
-                else validate_deadline_s(deadline_s)
+                else _validate_deadline_s(deadline_s)
             )
             if device is None:
                 device = torch.device("cuda", torch.cuda.current_device())

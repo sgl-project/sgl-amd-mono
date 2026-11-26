@@ -45,11 +45,14 @@ def latent_input_gather(
     router_down_weight_slice: torch.Tensor,
     *,
     router_cols: int = 896,
-    latent_cols: int = 3584,
     gemm_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """1/8 replicated [router; down_proj] GEMM + zero-copy dual-output Lamport AG."""
     assert 1 <= normed_hidden.shape[0] <= DECODE_MAX_ROWS
+    if router_cols % TP != 0:
+        raise ValueError(
+            f"router_cols must be a multiple of TP={TP}, got {router_cols}"
+        )
     gemm = _default_gemm if gemm_fn is None else gemm_fn
     router_slice = router_cols // TP
     local_slice = gemm(normed_hidden, router_down_weight_slice)

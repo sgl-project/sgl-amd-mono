@@ -124,7 +124,6 @@ def _check_decode_once(
     gi = torch.Generator(device=dev).manual_seed(1000 + m * 10 + it)
     x = (torch.randn(m, H, generator=gi, device=dev) * 0.5).bfloat16()
 
-    # 1) 1/8 latent_input_gather
     r_got, l_got = latent_input_gather(
         heap=heap, normed_hidden=x, router_down_weight_slice=w_front_sl
     )
@@ -135,7 +134,6 @@ def _check_decode_once(
     l_err = (l_got.float() - l_ref.float()).abs().max().item()
     assert r_err < 2e-2 and l_err < 2e-2, f"M={m} it={it}: r_err={r_err}, l_err={l_err}"
 
-    # 2) deferred_topk_lamport_ar (direct + sorted-index)
     # Build all ranks' partials deterministically so reference sums in rank order
     exp_all = (
         torch.randn(TP, m, TOP_K, LAT, generator=gi, device=dev) * 0.25
@@ -185,7 +183,6 @@ def _check_decode_once(
         assert torch.equal(lat2, lat_got), f"sorted_idx mismatch at M={m}"
         assert torch.equal(sh_full, sh_ref), f"gather_full_shared mismatch at M={m}"
 
-    # 3) 1/8 moetail_gather
     prefix = (torch.randn(m, H, generator=gi, device=dev) * 0.25).bfloat16()
     pref_sl = prefix[:, rank * sl : (rank + 1) * sl].contiguous()
     stream_got = moetail_gather(
@@ -217,7 +214,6 @@ def _check_decode_eager_rotation(
     w_front_sl: torch.Tensor,
     w_up_sl: torch.Tensor,
 ) -> None:
-    # 4) 10 eager back-to-back iterations with rotating inputs + graph capture rejection
     m_g = 64
     x_buf = torch.randn(m_g, H, dtype=torch.bfloat16, device=dev) * 0.5
     exp_buf = torch.randn(m_g, TOP_K, LAT, dtype=torch.bfloat16, device=dev) * 0.25
@@ -420,7 +416,6 @@ def _check_prefill_rs(
     gi: torch.Generator,
     w_oproj: torch.Tensor,
 ) -> None:
-    # 1) overlapped_o_proj_rs (o_proj GEMM chunks x 64-block XGMI RS, 0 extra weights)
     x_all = (
         torch.randn(TP, m, O_PROJ_K_LOCAL, generator=gi, device=dev) * 0.3
     ).bfloat16()
@@ -434,7 +429,7 @@ def _check_prefill_rs(
     err_rs = (got_rs.float() - ref_rs.float()).abs().max().item()
     assert err_rs < 5e-2, f"o_proj RS M={m}: err={err_rs}"
 
-    # 2) standalone 64-block RS check (bit-exact vs rank-order fp32)
+    # Bit-exact vs a rank-order fp32 sum.
     p_all = (torch.randn(TP, padded, LAT, generator=gi, device=dev) * 0.25).bfloat16()
     got_lat_rs = prefill_reduce_scatter_32cu(heap=heap, partial=p_all[rank])
     acc = torch.zeros(r_per, LAT, dtype=torch.float32, device=dev)
@@ -457,7 +452,6 @@ def _check_prefill_front_tail(
     w_qkv_a: torch.Tensor,
     w_norm: torch.Tensor,
 ) -> None:
-    # 3) sharded_front_fp4_ag (E2M1 FP4 AND MXFP8)
     normed_all = (torch.randn(padded, H, generator=gi, device=dev) * 0.4).bfloat16()
     normed_shard = normed_all[rank * r_per : (rank + 1) * r_per].contiguous()
     for use_fp4 in (True, False):
@@ -502,7 +496,6 @@ def _check_prefill_front_tail(
         assert torch.equal(q_all, q_ref[:m]), f"fp4={use_fp4} M={m} q_data mismatch"
         assert torch.equal(s_all, s_ref[:m]), f"fp4={use_fp4} M={m} q_scale mismatch"
 
-    # 4) moe_tail_mix_qkv_a (1/8 up_proj + 1/8 2112 qkv_a + XGMI AG)
     lat_all = (torch.randn(padded, LAT, generator=gi, device=dev) * 0.3).bfloat16()
     sh_all = (torch.randn(padded, H, generator=gi, device=dev) * 0.3).bfloat16()
     pr_all = (torch.randn(padded, H, generator=gi, device=dev) * 0.3).bfloat16()
@@ -517,7 +510,6 @@ def _check_prefill_front_tail(
         up_proj_weight=w_up,
         next_qkv_a_weight=w_qkv_a,
     )
-    # Verify against full-row qkv_a projection
     st_full = (
         F.linear(rms_norm_bf16(hidden=lat_all[:m], weight=w_norm), w_up)
         + sh_all[:m]
@@ -528,7 +520,7 @@ def _check_prefill_front_tail(
     rel_qkv = err_qkv / (qkv_a_ref.float().abs().max().item() + 1e-6)
     assert rel_qkv < 1e-2, f"moe_tail_mix_qkv_a M={m}: err={err_qkv} rel={rel_qkv}"
 
-    # 5) 7168-dim auto-chunked row_allgather check (including M=8192!)
+    # Above 320 rows per rank the 7168-dim gather runs in chunks.
     got_7168 = prefill_row_allgather(heap=heap, x_shard=normed_shard, num_tokens=m)
     assert torch.equal(got_7168, normed_all[:m]), f"row_allgather 7168 M={m} mismatch!"
 
@@ -569,17 +561,20 @@ def _bench_prefill(
 
         t_oproj_base = _bench_us(_oproj_base)
 
-        t_fp4_ag = _bench_us(
-            lambda: sharded_front_fp4_ag(
+        def _front_ag(use_fp4: bool):
+            return sharded_front_fp4_ag(
                 heap=heap,
                 normed_shard=normed_sh,
                 num_tokens=m,
                 router_down_weight=w_rd,
                 router_cols=ROUTER,
                 topk_fn=_topk_fn,
-                use_fp4=True,
+                use_fp4=use_fp4,
             )
-        )
+
+        t_fp4_ag = _bench_us(lambda: _front_ag(use_fp4=True))
+        # MXFP8 is the serving payload (the hook's default use_fp4=False).
+        t_fp8_ag = _bench_us(lambda: _front_ag(use_fp4=False))
 
         def _bf16_ag_base():
             dist.all_gather_into_tensor(normed_full, normed_sh)
@@ -616,6 +611,7 @@ def _bench_prefill(
             print(
                 f"M={m:4d} | o_proj+XGMI_RS: {t_oproj_ov:7.1f} vs RCCL {t_oproj_base:7.1f} us ({t_oproj_base / t_oproj_ov:.2f}x) "
                 f"| 1/8 front+FP4_AG: {t_fp4_ag:7.1f} vs BF16_AG+full {t_bf16_base:7.1f} us ({t_bf16_base / t_fp4_ag:.2f}x) "
+                f"| 1/8 front+FP8_AG: {t_fp8_ag:7.1f} vs BF16_AG+full {t_bf16_base:7.1f} us ({t_bf16_base / t_fp8_ag:.2f}x) "
                 f"| tail+qkv_a_2112_AG: {t_qkv_mix:7.1f} vs 7168_AG+full {t_qkv_base:7.1f} us ({t_qkv_base / t_qkv_mix:.2f}x)"
             )
 
