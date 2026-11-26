@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi-K3.1 wide launch tile configs keep every stage of a launch in one BLOCKS round."""
+"""Kimi-K3.1 wide launch tile configs keep the five GEMM stages of a launch in one BLOCKS round."""
 
 import math
 
