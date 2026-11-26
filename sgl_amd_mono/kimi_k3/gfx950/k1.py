@@ -259,7 +259,7 @@ def _in_proj_operands(attn):
         w_fb = attn._bfa_f_b_w
     else:
         # bf16: the merged view SGLang builds when a monokernel backend is selected
-        merged = getattr(attn, "_qkvgbfa_layer", None)
+        merged = attn._qkvgbfa_layer
         if merged is None:
             raise ValueError(
                 "the KDA in-projection is not merged "

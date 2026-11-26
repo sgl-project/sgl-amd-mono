@@ -717,7 +717,7 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
         row = NVB
         case = K1Case(self.device, num_acc=QLEN, write_idx=row)
         case.blocks = case.blocks[:, :row].contiguous()
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(AssertionError, "past a bank"):
             case.run()
 
 
