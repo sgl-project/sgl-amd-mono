@@ -61,7 +61,7 @@ def models_for(files):
     serving tests, no speed test or accuracy benchmark, which would measure the
     same kernels as the base branch. A PR whose code changes in more than
     ``FULL_TIER_MAX_MODELS`` models runs them at the smoke tier, and ``common`` in
-    full: a change that broad is a refactor, and the nightly runs them in full."""
+    full: a change that broad is a refactor, and the weekly run runs them in full."""
     changed = [f["filename"] for f in files]
     code = {
         p for f in changed if f.startswith("sgl_amd_mono/") and (p := package_of(f))
@@ -84,7 +84,7 @@ def models_for(files):
     if len(touched) > FULL_TIER_MAX_MODELS:
         why = (
             f"code changed in {len(touched)} models, more than "
-            f"{FULL_TIER_MAX_MODELS}; the nightly runs them in full"
+            f"{FULL_TIER_MAX_MODELS}; the weekly run runs them in full"
         )
         models.setdefault("common", (why, "full"))
         models.update({key: (why, "smoke") for key in touched})

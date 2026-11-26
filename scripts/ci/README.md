@@ -10,8 +10,14 @@ nodes:
   SGLang ROCm image, the accuracy benchmarks (but the `weekly` ones: AIME26 x4,
   the costliest, and a model's `weekly_evals`, such as Kimi-K3's MMMU-Pro, ~8 h
   at one request at a time) and the speed test with the monokernels on, for the models marked
-  `nightly` in `models.py`, held to each model's fixed `baseline`. Saturday's
-  **weekly** run has every benchmark with the monokernels on and off; its off
+  `nightly` in `models.py`, held to each model's fixed `baseline`. A model the PR
+  test runs is in the nightly at the **tests** tier only (its tests and serving
+  tests, no benchmark or speed test): every change to it is measured by the PR
+  test, so between PRs only the SGLang image changes, and its tests catch that
+  the day it does. Of the nightly models, only Kimi-K3 (`"pr": False`) still runs
+  its benchmarks and speed test every night. Saturday's
+  **weekly** run has every benchmark with the monokernels on and off, for every
+  model in full; its off
   results are the reference the nightly and the PR test read until the next one.
   A run of the nightly workflow with `weekly` ticked writes that reference too,
   from whichever branch it runs, so run it by hand on `main` only.
@@ -69,7 +75,7 @@ MiniMax-M3) or one whose checkpoint is not on the CI nodes. A dispatch with
 - a PR whose package code changes in more than `FULL_TIER_MAX_MODELS` (3) models,
   such as a refactor or an API move across packages, runs each of them at the
   **smoke** tier instead of the full one, and `common` in full: fourteen full-tier
-  jobs would hold both GPU runners for most of a day. The nightly runs them in
+  jobs would hold both GPU runners for most of a day. The weekly run runs them in
   full; to run a PR in full anyway, run the workflow by hand with `models`.
 
 A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
@@ -94,13 +100,13 @@ these sides:
   only, read-only in the PR test and the nightly. The weekly run hands the files
   it writes to the directory's owner (the runner account).
 
-| Check | PR test, full tier | PR test, smoke tier | Nightly | Weekly |
-| --- | --- | --- | --- | --- |
-| Tests | unit (on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same | unit, kernel and serving tests | same |
-| Kernel microbenchmark | the model's timing scripts, base and PR | same | main | main |
-| Accuracy | sgl-eval GSM8K (1319 questions), on and off; GPQA too with `run-ci-extra` | the serving tests' GSM8K and KL bounds | GSM8K, GPQA Diamond (and MMMU-Pro for vision models), on | the nightly's and AIME26 x4, on and off |
-| E2E performance | InferenceX fixed length at the model's concurrencies, base and on | the gate concurrencies only | on (against the monokernel-off reference) | off and on |
-| Scope | the server's startup lines that say which steps the launches serve | same | same | same |
+| Check | PR test, full tier | PR test, smoke tier | Nightly, tests tier (models the PR test runs) | Nightly, full (Kimi-K3) | Weekly |
+| --- | --- | --- | --- | --- | --- |
+| Tests | unit (on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same | unit, kernel (the PR test's widths) and serving tests | unit, kernel and serving tests | same |
+| Kernel microbenchmark | the model's timing scripts, base and PR | same | main | main | main |
+| Accuracy | sgl-eval GSM8K (1319 questions), on and off; GPQA too with `run-ci-extra` | the serving tests' GSM8K and KL bounds | the serving tests' bounds | GSM8K, GPQA Diamond (and MMMU-Pro for vision models), on | every benchmark (AIME26 x4 too), on and off |
+| E2E performance | InferenceX fixed length at the model's concurrencies, base and on | the gate concurrencies only | none | on (against the monokernel-off reference) | off and on |
+| Scope | the server's startup lines that say which steps the launches serve | same | the serving tests | same | same |
 
 E2E performance is `sglang.benchmark.serving`: random 8k in / 1k out, range
 ratio 0.8, 10 prompts a slot. The report keeps median TPOT (p50), which gates, and
@@ -154,7 +160,7 @@ the pinned commit serves, a server with the monokernels on answering a few
 requests. A change in SGLang that the pinned commit does not follow, such as a
 field added to an op, fails that check the day the image picks it up.
 
-The nightly fails the same way on tests. It holds each on score to the model's
+The nightly fails the same way on tests. For a model it runs in full, it holds each on score to the model's
 `baseline` in `models.py`: GSM8K below it fails, the other benchmarks warn. A
 benchmark without a baseline is compared with the monokernel-off reference (the
 latest weekly off result) instead. Each weekly report suggests baselines (the off
