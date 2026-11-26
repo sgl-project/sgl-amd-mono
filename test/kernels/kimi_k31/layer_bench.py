@@ -168,6 +168,34 @@ def sort_check_aux16(m, nl, tk_ids, tk_w, moe_out, sortb, rank):
     return bad
 
 
+def _prefix_capture_is_exact(cap_view, mid) -> bool:
+    # prefix capture emits the kernel's own mid slice unchanged; compare bits,
+    # since torch.equal treats +0 and -0 as equal
+    parts = [torch.empty_like(mid) for _ in range(TP)]
+    dist.all_gather(parts, mid.contiguous())
+    full = torch.cat(parts, dim=-1)
+    return torch.equal(cap_view.view(torch.int16), full.view(torch.int16))
+
+
+def _passes(e, *, restart) -> bool:
+    # end to end a top-16 flips where the 16th / 17th keys are closer than the
+    # upstream rounding; the routing itself must match on its own logits exactly
+    # restart: h is the attention output alone (no prefix), so it carries core's error undiluted
+    return (
+        e[0] < 1e-2
+        and e[1] < (3e-2 if restart else 1e-2)
+        and e[2] < 3e-2
+        and e[3] < 3e-2
+        and e[4] < 3e-2
+        and e[5] < (2e-3 if restart else 1e-3)
+        and e[8] == 0
+        and e[9] < 1e-5
+        and e[10] < 1e-2
+        and e[11] < 1e-2
+        and e[12] == 0
+    )
+
+
 def run(args, m, rank, dev, cpu):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
@@ -563,16 +591,8 @@ def run(args, m, rank, dev, cpu):
         )  # the unused row
         if cap:
             worst["cap"] = max(worst["cap"], rel(cap_view, s["ref"]["cap"]))
-            if cap == "prefix":
-                # prefix capture emits the kernel's own mid slice unchanged; compare bits,
-                # since torch.equal treats +0 and -0 as equal
-                mid_parts = [torch.empty_like(mid) for _ in range(TP)]
-                dist.all_gather(mid_parts, mid.contiguous())
-                mid_full = torch.cat(mid_parts, dim=-1)
-                if not torch.equal(
-                    cap_view.view(torch.int16), mid_full.view(torch.int16)
-                ):
-                    worst["cap"] = float("inf")
+            if cap == "prefix" and not _prefix_capture_is_exact(cap_view, mid):
+                worst["cap"] = float("inf")
             others = torch.cat(
                 [aux[..., : CAP_SLOT * H], aux[..., (CAP_SLOT + 1) * H :]], dim=-1
             )
@@ -638,23 +658,7 @@ def run(args, m, rank, dev, cpu):
     every = [torch.empty_like(stats) for _ in range(TP)]
     dist.all_gather(every, stats)
     e = torch.stack(every).max(0).values.tolist()
-    # end to end a top-16 flips where the 16th / 17th keys are closer than the
-    # upstream rounding; the routing itself must match on its own logits exactly
-    # restart: h is the attention output alone (no prefix), so it carries core's error undiluted
-    rs = args.restart
-    ok = (
-        e[0] < 1e-2
-        and e[1] < (3e-2 if rs else 1e-2)
-        and e[2] < 3e-2
-        and e[3] < 3e-2
-        and e[4] < 3e-2
-        and e[5] < (2e-3 if rs else 1e-3)
-        and e[8] == 0
-        and e[9] < 1e-5
-        and e[10] < 1e-2
-        and e[11] < 1e-2
-        and e[12] == 0
-    )
+    ok = _passes(e, restart=args.restart)
     if rank == 0:
         print(
             f"layer m {m:3d} L {L} nvb a{nva}{'w' if wa else ''} m{nvm}  rel_l2 mid {e[0]:.2e} h {e[1]:.2e} core "

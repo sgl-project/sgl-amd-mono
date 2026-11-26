@@ -557,7 +557,7 @@ class Wide:
             *(Gemm(*(int(v) for v in c.split(":"))) for c in cfg_rows(b, self.L))
         )
 
-    def _variant(self, pk, b, L, captures, *, capture_stream):
+    def _variant(self, pk, *, captures, capture_stream):
         cap = capture_stream if (pk.i - 1) in captures else False
         return dict(
             nvb_a=pk.nvb,
@@ -580,7 +580,7 @@ class Wide:
         half, scratch = 0, 0
         for pk in self.layers.values():
             # sizing only: both capture streams use the same plan
-            v = self._variant(pk, b, L, captures, capture_stream="attn_res")
+            v = self._variant(pk, captures=captures, capture_stream="attn_res")
             for cap in (
                 False,
                 True,
@@ -759,7 +759,7 @@ class Wide:
             win_row = torch.full((b // L,), -1, dtype=torch.int32, device=dev)
             seen = set()
             for pk in self.layers.values():
-                v = self._variant(pk, b, L, set(), capture_stream="attn_res")
+                v = self._variant(pk, captures=set(), capture_stream="attn_res")
                 key = tuple(sorted(v.items()))
                 if key in seen:
                     continue
@@ -1008,7 +1008,7 @@ class Wide:
                 i += 1
             for n, li in enumerate(run):
                 pk = self.layers[li]
-                v = self._variant(pk, b, L, captures, capture_stream=capture_stream)
+                v = self._variant(pk, captures=captures, capture_stream=capture_stream)
                 assert v["t1"] == (n > 0 or (li - 1) in self.entry)
                 assert res.num_valid_blocks == pk.nvb, (
                     li,

@@ -586,7 +586,7 @@ def _seam(
 
 @flyc.jit
 def capture_row(c, row, m, cap_out, cap_ld):
-    """The row's gathered pre-norm mixture -> the DSpark capture slot (row stride
+    """The row's gathered capture (pre-norm mixture or raw prefix) -> the DSpark slot (row stride
     ``cap_ld`` elements, e.g. a column block of the packed aux buffer)."""
     tid = c["tid"]
     if tid < TP:

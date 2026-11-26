@@ -58,15 +58,9 @@ def test_wide_capture_stream_and_variant():
 
     pk = SimpleNamespace(i=76, nvb=7, write=False, t1=True)
     w = object.__new__(wide.Wide)
+    assert w._variant(pk, captures={75}, capture_stream="prefix")["capture"] == "prefix"
     assert (
-        w._variant(pk, b=48, L=6, captures={75}, capture_stream="prefix")["capture"]
-        == "prefix"
-    )
-    assert (
-        w._variant(pk, b=48, L=6, captures={75}, capture_stream="attn_res")["capture"]
+        w._variant(pk, captures={75}, capture_stream="attn_res")["capture"]
         == "attn_res"
     )
-    assert (
-        w._variant(pk, b=48, L=6, captures={79}, capture_stream="prefix")["capture"]
-        is False
-    )
+    assert w._variant(pk, captures={79}, capture_stream="prefix")["capture"] is False
