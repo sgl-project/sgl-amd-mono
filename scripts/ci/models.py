@@ -312,6 +312,9 @@ MODELS = {
         "name": "Kimi-K3 (Quark MXFP4, FP8 attention)",
         # K1 reads the FP8 in_proj only as SGLang's merged fused_qkvg_proj
         "blocked": "needs SGLang's merged Quark FP8 KDA in_proj (sgl-project/sglang#44362)",
+        # Not in the PR test: no checkpoint on the CI nodes and no kernel tests of its
+        # own (kimi_k3's run them), so a PR job would only re-run the unit tests.
+        "pr": False,
         "packages": ["kimi_k3"],
         "tp": 8,
         "paths": {

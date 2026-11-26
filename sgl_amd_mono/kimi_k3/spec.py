@@ -109,13 +109,13 @@ SGLANG_READS = {
     # the K3 AITER switch the expert layout depends on; its renamed Envs field
     # is optional, and SGLANG_AITER_K3_OPT is read where it does not exist yet
     "srt/environ.py": ("envs",),
-    # a Quark per-channel FP8 o_proj, and whether SGLang preshuffled it
     # the SiTU parameters K2 hard-codes
     "srt/configs/kimi_linear.py": (
         "activation_situ_beta",
         "activation_situ_linear_beta",
     ),
-    # set on every Quark linear; a non-Quark linear has none, hence the guarded read
+    # a Quark per-channel FP8 projection, and whether SGLang preshuffled it; scheme is
+    # set on every Quark linear, and a non-Quark linear has none (a guarded read)
     "srt/layers/quantization/quark/quark.py": ("scheme",),
     "srt/layers/quantization/quark/schemes/quark_w8a8_fp8.py": (
         "QuarkW8A8Fp8",
@@ -123,15 +123,15 @@ SGLANG_READS = {
         "is_static_input_scheme",
         "weight_scale",
     ),
+    "srt/layers/quantization/fp8_utils.py": (
+        "use_aiter_bpreshuffle_gemm",
+        "use_aiter_bpreshuffle_gemm(output_size)",
+    ),
     # o_proj's bias, which the launch has no term for
     "srt/layers/linear.py": ("bias",),
     # the experts' activation, which the launch computes as SiTU
     "srt/layers/moe/fused_moe_triton/layer.py": ("moe_runner_config",),
     "srt/layers/moe/moe_runner/base.py": ("activation",),
-    "srt/layers/quantization/fp8_utils.py": (
-        "use_aiter_bpreshuffle_gemm",
-        "use_aiter_bpreshuffle_gemm(output_size)",
-    ),
     "srt/utils/common.py": (
         "BumpAllocator",
         "get_bool_env_var",
