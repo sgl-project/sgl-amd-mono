@@ -16,8 +16,10 @@ nodes:
   test, so between PRs only the SGLang image changes, and its tests catch that
   the day it does. Saturday's
   **weekly** run has every benchmark with the monokernels on and off, for every
-  model in full, and the models marked `weekly` too: Qwen3.5-397B-A17B and the
-  deprecated DeepSeek-V4-Pro, which the PR test does not run (the deprecated
+  model in full, and the models marked `weekly` too: Qwen3.5-397B-A17B, the
+  deprecated DeepSeek-V4-Pro, which the PR test does not run, and Kimi-K3.1,
+  Muse-Spark and MiniMax-M3.1-Flash (their unit, kernel and timing tests: none
+  has a checkpoint or launches the CI nodes can serve yet) (the deprecated
   Kimi-K3 runs only when dispatched with `models`); its off
   results are the reference the nightly and the PR test read until the next one.
   A run of the nightly workflow with `weekly` ticked writes that reference too,

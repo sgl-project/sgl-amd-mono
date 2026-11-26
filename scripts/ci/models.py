@@ -321,6 +321,9 @@ MODELS = {
     },
     "kimi_k31": {
         "name": "Kimi-K3.1",
+        # the weekly run (Saturdays): its unit, kernel and timing tests until it
+        # has a checkpoint and a serving recipe
+        "weekly": True,
         "packages": ["kimi_k31", "kimi_k3"],
         "tp": 8,
         # moonshotai/Kimi-K3.1; not on the CI nodes yet, and no serving recipe
@@ -361,6 +364,9 @@ MODELS = {
     },
     "minimax_m31": {
         "name": "MiniMax-M3.1-Flash",
+        # the weekly run (Saturdays): its unit and kernel tests (no MI355X launches
+        # to serve yet)
+        "weekly": True,
         "packages": ["minimax_m31", "minimax"],
         "tp": 4,
         # the launches cover MI350X only; the CI nodes are MI355X
@@ -418,6 +424,9 @@ MODELS = {
     },
     "muse_spark": {
         "name": "Muse-Spark",
+        # the weekly run (Saturdays): its unit and kernel tests until it has a
+        # serving recipe
+        "weekly": True,
         "packages": ["muse_spark"],
         "tp": 8,
         # no serving recipe under test/e2e yet
