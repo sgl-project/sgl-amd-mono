@@ -266,8 +266,8 @@ MODELS = {
     },
     "glm53_flash": {
         "name": "GLM-5.3-Flash",
-        # Phase 1 of the nightly
-        "nightly": True,
+        # the weekly run (Saturdays) only: the PR test covers every change to it
+        "weekly": True,
         # set from the first weekly report
         "baseline": {},
         "packages": ["glm53_flash"],

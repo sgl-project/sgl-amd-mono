@@ -16,7 +16,8 @@ nodes:
   test, so between PRs only the SGLang image changes, and its tests catch that
   the day it does. Saturday's
   **weekly** run has every benchmark with the monokernels on and off, for every
-  model in full, and the models marked `weekly` too: Qwen3.5-397B-A17B, and
+  model in full, and the models marked `weekly` too: GLM-5.3-Flash and
+  Qwen3.5-397B-A17B (the PR test covers every change to them), and
   Kimi-K3.1, Muse-Spark and MiniMax-M3.1-Flash (their unit, kernel and timing
   tests: none has a checkpoint or launches the CI nodes can serve yet). The
   deprecated DeepSeek-V4-Pro and Kimi-K3 run only when dispatched with `models`.
@@ -55,6 +56,11 @@ sets it, and `queue-status.yml` (every 10 minutes, `queue_status.py`) keeps it
 current until the report sets the result. "Ahead" counts the GPU jobs running now
 and those queued by older runs; GitHub does not promise to hand queued jobs out
 oldest first, so it is an estimate.
+
+The same scheduled pass cancels a nightly run whose GPU job has waited for a runner
+more than 12 hours (`NIGHTLY_MAX_QUEUE_HOURS` in `queue_status.py`): the nightly's
+jobs take about 4.5 GPU hours, so it should end the day it starts, and the next one
+tests a newer image. The weekly run is never cancelled this way.
 
 ## What runs
 

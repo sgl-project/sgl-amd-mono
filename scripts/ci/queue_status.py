@@ -19,8 +19,13 @@ sets the final status.
 
 ``--run`` handles that one run only (the plan job calls it before its GPU jobs
 exist, with ``--models`` for the description); without it, every PR test that is
-queued or in progress (the queue-status workflow, on a schedule). Reads
-``GITHUB_TOKEN`` (actions: read, statuses: write) and ``GITHUB_REPOSITORY``.
+queued or in progress (the queue-status workflow, on a schedule). The scheduled
+pass also cancels a nightly run whose GPU job has waited for a runner more than
+``NIGHTLY_MAX_QUEUE_HOURS``: the nightly should end the day it starts, and the
+next one tests a newer image. The weekly run's jobs are not cancelled: nine of
+them queue behind each other for most of a day by design. Reads ``GITHUB_TOKEN``
+(actions: read, statuses: write; actions: write to cancel) and
+``GITHUB_REPOSITORY``.
 """
 
 import argparse
@@ -29,12 +34,18 @@ import os
 import sys
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 API = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 RUNNER_LABEL = "sgl-amd-mono-mi355x"
 CONTEXT = "AMD PR test"
 PR_TEST = "pr-test-amd.yml"
-GPU_WORKFLOWS = (PR_TEST, "nightly-amd.yml")
+NIGHTLY = "nightly-amd.yml"
+GPU_WORKFLOWS = (PR_TEST, NIGHTLY)
+# A nightly GPU job still waiting for a runner after this long cancels its run. The
+# nightly's jobs take ~4.5 GPU hours (about 2.5 h on the two runners), so a job
+# that starts by then still ends well inside the day.
+NIGHTLY_MAX_QUEUE_HOURS = float(os.environ.get("NIGHTLY_MAX_QUEUE_HOURS", "12"))
 
 
 def api(path, method="GET", body=None):
@@ -49,7 +60,27 @@ def api(path, method="GET", body=None):
         },
     )
     with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)
+        data = r.read()
+        return json.loads(data) if data else None
+
+
+def hours_since(ts, now):
+    return (
+        now - datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    ).total_seconds() / 3600
+
+
+def stale_nightly(runs, jobs, now):
+    """(run, hours) for each nightly run (not the weekly one) with a GPU job that
+    has waited for a runner more than NIGHTLY_MAX_QUEUE_HOURS."""
+    for run in runs:
+        waited = [
+            hours_since(j["created_at"], now)
+            for j in jobs[run["id"]]
+            if j["status"] == "queued" and j["name"].startswith("nightly (")
+        ]
+        if waited and max(waited) > NIGHTLY_MAX_QUEUE_HOURS:
+            yield run, max(waited)
 
 
 def active_runs(repo, workflow):
@@ -136,6 +167,16 @@ def main():
         for w in GPU_WORKFLOWS
         for r in runs[w]
     ]
+
+    if args.run is None:
+        now = datetime.now(timezone.utc)
+        for run, hours in stale_nightly(runs[NIGHTLY], jobs, now):
+            print(
+                f"cancel nightly run {run['id']}: a GPU job has waited {hours:.1f} h "
+                f"for a runner (limit {NIGHTLY_MAX_QUEUE_HOURS:g} h)"
+            )
+            if not args.dry_run:
+                api(f"repos/{repo}/actions/runs/{run['id']}/cancel", "POST")
 
     targets = [r for r in runs[PR_TEST] if args.run in (None, r["id"])]
     if args.run and not targets:
