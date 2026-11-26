@@ -404,6 +404,26 @@ MODELS = {
         "concurrency": [1, 2, 4, 8],
         "gate_concurrency": [1, 8],
     },
+    "qwen38_a95b_mxfp4": {
+        "name": "Qwen3.8-2.4T-A95B (MXFP4)",
+        # Phase 1 of the nightly
+        "nightly": True,
+        # set from the first weekly report
+        "baseline": {},
+        "packages": ["qwen38_a95b_mxfp4"],
+        "tp": 8,
+        "paths": {
+            "QWEN38_A95B_MXFP4_MODEL_PATH": f"{HF}/amd/Qwen3.8-2.4T-A95B-Quark-MXFP4"
+        },
+        "recipe": ("qwen38_a95b_mxfp4_server", "ARGS"),
+        "kernel_tests": ["test/kernels/test_qwen38_a95b_mxfp4_kernels.py"],
+        "e2e_tests": ["test/e2e/test_qwen38_a95b_mxfp4_server.py"],
+        "microbench": [],
+        "evals": TEXT_EVALS,
+        # decode steps of up to 8 rows
+        "concurrency": [1, 2, 4, 8, 16],
+        "gate_concurrency": [1, 8],
+    },
     "qwen38_flash_next": {
         "name": "Qwen3.8-Flash-Next (MXFP4)",
         # Phase 1 of the nightly
