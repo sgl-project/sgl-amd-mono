@@ -25,6 +25,7 @@ from sgl_amd_mono.common.ops import (
     ballot,
     fp8_to_bf16x8,
     hw_exp2,
+    lane_gather,
     mfma_bf16,
     permlane_swap,
     rsrc,
@@ -148,13 +149,17 @@ def lds_views(loop, tree):
 
 
 @flyc.jit
-def run_dattn(c, o_flag=None):
+def run_dattn(c, o_flag=None, o_box=None, prefetch=None):
     """D-attn's work on this CTA for ``c["S"]`` rows, ``c["QL"]`` a request.
     ``o_flag`` (a mailbox region): each level-2 merge raises its (request, KV
-    head, row tile)'s flag once its o rows are out (a launch that goes on to K2)."""
+    head, row tile)'s flag once its o rows are out (a launch that goes on to K2);
+    ``o_box`` (a mailbox region, [token][Q_K] bf16 pairs): the o rows go there as
+    tagged pairs instead (a launch whose o GEMV polls them). ``prefetch()`` (a
+    later stage's weights) is issued after this CTA's attention tasks, before its
+    merge jobs; its result is returned."""
     S, QL = c["S"], c["QL"]
     tid, bid, lane, wave = c["tid"], c["bid"], c["lane"], c["wave"]
-    put, poll = c["put"], c["poll"]
+    put, put_bf, poll = c["put"], c["put_bf"], c["poll"]
     part_w, pflag, l2_w, l2flag = c["part"], c["pflag"], c["l2"], c["l2flag"]
     a = c["args"]
     R = S // QL
@@ -183,6 +188,9 @@ def run_dattn(c, o_flag=None):
     r_q = rsrc(a["q"])
     r_part = rsrc(part_w.value)
     r_l2 = rsrc(l2_w.value)
+    # q and the block's K / V from this launch's D-pre (``hflag``): past the L2
+    hflag, xcm = c.get("hflag"), c.get("xcm", 0)
+    kv_policy = "sc1" if hflag is not None else ""
     stamp(c, 0)
 
     def req_pool_of(r):
@@ -289,8 +297,20 @@ def run_dattn(c, o_flag=None):
         a2 = ok.select(hw_exp2(m2 - mg), fx.Float32(0.0))
         return ok.select(mn, m), l * a1 + l2 * a2, ov * a1 + v2 * a2
 
+    def first_ids(r, p):
+        """Thread tid's page id of the first block of partition p of request r (tid <
+        IDS_CHUNKS * 16; clamped elsewhere)."""
+        keys = seq_len_of(r)
+        lo, hi = chunk_range(keys, 0)
+        c_lo = fx.max(lo, lo + p * (part // CHUNK))
+        c_last = fx.max(fx.min(hi, lo + (p + 1) * (part // CHUNK)) - 1, c_lo)
+        rpi = req_pool_of(r)
+        idx = fx.min(tid, IDS_CHUNKS * 16 - 1)
+        cc_i = fx.min(c_lo + idx // 16, c_last)
+        return fx.Int32(bo.buffer_load(r_pt, rpi * table_stride + (cc_i * 16 + idx % 16) * 16, vec_width=1, dtype=T.i32))  # fmt: skip
+
     # ============================================ attention tasks
-    def attn_task(r, h, rt0, p):
+    def attn_task(r, h, rt0, p, pre_id, use_pre):
         """Row tiles rt0 .. rt0 + NT of (request r, KV head h) over partition p: one
         K / V load and one V^T staging a chunk serve every tile of the task."""
         keys = seq_len_of(r)
@@ -310,6 +330,7 @@ def run_dattn(c, o_flag=None):
                     // 2,
                     vec_width=4,
                     dtype=T.i32,
+                    cache_modifier=xcm,
                 )  # fmt: skip
             )
             fx.ptr_store(
@@ -379,11 +400,14 @@ def run_dattn(c, o_flag=None):
                     voff = ((pg * 16 + l16d) * LOCAL_KV_HEADS + h) * HEAD_DIM + (
                         c16d + 4 * hf
                     ) * 16
-                    lds_dma_16(r_k, slot + (kt * PAGE_WORDS + hf * 256), voff)
+                    lds_dma_16(
+                        r_k, slot + (kt * PAGE_WORDS + hf * 256), voff, kv_policy
+                    )
                     lds_dma_16(
                         r_v,
                         slot + ((KEY_TILES + kt) * PAGE_WORDS + kt * V_SKEW + hf * 256),
                         voff,
+                        kv_policy,
                     )
 
         def quad_max(v):
@@ -406,22 +430,33 @@ def run_dattn(c, o_flag=None):
             b_hi = fx.min(b_lo + IDS_CHUNKS, c_hi)
             b_last = b_hi - 1
             gpu.barrier()  # the previous block's ids are consumed
-            rpi = req_pool_of(r)
             if tid < IDS_CHUNKS * 16:
-                idx = tid
-                cc_i = fx.min(b_lo + idx // 16, c_last)
-                slot0 = fx.Int32(bo.buffer_load(r_pt, rpi * table_stride + (cc_i * 16 + idx % 16) * 16, vec_width=1, dtype=T.i32))  # fmt: skip
-                fx.ptr_store(slot0 // 16, ids + idx)
+                if (b == 0) & use_pre:
+                    fx.ptr_store(
+                        pre_id // 16, ids + tid
+                    )  # (loaded before the head flags)
+                else:
+                    rpi = req_pool_of(r)
+                    idx = tid
+                    cc_i = fx.min(b_lo + idx // 16, c_last)
+                    slot0 = fx.Int32(bo.buffer_load(r_pt, rpi * table_stride + (cc_i * 16 + idx % 16) * 16, vec_width=1, dtype=T.i32))  # fmt: skip
+                    fx.ptr_store(slot0 // 16, ids + idx)
             gpu.barrier()
+            # only real chunks go out (a clamped repeat of the last chunk cost a third DMA
+            # whose landing the block's end waited for); the wait below counts what is in flight
             issue(b_lo, 0, b_lo)
-            issue(fx.min(b_lo + 1, b_last), 1, b_lo)
+            if b_lo + 1 <= b_last:
+                issue(b_lo + 1, 1, b_lo)
             for cc in range(b_lo, b_hi):
                 sl = (cc - b_lo) % 2
                 slot = wring + sl * SLOT_WORDS
                 key0 = cc * CHUNK + ks * KEYS_PER_WAVE
-                rocdl.s_waitcnt(
-                    vmcnt=2 * KEY_TILES * PAGE_DMAS
-                )  # chunk cc's pages landed (cc + 1's in flight)
+                if cc + 1 <= b_last:
+                    rocdl.s_waitcnt(
+                        vmcnt=2 * KEY_TILES * PAGE_DMAS
+                    )  # chunk cc's pages landed (cc + 1's in flight)
+                else:
+                    rocdl.s_waitcnt(vmcnt=0)  # chunk cc (the block's last) landed
                 # the chunk's K operands (tile kt, step: key l16, dims 32 step + 8 g4)
                 kb = []
                 for kt in range_constexpr(KEY_TILES):
@@ -519,7 +554,8 @@ def run_dattn(c, o_flag=None):
                     for it in range(NT)
                 ]
                 rocdl.s_waitcnt(lgkmcnt=0)  # every read of the slot is done
-                issue(fx.min(cc + 2, b_last), sl, b_lo)  # chunk cc + 2 into this slot
+                if cc + 2 <= b_last:
+                    issue(cc + 2, sl, b_lo)  # chunk cc + 2 into this slot
                 if cc == b_lo:
                     stamp(c, 4)  # the first chunk done
             rocdl.s_waitcnt(
@@ -606,7 +642,8 @@ def run_dattn(c, o_flag=None):
     for rr in range_constexpr(1, R):
         starts.append(starts[-1] + counts[rr - 1])
     total = starts[-1] + counts[-1]
-    for job in range(bid, total, BLOCKS):
+
+    def job_of(job):
         r = fx.Int32(0)
         for rr in range_constexpr(1, R):
             r = (job >= starts[rr]).select(fx.Int32(rr), r)
@@ -615,11 +652,26 @@ def run_dattn(c, o_flag=None):
             base = (r == rr).select(starts[rr], base)
         np_r = n_parts_of(r)
         local = job - base
-        p = local % np_r
-        rt0 = ((local // np_r) % TASK_TILES) * NT
-        h = (local // (np_r * TASK_TILES)) % LOCAL_KV_HEADS
-        attn_task(r, h, rt0, p)
+        return (
+            r,
+            ((local // (np_r * TASK_TILES)) % LOCAL_KV_HEADS),
+            ((local // np_r) % TASK_TILES) * NT,
+            local % np_r,
+        )
+
+    # this CTA's first task's first block of page ids, loaded before the head flags (the
+    # request's req_to_token row does not depend on this launch): the dependent
+    # req_pool -> table round trips overlap the wait instead of following Q
+    rq0, hq0, rtq0, pq0 = job_of(fx.min(bid, total - 1))
+    pre_id = first_ids(rq0, pq0)
+    if const_expr(hflag is not None):
+        if bid < total:
+            poll_flags(c, [(hflag, c["h_flags"])])
+    for job in range(bid, total, BLOCKS):
+        r, h, rt0, p = job_of(job)
+        attn_task(r, h, rt0, p, pre_id, job == bid)
     stamp(c, 1)  # the attention tasks done
+    pre = prefetch() if prefetch is not None else None
 
     # ============================================ merge jobs
     # a thread: row 16 rt + tid / 32, dims 8 ((tid / 4) % 8) + 64 pass .., partition lane tid % 4
@@ -668,36 +720,32 @@ def run_dattn(c, o_flag=None):
         return ok.select(mn, m), l * a1 + l2 * a2, o0 * a1 + p0 * a2, o1 * a1 + p1 * a2
 
     def combine_lanes(m, l, o0, o1):
-        """The four partition lanes of a (row, 8 dims) fold in LDS: every lane folds
-        the four in lane order (the same result on each; lane 0 stores)."""
-        slot = red + tid * 10
-        fx.ptr_store(m, slot)
-        fx.ptr_store(l, slot + 1)
-        for j in range_constexpr(4):
-            fx.ptr_store(fx.Float32(o0[j]), slot + (2 + j))
-            fx.ptr_store(fx.Float32(o1[j]), slot + (6 + j))
-        gpu.barrier()
-        base = red + (tid - pl) * 10
+        """The four partition lanes of a (row, 8 dims) fold across the quad by lane
+        gathers (ds_bpermute; no LDS round trip, no barrier): every lane folds the four
+        in lane order (the same result on each; lane 0 stores)."""
+        q0 = lane - pl  # the quad's first lane
+        vals = (
+            [m, l]
+            + [fx.Float32(o0[j]) for j in range(4)]
+            + [fx.Float32(o1[j]) for j in range(4)]
+        )
         m = fx.Float32(NEG)
         l = fx.Float32(0.0)
         o0 = fx.Vector.filled(4, 0.0, fx.Float32)
         o1 = fx.Vector.filled(4, 0.0, fx.Float32)
         for src in range_constexpr(MERGE_LANES):
-            s2 = base + src * 10
-            m2 = fx.ptr_load(s2)
-            l2 = fx.ptr_load(s2 + 1)
-            p0 = fx.Vector.from_elements(
-                [fx.ptr_load(s2 + (2 + j)) for j in range(4)], fx.Float32
-            )
-            p1 = fx.Vector.from_elements(
-                [fx.ptr_load(s2 + (6 + j)) for j in range(4)], fx.Float32
-            )
+            g = [
+                lane_gather(v.bitcast(fx.Int32), q0 + src).bitcast(fx.Float32)
+                for v in vals
+            ]
+            m2, l2 = g[0], g[1]
+            p0 = fx.Vector.from_elements(g[2:6], fx.Float32)
+            p1 = fx.Vector.from_elements(g[6:10], fx.Float32)
             mn = fx.max(m, m2)
             mg = (mn > fx.Float32(NO_MAX)).select(mn, fx.Float32(0.0))
             a1 = hw_exp2(m - mg)
             a2 = hw_exp2(m2 - mg)
             m, l, o0, o1 = mn, l * a1 + l2 * a2, o0 * a1 + p0 * a2, o1 * a1 + p1 * a2
-        gpu.barrier()  # ``red`` is reused by the CTA's next job
         return m, l, o0, o1
 
     def merge_l1(r, h, rt, g):
@@ -749,7 +797,7 @@ def run_dattn(c, o_flag=None):
                 fx.Int32(1),
             )
 
-    def merge_l2(r, h, rt):
+    def merge_l2(r, h, rt, one_pass=None):
         """Level-2 job: the groups' records (or, with at most DIRECT_MAX partitions,
         the partitions themselves) of (request r, head h, row tile rt) -> o rows
         (two passes over the dims)."""
@@ -771,32 +819,55 @@ def run_dattn(c, o_flag=None):
                     )
                 ],
             )
-        r_src = rsrc(direct.select(part_w.value, l2_w.value))
-        for dp in range_constexpr(D_PASSES):
+        lay = dattn_scratch_layout(S, QL)
+        nb = direct.select(
+            fx.Int64(lay["attn_part"][1] * 8), fx.Int64(lay["attn_l2"][1] * 8)
+        )
+        r_src = rsrc(direct.select(part_w.value, l2_w.value), nb)
+        # both passes' records in flight at once; a lane's records past the partitions
+        # (groups) load from past the region's end: zeros, no traffic (they were clamped
+        # repeats, folded out by ``ok``)
+        gs = [
+            k * MERGE_LANES + pl for k in range(DIRECT_MAX // MERGE_LANES)
+        ]  # partitions (direct) or groups (g < GROUPS)
+        dead = fx.Int32(0x3FFFFF00)
+        idxs = [direct.select(g < np_r, g < GROUPS).select(direct.select(part_row(r, h, fx.min(g, np_r - 1), row), l2_row(r, h, rt, fx.min(g, GROUPS - 1), row16)), dead) for g in gs]  # fmt: skip
+        if const_expr(one_pass is None):
+            passes = list(range(D_PASSES))
+        else:
+            passes = [
+                one_pass
+            ]  # (this CTA's pass of the dims; another CTA does the other)
+        recs = [
+            [load_rec(r_src, idx, (dch + 8 * dp) * 8) for idx in idxs] for dp in passes
+        ]
+        for pi in range_constexpr(len(passes)):
+            dp = passes[pi]
             d0 = (dch + 8 * dp) * 8
             m = fx.Float32(NEG)
             l = fx.Float32(0.0)
             o0 = fx.Vector.filled(4, 0.0, fx.Float32)
             o1 = fx.Vector.filled(4, 0.0, fx.Float32)
-            for k in range_constexpr(DIRECT_MAX // MERGE_LANES):
-                g = k * MERGE_LANES + pl  # a partition (direct) or a group (g < GROUPS)
-                idx = direct.select(
-                    part_row(r, h, fx.min(g, np_r - 1), row),
-                    l2_row(r, h, rt, fx.min(g, GROUPS - 1), row16),
-                )
-                ok = direct.select(g < np_r, g < GROUPS)
-                m, l, o0, o1 = fold_rec(m, l, o0, o1, load_rec(r_src, idx, d0), ok)
+            for k in range_constexpr(len(gs)):
+                ok = direct.select(gs[k] < np_r, gs[k] < GROUPS)
+                m, l, o0, o1 = fold_rec(m, l, o0, o1, recs[pi][k], ok)
             m, l, o0, o1 = combine_lanes(m, l, o0, o1)
             if (pl == 0) & (rt * 16 + row16 < ROWS):
                 inv = fx.Float32(1.0) / l
                 t = r * QL + (rt * 16 + row16) // GQA
-                ov = fx.Vector.from_elements([fx.Float32(o0[j]) for j in range(4)] + [fx.Float32(o1[j]) for j in range(4)], fx.Float32)  # fmt: skip
-                bo.buffer_store(
-                    (ov * inv).to(fx.BFloat16),
-                    rsrc(a["o"]),
-                    t * Q_K + (h * GQA + (rt * 16 + row16) % GQA) * HEAD_DIM + d0,
-                    cache_modifier=CM_DEV,
-                )
+                at = t * Q_K + (h * GQA + (rt * 16 + row16) % GQA) * HEAD_DIM + d0
+                if const_expr(o_box is not None):
+                    # tagged bf16 pairs: the o GEMV polls them (no flag)
+                    put_bf(o_box, at, [o0[j] * inv for j in range(4)])
+                    put_bf(o_box, at + 4, [o1[j] * inv for j in range(4)])
+                else:
+                    ov = fx.Vector.from_elements([fx.Float32(o0[j]) for j in range(4)] + [fx.Float32(o1[j]) for j in range(4)], fx.Float32)  # fmt: skip
+                    bo.buffer_store(
+                        (ov * inv).to(fx.BFloat16),
+                        rsrc(a["o"]),
+                        at,
+                        cache_modifier=CM_DEV,
+                    )
         if const_expr(o_flag is not None):
             # the (request, head, row tile)'s o rows are out: its flag, for the og tasks
             release_stores()
@@ -813,12 +884,23 @@ def run_dattn(c, o_flag=None):
             n_parts_of(r) > DIRECT_MAX
         ):  # else the level-2 job folds the partitions itself
             merge_l1(r, h, rt, g)
-    if mbid < n_l2:
-        rt = mbid % ROW_TILES
-        h = (mbid // ROW_TILES) % LOCAL_KV_HEADS
-        r = mbid // (ROW_TILES * LOCAL_KV_HEADS)
-        merge_l2(r, h, rt)
+    if const_expr(o_box is not None):
+        # a level-2 job's two dim passes on two CTAs (each half the records, one fold
+        # and one quad combine); the o box takes each pass's words independently
+        if mbid < n_l2 * D_PASSES:
+            j2 = mbid // D_PASSES
+            rt = j2 % ROW_TILES
+            h = (j2 // ROW_TILES) % LOCAL_KV_HEADS
+            r = j2 // (ROW_TILES * LOCAL_KV_HEADS)
+            merge_l2(r, h, rt, mbid % D_PASSES)
+    else:
+        if mbid < n_l2:
+            rt = mbid % ROW_TILES
+            h = (mbid // ROW_TILES) % LOCAL_KV_HEADS
+            r = mbid // (ROW_TILES * LOCAL_KV_HEADS)
+            merge_l2(r, h, rt)
     stamp(c, 2)  # the merge done (end)
+    return pre
 
 
 # ---------------------------------------------------------------- the launch
@@ -868,6 +950,7 @@ def dattn_context(
         "wave": tid // 64,
         **lds_views(*_attn_views(lds)),
         "put": mb.put,
+        "put_bf": mb.put_bf,
         "poll": mb.poll,
         "args": args,
         "trace_on": key.trace,

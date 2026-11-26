@@ -19,7 +19,6 @@ from types import SimpleNamespace
 
 import requests
 from minimax_m3_server import ARGS, DECODE_ARGS, ENV, MODEL
-from sglang.kernels.plugin_kernels.amd.spec import FLAG
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.kl_test_utils import (
     get_input_ids,
@@ -54,7 +53,7 @@ def _launch(args=ARGS, extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=args + [FLAG, *extra_args],
+        other_args=args + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )
@@ -178,7 +177,10 @@ class TestMonokernelCheck(CustomTestCase):
         ):
             process = _launch(
                 extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
-                extra_args=["--disable-cuda-graph"],
+                extra_args=[
+                    "--disable-decode-cuda-graph",
+                    "--disable-prefill-cuda-graph",
+                ],
                 log=(out, err),
             )
             try:

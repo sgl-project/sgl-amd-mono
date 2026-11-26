@@ -19,7 +19,6 @@ from types import SimpleNamespace
 import requests
 import torch
 from glm53_flash_server import ARGS, ENV, MODEL, MTP
-from sglang.kernels.plugin_kernels.amd.spec import FLAG
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
 )
@@ -49,7 +48,7 @@ def _launch(extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + [FLAG, *extra_args],
+        other_args=ARGS + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )
@@ -136,7 +135,13 @@ class TestMonokernelMtpEager(CustomTestCase):
         # the row for each of the request's rows (a graph replays unchecked). 4
         # requests of 2 to 11 pages, so the rows differ between requests
         para = "The river valley archive lists the flood height of every year. "
-        process = _launch(extra_args=[*MTP, "--disable-cuda-graph"])
+        process = _launch(
+            extra_args=[
+                *MTP,
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
+            ]
+        )
         try:
             r = requests.post(
                 DEFAULT_URL_FOR_TEST + "/generate",
@@ -168,7 +173,10 @@ class TestMonokernelCheck(CustomTestCase):
         ):
             process = _launch(
                 extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
-                extra_args=["--disable-cuda-graph"],
+                extra_args=[
+                    "--disable-decode-cuda-graph",
+                    "--disable-prefill-cuda-graph",
+                ],
                 log=(out, err),
             )
             try:

@@ -37,6 +37,17 @@ def acquire_loads():
     llvm.FenceOp(llvm.AtomicOrdering.acquire, syncscope="workgroup")
 
 
+def udiv(a, b):
+    """a // b of nonnegative int32 values as an unsigned division (no floor fixups:
+    the same quotient in about half the scalar instructions)."""
+    return fx.Int32(fx.Uint32(a) // (b if isinstance(b, int) else fx.Uint32(b)))
+
+
+def umod(a, b):
+    """a % b of nonnegative int32 values (unsigned)."""
+    return fx.Int32(fx.Uint32(a) % (b if isinstance(b, int) else fx.Uint32(b)))
+
+
 # ---------------------------------------------------------------- stage trace
 TRACE_SLOTS = 16  # stamps a CTA: int64 clock ticks (100 MHz) at trace[((layer % TRACE_LAYERS) BLOCKS + bid) TRACE_SLOTS + idx]
 TRACE_LAYERS = 64  # a layer's own stamp slots (``c["layer"]``): a server snapshot keeps every layer's last launch
@@ -44,10 +55,10 @@ TRACE_BLOCKS = 256  # CTAs a launch (``common.plan.BLOCKS``)
 
 
 @flyc.jit
-def stamp(c, idx: int):
+def stamp(c, idx: int, who: int = 0):
     """Trace stamp ``idx`` of this CTA, compiled in by a build with ``trace``: the
     100 MHz realtime clock, an int64 in the launch's ``*_trace`` scratch region
-    (``c["trace"]``, a pair a stamp), written by thread 0."""
+    (``c["trace"]``, a pair a stamp), written by thread ``who``."""
     if const_expr(not c.get("trace_on", False)):
         return
     layer = c.get("layer")
@@ -57,30 +68,40 @@ def stamp(c, idx: int):
         base = (layer % TRACE_LAYERS) * (TRACE_BLOCKS * TRACE_SLOTS) + c[
             "bid"
         ] * TRACE_SLOTS
-    if c["tid"] == 0:
+    if c["tid"] == who:
         now = clock()
         addr = c["trace"].value + fx.Int64((base + idx) * 8)
         ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr)).result
         llvm.StoreOp(as_ir_value(now), ptr, alignment=8)
 
 
+FLAG_STRIDE = 8  # pairs between a broadcast flag and the next: a 64 B line each (every CTA polls them)
+
+
 @flyc.jit
-def poll_flags(c, regions):
-    """Wait for the flags ``regions`` = [(region, n) | (region, base, n), ...] (flags
-    base .. base + n of each), one flag a thread, then a barrier and an acquire: one
-    round trip whatever the count (a thread polling every flag takes a round trip
-    per ``POLL_MAX`` specs). Every thread of the CTA must call it (the barrier)."""
+def poll_flags(c, regions, first=0, sync=True):
+    """Wait for the flags ``regions`` = [(region, n) | (region, base, n) | (region,
+    base, n, stride), ...] (flags base, base + stride, .. of each, n of them), one
+    flag a thread, then a barrier and an acquire: one round trip whatever the count
+    (a thread polling every flag takes a round trip per ``POLL_MAX`` specs). Every
+    thread of the CTA must call it (the barrier)."""
     tid = c["tid"]
-    off = 0
+    off = first  # the first polling thread (``first`` > 0: off wave 0, which works meanwhile)
     for spec in regions:
-        region, base, n = spec if len(spec) == 3 else (spec[0], 0, spec[1])
+        region, base, n, stride = (
+            spec
+            if len(spec) == 4
+            else ((*spec, 1) if len(spec) == 3 else (spec[0], 0, spec[1], 1))
+        )
         if (tid >= off) & (tid < off + n):
-            c["poll"]([(region, base + tid - off, 1)])
+            c["poll"]([(region, base + (tid - off) * stride, 1)])
         off += n
     if isinstance(off, int):
         assert off <= THREADS, off
-    gpu.barrier()
-    acquire_loads()
+    if const_expr(sync):
+        # (``sync`` False: the caller's next barrier and ``acquire_loads`` close the wait)
+        gpu.barrier()
+        acquire_loads()
 
 
 def lds_dma_16(rsrc_v, lds_ptr, voffset, policy: str = ""):
@@ -106,8 +127,33 @@ def lds_dma_16(rsrc_v, lds_ptr, voffset, policy: str = ""):
             as_ir_value(fx.Int32(voffset)),
             as_ir_value(uniform(fx.Int32(0))),
         ],
-        "s_mov_b32 m0, $1\n\ts_nop 0\n\tbuffer_load_dwordx4 $2, $0, $3 offen lds"  # codespell:ignore offen
-        + (" " + policy if policy else ""),
+        "s_mov_b32 m0, $1\n\ts_nop 0\n\tbuffer_load_dwordx4 $2, $0, $3 offen "  # codespell:ignore offen
+        + (policy + " " if policy else "")
+        + "lds",
+        "s,s,v,s,~{m0},~{memory}",
+        has_side_effects=True,
+    )
+
+
+def lds_dma_4(rsrc_v, lds_ptr, voffset):
+    """``buffer_load_dword ... lds``: 4 B a lane from byte ``voffset`` of ``rsrc_v`` into
+    LDS at ``lds_ptr`` (wave-uniform) + 4 lane, unseen by the compiler's wait counting
+    (``lds_dma_16``'s rules: the caller waits ``vmcnt`` before anything reads it)."""
+    r = as_ir_value(rsrc_v)
+    if "ptr<8>" in str(r.type):
+        r = bo._ptr8_to_v4i32(r)
+    rv = fx.Vector(r, (4,), fx.Int32)
+    rs = fx.Vector.from_elements([uniform(fx.Int32(rv[i])) for i in range(4)], fx.Int32)
+    base = uniform(fx.Int32(llvm.ptrtoint(T.i32, lds_ptr.llvm_ptr)))
+    llvm.inline_asm(
+        None,
+        [
+            as_ir_value(rs),
+            as_ir_value(base),
+            as_ir_value(fx.Int32(voffset)),
+            as_ir_value(uniform(fx.Int32(0))),
+        ],
+        "s_mov_b32 m0, $1\n\ts_nop 0\n\tbuffer_load_dword $2, $0, $3 offen lds",  # codespell:ignore offen
         "s,s,v,s,~{m0},~{memory}",
         has_side_effects=True,
     )

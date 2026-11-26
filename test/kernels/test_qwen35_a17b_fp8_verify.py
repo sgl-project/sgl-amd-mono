@@ -74,6 +74,20 @@ def device():
     return torch.device("cuda")
 
 
+@pytest.mark.parametrize("compiles", [True, False])
+def test_wg_stages_prefers_two_and_falls_back_to_one(monkeypatch, compiles):
+    """2 stages wherever ``_wg_kernel`` compiles with them, else 1."""
+    from sgl_amd_mono.qwen35_a17b.fp8.gfx950 import gemv
+
+    def launch(*args):
+        if args[-1] == 2 and not compiles:
+            raise RuntimeError("failed to translate module to LLVM IR")
+
+    monkeypatch.setattr(gemv, "_wg_stages", None)
+    monkeypatch.setattr(gemv, "_launch_wg", launch)
+    assert gemv.wg_stages() == (2 if compiles else 1)
+
+
 @pytest.mark.parametrize("rows", [4, 12, 17, 24, 32])
 def test_gemv_32_rows_matches_aiter_block_scale_gemm(device, rows):
     from sgl_amd_mono.qwen35_a17b.fp8.gfx950.gemv import (
