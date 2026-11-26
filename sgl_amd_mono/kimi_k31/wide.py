@@ -568,7 +568,7 @@ class Wide:
             restart=pk.write,
         )
 
-    def _ensure(self, b, L, captures):
+    def _ensure(self, b, L):
         """Peer buffer and activation buffers of bucket b (collective on first use:
         every rank reaches it on the same step)."""
         if b in self.bufs:
@@ -579,13 +579,12 @@ class Wide:
         cfg = self._cfg(b)
         half, scratch = 0, 0
         for pk in self.layers.values():
-            # sizing only: both capture streams use the same plan
-            v = self._variant(pk, captures=captures, capture_stream="attn_res")
+            nvb_a, nvb_m = pk.nvb, pk.nvb + int(pk.write)
             for cap in (
                 False,
                 True,
             ):  # sized for a capture launch too: the captured layers come later
-                pl = lay.plan(b, cfg, L, v["nvb_a"], v["nvb_m"], NF, cap)[0]
+                pl = lay.plan(b, cfg, L, nvb_a, nvb_m, NF, cap)[0]
                 half, scratch = (
                     max(half, pl.peer_offsets[1]),
                     max(scratch, pl.scratch_bytes()),
@@ -753,7 +752,7 @@ class Wide:
         )
         n = 0
         for b in buckets or self.buckets:
-            bufs = self._ensure(b, L, set())
+            bufs = self._ensure(b, L)
             st_idx = torch.full((b // L, L), -1, dtype=torch.int32, device=dev)
             num_acc = torch.ones(b // L, dtype=torch.int32, device=dev)
             win_row = torch.full((b // L,), -1, dtype=torch.int32, device=dev)
@@ -942,7 +941,7 @@ class Wide:
             )
         R = rows // L
         b = next(x for x in self.buckets if x >= rows)
-        bufs = self._ensure(b, L, captures)
+        bufs = self._ensure(b, L)
         cfg = bufs["cfg"]
         start(fb)
         zero_allocator = BumpAllocator(

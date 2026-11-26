@@ -168,7 +168,7 @@ def sort_check_aux16(m, nl, tk_ids, tk_w, moe_out, sortb, rank):
     return bad
 
 
-def _prefix_capture_is_exact(cap_view, mid) -> bool:
+def _prefix_capture_is_exact(*, cap_view, mid) -> bool:
     # prefix capture emits the kernel's own mid slice unchanged; compare bits,
     # since torch.equal treats +0 and -0 as equal
     parts = [torch.empty_like(mid) for _ in range(TP)]
@@ -593,7 +593,9 @@ def run(args, m, rank, dev, cpu):
         )  # the unused row
         if cap:
             worst["cap"] = max(worst["cap"], rel(cap_view, s["ref"]["cap"]))
-            if cap == "prefix" and not _prefix_capture_is_exact(cap_view, mid):
+            if cap == "prefix" and not _prefix_capture_is_exact(
+                cap_view=cap_view, mid=mid
+            ):
                 cap_bits_bad = 1.0
             others = torch.cat(
                 [aux[..., : CAP_SLOT * H], aux[..., (CAP_SLOT + 1) * H :]], dim=-1
