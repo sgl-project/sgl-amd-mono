@@ -50,11 +50,12 @@ oldest first, so it is an estimate.
 
 ## What runs
 
-`scope.py` maps a PR's changed files to models (`models.py`). An entry with
-`"pr": False` is not in the PR test: an outdated model (DeepSeek-V4-Pro, replaced
-by DeepSeek-V4.1-Flash; MiniMax-M3, replaced by MiniMax-M3.1-Flash) or one whose
-checkpoint is not on the CI nodes. A dispatch with `models` still runs it. Of the
-others:
+`scope.py` maps a PR's changed files to models (`models.py`). The PR test runs
+only the models InferenceX still benchmarks (the "default" models of
+<https://inferencex.semianalysis.com/infx/inference>). An entry with `"pr": False`
+is not in it: a model InferenceX lists as deprecated (DeepSeek-V4-Pro, Kimi-K3,
+MiniMax-M3) or one whose checkpoint is not on the CI nodes. A dispatch with
+`models` still runs it, and the nightly runs those it lists. Of the others:
 
 - a model whose own package code (`sgl_amd_mono/<pkg>/`) changed runs the
   **full** tier;
