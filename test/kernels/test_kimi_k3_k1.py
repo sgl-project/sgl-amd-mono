@@ -145,9 +145,9 @@ def _kda_reference(case, parts=None):
     return out.to(BF)
 
 
+# SGLang's ReplaySSM commit for one head, in torch: the ring rows of the
+# accepted tokens replayed onto the committed state [V, K].
 def _fold(state, raw_k, raw_v, gate, beta):
-    """SGLang's ReplaySSM commit for one head, in torch: the ring rows of the
-    accepted tokens replayed onto the committed state [V, K]."""
     for j in range(raw_k.shape[0]):
         k = raw_k[j] / torch.sqrt(raw_k[j].pow(2).sum() + 1e-6)
         state = state * torch.exp(gate[j]).unsqueeze(0)

@@ -113,7 +113,11 @@ SGLANG_READS = {
     "srt/layers/quantization/quark/schemes/quark_w8a8_fp8.py": (
         "QuarkW8A8Fp8",
         "weight_qscheme",
+        "is_static_input_scheme",
     ),
+    # the experts' activation, which the launch computes as SiTU
+    "srt/layers/moe/fused_moe_triton/layer.py": ("moe_runner_config",),
+    "srt/layers/moe/moe_runner/base.py": ("activation",),
     "srt/layers/quantization/fp8_utils.py": (
         "use_aiter_bpreshuffle_gemm",
         "use_aiter_bpreshuffle_gemm(output_size)",
@@ -182,9 +186,9 @@ def _covered_layers(hf_config) -> list[int]:
     return [i for i in range(dense, int(t.num_hidden_layers)) if i % freq == 0]
 
 
+# SGLang's Kimi-K3 AITER switch, which keeps the experts at their native
+# 384-wide intermediate; an SGLang without the Envs field reads the old name.
 def _k3_aiter_opt() -> bool:
-    """SGLang's Kimi-K3 AITER switch, which keeps the experts at their native
-    384-wide intermediate; an SGLang without the Envs field reads the old name."""
     from sglang.srt.environ import envs
 
     field = getattr(envs, "SGLANG_OPT_HIP_K3_AITER", None)
@@ -246,6 +250,10 @@ def _quark_fp8_storage(linear, name: str):
         isinstance(scheme, QuarkW8A8Fp8) and scheme.weight_qscheme == "per_channel"
     ):
         raise ValueError(f"an FP8 {name} is read only as Quark per-channel FP8")
+    # The launch multiplies the bf16 activation and applies only the weight scale;
+    # a static input scale would be clipped and rounded by SGLang and not by it.
+    if scheme.is_static_input_scheme:
+        raise ValueError(f"the FP8 {name} quantizes its input statically")
     if linear.weight.dim() != 2:
         raise ValueError(f"the FP8 {name} weight is not 2-D")
     # SGLang stores the weight transposed for its FP8 GEMM
@@ -269,9 +277,9 @@ def _quark_fp8_storage(linear, name: str):
     return use_aiter_bpreshuffle_gemm(rows), storage, scale.view(rows)
 
 
+# o_proj as the launch reads it: (``O_*`` format, the [7168, 1536] storage,
+# its fp32 scale a row or None). Raises ValueError naming what does not fit.
 def _o_proj_operands(o_proj):
-    """o_proj as the launch reads it: (``O_*`` format, the [7168, 1536] storage,
-    its fp32 scale a row or None). Raises ValueError naming what does not fit."""
     from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
 
     hidden = HF_CONFIG["hidden_size"]

@@ -195,15 +195,15 @@ def test_an_mla_layer_without_the_output_gate_is_refused(monkeypatch):
     assert any("output gate" in r for r in reasons), reasons
 
 
-def _fp8_o_proj(*, quark=True):
-    """o_proj as SGLang leaves a Quark per-channel FP8 one: the [out, in]
-    storage transposed for its GEMM, an fp32 scale a row."""
+# o_proj as SGLang leaves a Quark per-channel FP8 one: the [out, in]
+# storage transposed for its GEMM, an fp32 scale a row.
+def _fp8_o_proj(*, quark=True, dynamic=True):
     import torch
     from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 
     hidden = HF_CONFIG["hidden_size"]
     scheme = QuarkW8A8Fp8(
-        {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": True}
+        {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": dynamic}
     )
     return SimpleNamespace(
         weight=torch.zeros(hidden, 1536, dtype=torch.float8_e4m3fn).t(),
@@ -215,6 +215,13 @@ def _fp8_o_proj(*, quark=True):
 
 def test_a_quark_fp8_o_proj_passes(monkeypatch):
     assert _reasons(monkeypatch, _fake_layer(o_proj=_fp8_o_proj())) == []
+
+
+def test_a_static_input_fp8_o_proj_is_refused(monkeypatch):
+    """A Quark FP8 o_proj with a static input scale must not be served: the launch
+    skips that scale's clipping and rounding of the activation."""
+    reasons = _reasons(monkeypatch, _fake_layer(o_proj=_fp8_o_proj(dynamic=False)))
+    assert any("quantizes its input statically" in r for r in reasons), reasons
 
 
 def test_an_fp8_o_proj_outside_quark_is_refused(monkeypatch):

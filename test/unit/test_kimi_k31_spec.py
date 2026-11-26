@@ -46,11 +46,11 @@ def test_the_launches_name_their_server_args():
     assert server_args["speculative_algorithm"] == frozenset({"DSPARK", "DFLASH"})
 
 
+# kimi_k31's checks on one covered KDA layer, Kimi-K3's own checks taken as
+# passing (test_kimi_k3_spec pins those: they accept a Quark FP8 o_proj).
+# ``in_proj=None`` is a layer whose KDA in_proj is not merged; ``o_proj=None`` is
+# a qweight-only (GPTQ / AWQ-style) o_proj with no ``weight``.
 def _reasons(monkeypatch, *, in_proj=torch.bfloat16, o_proj=torch.bfloat16):
-    """kimi_k31's checks on one covered KDA layer, Kimi-K3's own checks taken as
-    passing (test_kimi_k3_spec pins those: they accept a Quark FP8 o_proj).
-    ``in_proj=None`` is a layer whose KDA in_proj is not merged; ``o_proj=None`` is
-    a qweight-only (GPTQ / AWQ-style) o_proj with no ``weight``."""
     monkeypatch.setattr(k31.k3, "_model_disable_reasons", lambda *a: [])
     monkeypatch.setattr(wide, "_is_covered", lambda layer: True)
 

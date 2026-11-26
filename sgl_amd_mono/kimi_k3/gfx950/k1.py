@@ -151,7 +151,7 @@ SGLANG_READS = {
     "srt/arg_groups/fields/exec_.py": ("enable_linear_replayssm_spec",),
     # the KDA state dtype SGLang allocates: SGLANG_MAMBA_SSM_DTYPE, which
     # --mamba-ssm-dtype sets, else the config, else float32
-    "srt/configs/mamba_utils.py": ("mamba2_state_dtype",),
+    "srt/configs/mamba_utils.py": ("mamba2_state_dtype", "temporal"),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
     # the kernel writes the bank row; this is the count that goes with it
     "srt/layers/attn_residual.py": ("_count_write", "num_valid_blocks"),
@@ -217,9 +217,9 @@ def _is_kda_layer(layer) -> bool:
     return hasattr(layer.self_attn, "qkv_conv1d")
 
 
+# (the KDA state SGLang allocates is bf16, the reasons the configuration rules
+# K1 out for every KDA layer at once).
 def _state_config():
-    """(the KDA state SGLang allocates is bf16, the reasons the configuration rules
-    K1 out for every KDA layer at once)."""
     from sglang.srt.configs.mamba_utils import mamba2_state_dtype
 
     # Kimi-K3's config sets no mamba_ssm_dtype, so SGLang resolves it from the env.
@@ -287,9 +287,9 @@ def _in_proj_operands(attn):
     return fmt, w_in, scale, w_fb
 
 
+# (the in-projection's operands or None, why K1 cannot take this layer):
+# fail-loud at build rather than per step.
 def _unsupported_reasons(attn):
-    """(the in-projection's operands or None, why K1 cannot take this layer):
-    fail-loud at build rather than per step."""
     operands, reasons = None, []
     try:
         operands = _in_proj_operands(attn)

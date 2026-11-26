@@ -80,12 +80,19 @@ def layer_weights(rank, device):
     o_proj is a TP shard, so it is drawn per rank. The attention-residual
     stream and its two norms are replicated, so they have to match on every
     rank."""
+    from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN, PROJ
 
     gc = torch.Generator(device=device).manual_seed(23)
     gr = torch.Generator(device=device).manual_seed(200 + rank)
+    w_o = randn(gr, HIDDEN, PROJ, scale=0.02)
     return {
-        "w_o": randn(gr, HIDDEN, PROJ, scale=0.02),
+        # a bf16 o_proj; main() swaps in an FP8 one for --o-proj fp8*
+        "w_o": w_o,
+        "ofmt": oproj.O_BF16,
+        "w_o_store": w_o,
+        "w_os": None,
+        "o_scale": None,
         "core": randn(gr, ROWS, PROJ, scale=0.3),
         # The bank is allocated for every block of the model, so only its
         # first nvb rows are live: that is the production stride.
@@ -210,9 +217,7 @@ def main():
 
     w = moe_weights(rank, dev, guint=False)
     w.update(layer_weights(rank, dev))
-    if args.o_proj == "bf16":
-        w.update(ofmt=oproj.O_BF16, w_o_store=w["w_o"], w_os=None, o_scale=None)
-    else:
+    if args.o_proj != "bf16":
         shuffled = args.o_proj == "fp8-shuffled"
         q, store, scale = fp8_o_proj(w_o=w["w_o"], shuffled=shuffled)
         w.update(
