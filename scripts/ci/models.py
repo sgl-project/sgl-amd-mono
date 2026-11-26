@@ -125,8 +125,7 @@ def nightly_tier(model: dict) -> str:
     tests and the pinned sgl-amd-mono check catch that the day it does. Such a
     model runs the nightly at the tests tier (quick kernel widths, no benchmark or
     speed test) and its benchmarks, speed test and full kernel widths in the weekly
-    run. A model the PR test does not run would run the nightly in full; the
-    deprecated DeepSeek-V4-Pro is in the weekly run only."""
+    run. A model the PR test does not run would run the nightly in full."""
     return "tests" if model.get("pr", True) else "full"
 
 
@@ -169,12 +168,8 @@ MODELS = {
     "deepseek_v4": {
         "name": "DeepSeek-V4-Pro",
         # Deprecated on InferenceX (DeepSeek-V4.1-Flash replaced it): not in the PR
-        # test, nor in the nightly; the weekly run (Saturdays) only. A dispatch with
-        # models=deepseek_v4 still runs it.
+        # test, nor in the nightly. A dispatch with models=deepseek_v4 still runs it.
         "pr": False,
-        "weekly": True,
-        # set from the first weekly report
-        "baseline": {},
         "packages": ["deepseek_v4"],
         "tp": 8,
         "paths": {"DEEPSEEK_V4_PRO_MODEL_PATH": f"{HF}/deepseek-ai/DeepSeek-V4-Pro"},
