@@ -118,7 +118,7 @@ class _Built(k3._Built):
 
 
 def _agree_xgmi_enabled() -> bool:
-    enabled = int(os.environ.get("SGLANG_AMD_MONO_K31_XGMI", "0") == "1")
+    enabled = int(os.environ.get("SGLANG_AMD_MONO_ENABLE_K31_XGMI", "0") == "1")
     if torch.distributed.is_initialized():
         from sglang.srt.runtime_context import get_parallel
 
@@ -129,7 +129,9 @@ def _agree_xgmi_enabled() -> bool:
                 vote, op=torch.distributed.ReduceOp.MIN, group=tp_group
             )
             if vote[0].item() == 0 and vote[1].item() == -1:
-                raise RuntimeError("SGLANG_AMD_MONO_K31_XGMI disagrees across TP ranks")
+                raise RuntimeError(
+                    "SGLANG_AMD_MONO_ENABLE_K31_XGMI disagrees across TP ranks"
+                )
             return vote[0].item() == 1
     return bool(enabled)
 

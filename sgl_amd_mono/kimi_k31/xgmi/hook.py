@@ -36,8 +36,8 @@ SGLANG_READS = {
     "srt/runtime_context.py": ("get_parallel",),
 }
 
-# Stays strictly above SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS (384) so DSA layers
-# during wide verify steps (up to 64x6=384 rows) never enter row-sharded prefill.
+# Stays strictly above the column tail's row cap (NextAttnRead.max_tokens, 384), so
+# DSA layers in wide verify steps (up to 64x6=384 rows) never take row-sharded prefill.
 DEFAULT_HOOK_PREFILL_MIN = 512
 DEFAULT_HOOK_PREFILL_MAX = 32768
 
@@ -52,11 +52,11 @@ class XgmiHookSummary(msgspec.Struct, frozen=True):
 
 
 def xgmi_enabled() -> bool:
-    return os.environ.get("SGLANG_AMD_MONO_K31_XGMI", "0") == "1"
+    return os.environ.get("SGLANG_AMD_MONO_ENABLE_K31_XGMI", "0") == "1"
 
 
 def _resolve_config() -> XgmiConfig:
-    fp4_env = os.environ.get("SGLANG_AMD_MONO_K31_XGMI_FP4")
+    fp4_env = os.environ.get("SGLANG_AMD_MONO_USE_K31_XGMI_FP4")
     use_fp4 = (
         fp4_env == "1"
         if fp4_env is not None
@@ -522,7 +522,9 @@ def maybe_install_xgmi_hooks(model, *, log_fn=None) -> Optional[XgmiHookSummary]
         vote = torch.tensor([enabled, -enabled], dtype=torch.int32)
         dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=tp_group)
         if vote[0].item() == 0 and vote[1].item() == -1:
-            raise RuntimeError("SGLANG_AMD_MONO_K31_XGMI disagrees across TP ranks")
+            raise RuntimeError(
+                "SGLANG_AMD_MONO_ENABLE_K31_XGMI disagrees across TP ranks"
+            )
         enabled = int(vote[0].item())
     if not enabled:
         return None

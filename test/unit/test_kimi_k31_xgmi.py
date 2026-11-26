@@ -132,9 +132,9 @@ def test_zero_copy_weight_slice():
 
 
 def test_xgmi_opt_in_default_off(monkeypatch):
-    monkeypatch.delenv("SGLANG_AMD_MONO_K31_XGMI", raising=False)
+    monkeypatch.delenv("SGLANG_AMD_MONO_ENABLE_K31_XGMI", raising=False)
     assert not xgmi_enabled()
-    monkeypatch.setenv("SGLANG_AMD_MONO_K31_XGMI", "1")
+    monkeypatch.setenv("SGLANG_AMD_MONO_ENABLE_K31_XGMI", "1")
     assert xgmi_enabled()
 
 
@@ -848,7 +848,7 @@ def test_maybe_install_current_device_failure_votes_zero(monkeypatch):
     from sgl_amd_mono.kimi_k31.xgmi import maybe_install_xgmi_hooks
 
     trace = _fake_tp_world(monkeypatch)
-    monkeypatch.setenv("SGLANG_AMD_MONO_K31_XGMI", "1")
+    monkeypatch.setenv("SGLANG_AMD_MONO_ENABLE_K31_XGMI", "1")
     monkeypatch.setattr(heap_mod, "_GLOBAL_HEAP", None)
     _patch_parallel(monkeypatch, object())
     monkeypatch.setattr(
@@ -869,7 +869,7 @@ def test_xgmi_opt_in_disagreement_raises_in_spec_and_hook(monkeypatch):
     from sgl_amd_mono.kimi_k31.xgmi import maybe_install_xgmi_hooks
 
     _fake_tp_world(monkeypatch)
-    monkeypatch.setenv("SGLANG_AMD_MONO_K31_XGMI", "1")
+    monkeypatch.setenv("SGLANG_AMD_MONO_ENABLE_K31_XGMI", "1")
     _patch_parallel(monkeypatch, object())
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
 
