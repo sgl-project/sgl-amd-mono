@@ -122,7 +122,24 @@ SGLANG_READS = {
         "start",
         "written_residual",
     ),
-    "srt/runtime_context.py": ("get_parallel",),
+    "srt/runtime_context.py": ("get_parallel", '"dcp_enabled"'),
+    "srt/arg_groups/fields/parallel.py": ("dcp_replicate_q_proj",),
+    "srt/models/deepseek_v2.py": (
+        "q_b_proj_qrep_weight",
+        "w_kc_qrep",
+        "use_deep_gemm_bmm",
+        "num_local_heads",
+        "dcp_size",
+        "qk_head_dim",
+    ),
+    "srt/models/deepseek_common/attention_forward_methods/forward_mla.py": (
+        "is_dcp_q_replicate_phase",
+    ),
+    "srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py": (
+        "forward_absorb_rocm_prepare",
+        '"_mono_pre"',
+        "q_replicate_active",
+    ),
     # the attention stops here and the launch runs o_proj; both attention
     # classes expose it. The rest are what the forward and the checks read.
     "srt/models/kimi_k3.py": (
@@ -344,6 +361,12 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
             )
         return banks[nb]
 
+    max_nhq = max(
+        (p.mla[0].nhq for p in packed_layers.values() if p.mla is not None), default=0
+    )
+    mla_out = _mla_outputs(rows, device, nhq=max_nhq) if max_nhq else None
+    dummy_qrep_qb = None
+    dummy_qrep_wkc = None
     for packed in packed_layers.values():
         # K1 first: on a served step it runs before this layer's K2, so the
         # waits pair up in the same order here as there.
@@ -355,9 +378,39 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
             from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
 
             key, w = packed.mla
+            w_warm = w
+            if key.nhq > mp.NHQ:
+                attn = packed.module.self_attn
+                qb_shp = (key.nhq * mp.QHD, mp.QL)
+                cand_qb = getattr(attn, "q_b_proj_qrep_weight", None)
+                if _valid_bf16_tensor(cand_qb, qb_shp):
+                    w_qb = cand_qb
+                else:
+                    if dummy_qrep_qb is None or tuple(dummy_qrep_qb.shape) != qb_shp:
+                        dummy_qrep_qb = torch.zeros(
+                            qb_shp, dtype=torch.bfloat16, device=device
+                        )
+                    w_qb = dummy_qrep_qb
+                w_warm = {**w, "w_qb": w_qb}
+                if key.qn:
+                    wkc_shp = (key.nhq, mp.QN, mp.KV)
+                    cand_kc = getattr(attn, "w_kc_qrep", None)
+                    if _valid_bf16_tensor(cand_kc, wkc_shp):
+                        w_kc = cand_kc
+                    else:
+                        if (
+                            dummy_qrep_wkc is None
+                            or tuple(dummy_qrep_wkc.shape) != wkc_shp
+                        ):
+                            dummy_qrep_wkc = torch.zeros(
+                                wkc_shp, dtype=torch.bfloat16, device=device
+                            )
+                        w_kc = dummy_qrep_wkc
+                    w_warm["w_kc"] = w_kc
+            out_warm = _mla_out_view(mla_out, key.nhq)
             mp.mla_pre_launch(
-                key, prefix=runner.prefix[:rows], blocks=bank(key.nblocks), w=w,
-                out=_mla_outputs(rows, device), scratch=runner.scratch,
+                key, prefix=runner.prefix[:rows], blocks=bank(key.nblocks), w=w_warm,
+                out=out_warm, scratch=runner.scratch,
                 layer=packed.i, epoch=runner.epoch,
             )  # fmt: skip
         _k2_launch(
@@ -508,6 +561,108 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
     )
 
 
+def _valid_bf16_tensor(t, shape: tuple[int, ...]) -> bool:
+    return (
+        isinstance(t, torch.Tensor)
+        and t.dtype == torch.bfloat16
+        and tuple(t.shape) == shape
+        and t.is_contiguous()
+    )
+
+
+def _sglang_mono_pre_supports_qrep(attn) -> bool:
+    """Whether SGLang's ``forward_absorb_rocm_prepare`` reshapes ``_mono_pre['q']``
+    with ``num_local_heads * dcp_size`` under DCP q-replicate (sgl-project/sglang#53130)."""
+    cached = getattr(attn, "_k3_mono_pre_qrep_ok", None)
+    if cached is not None:
+        return cached
+    fn = getattr(attn, "forward_absorb_rocm_prepare", None)
+    ok = False
+    if fn is not None:
+        try:
+            import ast
+            import inspect
+            import textwrap
+
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            reads_mono_pre = any(
+                isinstance(n, ast.Constant) and n.value == "_mono_pre"
+                for n in ast.walk(tree)
+            )
+            if reads_mono_pre:
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.If):
+                        continue
+                    test_names = {
+                        n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
+                    }
+                    if "pre" not in test_names:
+                        continue
+                    assigned: dict[str, ast.AST] = {}
+                    for stmt in node.body:
+                        if isinstance(stmt, ast.Assign):
+                            for tgt in stmt.targets:
+                                if isinstance(tgt, ast.Name):
+                                    assigned[tgt.id] = stmt.value
+                        for sub in ast.walk(stmt):
+                            if not (
+                                isinstance(sub, ast.Call)
+                                and isinstance(sub.func, ast.Attribute)
+                                and sub.func.attr == "view"
+                                and isinstance(sub.func.value, ast.Subscript)
+                                and isinstance(sub.func.value.value, ast.Name)
+                                and sub.func.value.value.id == "pre"
+                                and isinstance(sub.func.value.slice, ast.Constant)
+                                and sub.func.value.slice.value == "q"
+                                and len(sub.args) == 3
+                            ):
+                                continue
+                            head_expr = sub.args[1]
+                            if (
+                                isinstance(head_expr, ast.Name)
+                                and head_expr.id in assigned
+                            ):
+                                head_expr = assigned[head_expr.id]
+                            h_attrs = {
+                                n.attr
+                                for n in ast.walk(head_expr)
+                                if isinstance(n, ast.Attribute)
+                            }
+                            h_names = {
+                                n.id
+                                for n in ast.walk(head_expr)
+                                if isinstance(n, ast.Name)
+                            }
+                            if (
+                                "dcp_size" in h_attrs
+                                and "q_replicate_active" in h_names
+                            ):
+                                ok = True
+                                break
+                        if ok:
+                            break
+                    if ok:
+                        break
+        except (OSError, TypeError, SyntaxError):
+            ok = False
+    attn._k3_mono_pre_qrep_ok = ok
+    return ok
+
+
+def _mla_out_view(out: dict, nhq: int) -> dict:
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+
+    rows = out["q"].shape[0]
+    qb = nhq * mp.QHD
+    if out["q"].shape[1] == qb and out["qn"].shape[1] == nhq:
+        return out
+    return {
+        **out,
+        "q": out["q"].view(-1)[: rows * qb].view(rows, qb),
+        "qn": out["qn"].view(-1)[: rows * nhq * mp.KV].view(rows, nhq, mp.KV),
+    }
+
+
 def _mla_build(layer, rows: int):
     """An MLA layer's projection-front key and the weights it reads in place, or
     None (a KDA layer, or weights the launch does not take: SGLang's path)."""
@@ -521,10 +676,32 @@ def _mla_build(layer, rows: int):
     fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
     if hasattr(attn, "qkv_conv1d") or idx is None or fused is None:
         return None
-    if get_parallel().attn_dcp_size > 1:
-        # under DCP SGLang's MLA forward computes every head's q itself (the
-        # replicated q_b); the front hands over this rank's 12
-        return None
+    par = get_parallel()
+    if par.attn_dcp_size > 1:
+        # Under DCP8 q-replicate, run the full 96-head q_b_proj_qrep_weight and
+        # in-place w_kc_qrep once SGLang's _mono_pre handoff supports full heads.
+        dcp_size = getattr(attn, "dcp_size", 1)
+        if not (
+            getattr(par, "dcp_enabled", False)
+            and getattr(par, "dcp_replicate_q_proj", False)
+            and dcp_size > 1
+            and not getattr(attn, "use_deep_gemm_bmm", False)
+            and getattr(attn, "num_local_heads", 0) * dcp_size == mp.NHQ_QREP
+            and getattr(attn, "qk_head_dim", None) == mp.QHD
+            and _sglang_mono_pre_supports_qrep(attn)
+        ):
+            logger.info(
+                "monokernel: no DCP MLA front for layer %d: dcp=%s qrep=%s heads=%s qrep_handoff=%s",
+                layer.layer_id if hasattr(layer, "layer_id") else -1,
+                dcp_size,
+                getattr(par, "dcp_replicate_q_proj", False),
+                getattr(attn, "num_local_heads", 0) * dcp_size,
+                _sglang_mono_pre_supports_qrep(attn),
+            )
+            return None
+        nhq, qn_rm = mp.NHQ_QREP, True
+    else:
+        nhq, qn_rm = mp.NHQ, False
     w = {
         "ares_nw": layer.self_attention_res_norm.weight,
         "ares_qk": layer.self_attention_res_proj.weight.view(HIDDEN),
@@ -544,12 +721,7 @@ def _mla_build(layer, rows: int):
     }  # fmt: skip
     for n, shp in want.items():
         t = w[n]
-        if (
-            not isinstance(t, torch.Tensor)
-            or t.dtype != torch.bfloat16
-            or tuple(t.shape) != shp
-            or not t.is_contiguous()
-        ):
+        if not _valid_bf16_tensor(t, shp):
             logger.info("monokernel: no MLA front for layer %d: %s is %s", layer.layer_id if hasattr(layer, "layer_id") else -1, n, None if t is None else (t.dtype, tuple(t.shape)))  # fmt: skip
             return None
     # the absorb's weight as SGLang's bf16 bmm multiplies it: w_kc itself, unscaled
@@ -561,11 +733,13 @@ def _mla_build(layer, rows: int):
         and isinstance(wsc, (int, float))
         and wsc == 1.0
     )
-    if qn:
+    if qn and not qn_rm:
         w["w_kc"] = wkc.transpose(1, 2).contiguous().view(mp.NHQ * mp.KV, mp.QN)
     key = mp.MlaPreBuild(
         tokens=rows,
         qn=qn,
+        nhq=nhq,
+        qn_rm=qn and qn_rm,
         nblocks=layer.prev_valid_blocks,
         eps=layer.self_attention_res_norm.variance_epsilon,
         out_eps=layer.input_layernorm.variance_epsilon,
@@ -576,17 +750,19 @@ def _mla_build(layer, rows: int):
     return (key, w)
 
 
-def _mla_outputs(rows: int, device) -> dict:
+def _mla_outputs(rows: int, device, nhq: int | None = None) -> dict:
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+
+    nhq = mp.NHQ if nhq is None else nhq
 
     def z(n):
         return torch.zeros(rows, n, dtype=torch.bfloat16, device=device)
 
     return {
-        "q": z(mp.QB), "latent": z(mp.KV + mp.ROPE), "k_nope": z(mp.KV),
+        "q": z(nhq * mp.QHD), "latent": z(mp.KV + mp.ROPE), "k_nope": z(mp.KV),
         "q_lora": z(mp.QL), "gate": z(mp.GATE), "idx_q": z(mp.IQ),
         "idx_k": z(mp.IK), "idx_w": z(mp.IW),
-        "qn": torch.zeros(rows, mp.NHQ, mp.KV, dtype=torch.bfloat16, device=device),
+        "qn": torch.zeros(rows, nhq, mp.KV, dtype=torch.bfloat16, device=device),
     }  # fmt: skip
 
 
@@ -710,22 +886,45 @@ def _check(packed: _Layer, core, prefix_sum, attn_res, rows: int) -> None:
     ), (bank.dtype, tuple(bank.shape), bank.stride())
 
 
-def _mla_covered(packed, hidden, bank) -> bool:
+def _mla_covered(packed, hidden, bank, forward_batch=None) -> bool:
     """The MLA front takes a layer whose stream is a written tensor (not an owed
     contribution), with its bank open at the row count it was built for."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
     key, _ = packed.mla
-    return (
+    if not (
         bank is not None
         and isinstance(hidden, torch.Tensor)
         and hidden.dtype == torch.bfloat16
         and hidden.is_contiguous()
         and hidden.dim() == 2
+        and hidden.shape[0] == key.tokens
         and hidden.shape[1] == HIDDEN
         and bank.num_valid_blocks == key.nblocks
         and bank.block_residual.dtype == torch.bfloat16
+    ):
+        return False
+    if forward_batch is None:
+        return key.nhq == mp.NHQ
+    attn = packed.module.self_attn
+    q_rep_active = bool(
+        getattr(attn, "dcp_size", 1) > 1
+        and attn.is_dcp_q_replicate_phase(forward_batch)
+        and not attn.use_deep_gemm_bmm
+        and attn.w_kc_qrep is not None
+        and attn.q_b_proj_qrep_weight is not None
     )
+    if key.nhq > mp.NHQ:
+        if not (
+            q_rep_active
+            and _valid_bf16_tensor(attn.q_b_proj_qrep_weight, (key.nhq * mp.QHD, mp.QL))
+        ):
+            return False
+        if key.qn and not _valid_bf16_tensor(attn.w_kc_qrep, (key.nhq, mp.QN, mp.KV)):
+            return False
+        return True
+    return not q_rep_active
 
 
 class _LanguageModelShim:
@@ -772,7 +971,11 @@ class _Built:
         # The MLA front's outputs, one set a width (the layers run in sequence)
         dev = runner.device
         self._mla_out = {
-            rows: _mla_outputs(rows, dev)
+            rows: _mla_outputs(
+                rows,
+                dev,
+                nhq=max(p.mla[0].nhq for p in packed.values() if p.mla is not None),
+            )
             for rows, packed in by_width.items()
             if any(p.mla is not None for p in packed.values())
         }
@@ -895,7 +1098,7 @@ class _Built:
         from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
 
         state = self._k1_state
-        if packed.mla is not None and _mla_covered(packed, hidden, bank):
+        if packed.mla is not None and _mla_covered(packed, hidden, bank, forward_batch):
             return self._mla_core(
                 layer, packed, hidden, bank, forward_batch, zero_allocator
             )
@@ -930,11 +1133,17 @@ class _Built:
 
         key, w = packed.mla
         rows = hidden.shape[0]
-        out = self._mla_out[rows]
+        attn = layer.self_attn
+        out = _mla_out_view(self._mla_out[rows], key.nhq)
+        w_run = w
+        if key.nhq > mp.NHQ:
+            w_run = {**w, "w_qb": attn.q_b_proj_qrep_weight}
+            if key.qn:
+                w_run["w_kc"] = attn.w_kc_qrep
         # The launch reads the stream and does not add to it, as K1 does.
         set_written(hidden, forward_batch)
         mp.mla_pre_launch(
-            key, prefix=hidden, blocks=bank.block_residual, w=w, out=out,
+            key, prefix=hidden, blocks=bank.block_residual, w=w_run, out=out,
             scratch=self.runner.scratch, layer=packed.i, epoch=self.runner.epoch,
         )  # fmt: skip
         if key.write_idx >= 0:
@@ -945,7 +1154,6 @@ class _Built:
             .view(torch.bfloat16)
             .view(rows, HIDDEN)
         )
-        attn = layer.self_attn
         attn.__dict__["_mono_pre"] = {
             "q": out["q"], "latent": out["latent"], "k_nope": out["k_nope"],
             "q_lora": out["q_lora"], "gate": out["gate"],
