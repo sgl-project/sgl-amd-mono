@@ -114,7 +114,10 @@ SGLANG_READS = {
         "QuarkW8A8Fp8",
         "weight_qscheme",
         "is_static_input_scheme",
+        "weight_scale",
     ),
+    # o_proj's bias, which the launch has no term for
+    "srt/layers/linear.py": ("bias",),
     # the experts' activation, which the launch computes as SiTU
     "srt/layers/moe/fused_moe_triton/layer.py": ("moe_runner_config",),
     "srt/layers/moe/moe_runner/base.py": ("activation",),
