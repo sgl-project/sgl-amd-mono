@@ -557,7 +557,7 @@ class Wide:
             *(Gemm(*(int(v) for v in c.split(":"))) for c in cfg_rows(b, self.L))
         )
 
-    def _variant(self, pk, b, L, captures, capture_stream="attn_res"):
+    def _variant(self, pk, b, L, captures, *, capture_stream):
         cap = capture_stream if (pk.i - 1) in captures else False
         return dict(
             nvb_a=pk.nvb,
@@ -579,7 +579,8 @@ class Wide:
         cfg = self._cfg(b)
         half, scratch = 0, 0
         for pk in self.layers.values():
-            v = self._variant(pk, b, L, captures)
+            # sizing only: both capture streams use the same plan
+            v = self._variant(pk, b, L, captures, capture_stream="attn_res")
             for cap in (
                 False,
                 True,
@@ -758,7 +759,7 @@ class Wide:
             win_row = torch.full((b // L,), -1, dtype=torch.int32, device=dev)
             seen = set()
             for pk in self.layers.values():
-                v = self._variant(pk, b, L, set())
+                v = self._variant(pk, b, L, set(), capture_stream="attn_res")
                 key = tuple(sorted(v.items()))
                 if key in seen:
                     continue
