@@ -608,11 +608,8 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
         )
 
     def test_bf16_state_matches_torch(self):
-        """--mamba-ssm-dtype bfloat16: the state is read and written in bf16.
-
-        The kernel reads a state row as raw words, so an fp32 read of a bf16
-        pool is not an error, it is a different state.
-        """
+        """K1 must read and write bf16 state rows without interpreting them as fp32
+        (an fp32 read of a bf16 pool raises nothing; it is a different state)."""
         case = K1Case(self.device, num_acc=QLEN, state_bf16=True).run()
         parts = {}
         cos = _cos(case.core_out, _kda_reference(case, parts=parts))
