@@ -2,7 +2,7 @@
 weights in SGLang's layouts:
 
 - compile: every build key the spec can make (widths 1 .. 8, first layer, bf16
-  state) compiles;
+  state, MXFP4 in_proj_qkvz) compiles;
 - pad rows: K1 writes its live rows' core and state slots, zeros a pad row's core
   (state index <= 0), and leaves every other slot alone;
 - bf16 state: the fp32 recurrence on the widened state, stored rounded: the same
@@ -66,10 +66,11 @@ def scratch(key):
 
 def check_compile():
     keys = [
-        gdn.K1Build(tokens=s, first=f, state_bf16=b)
+        gdn.K1Build(tokens=s, first=f, state_bf16=b, qq=q)
         for s in range(1, MAXT + 1)
         for f in (False, True)
         for b in (False, True)
+        for q in (False, True)
     ]
     t0 = time.time()
     for key in keys:

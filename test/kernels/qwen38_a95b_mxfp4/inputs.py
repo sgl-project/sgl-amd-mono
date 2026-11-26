@@ -40,8 +40,8 @@ def errors(e):
     return {w: int(e[w]) for w in guard.ERROR_WORDS}
 
 
-def k1_weights(g):
-    """``gdn_pre``'s weights."""
+def k1_weights(g, qq=False):
+    """``gdn_pre``'s weights; ``qq``: an MXFP4 in_proj_qkvz."""
     w = {
         "ln_w": rnd(g, HIDDEN, scale=0.1),
         "w_ba": rnd(g, BA, HIDDEN, scale=0.05),
@@ -50,7 +50,11 @@ def k1_weights(g):
         "dt_bias": rnd(g, NV, scale=0.5),
         "norm_w": (1 + rnd(g, HD, scale=0.1, dtype=torch.float32)).to(BF),
     }
-    w["w_qkvz"] = rnd(g, QKVZ, HIDDEN, scale=0.02)
+    if qq:
+        w["w_qkvz"] = codes(g, QKVZ, HIDDEN // 2)
+        w["w_qkvzs"] = codes(g, QKVZ * HIDDEN // 32, lo=117, hi=121)
+    else:
+        w["w_qkvz"] = rnd(g, QKVZ, HIDDEN, scale=0.02)
     return w
 
 
@@ -62,7 +66,7 @@ def k1_state(g, slots, bf16=False):
     )
 
 
-def k2_weights(dev, rank, seed, fse=False):
+def k2_weights(dev, rank, seed, fse=False, oq=False):
     """``layer_post``'s weights: this rank's shards, then the replicated ones."""
     ne = E + int(fse)
     g = gen(dev, seed + rank)
@@ -72,7 +76,11 @@ def k2_weights(dev, rank, seed, fse=False):
         "w2": codes(g, ne, HIDDEN, RI // 2),
         "w2s": codes(g, ne * HIDDEN * RI // 32, lo=117, hi=121),
     }
-    w["w_o"] = rnd(g, HIDDEN, CORE, scale=0.02)
+    if oq:
+        w["w_o"] = codes(g, HIDDEN, CORE // 2)
+        w["w_os"] = codes(g, HIDDEN * CORE // 32, lo=117, hi=121)
+    else:
+        w["w_o"] = rnd(g, HIDDEN, CORE, scale=0.02)
     if not fse:
         w["w_sgu"] = rnd(g, 2 * SI, HIDDEN, scale=0.02)
         w["w_sd"] = rnd(g, HIDDEN, SI, scale=0.02)

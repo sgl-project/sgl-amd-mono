@@ -22,6 +22,13 @@ One launch a layer and rank, ``BLOCKS`` x ``THREADS``:
              l2norm, the recurrence on 16 state rows (fp32, in place), partial
              norms (ONRM), RMSNormGated -> ``core``
 
+With ``qq`` (an online-MXFP4 in_proj_qkvz on the ASM FP4 GEMM, its weight and
+scales shuffled as K2's fp4 o_proj's), the in_proj_qkvz tasks read the x rows
+through MXFP4 (RCEIL), as ``per_1x32_f4_quant_hip`` quantizes the GEMM's input;
+in_proj_ba stays bf16 on the unquantized rows, as 16 tasks (2 row groups x 8
+K parts) on CTAs 0 .. 15 whose weights go out at the start; the gates sum the
+parts.
+
 Rounding follows SGLang's decode path (the Triton conv update, the fused gated
 delta rule, RMSNormGated) where it is elementwise: every conv product
 rounded to bf16 as Triton's bf16 multiply does, the bf16 conv output, the bf16
@@ -70,6 +77,11 @@ from sgl_amd_mono.common.sync import Mailbox, sreg
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import _k3 as gemv
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layout as L
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950._k3 import KernelAbi, wave_sum
+from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.layer import (
+    fp4_gemv,
+    fp4_gemv_loads,
+    quant_x,
+)
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.layout import need
 
 SOURCES = kernel_sources(__name__)
@@ -91,6 +103,9 @@ HPK = NV // NK  # value heads a key head: 8
 GTASKS = NV * NVCH  # GDN tasks a token: 128
 SL = L.CONV_W - 1  # conv state entries (no spec decode)
 SOFTPLUS_THRESHOLD = 20.0
+BA_PARTS = 8  # ``qq``: in_proj_ba's K split
+BA_K = HIDDEN // BA_PARTS
+BA_TASKS = L.BA // ROWS * BA_PARTS  # 16, on CTAs 0 ..
 LOG2E = 1.0 / math.log(2.0)
 LN2 = math.log(2.0)
 TAG_SLOTS = 256
@@ -98,8 +113,9 @@ TAG_SLOTS = 256
 # the CTAs with a second in_proj task are past the front ones
 assert BLOCKS < PTASKS <= 2 * BLOCKS and NRED <= 2 * BLOCKS - PTASKS
 assert BLOCKS % (HPK * NVCH) == 0, "a key head's GDN tasks must share a round"
+assert BA_TASKS <= 2 * BLOCKS - QKVZ_TASKS
 
-REGIONS = ("msq", "proj", "qk", "onrm")
+REGIONS = ("msq", "proj", "qk", "onrm", "bapart")
 
 _STREAM = fx.Stream(None)
 
@@ -110,6 +126,7 @@ class K1Build(msgspec.Struct, frozen=True):
     eps: float = 1e-6  # input_layernorm
     norm_eps: float = 1e-6  # the gated norm
     state_bf16: bool = False  # bf16 recurrent state: fp32 math, rounded on store
+    qq: bool = False  # in_proj_qkvz MXFP4 (ASM FP4 GEMM layout)
     # SGLANG_AMD_MONO_FAULT_INJECT: the wait this rank stalls at (0: none), once
     # fault_after steps have run
     fault_site: int = 0
@@ -125,6 +142,7 @@ ABI = KernelAbi(
         "res_out",
         "ln_w",
         "w_qkvz",
+        "w_qkvzs",
         "w_ba",
         "conv_w",
         "conv_st",
@@ -155,6 +173,7 @@ def scratch_layout(key: K1Build) -> dict:
         "proj": s * NPROJ,
         "qk": s * NK * 2 * HD,
         "onrm": s * NV * NVCH,
+        "bapart": BA_TASKS * s * ROWS if key.qq else 0,
     }
     return pair_layout(pairs.items())
 
@@ -251,6 +270,12 @@ def proj_loads(c, rg):
     return gemv.loads(c["lane"], c["wave"], w, row0, HIDDEN)
 
 
+def qkvz_fp4_loads(c, rg):
+    """An fp4 in_proj_qkvz task's (rg < 288) operands for this wave."""
+    a = c["args"]
+    return fp4_gemv_loads(c["lane"], c["wave"], a["w_qkvz"], a["w_qkvzs"], rg, HIDDEN)
+
+
 @flyc.jit
 def local_x(c):
     """Every front task's sums of squares -> each token's rstd (fp32 sum in task
@@ -304,12 +329,41 @@ def local_x(c):
     gpu.barrier()
 
 
+def ba_loads(c, i):
+    """in_proj_ba part i's weights for this wave (rows 16 (i / 8) ..,
+    K columns ``BA_K`` (i % 8) ..)."""
+    g, q = i // BA_PARTS, i % BA_PARTS
+    return gemv.loads(
+        c["lane"], c["wave"], c["args"]["w_ba"], g * ROWS, BA_K, ldk=HIDDEN, k0=q * BA_K
+    )
+
+
 @flyc.jit
-def stage_proj(c, rg, ops):
-    """Rows 16 rg .. of [in_proj_qkvz; in_proj_ba] -> bf16 PROJ."""
+def stage_ba(c, i, ops):
+    """in_proj_ba part i on the unquantized x rows -> fp32 BAPART."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     xrow = HIDDEN + gemv.LDS_PAD
-    acc = gemv.mfmas(lane, wave, c["xl"], xrow, HIDDEN, s, ops)
+    xl = c["xl"] + (i % BA_PARTS) * BA_K // 2
+    acc = gemv.mfmas(lane, wave, xl, xrow, BA_K, s, ops)
+    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+    gpu.barrier()
+    if tid < ROWS * s:
+        r = tid % ROWS
+        t = tid // ROWS
+        c["put"](c["bapart"], (i * s + t) * ROWS + r, row_sum(red, r, t))
+    gpu.barrier()
+
+
+@flyc.jit
+def stage_proj(c, rg, ops, fp4=False):
+    """Rows 16 rg .. of [in_proj_qkvz; in_proj_ba] -> bf16 PROJ (``fp4``: an
+    in_proj_qkvz task on the quantized rows)."""
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    xrow = HIDDEN + gemv.LDS_PAD
+    if const_expr(fp4):
+        acc = fp4_gemv(lane, wave, c["xl"], xrow, HIDDEN, s, rg, ops)
+    else:
+        acc = gemv.mfmas(lane, wave, c["xl"], xrow, HIDDEN, s, ops)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     if tid < ROWS * s:
@@ -405,10 +459,27 @@ def gdn_gates(c, k, t, h):
         v = c["poll"]([(c["qk"], (t * NK + kh) * 2 * HD + tid, 1)])[0][0]
         fx.ptr_store(f32_of(v), c["qkl"] + tid)
     if tid == 2 * HD:
-        got = c["poll"](
-            [(c["proj"], t * NPROJ + B0 + h, 1), (c["proj"], t * NPROJ + A0 + h, 1)]
-        )
-        got = [[f32_of(got[0][0])], [f32_of(got[1][0])]]
+        if const_expr(c["qq"]):
+            s = c["S"]
+            parts = c["poll"](
+                [
+                    (c["bapart"], ((g * BA_PARTS + q) * s + t) * ROWS + h, 1)
+                    for g in range(2)
+                    for q in range(BA_PARTS)
+                ]
+            )
+            ba = []
+            for g in range_constexpr(2):
+                v = f32_of(parts[g * BA_PARTS][0])
+                for q in range_constexpr(1, BA_PARTS):
+                    v = v + f32_of(parts[g * BA_PARTS + q][0])
+                ba.append([bf16_round(v)])
+            got = ba
+        else:
+            got = c["poll"](
+                [(c["proj"], t * NPROJ + B0 + h, 1), (c["proj"], t * NPROJ + A0 + h, 1)]
+            )
+            got = [[f32_of(got[0][0])], [f32_of(got[1][0])]]
         x = got[1][0] + k["dtb"]
         sp = hw_log2(fx.Float32(1.0) + hw_exp(x)) * fx.Float32(LN2)
         sp = (x <= fx.Float32(SOFTPLUS_THRESHOLD)).select(sp, x)
@@ -563,7 +634,9 @@ def build(key: K1Build):
         rs: fx.Array[fx.Float32, 16, 16]
 
     keyed = key_tuple(key, SOURCES)
-    name = f"qwen38_mono_k1_s{s}_f{int(key.first)}_b{int(key.state_bf16)}"
+    name = (
+        f"qwen38_mono_k1_s{s}_f{int(key.first)}_b{int(key.state_bf16)}_q{int(key.qq)}"
+    )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k1(
@@ -572,6 +645,7 @@ def build(key: K1Build):
         res_out: Int64,
         ln_w: Int64,
         w_qkvz: Int64,
+        w_qkvzs: Int64,
         w_ba: Int64,
         conv_w: Int64,
         conv_st: Int64,
@@ -608,6 +682,7 @@ def build(key: K1Build):
         ):
             mb = Mailbox(step_tag(epoch, layer))
             c = {
+                "qq": key.qq,
                 "goff": gdn_offset(key),
                 "rs": lds.rs.ptr,
                 "S": s,
@@ -633,6 +708,7 @@ def build(key: K1Build):
                     "res_out": res_out,
                     "ln_w": ln_w,
                     "w_qkvz": w_qkvz,
+                    "w_qkvzs": w_qkvzs,
                     "w_ba": w_ba,
                     "conv_w": conv_w,
                     "conv_st": conv_st,
@@ -654,13 +730,37 @@ def build(key: K1Build):
             # poll's load retires behind every earlier load)
             if bid < NRED:
                 stage_front(c, bid)
-            rg = BLOCKS - 1 - bid
-            ops = proj_loads(c, rg)
-            local_x(c)
-            stage_proj(c, rg, ops)
-            if bid >= 2 * BLOCKS - PTASKS:
-                rg2 = 2 * BLOCKS - 1 - bid
-                stage_proj(c, rg2, proj_loads(c, rg2))
+            if const_expr(not key.qq):
+                rg = BLOCKS - 1 - bid
+                ops = proj_loads(c, rg)
+                local_x(c)
+                stage_proj(c, rg, ops)
+                if bid >= 2 * BLOCKS - PTASKS:
+                    rg2 = 2 * BLOCKS - 1 - bid
+                    stage_proj(c, rg2, proj_loads(c, rg2))
+            else:
+                # rg < 256 is in_proj_qkvz; the second tasks 256 .. 287 on CTAs
+                # 224 .. 255, their weights with the first's; in_proj_ba's parts
+                # on CTAs 0 .. 15 (unquantized x: before quant_x)
+                rg = BLOCKS - 1 - bid
+                ops = qkvz_fp4_loads(c, rg)
+                if bid >= 2 * BLOCKS - QKVZ_TASKS:
+                    rg2 = 2 * BLOCKS - 1 - bid
+                    ops2 = qkvz_fp4_loads(c, rg2)
+                    local_x(c)
+                    quant_x(c)
+                    stage_proj(c, rg, ops, fp4=True)
+                    stage_proj(c, rg2, ops2, fp4=True)
+                if bid < BA_TASKS:
+                    bops = ba_loads(c, bid)
+                    local_x(c)
+                    stage_ba(c, bid, bops)
+                    quant_x(c)
+                    stage_proj(c, rg, ops, fp4=True)
+                if (bid >= BA_TASKS) & (bid < 2 * BLOCKS - QKVZ_TASKS):
+                    local_x(c)
+                    quant_x(c)
+                    stage_proj(c, rg, ops, fp4=True)
             gdn_tasks(c)
 
     @flyc.jit
@@ -670,6 +770,7 @@ def build(key: K1Build):
         res_out: Int64,
         ln_w: Int64,
         w_qkvz: Int64,
+        w_qkvzs: Int64,
         w_ba: Int64,
         conv_w: Int64,
         conv_st: Int64,
@@ -695,6 +796,7 @@ def build(key: K1Build):
             res_out,
             ln_w,
             w_qkvz,
+            w_qkvzs,
             w_ba,
             conv_w,
             conv_st,
@@ -738,8 +840,10 @@ def gdn_pre(
     scratch,
     epoch,
     layer,
+    w_qkvzs=None,
 ):
-    """Host launcher; every weight as SGLang holds it after loading. ``residual``
+    """Host launcher; every weight as SGLang holds it after loading (``w_qkvzs``:
+    an fp4 in_proj_qkvz's scales, ``key.qq``). ``residual``
     None on the first layer (``key.first``). ``conv_state`` [slots, dim, 3] or a
     transposed view of [slots, 3, dim] (strides read); ``rstate`` [slots, 16,
     128, 128] fp32 (bf16 with ``key.state_bf16``), a slot dense, slots strided;
@@ -754,10 +858,24 @@ def gdn_pre(
         "hidden / res_out shape",
     )
     need(core.shape == (s, L.CORE) and ln_w.shape == (HIDDEN,), "core / ln_w shape")
-    need(
-        w_qkvz.shape == (L.QKVZ, HIDDEN) and w_qkvz.dtype == bf,
-        "in_proj_qkvz: bf16 [4608, 8192]",
-    )
+    if key.qq:
+        need(
+            w_qkvz.shape == (L.QKVZ, HIDDEN // 2)
+            and w_qkvz.dtype in (torch.uint8, torch.float4_e2m1fn_x2),
+            "in_proj_qkvz: fp4x2 [4608, 4096]",
+        )
+        need(
+            w_qkvzs is not None
+            and w_qkvzs.numel() == L.QKVZ * HIDDEN // 32
+            and w_qkvzs.element_size() == 1
+            and w_qkvzs.is_contiguous(),
+            "in_proj_qkvz scales: e8m0, one a 32-block",
+        )
+    else:
+        need(
+            w_qkvz.shape == (L.QKVZ, HIDDEN) and w_qkvz.dtype == bf,
+            "in_proj_qkvz: bf16 [4608, 8192]",
+        )
     need(w_ba.shape == (L.BA, HIDDEN), "in_proj_ba shape")
     need(conv_w.numel() == L.CONV * L.CONV_W and conv_w.dtype == bf, "conv1d weight")
     need(
@@ -790,6 +908,7 @@ def gdn_pre(
                 "res_out": res_out.data_ptr(),
                 "ln_w": ln_w.data_ptr(),
                 "w_qkvz": w_qkvz.data_ptr(),
+                "w_qkvzs": w_qkvzs.data_ptr() if key.qq else 0,
                 "w_ba": w_ba.data_ptr(),
                 "conv_w": conv_w.data_ptr(),
                 "conv_st": conv_state.data_ptr(),

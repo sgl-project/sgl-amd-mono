@@ -25,7 +25,7 @@ NEXTN verify step has one row for each token that it scores. GDN is Gated DeltaN
 | `spec.py` | the `MonoSpec`, its refusal reasons, the build and the forward `_Built.forward` |
 | `check.py` | check mode, which `SGLANG_AMD_MONO_CHECK=1` turns on |
 | `gfx950/gdn.py` | K1 as the FlyDSL kernel `gdn_pre`, its build key `K1Build` and its scratch layout |
-| `gfx950/layer.py` | K2 as the FlyDSL kernel `layer_post`, its build key `K2Build` and its scratch layout |
+| `gfx950/layer.py` | K2 as the FlyDSL kernel `layer_post`, its build key `K2Build`, its scratch layout and the FP4 GEMV helpers that K1 also uses |
 | `gfx950/layout.py` | the TP8 shapes and the addresses of the MXFP4 expert tiles and scales, with no FlyDSL import |
 | `gfx950/_k3.py` | the Kimi-K3 helpers that K1 and K2 use, copied from sgl-project/sglang#43481 |
 
@@ -91,6 +91,14 @@ A K1 launch has the same grid as K2. The table gives its stages in order.
 K1 computes the recurrence in f32, also when the SSM state is bf16. A pad row has a state index of 0 or less. K1
 writes no state for a pad row, and it writes a zero core row.
 
+Since sgl-project/sglang#43839, SGLang quantizes `in_proj_qkvz` and `out_proj` of the 69 GDN layers to MXFP4 at load
+time. It does this by default, and `SGLANG_ROCM_GDN_ONLINE_MXFP4=0` turns it off. Two builds run these projections:
+
+- The `qq` build of K1 reads the MXFP4 `in_proj_qkvz`. It quantizes the normed rows to MXFP4 with RCEIL scales, as
+  SGLang quantizes the input of its FP4 GEMM. `in_proj_ba` stays bf16 on the rows before the quantization, in 16 tasks
+  on CTAs 0 to 15.
+- The `oq` build of K2 reads the MXFP4 `out_proj`. Its `o_proj` stage quantizes the core rows to MXFP4 in the same way.
+
 ## 3. Hand-offs and guarded waits
 
 - Stages and ranks pass values through the tagged mailboxes of `common/sync.py`. Each value has a tag from the step
@@ -113,11 +121,14 @@ K2 reads these SGLang weights in place at each launch:
   has the addresses of their tiles.
 
 With `fse`, the shared expert is expert 512 of `w13` and `w2`, and K2 reads no bf16 weights of the shared expert.
+With `oq`, K2 reads the MXFP4 `out_proj` and its e8m0 scales in the shuffled layout of SGLang's FP4 GEMM.
 
 K1 reads these SGLang weights in place at each launch:
 
 - the input norm, `in_proj_qkvz`, `in_proj_ba`, the conv weights, `dt_bias` and the gated norm, in bf16
 - `A_log`, in f32
+
+With `qq`, K1 reads the MXFP4 `in_proj_qkvz` and its e8m0 scales in the same layout as `oq`.
 
 K1 also updates the bf16 conv state and the f32 or bf16 SSM state of each request in place.
 
@@ -138,16 +149,22 @@ The spec also refuses these GDN settings, because K1 cannot run them:
 - `--enable-linear-replayssm` without speculative decoding, because ReplaySSM defers the state update that K1 makes
   in place
 - an SSM state that is not f32 or bf16, or a conv state that is not bf16
-- GDN weights that are not bf16, or an `A_log` that is not f32
+- an `in_proj_qkvz` or `out_proj` that is neither bf16 nor MXFP4
+- an MXFP4 `in_proj_qkvz` or `out_proj` with the Hadamard-32 rotation of
+  [sglang#46059](https://github.com/sgl-project/sglang/pull/46059), or with another state of its quant method. K1 and
+  K2 do not rotate the activation. Set `SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0`.
+- other GDN weights that are not bf16, or an `A_log` that is not f32
 - a conv with a bias or without SiLU
 - a gated norm over less than a full head, without SiLU, or after the gate
 
 The spec accepts a layer with a bf16 shared expert, or with a fused shared expert and 513 routed experts. It refuses a
 layer with neither.
 
-On each rank, `_build` makes two K1 launches for each CUDA graph width. One K1 launch is for layer 0, which has no
-residual input. The other K1 launch is for the other GDN layers. `_build` also makes one K2 launch for each width and
-each shared-expert layout of the model. It compiles them before the first step.
+On each rank, `_build` makes two K1 launches for each CUDA graph width and each `in_proj_qkvz` dtype of the model. One
+K1 launch is for layer 0, which has no residual input. The other K1 launch is for the other GDN layers. `_build` also
+makes one K2 launch for each width, each shared-expert layout and each `o_proj` or `out_proj` dtype of the model. It
+compiles them before the first step. With the MXFP4 projections, K2 runs `oq` on the GDN layers and the bf16 build on
+the full-attention layers.
 The log shows "Qwen3.8 monokernel: N K1 and M K2 launches (widths [...], decode) in T s". With speculative decoding,
 `_build` makes no K1 launch, and the log shows "verify" instead of "decode". In the NEXTN test, each request has 4
 rows, so the widths are 4 and 8.
@@ -156,8 +173,8 @@ SGLang uses only the CUDA graph key of a step to choose between the monokernel a
 width, which is the number of requests times the rows of each request. Thus each rank makes the same choice, and a
 CUDA graph can replay it. A step with input embeddings or auxiliary hidden states runs SGLang's forward.
 
-The folder needs no SGLang changes. Start the server with `--monokernel-backend amd` and
-`SGLANG_ROCM_GDN_ONLINE_MXFP4=0`. After sgl-project/sglang#45389, the flag is `--enable-amd-monokernel`.
+The folder needs no SGLang changes. Start the server with `--monokernel-backend amd`. After sgl-project/sglang#45389,
+the flag is `--enable-amd-monokernel`.
 
 ## 6. Correctness checks
 
@@ -173,7 +190,8 @@ The kernel tests run K1 on 1 GPU and K2 on 8 GPUs, with random weights:
 - With a bf16 SSM state, K1 computes in f32 on the widened state. Its core and conv state are the same as those of the
   f32 build, bit for bit.
 - The port test compares K1 and K2 with the kernels of sgl-project/sglang#43516, bit for bit. It runs only where those
-  kernels are installed. It compares the `fse` build of K2 at 1, 4 and 8 rows.
+  kernels are installed. It compares the `fse` build of K2 at 1, 4 and 8 rows. It also compares the `qq` and `oq`
+  builds.
 
 Check mode needs `SGLANG_AMD_MONO_CHECK=1` and runs only in eager mode. It runs SGLang's own layer code next to each
 K2 launch, on the same input. On the rows that K2 and SGLang route to the same experts, `k2.out.cosine` must be at
@@ -184,7 +202,9 @@ conv and SSM state rows. `k1.core.cosine`, `k1.conv.cosine` and `k1.state.cosine
 
 The e2e test runs K1 and K2 on decode steps of width 1 to 8, and SGLang's forward on wider steps. It also runs GSM8K,
 measures the KL divergence of decode against prefill, runs check mode, and injects a fault on one rank. Check mode
-must log K1 and K2 checks at 1, 3 and 8 rows. A second check-mode test runs with `--enforce-shared-experts-fusion`.
+must log K1 and K2 checks at 1, 3 and 8 rows. The e2e servers keep the MXFP4 projections, so K1 runs `qq` and K2 runs
+`oq`. The first check-mode test needs the SGLang log line "Online MXFP4 GDN in_proj_qkvz,out_proj: N" with N of at
+least 1. A second check-mode test runs with `--enforce-shared-experts-fusion`.
 It also needs the SGLang log line "Quantizing the BF16 shared expert to MXFP4 while loading", because SGLang only warns
 when it does not fuse the shared expert. `TestMonokernelVerify` runs GSM8K at 4 concurrent requests on a NEXTN
 server. Its verify steps have 4 to 16 rows, and K2 serves the steps of up to 8 rows.
@@ -199,5 +219,4 @@ K1 and K2 run only with:
 - one chain of draft tokens for each request, with `--speculative-eagle-topk 1`
 - an f32 or bf16 SSM state and a bf16 conv state
 - `--enable-linear-replayssm` only with speculative decoding
-- bf16 GDN projections, so start the server with `SGLANG_ROCM_GDN_ONLINE_MXFP4=0`
 - the `aiter` attention backend

@@ -17,6 +17,7 @@ scales as the GEMM does, and adds the slices in fp32 at the end.
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -24,6 +25,9 @@ import triton
 import triton.language as tl
 
 from sgl_amd_mono.qwen35_a17b.fp8.gfx950.layout import BLOCK, FP8_MAX
+
+logger = logging.getLogger(__name__)
+
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -38,6 +42,11 @@ WG_SPLIT = 8
 WG_ROWS = 16
 WG_MAX_ROWS = 32
 WG_WARPS = 4
+# num_stages of the K loop in ``wg_dot``: 2 is the pipelined loop this was written
+# with. Triton 3.8 cannot compile it (LLVM translation of the pipelined
+# preshuffled-weight load), so ``wg_stages`` falls back to 1, the unpipelined loop.
+# 1 is only a fallback: some Triton builds compute it wrongly for M > 16.
+_wg_stages: int | None = None
 
 
 def _shuffled(weight: torch.Tensor) -> bool:
@@ -96,6 +105,7 @@ def wg_dot(
     GROUP: tl.constexpr,
     BN: tl.constexpr,
     ROWS: tl.constexpr,
+    STAGES: tl.constexpr,
 ):
     """fp32 ``[ROWS, BN]``: rows ``[0, M)`` of the product for weight rows
     ``pid * BN + [0, BN)``, K in ``S`` slices of one batched dot each."""
@@ -107,7 +117,7 @@ def wg_dot(
     # [n // 16, k // 32, k // 16 % 2, n % 16, k % 16] of [N/16, K/32, 2, 16, 16]
     w_row = (pid * (BN // 16) + nn // 16) * (K * 16) + (nn % 16) * 16
     acc = tl.zeros([S, ROWS, BN], dtype=tl.float32)
-    for step in tl.range(0, K // S // GROUP, num_stages=2):
+    for step in tl.range(0, K // S // GROUP, num_stages=STAGES):
         kb = s * (K // S // GROUP) + step
         k = kb[:, None] * GROUP + kk[None, :]
         x = tl.load(
@@ -146,6 +156,7 @@ def _wg_kernel(
     GROUP: tl.constexpr,
     BN: tl.constexpr,
     ROWS: tl.constexpr,
+    STAGES: tl.constexpr,
 ):
     pid = tl.program_id(0)
     acc = wg_dot(
@@ -165,6 +176,7 @@ def _wg_kernel(
         GROUP=GROUP,
         BN=BN,
         ROWS=ROWS,
+        STAGES=STAGES,
     )
     m = tl.arange(0, ROWS)
     n = pid * BN + tl.arange(0, BN)
@@ -195,7 +207,11 @@ def block_fp8_gemv_wg(
     if not wg_fits(m, k, weight):
         return block_fp8_gemv_q(x, xq, weight, scale)
     q, q_scale = xq
-    out = torch.empty(m, weight.shape[0], dtype=x.dtype, device=x.device)
+    return _launch_wg(q, q_scale, weight, scale, m, x.dtype, wg_stages())
+
+
+def _launch_wg(q, q_scale, weight, scale, m, dtype, stages):
+    out = torch.empty(m, weight.shape[0], dtype=dtype, device=q.device)
     _wg_kernel[(weight.shape[0] // WG_BN,)](
         q,
         q.stride(0),
@@ -209,14 +225,45 @@ def block_fp8_gemv_wg(
         out,
         out.stride(0),
         m,
-        K=k,
+        K=q.shape[1],
         S=WG_SPLIT,
         GROUP=BLOCK,
         BN=WG_BN,
         ROWS=wg_rows(m),
+        STAGES=stages,
         num_warps=WG_WARPS,
     )
     return out
+
+
+def wg_stages() -> int:
+    """``num_stages`` for ``wg_dot``: 2 where this Triton compiles it, else 1.
+
+    Decided once per process by compiling ``_wg_kernel`` for both row tiles, so it
+    follows the Triton build rather than its version number. Call it before CUDA
+    graph capture (the spec's ``_build`` does): the check launches the kernel.
+    """
+    global _wg_stages
+    if _wg_stages is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("call wg_stages() before CUDA graph capture")
+        try:
+            k, n = 4096, 128
+            q = torch.zeros(WG_MAX_ROWS, k, dtype=torch.float8_e4m3fn, device="cuda")
+            q_scale = torch.ones(k // BLOCK, WG_MAX_ROWS, device="cuda").t()
+            weight = torch.zeros(n, k, dtype=torch.float8_e4m3fn, device="cuda")
+            scale = torch.ones(n // BLOCK, k // BLOCK, device="cuda")
+            for m in (WG_ROWS, WG_MAX_ROWS):
+                _launch_wg(q[:m], q_scale[:m], weight, scale, m, torch.bfloat16, 2)
+            _wg_stages = 2
+        except Exception as e:  # noqa: BLE001 - Triton raises several types
+            logger.warning(
+                "wg_dot: num_stages=2 does not compile on Triton %s, using 1 (%s)",
+                triton.__version__,
+                str(e).strip().splitlines()[-1] if str(e).strip() else type(e).__name__,
+            )
+            _wg_stages = 1
+    return _wg_stages
 
 
 def _allow_block_fp8_linear() -> None:

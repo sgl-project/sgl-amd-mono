@@ -16,7 +16,10 @@ gathered embedding rows, and writes the spec's step tables (``--step-rows``: the
 step's rows, fewer than the width); ``--check-head``: the tail's logits against a
 torch tail and an f32 tail; ``--replays N``: a graph of ``--layers`` launches
 replays the eager step bitwise; ``--verify L`` (``kda`` or ``dsa``): an MTP verify
-launch of L rows a request equals its tokens' L decode launches bitwise."""
+launch of L rows a request equals its tokens' L decode launches bitwise;
+``--check-state-bf16`` (``kda``, ``dense`` or ``embed``, with or without
+``--verify``): a launch on a bf16 recurrent state equals the f32 launch on the same
+values, its written state and verify scratch the f32 ones rounded to bf16."""
 
 import argparse
 import os
@@ -1338,6 +1341,116 @@ def check_verify(args, rank, tp, group, device) -> bool:
     return ok
 
 
+def check_state_bf16(args, rank, tp, group, device) -> bool:
+    """A KDA launch on a bf16 recurrent state (``FlashBuild.state_bf16``) against
+    the f32 launch on the same values (the f32 state rounded to bf16 first), at the
+    same width; ``--kind`` ``kda``, ``dense`` (KDA and the dense MLP) or ``embed``
+    (the dense layer 0 from the step's tokens); a decode launch, or with ``--verify``
+    a verify launch: equal outputs and conv state (with ``--verify`` conv windows),
+    and the bf16 launch's written recurrent state (with ``--verify`` its verify
+    scratch) equal to the f32 launch's rounded to bf16."""
+    from msgspec.structs import replace
+
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.glm53_flash.gfx950.config import (
+        KDA_DIM,
+        KDA_HEADS,
+        KDA_PROJ,
+    )
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
+
+    kind, W, L = args.kind, args.rows, max(args.verify, 1)
+    if kind not in ("kda", "dense", "embed"):
+        raise SystemExit("--check-state-bf16 takes --kind kda, dense or embed")
+    dense = kind != "kda"
+    R = W // L
+    P, H, D = KDA_PROJ // tp, KDA_HEADS // tp, KDA_DIM
+    ffn = dense_weights(rank, tp, device) if dense else ffn_weights(rank, tp, device)
+    attn = kda_weights(rank, tp, device)
+    emb = embedding(rank, tp, device)[0] if kind == "embed" else None
+    ins = layer_inputs(W, device)
+    if kind == "embed":
+        x, res, post, comb = ins
+        ins = (torch.zeros_like(x), torch.zeros_like(res), torch.ones_like(post))
+        ins += (torch.zeros_like(comb),)
+    base, _ = kda_state(W, tp, device)
+    rec16 = base.rec_state.bfloat16()
+    idx = torch.zeros(W, dtype=torch.int32, device=device)
+    if L > 1:
+        idx[: R * L] = torch.arange(1, R + 1, device=device).repeat_interleave(L)
+    else:
+        idx[:] = torch.arange(1, W + 1, device=device)
+    runs = {}
+    for bf16, rec in ((False, rec16.float()), (True, rec16)):
+        key = FlashBuild(
+            rows=W,
+            tp=tp,
+            launches_per_step=1,
+            inter=GLOBAL_INTER // tp,
+            kda=True,
+            state_bf16=bf16,
+            dense=dense,
+            tokens=kind == "embed",
+            verify=L,
+            grouped=W >= GROUPED_FROM and not dense,
+            stop=False,
+        )
+        rt = FlashRuntime(key, rank, group, device)
+        rt.set_deadline(args.deadline)
+        state = replace(base, conv_state=base.conv_state.clone(), rec_state=rec.clone())
+        if L > 1:
+            state = replace(
+                state,
+                inter_rec=torch.full(
+                    (R + 1, L, H, D, D), float("nan"), dtype=rec.dtype, device=device
+                ),
+                inter_conv=torch.zeros(
+                    R + 1, L, 3, 3 * P, dtype=torch.bfloat16, device=device
+                ),
+            )
+        # an embed launch writes the step's tables: each side its own copy
+        step = step_inputs(W, W, tp, device) if kind == "embed" else None
+        out = FlashLayerOp(rt, ffn, 0, kda=attn, embedding=emb).launch(
+            *ins, state=state, state_idx=idx, step=step
+        )
+        rt.advance_step()
+        torch.cuda.synchronize()
+        words = rt.epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1].tolist()
+        if any(words):
+            print(f"rank {rank}: bf16 {bf16}: error words {words}", flush=True)
+            return False
+        runs[bf16] = (tuple(t.clone() for t in out), state, rt)
+    (f_out, f_st, _), (b_out, b_st, _) = runs[False], runs[True]
+    ok = True
+    for n, (a, b) in enumerate(zip(f_out, b_out)):
+        same = torch.equal(a, b)
+        ok &= same
+        print(f"rank {rank}: output {n} equal {same}")
+    pairs = [("conv_state", f_st.conv_state, b_st.conv_state)]
+    if L > 1:
+        pairs += [
+            ("rec_state (unchanged)", rec16, b_st.rec_state),
+            ("inter_rec", f_st.inter_rec[:R].bfloat16(), b_st.inter_rec[:R]),
+            ("inter_conv", f_st.inter_conv[:R], b_st.inter_conv[:R]),
+        ]
+    else:
+        changed = not torch.equal(b_st.rec_state[1 : W + 1], rec16[1 : W + 1])
+        ok &= changed
+        print(f"rank {rank}: the bf16 launch wrote its rows' state {changed}")
+        pairs.append(("rec_state", f_st.rec_state.bfloat16(), b_st.rec_state))
+    for name, a, b in pairs:
+        same = torch.equal(a, b)
+        ok &= same
+        print(f"rank {rank}: {name} equal {same}")
+    print(
+        f"rank {rank}: bf16 state vs f32 state ({kind}, {W} rows, verify {L}) ok {ok}"
+    )
+    for _, _, rt in runs.values():
+        rt.close()
+    return ok
+
+
 def _changed_rows(before: torch.Tensor, after: torch.Tensor) -> set:
     d = (before != after).reshape(before.shape[0], -1).any(1)
     return set(d.nonzero().flatten().tolist())
@@ -1412,6 +1525,12 @@ def main() -> int:
     ap.add_argument(
         "--writes", action="store_true", help="check the rows a launch writes"
     )
+    ap.add_argument(
+        "--check-state-bf16",
+        action="store_true",
+        help="a kda, dense or embed launch on a bf16 state vs on f32 (with --verify: "
+        "a verify launch)",
+    )
     args = ap.parse_args()
     MAX_LEN = args.max_len
     args.max_pools = args.max_pools or MAX_LEN // 4
@@ -1427,6 +1546,7 @@ def main() -> int:
         (args.check_dense, check_dense),
         (args.check_embed, check_embed),
         (args.check_head, check_head),
+        (args.check_state_bf16, check_state_bf16),
         (args.replays, check_replays),
         (args.verify, check_verify),
     ):

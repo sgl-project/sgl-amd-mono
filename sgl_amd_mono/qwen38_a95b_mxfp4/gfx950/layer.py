@@ -42,12 +42,16 @@ picks in top-k order (no union pass); with the fused shared expert and at
 least 4 rows, its gate | up tasks run before the route (they don't depend
 on it).
 
-One variant follows the stock flags:
+Two variants follow the stock flags:
 
 - ``fse`` (a fused shared expert, ``num_fused_shared_experts`` 1): the shared expert is
   expert 512 of w13 / w2, a pick of every token at top-k index 10 with weight
   sigmoid(bf16(x . w_sg)) (fp32, the top-k kernel's fused sigmoid); no sgu
   stage, no shared down rows.
+- ``oq`` (an online-MXFP4 out_proj on the ASM FP4 GEMM): o_proj's weight is
+  fp4x2 through ``shuffle_weight(layout=(16, 16))``, its scales through
+  ``e8m0_shuffle``; the core rows go through MXFP4 (RCEIL), as
+  ``per_1x32_f4_quant_hip`` quantizes the GEMM's input.
 """
 
 import math
@@ -75,6 +79,7 @@ from sgl_amd_mono.common.ops import (
     hw_rsq,
     ld_i32,
     load_ptr64,
+    mfma_bf16,
     row_sum,
     rsrc,
     uniform,
@@ -141,6 +146,7 @@ class K2Build(msgspec.Struct, frozen=True):
     tokens: int
     eps: float = 1e-6  # post_attention_layernorm
     fse: bool = False  # the shared expert fused as expert 512
+    oq: bool = False  # o_proj MXFP4 (ASM FP4 GEMM layout)
     # o_proj's input is core x sigmoid(gate) (bf16; the attention output gate
     # as Qwen3NextAttention applies it)
     og: bool = False
@@ -172,6 +178,7 @@ ABI = KernelAbi(
         "core",
         "residual",
         "w_o",
+        "w_os",
         "ln_w",
         "w_gate",
         "w_sg",
@@ -305,6 +312,17 @@ def pk_fp4_f32(old, a, b, scale, j):
     )
 
 
+def pk_bf16_fp4(word, scale, j):
+    """Byte j of ``word``'s two e2m1 codes times ``scale`` -> a bf16 pair."""
+    v = rocdl.cvt_scalef32_pk_bf16_fp4(
+        T.vec(2, T.bf16),
+        as_ir_value(fx.Int32(word)),
+        as_ir_value(fx.Float32(scale)),
+        j,
+    )
+    return fx.Vector(v).bitcast(fx.Int32)[0]
+
+
 def mfma_f4(a, b, acc, sa, sb):
     """16x16x128 fp4 x fp4 (e8m0 scales ``sa``, ``sb``: a lane's 32-block)."""
     return fx.Vector(
@@ -312,6 +330,36 @@ def mfma_f4(a, b, acc, sa, sb):
             T.vec(4, T.f32), [a, b, acc, 4, 4, 0, sa, 0, sb]
         )
     )
+
+
+def fp4x8_bf16(word, scale):
+    """The 8 fp4 of ``word`` times ``scale`` -> an MFMA operand (8 bf16 as 4 i32,
+    nibble order: element 2 j, 2 j + 1 from byte j)."""
+    out = []
+    for j in range(4):
+        v = rocdl.cvt_scalef32_pk_bf16_fp4(
+            T.vec(2, T.bf16),
+            as_ir_value(fx.Int32(word)),
+            as_ir_value(fx.Float32(scale)),
+            j,
+        )
+        out.append(fx.Vector(v).bitcast(fx.Int32)[0])
+    return fx.Vector.from_elements(out, fx.Int32)
+
+
+def fp4_mfmas(tile, scale, xl, xoff, acc):
+    """One 128-K step: a lane's 16 B of fp4 (4 dwords, K 32 (lane / 16) + 8 q ..
+    for dword q) against the bf16 B rows at LDS ``xl`` + ``xoff`` (the same K)."""
+    for q in range_constexpr(4):
+        xb = fx.Vector(
+            fx.ptr_load(
+                xl + (xoff + 8 * q) // 2,
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+        )
+        a = fp4x8_bf16(tile[q], scale)
+        acc = mfma_bf16(a.bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc)
+    return acc
 
 
 def fp4_tile(r_w, at):
@@ -324,13 +372,49 @@ def scale_word(r_s, byte_index):
     return fx.Int32(bo.buffer_load(r_s, byte_index // 4, vec_width=1, dtype=T.i32))
 
 
+def fp4_gemv_loads(lane, wave, w, ws, rg, k):
+    """An online-MXFP4 linear's rows 16 rg .. (K ``k``, the ASM FP4 GEMM's
+    shuffled weight and scales) for this wave: its K steps' tiles (wave w:
+    steps w n .. w n + n - 1) and their scale words (a word: two steps)."""
+    n = k // L.FP4_STEP // WAVES
+    r_w, r_s = rsrc(w), rsrc(ws)
+    row = rg * ROWS + lane % ROWS
+    tiles = [
+        fp4_tile(r_w, L.fp4_tile_dword(0, rg, k, wave * n + i, lane)) for i in range(n)
+    ]
+    words = [
+        scale_word(
+            r_s, L.scale_index(row, 4 * (wave * n + 2 * i) + lane // 16, k // 32)
+        )
+        for i in range(n // 2)
+    ]
+    return tiles + words
+
+
+def fp4_gemv(lane, wave, xl, xrow, k, s, rg, ops):
+    """The ``fp4_gemv_loads`` operands against the MXFP4-exact bf16 rows at LDS
+    ``xl`` (row stride ``xrow``) -> this wave's fp32 partial MFMA tile."""
+    n = k // L.FP4_STEP // WAVES
+    t = fx.min(lane % 16, s - 1)
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    for i in range_constexpr(n):
+        # the code is byte (step % 2) 2 + rg % 2 of its word (e8m0_shuffle)
+        code = (ops[n + i // 2] >> ((i % 2) * 16 + (rg % 2) * 8)) & 0xFF
+        xoff = t * xrow + (wave * n + i) * L.FP4_STEP + 32 * (lane // 16)
+        acc = fp4_mfmas(ops[i], pow2(code), xl, xoff, acc)
+    return acc
+
+
 # ---------------------------------------------------------------- o_proj
 @flyc.jit
 def stage_o(c, rg, ops):
     """Rows 16 rg ..: GEMV of the LDS core rows -> bf16 partials -> every rank's
     AR region, this rank's slot (thread: token, row pair)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
-    acc = gemv.mfmas(lane, wave, c["xl"], OK + gemv.LDS_PAD, OK, s, ops)
+    if const_expr(c["oq"]):
+        acc = fp4_gemv(lane, wave, c["xl"], OK + gemv.LDS_PAD, OK, s, rg, ops)
+    else:
+        acc = gemv.mfmas(lane, wave, c["xl"], OK + gemv.LDS_PAD, OK, s, ops)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     if tid < s * (ROWS // 2):
@@ -345,9 +429,12 @@ def stage_o(c, rg, ops):
 
 
 def o_loads(c, j):
-    """o_proj task bid + 256 j's weights for this wave."""
+    """o_proj task bid + 256 j's weights for this wave (fp4: its two K steps'
+    tiles and their scale word)."""
     lane, wave, a = c["lane"], c["wave"], c["args"]
     rg = c["bid"] + BLOCKS * j
+    if const_expr(c["oq"]):
+        return fp4_gemv_loads(lane, wave, a["w_o"], a["w_os"], rg, OK)
     return gemv.loads(lane, wave, a["w_o"], rg * ROWS, OK)
 
 
@@ -388,6 +475,8 @@ def run_oproj(c, oops):
         gated_rows_to_lds(c, core, c["args"]["gate"])
     else:
         gemv.rows_to_lds(c["tid"], core, OK, c["S"], c["xl"], OK + gemv.LDS_PAD)
+    if const_expr(c["oq"]):
+        quant_x(c, OK)
     for j in range_constexpr(OTASKS // BLOCKS):
         stage_o(c, c["bid"] + BLOCKS * j, oops[j])
 
@@ -502,6 +591,30 @@ def wait_x(c, klen, k0):
     x_rows_to_lds(c, klen, k0)
 
 
+@flyc.jit
+def quant_x(c, k=HIDDEN):
+    """The rows of K ``k`` in LDS through MXFP4 in place, 1 x 32 blocks (RCEIL
+    scale), 8 elements a lane (a block on 4 adjacent lanes: one 16 B LDS access
+    a lane, conflict-free): the routed experts' activations, as the stock
+    decode kernel takes them (the router and the shared expert read x
+    unquantized, before this), or an fp4 o_proj's core rows."""
+    s, tid, xl = c["S"], c["tid"], c["xl"]
+    xrow = k + gemv.LDS_PAD
+    nq = s * k // 8
+    for i in range_constexpr((nq + THREADS - 1) // THREADS):
+        e = fx.min(tid + THREADS * i, nq - 1)
+        at = ((e // (k // 8)) * xrow + 8 * (e % (k // 8))) // 2
+        wv, code = _quad_scale(xl + at)
+        sc = pow2(code)
+        q = fx.Int32(0)
+        for d in range_constexpr(4):
+            q = pk_fp4_bf16(q, wv[d], sc, d)
+        ys = [pk_bf16_fp4(q, sc, d) for d in range(4)]
+        if tid + THREADS * i < nq:
+            fx.ptr_store(fx.Vector.from_elements(ys, fx.Int32), xl + at)
+    gpu.barrier()
+
+
 def _quad_scale(ptr):
     """A lane's 8 bf16 at LDS ``ptr`` (4 words) and their 1 x 32 block's e8m0
     code (the amax over the block's 4 lanes)."""
@@ -535,11 +648,11 @@ def xq_scales(s):
 
 @flyc.jit
 def quant_x_fp4(c):
-    """The x rows in LDS (bf16, K ``HIDDEN``) -> MXFP4 codes over them, 1 x 32
-    blocks (RCEIL scale), 8 elements a lane: token t's block b at byte t
-    ``XQ_ROW`` + 16 b (element 2 j in byte j's low nibble; a lane's 8 elements
-    one word), its code at dword ``xq_scales`` + t (HIDDEN / 32) + b. Every
-    thread reads before any writes."""
+    """The x rows in LDS (bf16, K ``HIDDEN``) -> MXFP4 codes over them,
+    ``quant_x``'s arithmetic and lanes: token t's block b at byte t ``XQ_ROW`` +
+    16 b (element 2 j in byte j's low nibble; a lane's 8 elements one word), its
+    code at dword ``xq_scales`` + t (HIDDEN / 32) + b. Every thread reads
+    before any writes."""
     s, tid, xl = c["S"], c["tid"], c["xl"]
     xrow = HIDDEN + gemv.LDS_PAD
     kq = HIDDEN // 8
@@ -1200,13 +1313,14 @@ def build(key: K2Build):
         rs: fx.Array[fx.Float32, 16, 16]
 
     keyed = key_tuple(key, SOURCES)
-    name = f"qwen38_mono_k2_s{s}_f{int(key.fse)}_a{int(key.og)}"
+    name = f"qwen38_mono_k2_s{s}_f{int(key.fse)}_o{int(key.oq)}_a{int(key.og)}"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(
         core: Int64,
         residual: Int64,
         w_o: Int64,
+        w_os: Int64,
         ln_w: Int64,
         w_gate: Int64,
         w_sg: Int64,
@@ -1270,6 +1384,7 @@ def build(key: K2Build):
                 "rank": rank,
                 "eps": key.eps,
                 "fse": key.fse,
+                "oq": key.oq,
                 "KT": kt,
                 "put": mb.put,
                 "put_bf": mb.put_bf,
@@ -1297,6 +1412,7 @@ def build(key: K2Build):
                     "gate": gate,
                     "residual": residual,
                     "w_o": w_o,
+                    "w_os": w_os,
                     "ln_w": ln_w,
                     "w_gate": w_gate,
                     "w_sg": w_sg,
@@ -1387,6 +1503,7 @@ def build(key: K2Build):
         core: Int64,
         residual: Int64,
         w_o: Int64,
+        w_os: Int64,
         ln_w: Int64,
         w_gate: Int64,
         w_sg: Int64,
@@ -1411,6 +1528,7 @@ def build(key: K2Build):
             core,
             residual,
             w_o,
+            w_os,
             ln_w,
             w_gate,
             w_sg,
@@ -1455,13 +1573,15 @@ def layer_post(
     rank,
     epoch,
     layer,
+    w_os=None,
     w_sgu=None,
     w_sd=None,
     gate=None,
 ):
     """Host launcher; every weight as SGLang holds it after loading, the experts'
-    shuffled (``layout``). ``w_sgu`` / ``w_sd``: the unfused shared expert (not
-    ``key.fse``); ``gate``: the attention output gate (``key.og``), core's shape.
+    shuffled (``layout``). ``w_os``: an fp4 o_proj's scales (``key.oq``);
+    ``w_sgu`` / ``w_sd``: the unfused shared expert (not ``key.fse``); ``gate``:
+    the attention output gate (``key.og``), core's shape.
     ``peers``: the int64 table of every rank's peer buffer
     (``peer_buffer_bytes()`` each)."""
     s = key.tokens
@@ -1478,7 +1598,19 @@ def layer_post(
         "gate: core's shape, with og only",
     )
     need(ln_w.shape == (HIDDEN,), "norm shape")
-    need(w_o.shape == (HIDDEN, OK) and w_o.dtype == bf, "o_proj: bf16 [8192, 2048]")
+    if key.oq:
+        need(
+            w_o.shape == (HIDDEN, OK // 2) and w_o.dtype in fp4,
+            "o_proj: fp4x2 [8192, 1024]",
+        )
+        need(
+            w_os is not None
+            and w_os.numel() == HIDDEN * OK // 32
+            and w_os.element_size() == 1,
+            "o_proj scales: e8m0, one a 32-block",
+        )
+    else:
+        need(w_o.shape == (HIDDEN, OK) and w_o.dtype == bf, "o_proj: bf16 [8192, 2048]")
     need(w_gate.shape == (E, HIDDEN) and w_sg.numel() == HIDDEN, "router shape")
     if not key.fse:
         need(
@@ -1504,7 +1636,7 @@ def layer_post(
         w2s.numel() == ne * HIDDEN * RI // 32 and w2s.element_size() == 1,
         "w2 scales: e8m0, one a 32-block",
     )
-    used = [w_o, w_gate, w_sg, w_sgu, w_sd, w13, w13s, w2, w2s]
+    used = [w_o, w_os, w_gate, w_sg, w_sgu, w_sd, w13, w13s, w2, w2s]
     used += [gate]
     tensors = [core, residual, out, res_out, ln_w] + [w for w in used if w is not None]
     need(all(t.is_contiguous() for t in tensors), "a non-contiguous input")
@@ -1523,6 +1655,7 @@ def layer_post(
                 "core": core.data_ptr(),
                 "residual": residual.data_ptr(),
                 "w_o": w_o.data_ptr(),
+                "w_os": ptr(w_os) if key.oq else 0,
                 "ln_w": ln_w.data_ptr(),
                 "w_gate": w_gate.data_ptr(),
                 "w_sg": w_sg.data_ptr(),
