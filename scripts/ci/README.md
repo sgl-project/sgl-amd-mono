@@ -14,10 +14,11 @@ nodes:
   test runs is in the nightly at the **tests** tier only (its tests and serving
   tests, no benchmark or speed test): every change to it is measured by the PR
   test, so between PRs only the SGLang image changes, and its tests catch that
-  the day it does. Of the nightly models, only Kimi-K3 (`"pr": False`) still runs
-  its benchmarks and speed test every night. Saturday's
+  the day it does. Saturday's
   **weekly** run has every benchmark with the monokernels on and off, for every
-  model in full; its off
+  model in full, and the models marked `weekly` too: Qwen3.5-397B-A17B and the
+  deprecated DeepSeek-V4-Pro, which the PR test does not run (the deprecated
+  Kimi-K3 runs only when dispatched with `models`); its off
   results are the reference the nightly and the PR test read until the next one.
   A run of the nightly workflow with `weekly` ticked writes that reference too,
   from whichever branch it runs, so run it by hand on `main` only.
@@ -61,7 +62,7 @@ only the models InferenceX still benchmarks (the "default" models of
 <https://inferencex.semianalysis.com/infx/inference>). An entry with `"pr": False`
 is not in it: a model InferenceX lists as deprecated (DeepSeek-V4-Pro, Kimi-K3,
 MiniMax-M3) or one whose checkpoint is not on the CI nodes. A dispatch with
-`models` still runs it, and the nightly runs those it lists. Of the others:
+`models` still runs it, and the weekly run runs those it lists. Of the others:
 
 - a model whose own package code (`sgl_amd_mono/<pkg>/`) changed runs the
   **full** tier;
@@ -100,7 +101,7 @@ these sides:
   only, read-only in the PR test and the nightly. The weekly run hands the files
   it writes to the directory's owner (the runner account).
 
-| Check | PR test, full tier | PR test, smoke tier | Nightly, tests tier (models the PR test runs) | Nightly, full (Kimi-K3) | Weekly |
+| Check | PR test, full tier | PR test, smoke tier | Nightly, tests tier (models the PR test runs) | Nightly, full (a dispatch with `models`) | Weekly |
 | --- | --- | --- | --- | --- | --- |
 | Tests | unit (on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same | unit, kernel (the PR test's widths) and serving tests | unit, kernel and serving tests | same |
 | Kernel microbenchmark | the model's timing scripts, base and PR | same | main | main | main |

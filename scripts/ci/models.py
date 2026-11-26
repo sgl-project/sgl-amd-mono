@@ -125,7 +125,8 @@ def nightly_tier(model: dict) -> str:
     tests and the pinned sgl-amd-mono check catch that the day it does. Such a
     model runs the nightly at the tests tier (quick kernel widths, no benchmark or
     speed test) and its benchmarks, speed test and full kernel widths in the weekly
-    run. A model the PR test does not run (Kimi-K3) runs the nightly in full."""
+    run. A model the PR test does not run would run the nightly in full; the
+    deprecated DeepSeek-V4-Pro is in the weekly run only."""
     return "tests" if model.get("pr", True) else "full"
 
 
@@ -168,8 +169,12 @@ MODELS = {
     "deepseek_v4": {
         "name": "DeepSeek-V4-Pro",
         # Deprecated on InferenceX (DeepSeek-V4.1-Flash replaced it): not in the PR
-        # test, nor in the nightly. A dispatch with models=deepseek_v4 still runs it.
+        # test, nor in the nightly; the weekly run (Saturdays) only. A dispatch with
+        # models=deepseek_v4 still runs it.
         "pr": False,
+        "weekly": True,
+        # set from the first weekly report
+        "baseline": {},
         "packages": ["deepseek_v4"],
         "tp": 8,
         "paths": {"DEEPSEEK_V4_PRO_MODEL_PATH": f"{HF}/deepseek-ai/DeepSeek-V4-Pro"},
@@ -285,13 +290,10 @@ MODELS = {
     },
     "kimi_k3": {
         "name": "Kimi-K3",
-        # Deprecated on InferenceX (Kimi-K3.1-Pro replaced it): not in the PR test;
-        # the nightly still runs it, and a kimi_k3 package change runs kimi_k31.
+        # Deprecated on InferenceX (Kimi-K3.1-Pro replaced it): not in the PR test
+        # (a kimi_k3 package change runs kimi_k31), the nightly or the weekly run.
+        # A dispatch with models=kimi_k3 still runs it.
         "pr": False,
-        # Phase 1 of the nightly
-        "nightly": True,
-        # set from the first weekly report
-        "baseline": {},
         "packages": ["kimi_k3"],
         "tp": 8,
         "paths": {
