@@ -110,6 +110,8 @@ SGLANG_READS = {
     # is optional, and SGLANG_AITER_K3_OPT is read where it does not exist yet
     "srt/environ.py": ("envs",),
     # a Quark per-channel FP8 o_proj, and whether SGLang preshuffled it
+    # set on every Quark linear; a non-Quark linear has none, hence the guarded read
+    "srt/layers/quantization/quark/quark.py": ("scheme",),
     "srt/layers/quantization/quark/schemes/quark_w8a8_fp8.py": (
         "QuarkW8A8Fp8",
         "weight_qscheme",
@@ -493,9 +495,9 @@ NUMERICS = Numerics(
         # the launch widens the weight to bf16 and sums in MFMA order, SGLang's
         # FP8 GEMM quantizes the activation, and no reference sums in the
         # launch's order, so a sum near a bf16 rounding boundary can land one ulp
-        # apart. Measured on 8x MI355X: prefix 1 - 1.19e-7 accumulating (one fp32
-        # ulp of the cosine), exactly 1 resetting. A wrong scale or row costs
-        # far more than the bound allows.
+        # apart. Measured on 8x MI355X against check_k2's torch reference (the
+        # E4M3 weight in fp32 times the unquantized activation, row-scaled): prefix
+        # 1 - 1.19e-7 accumulating (one fp32 ulp of the cosine), exactly 1 resetting.
         "k2_fp8.prefix.cosine": 1.0 - 1e-6,
         "k2_fp8.x.cosine": 1.0 - 1e-6,
         # The layer output: the MoE on top of the seam. The expert sums land in

@@ -13,9 +13,7 @@ step, so every decode step is a DSpark verify step of 8 rows.
 import os
 
 MODEL = os.environ.get("KIMI_K3_QUARK_MODEL_PATH", "amd/Kimi-K3-Quark-MXFP4-AttnFP8")
-DRAFT = os.environ.get(
-    "KIMI_K3_DSPARK_MODEL_PATH", "moonshotai/RadixArk-Kimi-K3-DSpark"
-)
+DRAFT = os.environ.get("KIMI_K3_DSPARK_MODEL_PATH", "RadixArk/Kimi-K3-DSpark")
 ENV = {
     "SGLANG_USE_AITER": "1",
     # experts at their native 384-wide intermediate; the old name for SGLang

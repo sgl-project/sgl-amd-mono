@@ -632,14 +632,26 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
         the state this step's recurrence reached.
         """
         slot, h = 3, 5
-        for state_bf16 in (False, True):
-            case = K1Case(self.device, num_acc=1, ring_len=16, state_bf16=state_bf16)
+        kda = self.case.kda
+        # the last is the Quark recipe's K1: preshuffled FP8 in_proj, bf16 state
+        for state_bf16, wfmt in (
+            (False, kda.W_BF16),
+            (True, kda.W_BF16),
+            (True, kda.W_FP8_SHUFFLED),
+        ):
+            case = K1Case(
+                self.device,
+                num_acc=1,
+                ring_len=16,
+                state_bf16=state_bf16,
+                wfmt=wfmt,
+            )
             case.st_idx = torch.full_like(case.st_idx, slot)
             case.run()
             parts = {}
             want = _kda_reference(case, parts=parts)
             rk, rv, rg, rb = (t[slot, :, :QLEN] for t in case.ring)
-            with self.subTest(state_bf16=state_bf16):
+            with self.subTest(state_bf16=state_bf16, wfmt=wfmt):
                 self.assertGreater(_cos(case.core_out, want), COS_MIN)
                 self.assertTrue(
                     torch.equal(case.rstate, case.rstate_in),
@@ -670,7 +682,8 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
                 )
                 cos = _cos(folded, parts["states"][-1, h])
                 print(
-                    f"ring (bf16 state {state_bf16}): fold vs recurrence cos {cos:.6f}"
+                    f"ring (bf16 state {state_bf16}, wfmt {wfmt}): fold vs recurrence "
+                    f"cos {cos:.6f}"
                 )
                 self.assertGreater(cos, COS_MIN, "the ring does not fold to the state")
 
