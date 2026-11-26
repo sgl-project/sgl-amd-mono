@@ -662,11 +662,16 @@ def run(args, m, rank, dev, cpu):
     dist.all_gather(every, stats)
     e = torch.stack(every).max(0).values.tolist()
     ok = _passes(e, restart=args.restart)
+    capture_summary = ""
+    if cap:
+        capture_summary = f" capture {e[10]:.2e}"
+    if cap == "prefix":
+        capture_summary += " bit-exact " + ("yes" if e[13] == 0 else "NO")
     if rank == 0:
         print(
             f"layer m {m:3d} L {L} nvb a{nva}{'w' if wa else ''} m{nvm}  rel_l2 mid {e[0]:.2e} h {e[1]:.2e} core "
             f"{e[2]:.2e} windows {e[11]:.2e} latent {e[3]:.2e} shared {e[4]:.2e} topk_w {e[5]:.1e} topk rows differing {e[6]:.2%} "
-            f"(own logits: {int(e[8])} rows, w {e[9]:.1e}){f' capture {e[10]:.2e}' if cap else ''}{(' bit-exact ' + ('yes' if e[13] == 0 else 'NO')) if cap == 'prefix' else ''}  "
+            f"(own logits: {int(e[8])} rows, w {e[9]:.1e}){capture_summary}  "
             f"us: layer {e[7]:6.1f}  {'PASS' if ok else 'FAIL'}",
             flush=True,
         )
