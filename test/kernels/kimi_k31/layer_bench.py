@@ -193,6 +193,7 @@ def _passes(e, *, restart) -> bool:
         and e[10] < 1e-2
         and e[11] < 1e-2
         and e[12] == 0
+        and e[13] == 0
     )
 
 
@@ -562,6 +563,7 @@ def run(args, m, rank, dev, cpu):
         mid=0.0, h=0.0, core=0.0, latent=0.0, sh=0.0, w=0.0, w_own=0.0, cap=0.0, win=0.0
     )
     id_bad, id_rows, own_bad = 0, 0, 0
+    cap_bits_bad = 0.0  # a prefix capture that differs from mid in any bit
     for r in range(max(args.reps_check, SETS)):
         s = sets[r % SETS]
         for k in cur:
@@ -592,7 +594,7 @@ def run(args, m, rank, dev, cpu):
         if cap:
             worst["cap"] = max(worst["cap"], rel(cap_view, s["ref"]["cap"]))
             if cap == "prefix" and not _prefix_capture_is_exact(cap_view, mid):
-                worst["cap"] = float("inf")
+                cap_bits_bad = 1.0
             others = torch.cat(
                 [aux[..., : CAP_SLOT * H], aux[..., (CAP_SLOT + 1) * H :]], dim=-1
             )
@@ -652,6 +654,7 @@ def run(args, m, rank, dev, cpu):
             worst["cap"],
             worst["win"],
             float(sort_bad),
+            cap_bits_bad,
         ],
         device=dev,
     )
@@ -663,7 +666,7 @@ def run(args, m, rank, dev, cpu):
         print(
             f"layer m {m:3d} L {L} nvb a{nva}{'w' if wa else ''} m{nvm}  rel_l2 mid {e[0]:.2e} h {e[1]:.2e} core "
             f"{e[2]:.2e} windows {e[11]:.2e} latent {e[3]:.2e} shared {e[4]:.2e} topk_w {e[5]:.1e} topk rows differing {e[6]:.2%} "
-            f"(own logits: {int(e[8])} rows, w {e[9]:.1e}){f' capture {e[10]:.2e}' if cap else ''}  "
+            f"(own logits: {int(e[8])} rows, w {e[9]:.1e}){f' capture {e[10]:.2e}' if cap else ''}{(' bit-exact ' + ('yes' if e[13] == 0 else 'NO')) if cap == 'prefix' else ''}  "
             f"us: layer {e[7]:6.1f}  {'PASS' if ok else 'FAIL'}",
             flush=True,
         )
