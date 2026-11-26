@@ -92,15 +92,21 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     ]
     if unmerged:
         reasons.append(f"layers {unmerged}: the KDA in_proj is not merged")
+
     # Kimi-K3's checks take a Quark FP8 o_proj and in-projection (K1 and the layer
     # launch read them); the wide launch reads both as bf16 only.
+    def _o_proj_not_bf16(attn) -> bool:
+        # a qweight-only o_proj has no weight; K3's checks already report it
+        weight = getattr(attn.o_proj, "weight", None)
+        return weight is not None and weight.dtype != torch.bfloat16
+
     not_bf16 = [
         i
         for i in covered
         if i not in unmerged
         and (
             layers[i].self_attn._qkvgbfa_layer.weight.dtype != torch.bfloat16
-            or layers[i].self_attn.o_proj.weight.dtype != torch.bfloat16
+            or _o_proj_not_bf16(layers[i].self_attn)
         )
     ]
     if not_bf16:

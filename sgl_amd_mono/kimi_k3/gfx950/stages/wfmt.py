@@ -84,8 +84,9 @@ def check(fmt, w, scale, rows: int, k: int) -> None:
         )
         assert scale is None
         return
+    assert fmt in (FP8, FP8_SHUFFLED), fmt
     assert w.dtype == torch.float8_e4m3fn, w.dtype
-    assert w.shape[0] >= rows and w.shape[1] == k, tuple(w.shape)
+    assert w.dim() == 2 and w.shape[0] >= rows and w.shape[1] == k, tuple(w.shape)
     assert fmt != FP8_SHUFFLED or w.shape[0] % ROWS == 0, tuple(w.shape)
     assert (
         scale is not None

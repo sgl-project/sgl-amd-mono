@@ -234,16 +234,8 @@ def _state_config():
 
 
 def _in_proj_operands(attn):
-    """The in-projection and f_b as the launch reads them: (``kda.W_*`` format,
-    the [rows, HIDDEN] storage, its fp32 scale a row or None, f_b [PROJ, HD]).
-    Raises ValueError naming what does not fit.
-
-    Either is the merged [q,k,v,g | f_a | b | pad] buffer. A bf16 one is the
-    ``_qkvgbfa_layer`` view SGLang builds when a monokernel backend is selected.
-    A Quark FP8 one is fused_qkvg_proj's own weight, into which SGLang wrote the
-    [f_a | b] rows and their scales, padded to a multiple of 64 rows; f_b then
-    comes from the bf16 copy SGLang keeps for its fused decode.
-    """
+    """(``kda.W_*`` format, the merged [q,k,v,g | f_a | b | pad] storage
+    [rows, HIDDEN], its fp32 row scale or None, f_b [PROJ, HD]); ValueError if unfit."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
     from sgl_amd_mono.kimi_k3.spec import _quark_fp8_storage
 
@@ -253,6 +245,8 @@ def _in_proj_operands(attn):
             "extend (linear_attn_config.use_full_rank_gate)"
         )
     if getattr(attn, "_qkvgbfa_in_qkvg_proj", False):
+        # Quark FP8: SGLang wrote the [f_a | b] rows and scales into fused_qkvg_proj's
+        # own weight, padded to 64 rows; f_b is the bf16 copy its fused decode keeps
         shuffled, w_in, scale = _quark_fp8_storage(
             linear=attn.fused_qkvg_proj, name="KDA in-projection"
         )
@@ -264,6 +258,7 @@ def _in_proj_operands(attn):
         fmt = kda.W_FP8_SHUFFLED if shuffled else kda.W_FP8
         w_fb = attn._bfa_f_b_w
     else:
+        # bf16: the merged view SGLang builds when a monokernel backend is selected
         merged = getattr(attn, "_qkvgbfa_layer", None)
         if merged is None:
             raise ValueError(
@@ -825,7 +820,10 @@ def covered(packed: K1Layer, prefix, attn_res, state) -> bool:
         if not ok:
             _say(f"declined: {reason}")
             return False
-    _say("engaged on a decode step")
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
+
+    fmt = "bf16" if packed.key.wfmt == wfmt.BF16 else "fp8"
+    _say(f"engaged on a decode step ({fmt} in_proj)")
     return True
 
 

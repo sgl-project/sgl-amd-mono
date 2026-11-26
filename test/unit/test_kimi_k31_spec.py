@@ -49,7 +49,8 @@ def test_the_launches_name_their_server_args():
 def _reasons(monkeypatch, *, in_proj=torch.bfloat16, o_proj=torch.bfloat16):
     """kimi_k31's checks on one covered KDA layer, Kimi-K3's own checks taken as
     passing (test_kimi_k3_spec pins those: they accept a Quark FP8 o_proj).
-    ``in_proj=None`` is a layer whose KDA in_proj is not merged."""
+    ``in_proj=None`` is a layer whose KDA in_proj is not merged; ``o_proj=None`` is
+    a qweight-only (GPTQ / AWQ-style) o_proj with no ``weight``."""
     monkeypatch.setattr(k31.k3, "_model_disable_reasons", lambda *a: [])
     monkeypatch.setattr(wide, "_is_covered", lambda layer: True)
 
@@ -57,7 +58,8 @@ def _reasons(monkeypatch, *, in_proj=torch.bfloat16, o_proj=torch.bfloat16):
         return SimpleNamespace(weight=torch.zeros(8, 8, dtype=dtype))
 
     attn = SimpleNamespace(
-        _qkvgbfa_layer=None if in_proj is None else lin(in_proj), o_proj=lin(o_proj)
+        _qkvgbfa_layer=None if in_proj is None else lin(in_proj),
+        o_proj=SimpleNamespace(qweight=None) if o_proj is None else lin(o_proj),
     )
     layers = [SimpleNamespace(self_attn=attn)]
     return k31._model_disable_reasons(
@@ -90,3 +92,9 @@ def test_an_unmerged_in_proj_is_reported_once(monkeypatch):
     # an unmerged layer has no merged weight to read; it is refused for that alone
     reasons = _reasons(monkeypatch, in_proj=None, o_proj=torch.float8_e4m3fn)
     assert reasons == ["layers [0]: the KDA in_proj is not merged"], reasons
+
+
+def test_a_qweight_only_o_proj_leaves_the_refusal_to_kimi_k3(monkeypatch):
+    """A merged layer whose o_proj has no ``weight`` is reported by Kimi-K3's checks
+    ("o_proj has no weight"); kimi_k31's own checks must not raise on it."""
+    assert _reasons(monkeypatch, o_proj=None) == []

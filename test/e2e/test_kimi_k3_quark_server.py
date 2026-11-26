@@ -24,7 +24,7 @@ from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
 # K1's startup and first-step lines (sgl_amd_mono.kimi_k3.gfx950.k1._say).
-K1_ENGAGED = "Kimi-K3 K1: engaged on a decode step"
+K1_ENGAGED = "Kimi-K3 K1: engaged on a decode step (fp8 in_proj)"
 K1_NOT_BUILT = "Kimi-K3 K1: not built for the KDA layers"
 # sgl-eval GSM8K (200 questions) scored 0.98 with the monokernels on; the bound
 # is for gross failures, as in test_kimi_k3_server.

@@ -293,6 +293,8 @@ MODELS = {
     # runs the kernel tests.
     "kimi_k3_quark": {
         "name": "Kimi-K3 (Quark MXFP4, FP8 attention)",
+        # K1 reads the FP8 in_proj only as SGLang's merged fused_qkvg_proj
+        "blocked": "needs SGLang's merged Quark FP8 KDA in_proj (sgl-project/sglang#44362)",
         "packages": ["kimi_k3"],
         "tp": 8,
         "paths": {

@@ -236,14 +236,8 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
 
 
 def _quark_fp8_storage(linear, name: str):
-    """A Quark per-channel FP8 linear as SGLang stored it for its FP8 GEMM:
-    (whether it is in AITER's (16, 16) preshuffle, the [out, in] storage, its
-    fp32 scale a row). Raises ValueError naming what does not fit.
-
-    SGLang stores the weight transposed for its GEMM, so the storage is
-    ``weight.t()``; it is preshuffled exactly when its own
-    ``use_aiter_bpreshuffle_gemm`` chose that at load.
-    """
+    """(in AITER's (16, 16) preshuffle, the [out, in] storage, its fp32 row scale)
+    of a Quark per-channel FP8 linear; ValueError if unfit."""
     from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
     from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 
@@ -254,6 +248,7 @@ def _quark_fp8_storage(linear, name: str):
         raise ValueError(f"an FP8 {name} is read only as Quark per-channel FP8")
     if linear.weight.dim() != 2:
         raise ValueError(f"the FP8 {name} weight is not 2-D")
+    # SGLang stores the weight transposed for its FP8 GEMM
     storage = linear.weight.t()
     if storage.dtype != torch.float8_e4m3fn:
         raise ValueError(f"the FP8 {name} is {storage.dtype}, not E4M3 (float8_e4m3fn)")
@@ -270,6 +265,7 @@ def _quark_fp8_storage(linear, name: str):
         raise ValueError(
             f"the FP8 {name} has no fp32 scale for each of its {rows} rows"
         )
+    # preshuffled exactly when SGLang's own GEMM chose that at load
     return use_aiter_bpreshuffle_gemm(rows), storage, scale.view(rows)
 
 
@@ -324,7 +320,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         experts = getattr(moe, "experts", None)
         up = getattr(moe, "routed_expert_up_proj", None)
         try:
-            _o_proj_operands(getattr(attn, "o_proj", None))
+            _o_proj_operands(attn.o_proj)
             o_proj_reason = None
         except ValueError as e:
             o_proj_reason = str(e)
