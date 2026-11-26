@@ -48,6 +48,7 @@ SPECS = {
     ): "sgl_amd_mono.qwen38_flash_next.spec:SPEC",
     ("MuseSparkForConditionalGeneration", None): "sgl_amd_mono.muse_spark.spec:SPEC",
     ("DFlash2DraftModel", None): "sgl_amd_mono.muse_spark.draft:SPEC",
+    ("Qwen3_5ForConditionalGeneration", None): "sgl_amd_mono.qwen3_8_dense.spec:SPEC",
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
