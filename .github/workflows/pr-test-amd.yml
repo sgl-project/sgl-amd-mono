@@ -34,6 +34,10 @@ on:
         description: "Add GPQA, as the run-ci-extra label does"
         type: boolean
         default: false
+      parallel:
+        description: "Start the model jobs with stage A instead of after it, as the parallel-stages label does"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -119,6 +123,9 @@ jobs:
       base_sha: ${{ steps.pr.outputs.base_sha }}
       image: ${{ steps.image.outputs.image }}
       extra: ${{ contains(github.event.pull_request.labels.*.name, 'run-ci-extra') || inputs.extra || false }}
+      # parallel-stages: the model jobs start with stage A (test-parallel), not
+      # after it (test), so they keep their place in the runners' queue
+      parallel: ${{ contains(github.event.pull_request.labels.*.name, 'parallel-stages') || inputs.parallel || false }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -288,6 +295,70 @@ jobs:
     if: >-
       !cancelled() && needs.plan.result == 'success'
       && needs.stage-a.result == 'success' && needs.plan.outputs.has_models == 'true'
+      && needs.plan.outputs.parallel != 'true'
+    name: test (${{ matrix.model }}, ${{ matrix.tier }})
+    # Two runners on a cluster host that submits Slurm jobs (scripts/ci/runner.sh);
+    # each job takes one of the two CI nodes.
+    runs-on: [self-hosted, sgl-amd-mono-mi355x]
+    timeout-minutes: 1200
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      CI_IMAGE: ${{ needs.plan.outputs.image }}
+      CI_PR: ${{ needs.plan.outputs.pr }}
+      CI_PR_SHA: ${{ needs.plan.outputs.pr_sha }}
+      CI_BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+      CI_EXTRA: ${{ needs.plan.outputs.extra == 'true' && '1' || '' }}
+      # The runner host's local disk: a shared home may be slow to write.
+      RESULTS: /tmp/sgl-amd-mono-ci/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      # The scripts that run outside the container come from the base branch. The
+      # cluster job fetches the PR and base commits onto the node itself.
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
+      - name: Run on the CI node
+        env:
+          CI_RESULTS: ${{ env.RESULTS }}/${{ matrix.model }}
+        run: bash harness/scripts/ci/slurm_launch.sh "${{ matrix.model }}" "${{ matrix.tier }}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mono-ci-${{ matrix.model }}
+          path: ${{ env.RESULTS }}/${{ matrix.model }}
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Judge
+        # bash (not the default bash -e) runs with pipefail: a failed check fails
+        # the model's job instead of passing through tee's exit status
+        shell: bash
+        run: |
+          python3 harness/scripts/ci/report.py --results "$RESULTS" --model "${{ matrix.model }}" \
+            --title-type "${{ needs.plan.outputs.title_type }}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Cancel the cluster job
+        if: cancelled()
+        run: scancel --name "sgl-amd-mono-ci-${{ github.run_id }}-${{ matrix.model }}" || true
+
+      - name: Clean up
+        if: always()
+        run: rm -rf "$RESULTS/${{ matrix.model }}"
+
+  # The same model jobs with the parallel-stages label (or `parallel` on a
+  # dispatch): they start with stage A instead of after it, so they keep their
+  # place in the runners' queue on a busy day. Stage A still gates the report.
+  test-parallel:
+    needs: plan
+    if: >-
+      !cancelled() && needs.plan.result == 'success'
+      && needs.plan.outputs.has_models == 'true' && needs.plan.outputs.parallel == 'true'
     name: test (${{ matrix.model }}, ${{ matrix.tier }})
     # Two runners on a cluster host that submits Slurm jobs (scripts/ci/runner.sh);
     # each job takes one of the two CI nodes.
@@ -344,7 +415,7 @@ jobs:
         run: rm -rf "$RESULTS/${{ matrix.model }}"
 
   report:
-    needs: [plan, stage-a, test]
+    needs: [plan, stage-a, test, test-parallel]
     # Not on a cancelled run: a newer run (a new label or push) has taken over the status.
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
