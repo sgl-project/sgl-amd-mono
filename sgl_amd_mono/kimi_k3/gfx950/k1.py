@@ -537,7 +537,7 @@ def prepare(batch: Optional[K1Batch], forward_batch) -> Optional[dict]:
     ring = getattr(cache, "replayssm_rawv", None) is not None and inter_ssm is None
     if (inter_ssm is None and not ring) or not windows:
         return None
-    if ring and getattr(pool.mamba_pool, "replayssm_request_ring", False):
+    if ring and pool.mamba_pool.replayssm_request_ring:
         # Host-only checkpoints (sgl-project/sglang#44718) index the ring by
         # request, not by the slot K1 stores at.
         _say("declined: the ReplaySSM ring is request-scoped")

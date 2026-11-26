@@ -253,6 +253,8 @@ def _quark_fp8_storage(linear, name: str):
     ):
         raise ValueError(f"an FP8 {name} is read only as Quark per-channel FP8")
     storage = linear.weight.t()
+    if storage.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"the FP8 {name} is {storage.dtype}, not E4M3 (float8_e4m3fn)")
     if storage.dim() != 2 or not storage.is_contiguous():
         raise ValueError(f"the FP8 {name} is not SGLang's transposed contiguous weight")
     rows = storage.shape[0]

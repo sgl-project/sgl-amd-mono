@@ -273,18 +273,14 @@ def test_the_fp8_kda_in_proj_layout_is_the_one_sglang_chose(monkeypatch, shuffle
     assert w_fb is attn._bfa_f_b_w
 
 
-def test_k1_builds_for_replayssm_and_a_bf16_state(monkeypatch):
-    # The AgentX recipe's KDA state: --mamba-ssm-dtype bfloat16 and the ReplaySSM
-    # ring. Each picks a launch variant; only a state dtype K1 has none for is
-    # refused.
+def test_k1_takes_a_bf16_or_fp32_state_only(monkeypatch):
+    # The AgentX recipe's --mamba-ssm-dtype bfloat16 picks a launch variant; only
+    # a state dtype K1 has no variant for is refused.
     import sglang.srt.runtime_context as runtime_context
 
     from sgl_amd_mono.kimi_k3.gfx950 import k1
 
-    mamba = SimpleNamespace(
-        mamba_ssm_dtype="bfloat16",
-        enable_linear_replayssm_spec=True,
-    )
+    mamba = SimpleNamespace(mamba_ssm_dtype="bfloat16")
     monkeypatch.setattr(
         runtime_context, "get_exec", lambda: SimpleNamespace(mamba=mamba)
     )

@@ -177,8 +177,12 @@ def _profile_lines(
     """
     if got.dim() < 2 or got.shape != want.shape:
         return []
-    # [1, tokens, ...] for a pool slice, [tokens, ...] for core and bank
-    tok = 1 if got.dim() >= 4 else 0
+    # [1, heads, ring_len, ...] for a ReplaySSM ring slice, [1, tokens, ...] for
+    # another pool slice, [tokens, ...] for core and bank
+    if name.startswith("ring_"):
+        tok = 2
+    else:
+        tok = 1 if got.dim() >= 4 else 0
     lines = [
         f"{launch}.{name} by_token got {_profile(got, tok)} want {_profile(want, tok)}"
     ]
@@ -188,6 +192,10 @@ def _profile_lines(
             f"want {_profile(want, tok + 1)}"
         )
     return lines
+
+
+# Metric names already reported as having no bound in NUMERICS.
+_unbounded_said: set[str] = set()
 
 
 def _report(i: int, outputs: dict, launch: str) -> None:
@@ -207,6 +215,10 @@ def _report(i: int, outputs: dict, launch: str) -> None:
         i,
         " ".join(f"{k}={v:.8g}" for k, v in values.items()),
     )
+    # No bound measured yet (e.g. k1.ring_*, k1_fp8.ssm): said once, not passed silently.
+    for name in sorted(values.keys() - NUMERICS.bounds.keys() - _unbounded_said):
+        _unbounded_said.add(name)
+        logger.warning("monokernel check: %s has no bound, so it is not checked", name)
     missed = set()
     for name, bound in NUMERICS.bounds.items():
         v = values.get(name)
