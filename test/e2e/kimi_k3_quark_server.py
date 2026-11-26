@@ -3,11 +3,12 @@
 
 This is the checkpoint that reaches the launches' Quark FP8 attention
 projections, and the recipe adds the bf16 KDA state (--mamba-ssm-dtype
-bfloat16) and the ReplaySSM ring (--enable-linear-replayssm-spec). It is the
-AgentX c1 recipe (sglang-gpu-perf kimi_k3/agentx/run_conc1.sh) without what
-only a benchmark needs: simulated acceptance, the 1M context, the chat parsers
-and the host's ROCm runtime tuning. As in kimi_k3_server, one request runs a
-step, so every decode step is a DSpark verify step of 8 rows.
+bfloat16) and the ReplaySSM ring (--enable-linear-replayssm-spec). It is derived
+from the AgentX c1 recipe (sglang-gpu-perf kimi_k3/agentx/run_conc1.sh): without
+simulated acceptance, the 1M context, the chat parsers and the host's ROCm runtime
+tuning, and with SGLang's fcfs scheduler where AgentX sets lpm. As in
+kimi_k3_server, one request runs a step, so every decode step is a DSpark verify
+step of 8 rows.
 """
 
 import os

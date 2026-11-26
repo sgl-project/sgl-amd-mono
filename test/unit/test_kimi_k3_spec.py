@@ -361,3 +361,40 @@ def test_experts_with_another_activation_are_refused(monkeypatch):
     whichever expert layout AITER's switches select."""
     reasons = _reasons(monkeypatch, _fake_layer(act="silu"))
     assert any("not SiTU" in r for r in reasons), reasons
+
+
+def test_k1_declines_a_request_scoped_replayssm_ring(monkeypatch):
+    """A request-indexed ReplaySSM ring (sgl-project/sglang#44718) must fall back to
+    SGLang before K1 stages anything: K1 writes the ring by slot."""
+    import torch
+    from sglang.srt.model_executor import forward_context
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+
+    def run(request_ring):
+        cache = SimpleNamespace(
+            intermediate_ssm=None,
+            intermediate_conv_window=[torch.zeros(1)],
+            replayssm_rawv=torch.zeros(1),
+        )
+        pool = SimpleNamespace(
+            mamba_pool=SimpleNamespace(
+                mamba_cache=cache, replayssm_request_ring=request_ring
+            )
+        )
+        backend = SimpleNamespace(req_to_token_pool=pool, forward_metadata=object())
+        monkeypatch.setattr(
+            forward_context,
+            "get_attn_backend",
+            lambda: SimpleNamespace(linear_attn_backend=backend),
+        )
+        batch = SimpleNamespace(idx=None, layers=[])
+        fb = SimpleNamespace(spec_info=object())
+        try:
+            out = k1.prepare(batch, fb)
+        except Exception:  # past the guard the stub runs out; staging had begun
+            out = "staged"
+        return out, batch.idx
+
+    assert run(request_ring=True) == (None, None)
+    assert run(request_ring=False) != (None, None)
