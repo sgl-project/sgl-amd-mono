@@ -16,7 +16,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
 | DeepSeek-V4-Pro | MI355X (gfx950) | 8 | All 61 layers (one launch each) in decode steps of up to 8 rows, and DSpark verify steps of one request (5 to 8 tokens) |
-| GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | All 45 layers (one launch each; layer 0 from the tokens, with the embedding) and the final norm, LM head and logits (one launch), in decode steps of up to 8 rows (4 at TP2) |
+| GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | All 45 layers (one launch each; layer 0 from the tokens, with the embedding) and the final norm, LM head and logits (one launch), in decode and MTP verify steps of up to 16 rows (4 at TP2), on an f32 or bf16 KDA state (`--mamba-ssm-dtype bfloat16`) |
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows |
 | GLM-5.2 (MXFP4 experts) | MI355X (gfx950) | 4, 8 | As GLM-5.3; the routed experts in MXFP4, on MXFP8 activations |
 | GLM-5.3 (MXFP4) | MI355X (gfx950) | 4, 8 | As GLM-5.3 |
@@ -45,6 +45,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 - AMD Instinct MI350X or MI355X
 - MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--enable-amd-monokernel` refuses MiniMax-M3 and names them.
 - MiniMax-M3.1-Flash needs SGLang's MiniMax-M3.1-Flash support ([sgl-project/sglang#45925](https://github.com/sgl-project/sglang/pull/45925)) and its gfx950 path ([#45936](https://github.com/sgl-project/sglang/pull/45936)).
+- GLM-5.3-Flash on a bf16 KDA state (`--mamba-ssm-dtype bfloat16`): SGLang's gfx950 HIP prefill and row-streaming decode take a bf16 state with [sgl-project/sglang#49036](https://github.com/sgl-project/sglang/pull/49036) (on [#44659](https://github.com/sgl-project/sglang/pull/44659)). Without them, SGLang's prefill and its decode steps the kernels do not cover run its Triton kernels.
 - Qwen3.8-2.4T runs the fused shared expert (`--enforce-shared-experts-fusion`) in MXFP4 with [sgl-project/sglang#41899](https://github.com/sgl-project/sglang/pull/41899), and the MXFP4 GDN projections of [sgl-project/sglang#43839](https://github.com/sgl-project/sglang/pull/43839).
 
 ### Installation
