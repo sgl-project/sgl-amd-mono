@@ -154,6 +154,9 @@ MODELS = {
     },
     "deepseek_v4": {
         "name": "DeepSeek-V4-Pro",
+        # Outdated (DeepSeek-V4.1-Flash replaced it): not in the PR test, nor in the nightly.
+        # A dispatch with models=deepseek_v4 still runs it.
+        "pr": False,
         "packages": ["deepseek_v4"],
         "tp": 8,
         "paths": {"DEEPSEEK_V4_PRO_MODEL_PATH": f"{HF}/deepseek-ai/DeepSeek-V4-Pro"},
@@ -315,6 +318,9 @@ MODELS = {
     },
     "minimax_m3": {
         "name": "MiniMax-M3 (MXFP4)",
+        # Outdated (MiniMax-M3.1-Flash replaced it): not in the PR test, nor in the nightly.
+        # A dispatch with models=minimax_m3 still runs it.
+        "pr": False,
         # SGLang refuses --enable-amd-monokernel for it until both merge
         "blocked": "needs SGLang's page16 SHUFFLE K/V (sgl-project/sglang#41998, #41708)",
         "packages": ["minimax_m3", "minimax"],

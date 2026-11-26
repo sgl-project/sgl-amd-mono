@@ -95,7 +95,19 @@ def models_for(files):
                 for key, m in touched.items()
             }
         )
-    return models or {"common": ("no model package changed", "full")}
+    if models:
+        return models
+    left_out = sorted(
+        k
+        for k, m in MODELS.items()
+        if k not in PR_MODELS and set(m["packages"]) & (code | tests)
+    )
+    if left_out:
+        why = (
+            f"{', '.join(left_out)} not in the PR test (a dispatch with models runs it)"
+        )
+        return {"common": (why, "full")}
+    return {"common": ("no model package changed", "full")}
 
 
 def codeowners_rule(files):

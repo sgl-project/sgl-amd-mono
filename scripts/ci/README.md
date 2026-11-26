@@ -50,7 +50,11 @@ oldest first, so it is an estimate.
 
 ## What runs
 
-`scope.py` maps a PR's changed files to models (`models.py`):
+`scope.py` maps a PR's changed files to models (`models.py`). An entry with
+`"pr": False` is not in the PR test: an outdated model (DeepSeek-V4-Pro, replaced
+by DeepSeek-V4.1-Flash; MiniMax-M3, replaced by MiniMax-M3.1-Flash) or one whose
+checkpoint is not on the CI nodes. A dispatch with `models` still runs it. Of the
+others:
 
 - a model whose own package code (`sgl_amd_mono/<pkg>/`) changed runs the
   **full** tier;
