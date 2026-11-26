@@ -206,7 +206,7 @@ jobs:
             -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             -f description="$(cut -c1-140 <<< "Running: $models")" > /dev/null
 
-  # Stage A: `common` (the unit tests and the common kernel tests, ~15 min) runs
+  # Stage A: `common` (the unit tests and the common kernel tests, ~5 min) runs
   # first, on its own. The model jobs start only once it passes: a PR that breaks
   # the package fails here instead of holding both runners for hours.
   stage-a:

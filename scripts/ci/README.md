@@ -72,8 +72,10 @@ MiniMax-M3) or one whose checkpoint is not on the CI nodes. A dispatch with
   jobs would hold both GPU runners for most of a day. The nightly runs them in
   full; to run a PR in full anyway, run the workflow by hand with `models`.
 
-Every run tests `common` first, as **stage A** (`stage A (common, full)`, ~15
-minutes): the unit tests and the common kernel tests. The model jobs start only
+Every run tests `common` first, as **stage A** (`stage A (common, full)`, ~5
+minutes): the unit tests and the common kernel tests, but the TP4 fault sweep
+(`PR_COMMON_KERNEL_DESELECT`, ~9 minutes), which the nightly runs; the TP2 fault
+test and the clean run still run on every PR. The model jobs start only
 once it passes, so a PR that breaks the package fails in minutes instead of holding
 both runners for hours; the report then lists each model as not run.
 

@@ -59,6 +59,10 @@ COMMON_KERNEL_TESTS = [
     "test/kernels/test_guard_multi_rank.py",
     "test/kernels/test_compiled_dispatch.py",
 ]
+# What a PR's common job leaves to the nightly (pytest -k): the TP4 fault sweep
+# (8 fault runs, 9 of stage A's ~14 minutes). A PR still runs the TP2 fault test
+# and the clean run, so the guard's stop on a fault is checked on every PR.
+PR_COMMON_KERNEL_DESELECT = "not test_fault_stops_every_rank_tp4"
 
 # Paths whose change runs every model.
 SHARED_PATHS = ("sgl_amd_mono/common/", "sgl_amd_mono/__init__.py", "pyproject.toml")

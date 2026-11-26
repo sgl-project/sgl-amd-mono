@@ -63,6 +63,7 @@ from models import (  # noqa: E402
     ISL,
     MODELS,
     OSL,
+    PR_COMMON_KERNEL_DESELECT,
     PR_EVALS,
     PROMPTS_PER_SLOT,
     RANGE_RATIO,
@@ -203,7 +204,7 @@ class Run:
 
     # -- tests ----------------------------------------------------------------
 
-    def pytest(self, name, files, timeout, src=None, into="tests"):
+    def pytest(self, name, files, timeout, src=None, into="tests", select=""):
         """Run ``files`` of the checkout ``src`` (default: the PR) and record the
         counts, and which tests failed, as ``result[into][name]``."""
         src = src or self.args.pr
@@ -212,8 +213,9 @@ class Run:
             return
         log = name if into == "tests" else f"{into.split('_')[0]}-{name}"  # base-unit
         xml = self.logs / f"{log}.xml"
+        k = f"-k {shlex.quote(select)} " if select else ""
         rc = self.sh(
-            f"python3 -m pytest -v -rA --junitxml={xml} " + " ".join(files),
+            f"python3 -m pytest -v -rA --junitxml={xml} {k}" + " ".join(files),
             log,
             cwd=src,
             timeout=timeout,
@@ -574,7 +576,13 @@ class Run:
         if self.key == "common":
             self.install(a.pr)
             self.pytest("unit", ["test/unit"], 1800)
-            self.pytest("kernels", COMMON_KERNEL_TESTS, 3600)
+            self.pytest(
+                "kernels",
+                COMMON_KERNEL_TESTS,
+                3600,
+                # a PR leaves the TP4 fault sweep to the nightly
+                select=PR_COMMON_KERNEL_DESELECT if a.mode == "pr" else "",
+            )
             return
         if why:
             self.result["skipped"]["serving"] = why
