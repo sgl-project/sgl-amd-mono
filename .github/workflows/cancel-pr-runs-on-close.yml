@@ -1,0 +1,89 @@
+name: Cancel PR Runs on Close
+
+# Cancels every unfinished run of a PR when it closes (merged or not), so a merged or
+# abandoned PR stops holding the two CI nodes. Two kinds of runs belong to a PR:
+# - runs on its head branch (label-triggered PR tests, lint, unit tests), matched by
+#   branch and head repository, as in sgl-project/sglang's cancel-pr-workflows-on-close.yml;
+# - PR tests a maintainer dispatched with its number (`gh workflow run pr-test-amd.yml
+#   -f pr=N`), which carry the branch they ran from (main, a test branch), matched by
+#   their title "PR Test (AMD) #N" (pr-test-amd.yml's run-name).
+# Cancelling a PR test also ends its Slurm job and frees the node.
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  cancel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel unfinished runs of this PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO_ID: ${{ github.event.pull_request.head.repo.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FAILURES=0
+          # One status a request, so sweep every non-terminal state; pass 2 catches
+          # runs still being created during pass 1.
+          for pass in 1 2; do
+            run_ids=""
+            for status in queued in_progress waiting pending requested action_required; do
+              ids=""
+              for attempt in 1 2 3; do
+                if ids=$(gh api -X GET "repos/$REPO/actions/runs" --paginate \
+                  -f status="$status" -F per_page=100 \
+                  --jq ".workflow_runs[]
+                        | select(.id != $GITHUB_RUN_ID)
+                        | select((.head_branch == \"$HEAD_BRANCH\"
+                                  and .head_repository.id == ${HEAD_REPO_ID:-0})
+                                 or .display_title == \"PR Test (AMD) #$PR\")
+                        | .id"); then
+                  break
+                fi
+                ids=""
+                if [ "$attempt" -eq 3 ]; then
+                  echo "::error::Listing $status runs failed after 3 attempts"
+                  FAILURES=1
+                else
+                  sleep 5
+                fi
+              done
+              run_ids="$run_ids"$'\n'"$ids"
+            done
+            run_ids=$(echo "$run_ids" | sed '/^$/d' | sort -u)
+            if [ -z "$run_ids" ]; then
+              echo "Pass $pass: no unfinished runs of #$PR"
+              break
+            fi
+            echo "Pass $pass: cancelling $(echo "$run_ids" | wc -l | tr -d ' ') run(s) of #$PR"
+            for run_id in $run_ids; do
+              echo "Cancelling https://github.com/$REPO/actions/runs/$run_id"
+              if gh run cancel "$run_id" --repo "$REPO" 2>/dev/null; then
+                continue
+              fi
+              # runs held by an approval or a protection rule need a force-cancel
+              if gh api -X POST "repos/$REPO/actions/runs/$run_id/force-cancel" >/dev/null 2>&1; then
+                echo "  force-cancelled"
+                continue
+              fi
+              state=$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.status' 2>/dev/null || echo unknown)
+              if [ "$state" = "completed" ]; then
+                echo "  already finished"
+              else
+                echo "::error::Failed to cancel run $run_id (status: $state)"
+                FAILURES=1
+              fi
+            done
+            if [ "$pass" -eq 1 ]; then
+              sleep 20
+            fi
+          done
+          exit "$FAILURES"

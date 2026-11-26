@@ -1,4 +1,8 @@
 name: PR Test (AMD)
+# The PR number in every run's title, label-triggered or dispatched: a dispatched run's
+# branch is the ref it ran from (main, a test branch), so cancel-pr-runs-on-close.yml
+# finds a PR's runs by this title.
+run-name: "PR Test (AMD) #${{ github.event.pull_request.number || inputs.pr }}"
 
 # The PR test of the review guideline: per model the PR touches, its unit, kernel and
 # serving tests, accuracy (sgl-eval) and InferenceX fixed-length speed against the
@@ -104,6 +108,7 @@ jobs:
       contents: read
       pull-requests: write
       statuses: write
+      actions: read
     outputs:
       matrix: ${{ steps.scope.outputs.matrix }}
       title_type: ${{ steps.scope.outputs.title_type }}
@@ -187,13 +192,17 @@ jobs:
       - name: Pending status
         env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
+          models="$(jq -r '.models | keys | join(", ")' scope.json)"
+          # Where the run stands in the GPU runners' queue; queue-status.yml keeps it
+          # current until the report. A failed estimate falls back to the model list.
+          python3 harness/scripts/ci/queue_status.py --run "${{ github.run_id }}" --models "$models" && exit 0
           # GitHub caps a status description at 140 characters.
-          desc="$(jq -r '"Running: " + (.models | keys | join(", "))' scope.json | cut -c1-140)"
           gh api "repos/${{ github.repository }}/statuses/${{ steps.pr.outputs.pr_sha }}" \
             -f state=pending -f context="$STATUS_CONTEXT" \
             -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            -f description="$desc" > /dev/null
+            -f description="$(cut -c1-140 <<< "Running: $models")" > /dev/null
 
   test:
     needs: plan

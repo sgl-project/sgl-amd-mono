@@ -39,9 +39,23 @@ comment up to date with the report. Each model's logs (servers, benchmarks,
 tests) are in the run's `mono-ci-<model>` artifact. The nightly writes its report
 to the run's summary.
 
+The PR test's GPU jobs share the two runners with the nightly and with each
+other, so a run can wait hours for one. While it waits or runs, its pending
+status says where it stands: `Waiting for a GPU runner: ~N jobs ahead. Will run
+...`, then `3/14 done; running <model>; 9 waiting, ~N jobs ahead`. The plan job
+sets it, and `queue-status.yml` (every 10 minutes, `queue_status.py`) keeps it
+current until the report sets the result. "Ahead" counts the GPU jobs running now
+and those queued by older runs; GitHub does not promise to hand queued jobs out
+oldest first, so it is an estimate.
+
 ## What runs
 
-`scope.py` maps a PR's changed files to models (`models.py`):
+`scope.py` maps a PR's changed files to models (`models.py`). The PR test runs
+only the models InferenceX still benchmarks (the "default" models of
+<https://inferencex.semianalysis.com/infx/inference>). An entry with `"pr": False`
+is not in it: a model InferenceX lists as deprecated (DeepSeek-V4-Pro, Kimi-K3,
+MiniMax-M3) or one whose checkpoint is not on the CI nodes. A dispatch with
+`models` still runs it, and the nightly runs those it lists. Of the others:
 
 - a model whose own package code (`sgl_amd_mono/<pkg>/`) changed runs the
   **full** tier;
@@ -52,6 +66,11 @@ to the run's summary.
   test or accuracy benchmark, since the served kernels are the base branch's;
 - a PR that changes no model runs `common`: the unit tests and the common kernel
   tests.
+- a PR whose package code changes in more than `FULL_TIER_MAX_MODELS` (3) models,
+  such as a refactor or an API move across packages, runs each of them at the
+  **smoke** tier instead of the full one, and `common` in full: fourteen full-tier
+  jobs would hold both GPU runners for most of a day. The nightly runs them in
+  full; to run a PR in full anyway, run the workflow by hand with `models`.
 
 A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
 checks representative widths only (DeepSeek-V4.1's K1, K2 and target FFN launch at

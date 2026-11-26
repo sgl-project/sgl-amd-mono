@@ -97,11 +97,11 @@ def accuracy_check(key, r):
         if not m.get("e2e_tests"):
             return (
                 WARN,
-                "smoke tier (shared code changed): no accuracy check for this model",
+                "smoke tier (shared code, or code in many models, changed): no accuracy check for this model",
             )
         return (
             PASS,
-            "smoke tier (shared code changed): the serving tests' GSM8K and KL bounds (Tests)",
+            "smoke tier (shared code, or code in many models, changed): the serving tests' GSM8K and KL bounds (Tests)",
         )
     acc = r.get("accuracy", {})
     states, parts = [], []
