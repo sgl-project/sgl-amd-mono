@@ -191,6 +191,11 @@ def main():
         models = {k: ("requested", "full") for k in keys}
     else:
         models = models_for(files)
+    # Stage A: every run tests `common` (the unit and common kernel tests) first;
+    # the model jobs start only once it passes.
+    models.setdefault(
+        "common", ("stage A: runs before the models, which wait for it to pass", "full")
+    )
     models = {k: {"why": why, "tier": tier} for k, (why, tier) in models.items()}
     m = TITLE.match(args.title)
     title_type = m.group(1) if m else ""
@@ -209,10 +214,14 @@ def main():
     print(json.dumps(scope, indent=2))
     if out := os.environ.get("GITHUB_OUTPUT"):
         with open(out, "a") as f:
+            # the model jobs, after stage A (`common`, a job of its own)
             matrix = [
-                {"model": k, "tier": v["tier"]} for k, v in sorted(models.items())
+                {"model": k, "tier": v["tier"]}
+                for k, v in sorted(models.items())
+                if k != "common"
             ]
             f.write(f"matrix={json.dumps(matrix)}\n")
+            f.write(f"has_models={str(bool(matrix)).lower()}\n")
             f.write(f"title_type={title_type}\n")
 
 

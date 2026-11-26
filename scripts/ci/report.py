@@ -423,6 +423,16 @@ def pinned_check(r):
 
 
 def model_section(key, r, needs_gain):
+    if r.get("not_run"):
+        # stage A failed: the model's job never started, so it has no checks
+        return FAIL, "\n".join(
+            [
+                f"### {MODELS.get(key, {}).get('name', key)} (`{key}`)",
+                "",
+                f"{ICON[FAIL]} Not run: {r['not_run']}. Fix `common` first; the model "
+                "jobs start once it passes.",
+            ]
+        )
     checks = [("Scope", *scope_check(key, r))] if key != "common" else []
     if key != "common":
         checks += [
@@ -510,10 +520,16 @@ def best_gain(key, r):
     return max(gains, default=None)
 
 
+# Set by --stage-a-failed: the model jobs did not start, as stage A (common) failed.
+STAGE_A_FAILED = False
+
+
 def load(results: Path, key):
     p = results / key / "result.json"
     if p.exists():
         return json.loads(p.read_text())
+    if STAGE_A_FAILED and key != "common":
+        return {"model": key, "not_run": "stage A (`common`) failed"}
     return {"model": key, "error": "no result.json: the job did not finish"}
 
 
@@ -536,7 +552,14 @@ def main():
     ap.add_argument("--title-type", default="")
     ap.add_argument("--run-url", default="")
     ap.add_argument("--out")
+    ap.add_argument(
+        "--stage-a-failed",
+        action="store_true",
+        help="PR test: stage A (common) failed, so the model jobs did not run",
+    )
     args = ap.parse_args()
+    global STAGE_A_FAILED
+    STAGE_A_FAILED = args.stage_a_failed
     results = Path(args.results)
 
     if args.model:
