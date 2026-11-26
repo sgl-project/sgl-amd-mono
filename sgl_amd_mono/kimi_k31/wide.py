@@ -584,7 +584,9 @@ class Wide:
                 False,
                 True,
             ):  # sized for a capture launch too: the captured layers come later
-                pl = lay.plan(b, cfg, L, nvb_a, nvb_m, NF, cap)[0]
+                pl = lay.plan(b, cfg, L, nvb_a=nvb_a, nvb_m=nvb_m, nf=NF, capture=cap)[
+                    0
+                ]
                 half, scratch = (
                     max(half, pl.peer_offsets[1]),
                     max(scratch, pl.scratch_bytes()),
