@@ -139,9 +139,8 @@ CFGS = {  # rows -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks;
         "128:64:2:4:1",
     ),
 }
-# Sorted (lo, hi, cfg) row ranges overriding the CFGS entry where its tiles would need a second BLOCKS round
-# (row tiles x column tiles x ks) or pad a row tile past b; every bucket fits one round in all five stages,
-# and the front and in_proj do at every row count up to max(CFGS) (test/unit/test_kimi_k31_wide_cfg.py)
+# Sorted (lo, hi, cfg) row ranges overriding CFGS where its tiles need a second BLOCKS round or pad a row tile past b;
+# every bucket fits one round, and the front and in_proj do at every row count up to max(CFGS) (unit tested)
 FRONT_ROW_RANGES = (
     (65, 96, "96:128:2:4:8"),
     (129, 191, "96:128:2:4:4"),

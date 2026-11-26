@@ -287,8 +287,8 @@ MODELS = {
             "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --rows 16,128",
             # 6 draft tokens a request: two of the buckets whose tiles no 8-token bucket runs
             (
-                "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py"
-                " --L 6 --rows 96,288 --nvb-a 2 --write-a --nvb-m 3 --front-map --up-norm"
+                "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --L 6 --rows 96,288"
+                " --nvb-a 2 --write-a --nvb-m 3 --restart --front-map --up-norm"
             ),
         ],
         "evals": [],
