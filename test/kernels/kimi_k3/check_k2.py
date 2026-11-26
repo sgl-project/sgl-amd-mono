@@ -106,9 +106,9 @@ def layer_weights(rank, device):
     }
 
 
+# o_proj quantized per row to E4M3 as Quark's per-channel FP8 is ->
+# (the values, their storage in the launch's layout, the fp32 scale a row).
 def fp8_o_proj(w_o, shuffled):
-    """o_proj quantized per row to E4M3 as Quark's per-channel FP8 is ->
-    (the values, their storage in the launch's layout, the fp32 scale a row)."""
     from aiter.ops.shuffle import shuffle_weight
 
     scale = w_o.float().abs().amax(dim=1).clamp(min=1e-12) / 448.0

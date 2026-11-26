@@ -74,6 +74,9 @@ class TestMonokernelKimiK3Quark(k3.TestMonokernelKimiK3):
         # The bf16 state is restored from the radix cache here, which the parent's
         # cache-flushing KL check never reaches. The decode-cache-hit helper is
         # not used: at --mamba-track-interval 1024 under half its turns hit.
+        info = requests.get(DEFAULT_URL_FOR_TEST + "/server_info", timeout=60).json()
+        # the helper returns without scoring when the radix cache is off
+        self.assertFalse(info["disable_radix_cache"])
         assert_prefill_hit_match(
             DEFAULT_URL_FOR_TEST,
             {MODEL: {"kl_div": KL_CACHE_HIT_BOUND}},
