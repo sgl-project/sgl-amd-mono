@@ -118,7 +118,6 @@ class _Built(k3._Built):
 
 
 def _agree_xgmi_enabled() -> bool:
-    """Agree on SGLANG_AMD_MONO_K31_XGMI across TP ranks before importing xgmi."""
     enabled = int(os.environ.get("SGLANG_AMD_MONO_K31_XGMI", "0") == "1")
     if torch.distributed.is_initialized():
         from sglang.srt.runtime_context import get_parallel

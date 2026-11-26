@@ -244,7 +244,6 @@ def _make_row_sharded_tail(mlp, heap: XgmiHeap, takes_layer):
 
 
 def _layer_plan(layer):
-    """Inspect a MoE layer without mutating it; return (attn_state, orig_read, tp_plan_entry)."""
     mlp = layer.mlp
     bf16_ok = (
         layer.post_attention_layernorm.weight.dtype == torch.bfloat16
@@ -269,7 +268,6 @@ def _layer_plan(layer):
 
 
 def _snapshot_still_matches(layer, attn_state, orig_read, plan_entry) -> bool:
-    """Verify live layer fields and readout still match the TP-agreed snapshot."""
     rebound_ok, row_front_on, need_normed_all, min_tok, max_tok = plan_entry
     mlp = layer.mlp
     if (
@@ -306,11 +304,6 @@ def _prepare_moe_layer_hook(
     gemm_fn,
     row_shard_cls,
 ):
-    """Build one MoE layer's replacement hooks without mutating the model.
-
-    None when ``plan_entry`` marks the layer ineligible; the tuple is committed only
-    after every TP rank passes the installation vote.
-    """
     rebound_ok, row_front_on, need_normed_all, min_tok, max_tok = plan_entry
     if not rebound_ok:
         return None
@@ -384,12 +377,12 @@ def _prepare_all_hooks(
     gemm_fn,
     row_shard_cls,
 ) -> Optional[list]:
-    """Every eligible layer's prepared hooks, or None if a layer drifted from its plan."""
     prepared = []
     for (layer, attn_state, orig_read), entry in zip(moe_targets, plan_entries):
         if not _snapshot_still_matches(
             layer, attn_state=attn_state, orig_read=orig_read, plan_entry=entry
         ):
+            # None: this layer drifted from its TP-agreed plan.
             return None
         item = _prepare_moe_layer_hook(
             layer,

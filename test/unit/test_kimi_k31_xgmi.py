@@ -158,7 +158,6 @@ def _make_moe_layer(
     min_tok: int = 512,
     norm_dtype: torch.dtype = torch.bfloat16,
 ):
-    """A latent-MoE layer wired to an AttnBankState readout; returns (layer, bank_state)."""
     from sglang.srt.layers.layer_boundary.residual.attn_bank import (
         AttnBankState,
         _FfnReadout,

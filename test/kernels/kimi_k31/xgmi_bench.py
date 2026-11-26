@@ -52,7 +52,6 @@ def _flush_buf() -> torch.Tensor:
 
 
 def _bench_us(fn, iters: int = 30, warmup: int = 8) -> float:
-    """Median us per call."""
     # Cold L2 and MALL before every timed call (kernel-benchmark rule: no L2-hot loops).
     flush = _flush_buf()
     for _ in range(warmup):
@@ -78,10 +77,10 @@ def check_decode(heap: XgmiHeap, rank: int, dev: torch.device, do_bench: bool):
     w_up = (torch.randn(H, LAT, generator=g, device=dev) * 0.02).bfloat16()
     w_norm = torch.ones(LAT, dtype=torch.bfloat16, device=dev)
 
-    r_sl = slice_replicated_weight(w_router, rank)
-    l_sl = slice_replicated_weight(w_down, rank)
+    r_sl = slice_replicated_weight(w_router, rank=rank)
+    l_sl = slice_replicated_weight(w_down, rank=rank)
     w_front_sl = torch.cat([r_sl, l_sl], dim=0).contiguous()  # [560, 7168]
-    w_up_sl = slice_replicated_weight(w_up, rank)  # [896, 3584]
+    w_up_sl = slice_replicated_weight(w_up, rank=rank)  # [896, 3584]
 
     weights = dict(
         w_router=w_router,
@@ -126,7 +125,9 @@ def _check_decode_once(
     x = (torch.randn(m, H, generator=gi, device=dev) * 0.5).bfloat16()
 
     # 1) 1/8 latent_input_gather
-    r_got, l_got = latent_input_gather(heap, x, w_front_sl)
+    r_got, l_got = latent_input_gather(
+        heap=heap, normed_hidden=x, router_down_weight_slice=w_front_sl
+    )
     r_ref = F.linear(x, w_router)
     l_ref = F.linear(x, w_down)
     # Minor GEMM tiling rounding between [560,H] and [4480,H] in bf16
@@ -143,7 +144,11 @@ def _check_decode_once(
     sh_all = (torch.randn(TP, m, H, generator=gi, device=dev) * 0.25).bfloat16()
 
     lat_got, sh_sl_got = deferred_topk_ar(
-        heap, exp_all[rank], tw, sh_all[rank], gather_full_shared=False
+        heap=heap,
+        expert_out=exp_all[rank],
+        topk_weights=tw,
+        shared_partial=sh_all[rank],
+        gather_full_shared=False,
     )
     # Reference: per-rank fp32 top-k -> bf16, then rank-order fp32 sum across TP8 -> bf16
     per_rank_lat = (exp_all.float() * tw[None, :, :, None]).sum(dim=2).bfloat16()
@@ -170,10 +175,10 @@ def _check_decode_once(
         exp_flat = torch.empty(m * TOP_K, LAT, dtype=torch.bfloat16, device=dev)
         exp_flat[perm.long()] = exp_all[rank].reshape(m * TOP_K, LAT)
         lat2, sh_full = deferred_topk_ar(
-            heap,
-            exp_flat,
-            tw,
-            sh_all[rank],
+            heap=heap,
+            expert_out=exp_flat,
+            topk_weights=tw,
+            shared_partial=sh_all[rank],
             sorted_idx=sidx,
             gather_full_shared=True,
         )
@@ -184,10 +189,15 @@ def _check_decode_once(
     prefix = (torch.randn(m, H, generator=gi, device=dev) * 0.25).bfloat16()
     pref_sl = prefix[:, rank * sl : (rank + 1) * sl].contiguous()
     stream_got = moetail_gather(
-        heap, lat_got, w_up_sl, sh_sl_got, pref_sl, norm_weight=w_norm
+        heap=heap,
+        latent=lat_got,
+        up_weight_slice=w_up_sl,
+        shared_slice=sh_sl_got,
+        prefix_slice=pref_sl,
+        norm_weight=w_norm,
     )
     stream_ref = (
-        F.linear(rms_norm_bf16(lat_got, w_norm), w_up).float()
+        F.linear(rms_norm_bf16(hidden=lat_got, weight=w_norm), w_up).float()
         + sh_ref.float()
         + prefix.float()
     ).bfloat16()
@@ -229,9 +239,20 @@ def _check_decode_eager_rotation(
         x_buf.copy_(x_new)
         exp_buf.copy_(exp_all[rank])
         sh_buf.copy_(sh_all[rank])
-        g_r, g_l = latent_input_gather(heap, x_buf, w_front_sl)
-        g_lat, g_sh = deferred_topk_ar(heap, exp_buf, tw_buf, sh_buf)
-        g_st = moetail_gather(heap, g_lat, w_up_sl, g_sh, pref_buf, norm_weight=w_norm)
+        g_r, g_l = latent_input_gather(
+            heap=heap, normed_hidden=x_buf, router_down_weight_slice=w_front_sl
+        )
+        g_lat, g_sh = deferred_topk_ar(
+            heap=heap, expert_out=exp_buf, topk_weights=tw_buf, shared_partial=sh_buf
+        )
+        g_st = moetail_gather(
+            heap=heap,
+            latent=g_lat,
+            up_weight_slice=w_up_sl,
+            shared_slice=g_sh,
+            prefix_slice=pref_buf,
+            norm_weight=w_norm,
+        )
         torch.cuda.synchronize()
         ref_r = F.linear(x_new, w_router)
         ref_l = F.linear(x_new, w_down)
@@ -251,7 +272,7 @@ def _check_decode_eager_rotation(
         )
         assert torch.equal(g_sh, sh_sl_r), f"eager sh_sl rep={rep}"
         st_full_r = (
-            F.linear(rms_norm_bf16(g_lat, w_norm), w_up).float()
+            F.linear(rms_norm_bf16(hidden=g_lat, weight=w_norm), w_up).float()
             + sh_r.float()
             + pref_full_g.float()
         ).bfloat16()
@@ -265,7 +286,9 @@ def _check_decode_eager_rotation(
     graph = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(graph):
-            latent_input_gather(heap, x_buf, w_front_sl)
+            latent_input_gather(
+                heap=heap, normed_hidden=x_buf, router_down_weight_slice=w_front_sl
+            )
     except RuntimeError:
         rejected_capture = True
     assert rejected_capture, "XgmiHeap must reject CUDA graph capture"
@@ -298,10 +321,18 @@ def _bench_decode(
         pref_sl = pref_full[:, rank * (H // TP) : (rank + 1) * (H // TP)].contiguous()
         w_front_full = torch.cat([w_router, w_down], dim=0).contiguous()
 
-        t_front_xgmi = _bench_us(lambda: latent_input_gather(heap, x, w_front_sl))
+        t_front_xgmi = _bench_us(
+            lambda: latent_input_gather(
+                heap=heap, normed_hidden=x, router_down_weight_slice=w_front_sl
+            )
+        )
         t_front_base = _bench_us(lambda: F.linear(x, w_front_full))
 
-        t_ar_xgmi = _bench_us(lambda: deferred_topk_ar(heap, exp, tw, sh))
+        t_ar_xgmi = _bench_us(
+            lambda: deferred_topk_ar(
+                heap=heap, expert_out=exp, topk_weights=tw, shared_partial=sh
+            )
+        )
 
         def _ar_base():
             lat_p = (exp.float() * tw[:, :, None]).sum(dim=1).bfloat16()
@@ -313,12 +344,21 @@ def _bench_decode(
 
         t_tail_xgmi = _bench_us(
             lambda: moetail_gather(
-                heap, lat, w_up_sl, sh_sl, pref_sl, norm_weight=w_norm
+                heap=heap,
+                latent=lat,
+                up_weight_slice=w_up_sl,
+                shared_slice=sh_sl,
+                prefix_slice=pref_sl,
+                norm_weight=w_norm,
             )
         )
 
         def _tail_base():
-            return F.linear(rms_norm_bf16(lat, w_norm), w_up) + sh + pref_full
+            return (
+                F.linear(rms_norm_bf16(hidden=lat, weight=w_norm), w_up)
+                + sh
+                + pref_full
+            )
 
         t_tail_base = _bench_us(_tail_base)
 
@@ -362,7 +402,7 @@ def check_prefill(heap: XgmiHeap, rank: int, dev: torch.device, do_bench: bool):
     if rank == 0:
         print(
             f"[PASS] Prefill (M=200,1024,4096,5292,8192,32768, heap={heap.heap_mib:.1f} MiB): "
-            "overlapped_o_proj_rs, 32-CU RS, FP4/FP8 pack AG, moe_tail_mix_qkv_a, row_allgather"
+            "overlapped_o_proj_rs, 64-block RS, FP4/FP8 pack AG, moe_tail_mix_qkv_a, row_allgather"
         )
 
     if do_bench:
@@ -380,27 +420,27 @@ def _check_prefill_rs(
     gi: torch.Generator,
     w_oproj: torch.Tensor,
 ) -> None:
-    # 1) overlapped_o_proj_rs (224-CU GEMM x 32-CU XGMI RS, 0 extra weights)
+    # 1) overlapped_o_proj_rs (o_proj GEMM chunks x 64-block XGMI RS, 0 extra weights)
     x_all = (
         torch.randn(TP, m, O_PROJ_K_LOCAL, generator=gi, device=dev) * 0.3
     ).bfloat16()
-    got_rs = overlapped_o_proj_rs(heap, x_all[rank], w_oproj)
+    got_rs = overlapped_o_proj_rs(heap=heap, hidden=x_all[rank], o_proj_weight=w_oproj)
 
     # Reference: each rank runs full F.linear, pad, reduce_scatter_tensor
     part_local = F.linear(x_all[rank], w_oproj)
-    part_pad, _ = pad_rows_to_tp(part_local, TP)
+    part_pad, _ = pad_rows_to_tp(part_local, tp=TP)
     ref_rs = torch.empty(r_per, H, dtype=torch.bfloat16, device=dev)
     dist.reduce_scatter_tensor(ref_rs, part_pad)
     err_rs = (got_rs.float() - ref_rs.float()).abs().max().item()
     assert err_rs < 5e-2, f"o_proj RS M={m}: err={err_rs}"
 
-    # 2) standalone 32-CU RS check (bit-exact vs rank-order fp32)
+    # 2) standalone 64-block RS check (bit-exact vs rank-order fp32)
     p_all = (torch.randn(TP, padded, LAT, generator=gi, device=dev) * 0.25).bfloat16()
-    got_lat_rs = prefill_reduce_scatter_32cu(heap, p_all[rank])
+    got_lat_rs = prefill_reduce_scatter_32cu(heap=heap, partial=p_all[rank])
     acc = torch.zeros(r_per, LAT, dtype=torch.float32, device=dev)
     for r in range(TP):
         acc = acc + p_all[r, rank * r_per : (rank + 1) * r_per].float()
-    assert torch.equal(got_lat_rs, acc.bfloat16()), f"32-CU RS M={m} mismatch!"
+    assert torch.equal(got_lat_rs, acc.bfloat16()), f"64-block RS M={m} mismatch!"
 
 
 def _check_prefill_front_tail(
@@ -429,7 +469,13 @@ def _check_prefill_front_tail(
             return ids_l, w_l
 
         q_all, s_all, ids_all, w_all = sharded_front_fp4_ag(
-            heap, normed_shard, m, w_rd, ROUTER, _cap_topk, use_fp4=use_fp4
+            heap=heap,
+            normed_shard=normed_shard,
+            num_tokens=m,
+            router_down_weight=w_rd,
+            router_cols=ROUTER,
+            topk_fn=_cap_topk,
+            use_fp4=use_fp4,
         )
         ids_ref = torch.empty(padded, TOP_K, dtype=torch.int32, device=dev)
         w_ref = torch.empty(padded, TOP_K, dtype=torch.float32, device=dev)
@@ -462,18 +508,20 @@ def _check_prefill_front_tail(
     pr_all = (torch.randn(padded, H, generator=gi, device=dev) * 0.3).bfloat16()
     sl = slice(rank * r_per, (rank + 1) * r_per)
     st_sh, _, qkv_a_got = moe_tail_mix_qkv_a(
-        heap,
-        lat_all[sl].contiguous(),
-        sh_all[sl].contiguous(),
-        pr_all[sl].contiguous(),
-        m,
-        latent_norm_fn=lambda z: rms_norm_bf16(z, w_norm),
+        heap=heap,
+        latent_shard=lat_all[sl].contiguous(),
+        shared_shard=sh_all[sl].contiguous(),
+        prefix_shard=pr_all[sl].contiguous(),
+        num_tokens=m,
+        latent_norm_fn=lambda z: rms_norm_bf16(hidden=z, weight=w_norm),
         up_proj_weight=w_up,
         next_qkv_a_weight=w_qkv_a,
     )
     # Verify against full-row qkv_a projection
     st_full = (
-        F.linear(rms_norm_bf16(lat_all[:m], w_norm), w_up) + sh_all[:m] + pr_all[:m]
+        F.linear(rms_norm_bf16(hidden=lat_all[:m], weight=w_norm), w_up)
+        + sh_all[:m]
+        + pr_all[:m]
     )
     qkv_a_ref = F.linear(st_full, w_qkv_a)
     err_qkv = (qkv_a_got.float() - qkv_a_ref.float()).abs().max().item()
@@ -481,7 +529,7 @@ def _check_prefill_front_tail(
     assert rel_qkv < 1e-2, f"moe_tail_mix_qkv_a M={m}: err={err_qkv} rel={rel_qkv}"
 
     # 5) 7168-dim auto-chunked row_allgather check (including M=8192!)
-    got_7168 = prefill_row_allgather(heap, normed_shard, m)
+    got_7168 = prefill_row_allgather(heap=heap, x_shard=normed_shard, num_tokens=m)
     assert torch.equal(got_7168, normed_all[:m]), f"row_allgather 7168 M={m} mismatch!"
 
 
@@ -510,7 +558,9 @@ def _bench_prefill(
         sh_sh = torch.randn(r_per, H, dtype=torch.bfloat16, device=dev) * 0.3
         pr_sh = torch.randn(r_per, H, dtype=torch.bfloat16, device=dev) * 0.3
 
-        t_oproj_ov = _bench_us(lambda: overlapped_o_proj_rs(heap, x_loc, w_oproj))
+        t_oproj_ov = _bench_us(
+            lambda: overlapped_o_proj_rs(heap=heap, hidden=x_loc, o_proj_weight=w_oproj)
+        )
 
         def _oproj_base():
             p = F.linear(x_loc, w_oproj)
@@ -521,7 +571,13 @@ def _bench_prefill(
 
         t_fp4_ag = _bench_us(
             lambda: sharded_front_fp4_ag(
-                heap, normed_sh, m, w_rd, ROUTER, _topk_fn, use_fp4=True
+                heap=heap,
+                normed_shard=normed_sh,
+                num_tokens=m,
+                router_down_weight=w_rd,
+                router_cols=ROUTER,
+                topk_fn=_topk_fn,
+                use_fp4=True,
             )
         )
 
@@ -534,19 +590,23 @@ def _bench_prefill(
 
         t_qkv_mix = _bench_us(
             lambda: moe_tail_mix_qkv_a(
-                heap,
-                lat_sh,
-                sh_sh,
-                pr_sh,
-                m,
-                latent_norm_fn=lambda z: rms_norm_bf16(z, w_norm),
+                heap=heap,
+                latent_shard=lat_sh,
+                shared_shard=sh_sh,
+                prefix_shard=pr_sh,
+                num_tokens=m,
+                latent_norm_fn=lambda z: rms_norm_bf16(hidden=z, weight=w_norm),
                 up_proj_weight=w_up,
                 next_qkv_a_weight=w_qkv_a,
             )
         )
 
         def _tail_ag_qkv_base():
-            up = F.linear(rms_norm_bf16(lat_sh, w_norm), w_up) + sh_sh + pr_sh
+            up = (
+                F.linear(rms_norm_bf16(hidden=lat_sh, weight=w_norm), w_up)
+                + sh_sh
+                + pr_sh
+            )
             dist.all_gather_into_tensor(normed_full, up)
             return F.linear(normed_full, w_qkv_a)
 
@@ -554,7 +614,7 @@ def _bench_prefill(
 
         if rank == 0:
             print(
-                f"M={m:4d} | o_proj+32CU_RS: {t_oproj_ov:7.1f} vs RCCL {t_oproj_base:7.1f} us ({t_oproj_base / t_oproj_ov:.2f}x) "
+                f"M={m:4d} | o_proj+XGMI_RS: {t_oproj_ov:7.1f} vs RCCL {t_oproj_base:7.1f} us ({t_oproj_base / t_oproj_ov:.2f}x) "
                 f"| 1/8 front+FP4_AG: {t_fp4_ag:7.1f} vs BF16_AG+full {t_bf16_base:7.1f} us ({t_bf16_base / t_fp4_ag:.2f}x) "
                 f"| tail+qkv_a_2112_AG: {t_qkv_mix:7.1f} vs 7168_AG+full {t_qkv_base:7.1f} us ({t_qkv_base / t_qkv_mix:.2f}x)"
             )
@@ -574,7 +634,7 @@ def main():
     dist.init_process_group(backend="nccl", device_id=dev)
     cpu_group = dist.new_group(backend="gloo")
 
-    heap = XgmiHeap(cpu_group, rank, dev)
+    heap = XgmiHeap(cpu_group=cpu_group, rank=rank, device=dev)
     if rank == 0:
         print(
             f"Initialized XgmiHeap: {heap.heap_mib:.2f} MiB ({heap.heap_bytes / (1 << 30):.3f} GiB) / GPU"

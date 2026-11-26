@@ -6,7 +6,7 @@
 //   2. xgmi_deferred_topk_lamport_ar (Decode 1..192 rows: deferred top-k + routed AR + shared RS/AR)
 //   3. xgmi_moetail_column_gather   (Decode 1..192 rows: 1/8 up_slice + shared + prefix -> full stream)
 //   4. xgmi_fused_rmsnorm_bf16      (Decode 1..192 rows: 1-launch wave64 RMSNorm for latent [M, 3584])
-//   5. xgmi_rs_chunk_32cu           (Prefill 200..8192 rows: 32-CU RS overlapped with 224-CU o_proj)
+//   5. xgmi_rs_chunk_32cu           (Prefill 200..8192 rows: 64-block RS, overlappable with o_proj chunks)
 //   6. xgmi_fp4_pack_allgather      (Prefill 200..8192 rows: fused E2M1 FP4 / FP8 + scale + topk AllGather)
 //   7. xgmi_row_allgather           (Prefill 200..8192 rows: 2112-dim qkv_a AG & chunked 7168 Attn AG)
 
@@ -212,13 +212,6 @@ static inline void validate_peer_mapping(
 static inline void check_align(const at::Tensor &t, size_t align, const char *name) {
     TORCH_CHECK((reinterpret_cast<uintptr_t>(t.data_ptr()) & (align - 1)) == 0,
                 name, " pointer must be aligned to ", align, " bytes");
-}
-
-static inline void check_epoch_span(const at::Tensor &block_epoch, int64_t epoch_off, int blocks, c10::Device dev) {
-    TORCH_CHECK(block_epoch.is_contiguous() && block_epoch.dtype() == at::kInt &&
-                    block_epoch.device() == dev && epoch_off >= 0 &&
-                    epoch_off + blocks <= block_epoch.numel(),
-                "block_epoch span out of bounds");
 }
 
 static inline hipStream_t checked_eager_stream(c10::Device dev) {
@@ -1213,7 +1206,7 @@ void fused_rmsnorm_bf16_op(
     TORCH_CHECK(x.device() == w.device() && x.device() == out.device());
     const int M = checked_int32_dim(x.size(0), "M");
     const int D = checked_int32_dim(x.size(1), "D");
-    TORCH_CHECK(M >= 1 && (D & 7) == 0 && w.numel() == D);
+    TORCH_CHECK(M >= 1 && D >= 8 && (D & 7) == 0 && w.numel() == D);
     check_align(x, 16, "x");
     check_align(w, 16, "w");
     check_align(out, 16, "out");

@@ -36,12 +36,7 @@ def overlapped_o_proj_rs(
     gemm_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
     n_chunks: Optional[int] = None,
 ) -> torch.Tensor:
-    """TP-sharded o_proj GEMM + 7-link-parallel XGMI Reduce-Scatter (0 extra weight).
-
-    Measured on 8x MI355X: single-stream 1-shot RS beats RCCL up to M=4096 and avoids
-    cross-stream CUDACachingAllocator fragmentation above M=8192; 4-chunk N-overlap wins
-    in the 4097..8192 window where each chunk fits in one 28 MiB RS ring slot.
-    """
+    """TP-sharded o_proj GEMM + 7-link-parallel XGMI Reduce-Scatter (0 extra weight)."""
     gemm = _default_gemm if gemm_fn is None else gemm_fn
     x_pad, _ = pad_rows_to_tp(hidden, tp=TP)
     padded_rows = x_pad.shape[0]
@@ -50,6 +45,8 @@ def overlapped_o_proj_rs(
 
     max_chunks = len(heap.chunk_events)
     if n_chunks is None:
+        # Tuned on warm-L2 runs; cold-cache xgmi_bench.py has RCCL ahead from M=2048, re-tune.
+        # Up to PREFILL_MAX_ROWS each of the 4 chunks fits one 28 MiB RS ring slot.
         n_chunks = 4 if 4096 < padded_rows <= PREFILL_MAX_ROWS else 1
     elif (
         isinstance(n_chunks, bool)
