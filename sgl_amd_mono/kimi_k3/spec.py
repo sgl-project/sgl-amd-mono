@@ -252,10 +252,12 @@ def _quark_fp8_storage(linear, name: str):
         isinstance(scheme, QuarkW8A8Fp8) and scheme.weight_qscheme == "per_channel"
     ):
         raise ValueError(f"an FP8 {name} is read only as Quark per-channel FP8")
+    if linear.weight.dim() != 2:
+        raise ValueError(f"the FP8 {name} weight is not 2-D")
     storage = linear.weight.t()
     if storage.dtype != torch.float8_e4m3fn:
         raise ValueError(f"the FP8 {name} is {storage.dtype}, not E4M3 (float8_e4m3fn)")
-    if storage.dim() != 2 or not storage.is_contiguous():
+    if not storage.is_contiguous():
         raise ValueError(f"the FP8 {name} is not SGLang's transposed contiguous weight")
     rows = storage.shape[0]
     scale = linear.weight_scale
@@ -277,10 +279,11 @@ def _o_proj_operands(o_proj):
     from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
 
     hidden = HF_CONFIG["hidden_size"]
+    # GPTQ / AWQ-style linears keep qweight and have no weight
     weight = getattr(o_proj, "weight", None)
     if weight is None:
         raise ValueError("o_proj has no weight")
-    if getattr(o_proj, "bias", None) is not None:
+    if o_proj.bias is not None:
         raise ValueError("o_proj has a bias")
     if weight.dtype == torch.bfloat16:
         if tuple(weight.shape) != (hidden, CORE) or not weight.is_contiguous():

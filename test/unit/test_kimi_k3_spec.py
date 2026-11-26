@@ -273,22 +273,19 @@ def test_the_fp8_kda_in_proj_layout_is_the_one_sglang_chose(monkeypatch, shuffle
     assert w_fb is attn._bfa_f_b_w
 
 
-def test_k1_takes_a_bf16_or_fp32_state_only(monkeypatch):
-    # The AgentX recipe's --mamba-ssm-dtype bfloat16 picks a launch variant; only
-    # a state dtype K1 has no variant for is refused.
-    import sglang.srt.runtime_context as runtime_context
+def test_k1_takes_a_bf16_or_fp32_state_only():
+    # K1 builds for the state SGLang allocates, which --mamba-ssm-dtype reaches
+    # through SGLANG_MAMBA_SSM_DTYPE; an env-only setting must pick the same variant.
+    from sglang.srt.environ import envs
 
     from sgl_amd_mono.kimi_k3.gfx950 import k1
 
-    mamba = SimpleNamespace(mamba_ssm_dtype="bfloat16")
-    monkeypatch.setattr(
-        runtime_context, "get_exec", lambda: SimpleNamespace(mamba=mamba)
-    )
-    assert k1._state_config() == (True, [])
-    mamba.mamba_ssm_dtype = "float32"
-    assert k1._state_config() == (False, [])
-    mamba.mamba_ssm_dtype = "float16"
-    assert "float32 or bfloat16" in k1._state_config()[1][0]
+    with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+        assert k1._state_config() == (True, [])
+    with envs.SGLANG_MAMBA_SSM_DTYPE.override("float32"):
+        assert k1._state_config() == (False, [])
+    with envs.SGLANG_MAMBA_SSM_DTYPE.override("float16"):
+        assert "float32 or bfloat16" in k1._state_config()[1][0]
 
 
 def test_padded_experts_are_refused(monkeypatch):

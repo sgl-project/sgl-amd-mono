@@ -148,10 +148,10 @@ SGLANG_READS = {
     ),
     "srt/runtime_context.py": ("get_exec",),
     # the server configuration K1's state handling rules out
-    "srt/arg_groups/fields/exec_.py": (
-        "enable_linear_replayssm_spec",
-        "mamba_ssm_dtype",
-    ),
+    "srt/arg_groups/fields/exec_.py": ("enable_linear_replayssm_spec",),
+    # the KDA state dtype SGLang allocates: SGLANG_MAMBA_SSM_DTYPE, which
+    # --mamba-ssm-dtype sets, else the config, else float32
+    "srt/configs/mamba_utils.py": ("mamba2_state_dtype",),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
     # the kernel writes the bank row; this is the count that goes with it
     "srt/layers/attn_residual.py": ("_count_write", "num_valid_blocks"),
@@ -218,22 +218,19 @@ def _is_kda_layer(layer) -> bool:
 
 
 def _state_config():
-    """(``--mamba-ssm-dtype`` is bf16, the reasons the configuration rules K1
-    out for every KDA layer at once)."""
-    from sglang.srt.runtime_context import get_exec
+    """(the KDA state SGLang allocates is bf16, the reasons the configuration rules
+    K1 out for every KDA layer at once)."""
+    from sglang.srt.configs.mamba_utils import mamba2_state_dtype
 
-    try:
-        mamba = get_exec().mamba
-    except ValueError:  # not published: no server, nothing to rule out
-        return False, []
+    # Kimi-K3's config sets no mamba_ssm_dtype, so SGLang resolves it from the env.
+    dtype = mamba2_state_dtype(None).temporal
     reasons = []
-    dtype = mamba.mamba_ssm_dtype
-    if dtype not in (None, "float32", "bfloat16", torch.float32, torch.bfloat16):
+    if dtype not in (torch.float32, torch.bfloat16):
         reasons.append(
             f"the recurrent state is {dtype} (--mamba-ssm-dtype); K1 takes "
             "float32 or bfloat16"
         )
-    return dtype in ("bfloat16", torch.bfloat16), reasons
+    return dtype == torch.bfloat16, reasons
 
 
 def _in_proj_operands(attn):
@@ -250,7 +247,7 @@ def _in_proj_operands(attn):
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
     from sgl_amd_mono.kimi_k3.spec import _quark_fp8_storage
 
-    if not getattr(attn, "use_full_rank_gate", False):
+    if not attn.use_full_rank_gate:
         raise ValueError(
             "the KDA gate is not full-rank, so there is no wide projection to "
             "extend (linear_attn_config.use_full_rank_gate)"
