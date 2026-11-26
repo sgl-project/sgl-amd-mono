@@ -309,6 +309,13 @@ def test_the_separated_a4w4_expert_layout_is_not_refused(monkeypatch):
     monkeypatch.setattr(k3, "_k3_aiter_opt", lambda: True)
     reasons = k3._config_disable_reasons(None, K3)
     assert not any("interleaved" in r or "K3_AITER" in r for r in reasons), reasons
+    # and the launch is built for that separated layout, A8W4 for the interleaved one
+    moe = SimpleNamespace(
+        experts=SimpleNamespace(moe_runner_config=SimpleNamespace(activation="situ"))
+    )
+    assert k3._gu_interleaved(moe) is False
+    monkeypatch.setenv("AITER_SITUV2_A8W4", "1")
+    assert k3._gu_interleaved(moe) is True
 
 
 def test_the_k3_aiter_switch_is_read_under_either_name(monkeypatch):
