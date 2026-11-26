@@ -239,6 +239,17 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
             "rename): without it the experts are padded past their native "
             "384-wide intermediate"
         )
+    # K2 computes SiTU with fixed (beta, linear_beta); SGLang reads them from the config
+    from sgl_amd_mono.kimi_k3.gfx950.stages.moe import BETA, LBETA
+
+    situ = (
+        getattr(t, "activation_situ_beta", None),
+        getattr(t, "activation_situ_linear_beta", None),
+    )
+    if situ != (BETA, LBETA):
+        reasons.append(
+            f"SiTU (beta, linear_beta) is {situ}; the launch computes ({BETA}, {LBETA})"
+        )
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons

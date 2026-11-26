@@ -263,7 +263,8 @@ def _in_proj_operands(attn):
         if merged is None:
             raise ValueError(
                 "the KDA in-projection is not merged "
-                "(SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ=0, or attention weights this "
+                "(SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ=0, SGLANG_ROCM_K3_FUSE_KDA_INPROJ=0 "
+                "before the rename, or attention weights this "
                 "merge may not concatenate)"
             )
         w_in, scale, fmt = merged.weight, None, kda.W_BF16

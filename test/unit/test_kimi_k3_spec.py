@@ -23,6 +23,7 @@ KDA = [i for i in range(1, 93) if i not in FULL_ATTN]
 TEXT = SimpleNamespace(
     num_hidden_layers=93,
     attn_res_block_size=12,
+    activation_situ_beta=4.0, activation_situ_linear_beta=25.0,
     linear_attn_config={**LINEAR_ATTN_CONFIG, "full_attn_layers": FULL_ATTN + [93],
                         "kda_layers": KDA},
     **HF_CONFIG,
@@ -316,6 +317,19 @@ def test_the_separated_a4w4_expert_layout_is_not_refused(monkeypatch):
     assert k3._gu_interleaved(moe) is False
     monkeypatch.setenv("AITER_SITUV2_A8W4", "1")
     assert k3._gu_interleaved(moe) is True
+
+
+def test_a_situ_the_launch_does_not_compute_is_refused(monkeypatch):
+    """K2 computes SiTU with fixed (beta, linear_beta); a config with other values,
+    here under the A4W4 layout, must not reach the launch."""
+    monkeypatch.setenv("AITER_SITUV2_A4W4", "1")
+    monkeypatch.setenv("AITER_SITUV2_A8W4", "0")
+    monkeypatch.setattr(k3, "_k3_aiter_opt", lambda: True)
+    text = SimpleNamespace(**{**vars(TEXT), "activation_situ_beta": 2.0})
+    hf = SimpleNamespace(**{**vars(K3), "text_config": text})
+    reasons = k3._config_disable_reasons(None, hf)
+    assert any("SiTU (beta, linear_beta)" in r for r in reasons), reasons
+    assert not any("SiTU" in r for r in k3._config_disable_reasons(None, K3))
 
 
 def test_the_k3_aiter_switch_is_read_under_either_name(monkeypatch):
