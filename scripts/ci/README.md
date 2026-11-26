@@ -72,12 +72,16 @@ MiniMax-M3) or one whose checkpoint is not on the CI nodes. A dispatch with
   jobs would hold both GPU runners for most of a day. The nightly runs them in
   full; to run a PR in full anyway, run the workflow by hand with `models`.
 
-Every run tests `common` first, as **stage A** (`stage A (common, full)`, ~5
-minutes): the unit tests and the common kernel tests, but the TP4 fault sweep
-(`PR_COMMON_KERNEL_DESELECT`, ~9 minutes), which the nightly runs; the TP2 fault
-test and the clean run still run on every PR. The model jobs start only
-once it passes, so a PR that breaks the package fails in minutes instead of holding
-both runners for hours; the report then lists each model as not run.
+Every run tests `common` first, as **stage A** (the `stage-a` job, shown as
+`test (common, full)`; ~5 minutes, estimated): the unit tests and the common
+kernel tests except the TP4 fault sweep (`PR_COMMON_KERNEL_DESELECT`, ~9 minutes),
+which the nightly runs; the TP2 fault test and the clean run still run on every
+PR. The model jobs start only once it passes, so a PR that breaks the package fails
+in minutes instead of holding both runners for hours; the report then lists each
+model as not run. Only a test failure stops them: when stage A's cluster job does
+not run at all (Slurm, the node), the model jobs still run and the report fails
+`common`. GitHub queues the model jobs when stage A ends, so on a busy day they
+wait behind jobs queued in the meantime.
 
 A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
 checks representative widths only (DeepSeek-V4.1's K1, K2 and target FFN launch at

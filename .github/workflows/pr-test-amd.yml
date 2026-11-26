@@ -208,13 +208,17 @@ jobs:
 
   # Stage A: `common` (the unit tests and the common kernel tests, ~5 min) runs
   # first, on its own. The model jobs start only once it passes: a PR that breaks
-  # the package fails here instead of holding both runners for hours.
+  # the package fails here instead of holding both runners for hours. Only a test
+  # failure stops them; a cluster job that never ran (Slurm, the node) lets them
+  # run, and the report still fails `common`.
   stage-a:
     needs: plan
     # The gate a dispatched run skips is upstream of this job too, and a skipped
     # job anywhere upstream skips it unless its condition says otherwise.
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
-    name: stage A (common, full)
+    # The name the model jobs have: the mono dashboard and the CI monitor read
+    # `test (<model>, <tier>)`.
+    name: test (common, full)
     # Two runners on a cluster host that submits Slurm jobs (scripts/ci/runner.sh);
     # each job takes one of the two CI nodes.
     runs-on: [self-hosted, sgl-amd-mono-mi355x]
@@ -237,6 +241,10 @@ jobs:
           persist-credentials: false
 
       - name: Run on the CI node
+        id: launch
+        # slurm_launch.sh fails only when the cluster job itself did not run; the
+        # Judge step decides what that means for the gate
+        continue-on-error: true
         env:
           CI_RESULTS: ${{ env.RESULTS }}/common
         run: bash harness/scripts/ci/slurm_launch.sh "common" "full"
@@ -251,9 +259,17 @@ jobs:
 
       - name: Judge
         # bash (not the default bash -e) runs with pipefail: a failed check fails
-        # the model's job instead of passing through tee's exit status
+        # the job instead of passing through tee's exit status. A cluster job that
+        # did not run is no verdict on the PR: the model jobs still run, and the
+        # report fails `common` for it.
         shell: bash
+        env:
+          LAUNCH: ${{ steps.launch.outcome }}
         run: |
+          if [[ "$LAUNCH" != success ]]; then
+            echo "::warning::stage A's cluster job did not run (Slurm or the node, not the PR's tests); the model jobs still run and the report fails common"
+            exit 0
+          fi
           python3 harness/scripts/ci/report.py --results "$RESULTS" --model "common" \
             --title-type "${{ needs.plan.outputs.title_type }}" | tee -a "$GITHUB_STEP_SUMMARY"
 
