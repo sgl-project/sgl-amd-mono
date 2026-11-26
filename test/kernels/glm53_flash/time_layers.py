@@ -1,7 +1,8 @@
 """Kernel-only time of the GLM-5.3-Flash layer launch, under torchrun (TP 2, 4 or 8):
 
     torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py \\
-        --kind model --rows 2,4,8 [--pos 2047] [--layers 12] [--row-major] [--per-row-moe]
+        --kind model --rows 2,4,8 [--pos 2047] [--layers 12] [--row-major] [--per-row-moe] \\
+        [--state-bf16]
 
 One HIP graph holds a step of launches, inputs chained layer to layer, every row
 live. Each layer has its own random weights (``check_layer.py``'s, seeded by layer,
@@ -15,7 +16,8 @@ step's tokens, the dense layers 1 and 2, layers 3 to 44, then the tail. ``kda``,
 ``dsa``, ``dense``, ``embed`` (layer 0 from the tokens) and ``head`` (the tail) run
 ``--layers`` launches of one kind; each ``embed`` and ``head`` launch takes the step's
 input, the others the previous launch's output. FP8 projections are read in place (AITER's (16, 16) layout), or row-major with
-``--row-major``. After an eager step and 20 warm-up replays, each of ``--trials``
+``--row-major``. KDA launches keep an f32 recurrent state, or a bf16 one with
+``--state-bf16`` (``FlashBuild.state_bf16``). After an eager step and 20 warm-up replays, each of ``--trials``
 trials replays the graph ``--reps`` times; rank 0 prints per-launch microseconds
 (trial time / (reps x launches)): the median, minimum and maximum over trials, the
 slowest rank's median, and whether every error word stayed clean."""
@@ -90,6 +92,16 @@ def _verify_caches(rows: int, L: int, pos: int, device):
     return caches, table, pt.repeat_interleave(L, 0).contiguous()
 
 
+def _kda_state(args, rows: int, tp: int, device):
+    """``check_layer``'s KDA state, its recurrent state in bf16 with ``--state-bf16``."""
+    from msgspec.structs import replace
+
+    state, idx = cl.kda_state(rows, tp, device)
+    if args.state_bf16:
+        state = replace(state, rec_state=state.rec_state.bfloat16())
+    return state, idx
+
+
 def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
     """The runtimes (one a kind), each layer's op and launch arguments."""
     from sgl_amd_mono.glm53_flash.gfx950.config import GLOBAL_INTER
@@ -111,6 +123,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             launches_per_step=kinds.count(kind),
             inter=GLOBAL_INTER // tp,
             kda=not (dsa or head),
+            state_bf16=args.state_bf16 and not (dsa or head),
             dsa=dsa,
             max_pools=args.max_pools if dsa else 0,
             qkv_shuffled=shuffled and dsa,
@@ -141,7 +154,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
         if kind in ("dense", "embed"):
             ffn = cl.dense_weights(rank, tp, device, shuffled)
             attn = cl.kda_weights(rank, tp, device)
-            state, idx = cl.kda_state(rows, tp, device)
+            state, idx = _kda_state(args, rows, tp, device)
             embedding = cl.embedding(rank, tp, device)[0] if kind == "embed" else None
             op = FlashLayerOp(runtimes[kind], ffn, n, kda=attn, embedding=embedding)
             ops.append(op)
@@ -153,7 +166,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
         ffn = cl.ffn_weights(rank, tp, device)
         if kind == "kda":
             attn = cl.kda_weights(rank, tp, device)
-            state, idx = cl.kda_state(rows, tp, device)
+            state, idx = _kda_state(args, rows, tp, device)
             ops.append(FlashLayerOp(runtimes[kind], ffn, n, kda=attn))
             extra.append(dict(state=state, state_idx=idx))
         else:
@@ -227,6 +240,7 @@ def _time(args, rows: int, rank: int, tp: int, group, device) -> None:
             f"TIME kind={args.kind} rows={rows} verify={args.verify} tp={tp} "
             f"launches={len(kinds)} "
             f"pos={args.pos} fp8={'row-major' if args.row_major else 'in-place'} "
+            f"state={'bf16' if args.state_bf16 else 'f32'} "
             f"us_per_launch median={median:.2f} min={min(per_launch):.2f} "
             f"max={max(per_launch):.2f} "
             f"slowest_rank_median={max(m for m, _ in medians):.2f} "
@@ -264,6 +278,9 @@ def main() -> int:
         "--per-row-moe",
         action="store_true",
         help="the per-row MoE at every width, the baseline of the grouped one",
+    )
+    ap.add_argument(
+        "--state-bf16", action="store_true", help="a bf16 KDA recurrent state"
     )
     ap.add_argument(
         "--verify", type=int, default=1, help="dsa: an MTP verify step's rows a request"
