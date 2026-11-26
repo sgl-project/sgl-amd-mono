@@ -253,6 +253,9 @@ class FlashBuild(msgspec.Struct, frozen=True):
     inter: int  # this rank's expert intermediate width
     kda: bool = False
     conv_dim_first: bool = False  # KDA conv state [slots, 3P, 3], else [slots, 3, 3P]
+    # with kda: the recurrent state and its verify scratch in bf16 (SGLang's
+    # --mamba-ssm-dtype bfloat16), else f32; the math stays f32 either way
+    state_bf16: bool = False
     dsa: bool = False
     max_pools: int = 0  # kpool pools a sparse-attention row scores at most
     # which of q_a | kv_a, q_b and o_proj are FP8 with 128 x 128 block scales
@@ -308,6 +311,8 @@ def build_flash_kernel(key: FlashBuild):
     S, W, launches_per_step = key.rows, key.tp, key.launches_per_step
     kda, dsa, max_pools = key.kda, key.dsa, key.max_pools
     conv_dim_first = key.conv_dim_first
+    STATE_BF16 = kda and key.state_bf16
+    STATE_BYTES = 2 if STATE_BF16 else 4
     fault_site, fault_after = key.fault_site, key.fault_after
     dense, head, tokens = key.dense, key.head, key.tokens
     # a verify step: VL rows a request, NREQ whole requests in the width
@@ -340,7 +345,16 @@ def build_flash_kernel(key: FlashBuild):
     if head:
         name = kernel_symbol("glm53_flash_tail", s=S, tp=W)
     else:
-        extra = {k: 1 for k, on in (("n", dense), ("e", tokens), ("g", GROUPED)) if on}
+        extra = {
+            k: 1
+            for k, on in (
+                ("n", dense),
+                ("e", tokens),
+                ("g", GROUPED),
+                ("b", kda and key.state_bf16),
+            )
+            if on
+        }
         if VERIFY:
             extra["v"] = VL
         name = kernel_symbol(
@@ -596,6 +610,38 @@ def build_flash_kernel(key: FlashBuild):
             return bf2_f32(
                 fx.Int32(bo.buffer_load(r, elem // 2, vec_width=1, dtype=T.i32))
             )
+
+        def ld_state(r, elem):
+            """Recurrent-state elements elem .. elem + 31 (elem a multiple of 32) ->
+            32 f32."""
+            if const_expr(STATE_BF16):
+                return [v for q in range(4) for v in ld_bf16s(r, elem + 8 * q, 8)]
+            out = []
+            for q in range_constexpr(8):
+                w4 = fx.Vector(
+                    bo.buffer_load(r, elem + 4 * q, vec_width=4, dtype=T.f32)
+                )
+                out += [w4[e] for e in range(4)]
+            return out
+
+        def st_state(r, elem, hv):
+            """32 f32 -> recurrent-state elements elem .. elem + 31 (with STATE_BF16
+            rounded to nearest even, as torch's .to(bfloat16))."""
+            if const_expr(STATE_BF16):
+                for q in range_constexpr(4):
+                    w = (
+                        fx.Vector.from_elements(hv[8 * q : 8 * q + 8], fx.Float32)
+                        .to(fx.BFloat16)
+                        .bitcast(fx.Int32)
+                    )
+                    bo.buffer_store(w, r, (elem + 8 * q) // 2)
+            else:
+                for q in range_constexpr(8):
+                    bo.buffer_store(
+                        fx.Vector.from_elements(hv[4 * q : 4 * q + 4], fx.Float32),
+                        r,
+                        elem + 4 * q,
+                    )
 
         def bf16_round(a):
             return fx.Float32(fx.Float32(a).to(fx.BFloat16))
@@ -1997,16 +2043,10 @@ def build_flash_kernel(key: FlashBuild):
                     k0 = (tid % 4) * 32
                     r_rs = _rsrc(
                         rec_state
-                        + (slot * rec_stride + fx.Int64(h * KD * KD)) * fx.Int64(4)
+                        + (slot * rec_stride + fx.Int64(h * KD * KD))
+                        * fx.Int64(STATE_BYTES)
                     )
-                    hv = []
-                    for q in range_constexpr(8):
-                        w4 = fx.Vector(
-                            bo.buffer_load(
-                                r_rs, vr * KD + k0 + 4 * q, vec_width=4, dtype=T.f32
-                            )
-                        )
-                        hv += [w4[e] for e in range(4)]
+                    hv = ld_state(r_rs, vr * KD + k0)
                     for j in range_constexpr(VL):
                         row = s + j
                         # every thread polls (the channel and gate clamped), so the
@@ -2085,16 +2125,9 @@ def build_flash_kernel(key: FlashBuild):
                                     req * inter_rec_stride
                                     + fx.Int64((j * H + h) * KD * KD)
                                 )
-                                * fx.Int64(4)
+                                * fx.Int64(STATE_BYTES)
                             )
-                            for q in range_constexpr(8):
-                                bo.buffer_store(
-                                    fx.Vector.from_elements(
-                                        hv[4 * q : 4 * q + 4], fx.Float32
-                                    ),
-                                    r_irs,
-                                    vr * KD + k0 + 4 * q,
-                                )
+                            st_state(r_irs, vr * KD + k0, hv)
                         if tid % 4 == 0:
                             lds_st(
                                 xs,
@@ -2156,16 +2189,10 @@ def build_flash_kernel(key: FlashBuild):
                 k0 = (tid % 4) * 32
                 r_rs = _rsrc(
                     rec_state
-                    + (slot * rec_stride + fx.Int64(h * KD * KD)) * fx.Int64(4)
+                    + (slot * rec_stride + fx.Int64(h * KD * KD))
+                    * fx.Int64(STATE_BYTES)
                 )
-                hv = []
-                for q in range_constexpr(8):
-                    w4 = fx.Vector(
-                        bo.buffer_load(
-                            r_rs, vr * KD + k0 + 4 * q, vec_width=4, dtype=T.f32
-                        )
-                    )
-                    hv += [w4[e] for e in range(4)]
+                hv = ld_state(r_rs, vr * KD + k0)
                 # one poll a thread: its conv channel, its gate and the row's beta
                 if tid < 3 * KD:
                     gi = fx.min(tid, 2 * KD - 1)
@@ -2233,12 +2260,7 @@ def build_flash_kernel(key: FlashBuild):
                     o = _xred(o, off, lambda a, b: a + b)
 
                 def store_rec():
-                    for q in range_constexpr(8):
-                        bo.buffer_store(
-                            fx.Vector.from_elements(hv[4 * q : 4 * q + 4], fx.Float32),
-                            r_rs,
-                            vr * KD + k0 + 4 * q,
-                        )
+                    st_state(r_rs, vr * KD + k0, hv)
 
                 if const_expr(not STATES_LAST):
                     if valid:
