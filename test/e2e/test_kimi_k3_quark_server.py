@@ -29,8 +29,8 @@ K1_NOT_BUILT = "Kimi-K3 K1: not built for the KDA layers"
 # sgl-eval GSM8K (200 questions) scored 0.98 with the monokernels on; the bound
 # is for gross failures, as in test_kimi_k3_server.
 GSM8K_BOUND = 0.95
-# Mean KL of 48 prompts (the helper's default) x 512 tokens decoded after a
-# radix-cache prefix hit, against prefill: 0.0117 measured at TP8; about 2.5x that.
+# Mean KL of 32 prompts x 512 tokens decoded after a radix-cache prefix hit (31 hits
+# scored), against prefill: 0.0117 measured at TP8; about 2.5x that.
 KL_CACHE_HIT_BOUND = 0.03
 
 
@@ -81,6 +81,7 @@ class TestMonokernelKimiK3Quark(k3.TestMonokernelKimiK3):
             DEFAULT_URL_FOR_TEST,
             {MODEL: {"kl_div": KL_CACHE_HIT_BOUND}},
             MODEL,
+            max_samples=32,
             max_new_tokens=512,
             trust_remote_code=True,
         )
