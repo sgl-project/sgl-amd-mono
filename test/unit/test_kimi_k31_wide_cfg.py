@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi-K3.1 wide launch tile configs keep the MoE front and in_proj in one BLOCKS round."""
+"""Kimi-K3.1 wide launch tile configs keep every stage of a launch in one BLOCKS round."""
 
 import math
 
@@ -10,28 +10,34 @@ from sgl_amd_mono.kimi_k3.gfx950.attention.kda import NPROJ
 from sgl_amd_mono.kimi_k31 import wide
 
 
-def _tasks(cfg: str, rows: int, cols: int) -> int:
-    # gfx950/layer.py: row tiles x column tiles x split-K slices
+def _tasks(cfg: str, rows: int, cols: int, split_k: bool = True) -> int:
+    # gfx950/layer.py: row tiles x column tiles (x split-K slices, except shared down)
     bm, bn, _, _, ks = (int(x) for x in cfg.split(":"))
-    return math.ceil(rows / bm) * math.ceil(cols / bn) * ks
+    return math.ceil(rows / bm) * math.ceil(cols / bn) * (ks if split_k else 1)
 
 
 def test_every_row_count_fits_one_round() -> None:
     """A front or in_proj tile choice with more tasks than BLOCKS costs a whole second round;
-    every row count up to the largest CFGS key fits, not only today's buckets."""
+    the row ranges keep both in one round at every row count, not only today's buckets."""
     for b in range(wide.NARROW + 1, max(wide.CFGS) + 1):
         _, inp, _, front, _ = wide._row_cfgs(b)
-        assert _tasks(front, rows=b, cols=wide.NF) <= BLOCKS, (b, front)
-        assert _tasks(inp, rows=b, cols=NPROJ) <= BLOCKS, (b, inp)
+        assert _tasks(cfg=front, rows=b, cols=wide.NF) <= BLOCKS, (b, front)
+        assert _tasks(cfg=inp, rows=b, cols=NPROJ) <= BLOCKS, (b, inp)
 
 
 @pytest.mark.parametrize("L", wide.SUPPORTED_L)
-def test_every_bucket_is_within_the_checked_rows(L: int) -> None:
-    # a bucket past the largest CFGS key falls back to that key's tiles, which the test above does not check
+def test_every_bucket_fits_one_round(L: int) -> None:
     for r in wide.REQ_BUCKETS:
         b = L * r
-        assert wide.NARROW < b <= max(wide.CFGS), (L, b)
-        assert wide.cfg_rows(b, L) == wide._row_cfgs(b)
+        up, inp, oproj, front, sdown = wide.cfg_rows(b=b, L=L)
+        tasks = {
+            "up": _tasks(cfg=up, rows=b, cols=wide.SL),
+            "in_proj": _tasks(cfg=inp, rows=b, cols=NPROJ),
+            "o_proj": _tasks(cfg=oproj, rows=b, cols=wide.H),
+            "front": _tasks(cfg=front, rows=b, cols=wide.NF),
+            "shared down": _tasks(cfg=sdown, rows=b, cols=wide.H, split_k=False),
+        }
+        assert max(tasks.values()) <= BLOCKS, (L, b, tasks)
 
 
 def test_row_ranges_are_sorted_and_disjoint() -> None:
