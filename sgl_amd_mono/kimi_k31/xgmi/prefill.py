@@ -45,7 +45,7 @@ def overlapped_o_proj_rs(
 
     max_chunks = len(heap.chunk_events)
     if n_chunks is None:
-        # Tuned on warm-L2 runs; cold-cache xgmi_bench.py has RCCL ahead from M=2048, re-tune.
+        # TODO(yuychang): re-tune the 4-chunk threshold on cold-cache timings.
         # Up to PREFILL_MAX_ROWS each of the 4 chunks fits one 28 MiB RS ring slot.
         n_chunks = 4 if 4096 < padded_rows <= PREFILL_MAX_ROWS else 1
     elif (
