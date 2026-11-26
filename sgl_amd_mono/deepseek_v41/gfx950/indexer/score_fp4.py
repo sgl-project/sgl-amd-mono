@@ -11,6 +11,9 @@
     iq  [S, HEADS, DIM / 2] E2M1, iqs [S, 4 (K chunk), 16 (head % 16), 4 (head // 16, padded)]
         E8M0, iw [S, HEADS] bf16 (widening to f32 is exact)
 
+A page8 pool (``SGLANG_HIP_DSV41_INDEX_K_PAGE8``) holds kv and ks in aiter's 8-row pages instead,
+which are the virtual pages: only ``_keys`` reads the two layouts differently.
+
 Lane (g, l) of tile nt holds key 4 l + nt, so a step's page is one lookup and its four tiles'
 scales one dword. The logits match aiter ``pa_mqa_logits_fp4_rowgroup`` only in its arithmetic
 order: relu as x + |x| against half the weight, the lane's heads in one fma chain, then the
@@ -40,6 +43,7 @@ from sgl_amd_mono.common.plan import BLOCKS, WAVES
 from . import index_plan as ip
 
 PAGE = ip.BLOCK_ROWS
+# a page8 pool's page, in aiter's ``pack_kv_cache`` layout
 PAGE_BYTES = PAGE * ip.DIM // 2
 PAGE_SCALES = PAGE * ip.DIM // 32
 # SGLang's FP4 index plane (``deepseek_v4_memory_pool``): 64-row pages, payload and scales apart
@@ -216,6 +220,13 @@ def _keys(c, page, nt):
     REINDEX row, whose request's other rows read the same candidate pages."""
     a, lane = c["args"], c["lane"]
     l, g = lane % 16, lane // 16
+    if const_expr(c["page8"]):
+        # payload [key % 4][chunk][key // 4][16 B], scales [chunk][key]: this lane's 4 (l % 2) + nt
+        page = fx.Int64(page)
+        base = a["plane"] + page * PAGE_BYTES + fx.Int64(g * 32 + (l % 2) * 16)
+        kv = [global_load(base + t * 128, 4, nt) for t in range(4)]
+        at = a["pscale"] + page * PAGE_SCALES + fx.Int64(g * 8 + (l % 2) * 4)
+        return kv, fx.Int32(global_load(at))
     # ``page`` is virtual: 8 x SGLang's 64-row page + the 8-row sub page
     sub = page & 7
     phys = fx.Int64(page >> 3)
