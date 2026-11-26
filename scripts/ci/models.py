@@ -285,7 +285,7 @@ MODELS = {
         "e2e_tests": [],
         "microbench": [
             "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --rows 16,128",
-            # 6 draft tokens a request: the buckets whose tiles differ from the 8-token rows'
+            # 6 draft tokens a request: two of the buckets whose tiles no 8-token bucket runs
             (
                 "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py"
                 " --L 6 --rows 96,288 --nvb-a 2 --nvb-m 3"

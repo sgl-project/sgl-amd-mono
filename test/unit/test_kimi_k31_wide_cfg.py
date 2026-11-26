@@ -6,23 +6,23 @@ import math
 import pytest
 
 from sgl_amd_mono.common.plan import BLOCKS
+from sgl_amd_mono.kimi_k3.gfx950.attention.kda import NPROJ
 from sgl_amd_mono.kimi_k31 import wide
 
 
-def _row_tiles(cfg: str) -> tuple[int, int]:
-    bm, _, _, _, ks = (int(x) for x in cfg.split(":"))
-    return bm, ks
+def _tasks(cfg: str, rows: int, cols: int) -> int:
+    # gfx950/layer.py: row tiles x column tiles x split-K slices
+    bm, bn, _, _, ks = (int(x) for x in cfg.split(":"))
+    return math.ceil(rows / bm) * math.ceil(cols / bn) * ks
 
 
 def test_every_row_count_fits_one_round() -> None:
-    """A row tile + split-K that needs a second round of the front (17 column tiles) or in_proj (50) costs a
-    whole extra round; every row count up to the largest CFGS key fits, not only today's buckets."""
+    """A front or in_proj tile choice with more tasks than BLOCKS costs a whole second round;
+    every row count up to the largest CFGS key fits, not only today's buckets."""
     for b in range(wide.NARROW + 1, max(wide.CFGS) + 1):
         _, inp, _, front, _ = wide._row_cfgs(b)
-        bm, ks = _row_tiles(front)
-        assert 17 * math.ceil(b / bm) * ks <= BLOCKS, (b, front)
-        bm, ks = _row_tiles(inp)
-        assert 50 * math.ceil(b / bm) * ks <= BLOCKS, (b, inp)
+        assert _tasks(front, rows=b, cols=wide.NF) <= BLOCKS, (b, front)
+        assert _tasks(inp, rows=b, cols=NPROJ) <= BLOCKS, (b, inp)
 
 
 @pytest.mark.parametrize("L", wide.SUPPORTED_L)

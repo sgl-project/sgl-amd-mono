@@ -100,8 +100,8 @@ REQ_BUCKETS = (
 )  # requests a bucket holds; its rows are L x requests
 SUPPORTED_L = (6, 8)
 BUCKETS = tuple(8 * r for r in REQ_BUCKETS)
-CFGS = {  # rows -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; a bucket of b rows
-    # takes the smallest key >= b (_row_cfgs)
+CFGS = {  # rows -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks;
+    # a bucket of b rows takes the smallest key >= b
     16: (
         "16:128:1:8:8",
         "16:128:1:8:4",
@@ -139,9 +139,9 @@ CFGS = {  # rows -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; a
         "128:64:2:4:1",
     ),
 }
-# Sorted (lo, hi, cfg) row ranges overriding the CFGS entry where its row tile would need a second BLOCKS round
-# (front: 17 column tiles x row tiles x ks; in_proj: 50 column tiles x row tiles x ks) or pad a row tile past
-# b. Every row count up to max(CFGS) fits one round (test/unit/test_kimi_k31_wide_cfg.py), not only the buckets.
+# Sorted (lo, hi, cfg) row ranges overriding the CFGS entry where its tiles would need a second BLOCKS round,
+# counted as row tiles x column tiles x ks (front: NF columns, in_proj: kda.NPROJ), or pad a row tile past b;
+# every row count up to max(CFGS) fits one round, not only the buckets (test/unit/test_kimi_k31_wide_cfg.py)
 FRONT_ROW_RANGES = (
     (65, 96, "96:128:2:4:8"),
     (129, 191, "96:128:2:4:4"),
@@ -167,7 +167,9 @@ SDOWN_ROW_RANGES = (
 _TUNED_ROW_KEYS = tuple(sorted(CFGS))
 
 
-def _row_override(b: int, ranges: tuple, default: str) -> str:
+def _row_override(
+    b: int, ranges: tuple[tuple[int, int, str], ...], default: str
+) -> str:
     for lo, hi, cfg in ranges:
         if lo <= b <= hi:
             return cfg
@@ -204,15 +206,14 @@ def cfg_rows(b: int, L: int) -> tuple[str, str, str, str, str]:
 
 
 def _row_cfgs(b: int) -> tuple[str, str, str, str, str]:
-    # the smallest CFGS key >= b (the largest past it), refined by the row ranges
     tuned_rows = next((k for k in _TUNED_ROW_KEYS if k >= b), _TUNED_ROW_KEYS[-1])
     up, inp, oproj, front, sdown = CFGS[tuned_rows]
     return (
-        _row_override(b, UP_ROW_RANGES, up),
-        _row_override(b, INP_ROW_RANGES, inp),
+        _row_override(b=b, ranges=UP_ROW_RANGES, default=up),
+        _row_override(b=b, ranges=INP_ROW_RANGES, default=inp),
         oproj,
-        _row_override(b, FRONT_ROW_RANGES, front),
-        _row_override(b, SDOWN_ROW_RANGES, sdown),
+        _row_override(b=b, ranges=FRONT_ROW_RANGES, default=front),
+        _row_override(b=b, ranges=SDOWN_ROW_RANGES, default=sdown),
     )
 
 
