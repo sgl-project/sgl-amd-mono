@@ -110,6 +110,11 @@ SGLANG_READS = {
     # is optional, and SGLANG_AITER_K3_OPT is read where it does not exist yet
     "srt/environ.py": ("envs",),
     # a Quark per-channel FP8 o_proj, and whether SGLang preshuffled it
+    # the SiTU parameters K2 hard-codes
+    "srt/configs/kimi_linear.py": (
+        "activation_situ_beta",
+        "activation_situ_linear_beta",
+    ),
     # set on every Quark linear; a non-Quark linear has none, hence the guarded read
     "srt/layers/quantization/quark/quark.py": ("scheme",),
     "srt/layers/quantization/quark/schemes/quark_w8a8_fp8.py": (
@@ -240,12 +245,9 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
             "384-wide intermediate"
         )
     # K2 computes SiTU with fixed (beta, linear_beta); SGLang reads them from the config
-    from sgl_amd_mono.kimi_k3.gfx950.stages.moe import BETA, LBETA
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import BETA, LBETA
 
-    situ = (
-        getattr(t, "activation_situ_beta", None),
-        getattr(t, "activation_situ_linear_beta", None),
-    )
+    situ = (t.activation_situ_beta, t.activation_situ_linear_beta)
     if situ != (BETA, LBETA):
         reasons.append(
             f"SiTU (beta, linear_beta) is {situ}; the launch computes ({BETA}, {LBETA})"

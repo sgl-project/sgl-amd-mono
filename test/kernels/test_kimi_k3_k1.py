@@ -623,14 +623,8 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
         self.assertGreater(cos, COS_MIN, "the bf16 states written differ")
 
     def test_replayssm_ring(self):
-        """ReplaySSM: no state is written, and the ring rows are what SGLang's
-        commit replays onto the committed state.
-
-        The commit folds the ring of the request's own slot, positions 0 ..
-        accepted, onto that slot's state. So the rows must sit at [slot, head,
-        token], hold k and v before the l2norm and the delta, and fold back to
-        the state this step's recurrence reached.
-        """
+        """ReplaySSM: only the active slot's ring rows change, and replaying them onto
+        the committed state reproduces the state this step's recurrence reached."""
         slot, h = 3, 5
         kda = self.case.kda
         # the last is the Quark recipe's K1: preshuffled FP8 in_proj, bf16 state
