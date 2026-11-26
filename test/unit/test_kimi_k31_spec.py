@@ -98,3 +98,24 @@ def test_a_qweight_only_o_proj_leaves_the_refusal_to_kimi_k3(monkeypatch):
     """A merged layer whose o_proj has no ``weight`` is reported by Kimi-K3's checks
     ("o_proj has no weight"); kimi_k31's own checks must not raise on it."""
     assert _reasons(monkeypatch, o_proj=None) == []
+
+
+def test_the_wide_launch_refuses_a_bf16_kda_state(monkeypatch):
+    """The wide KDA stage reads the recurrent state as fp32; a bf16 state (which
+    Kimi-K3's K1 accepts) must not reach it."""
+    from sglang.srt.environ import envs
+
+    monkeypatch.setattr(k31.k3, "_config_disable_reasons", lambda *a: [])
+    monkeypatch.setattr(
+        k31.k3, "_text_config", lambda hf: SimpleNamespace(dsa_config={})
+    )
+
+    def refused():
+        cfg = SimpleNamespace(dcp_size=8, speculative_num_draft_tokens=6)
+        reasons = k31._config_disable_reasons(cfg, None)
+        return any("the wide launch reads float32" in r for r in reasons)
+
+    with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+        assert refused()
+    with envs.SGLANG_MAMBA_SSM_DTYPE.override("float32"):
+        assert not refused()

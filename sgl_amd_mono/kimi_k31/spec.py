@@ -28,6 +28,8 @@ from sgl_amd_mono.kimi_k3 import spec as k3
 from sgl_amd_mono.kimi_k31 import wide
 
 SGLANG_READS = {
+    # the KDA state dtype SGLang allocates, which the wide launch reads as fp32
+    "srt/configs/mamba_utils.py": ("mamba2_state_dtype", "temporal"),
     "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "Feature",
         "Numerics",
@@ -69,6 +71,13 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     ):
         # CONTEXT_PARALLEL is accepted for DCP; attention CP reshapes the decode rows
         reasons.append("attention context parallel is on; only --dcp-size is accepted")
+    # The wide KDA stage reads the recurrent state as fp32 (4 B a slot element);
+    # Kimi-K3's K1 also takes bf16, the wide launch does not.
+    from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+
+    state = mamba2_state_dtype(None).temporal
+    if state != torch.float32:
+        reasons.append(f"the KDA state is {state}; the wide launch reads float32")
     tokens = getattr(cfg, "speculative_num_draft_tokens", None)
     if tokens not in wide.SUPPORTED_L:
         reasons.append(
