@@ -194,8 +194,8 @@ def sigmoid(z):
 # ---------------------------------------------------------------- gemv CTAs
 def gemv_loads(c, rg, chunks):
     """This wave's weight operands of rows 16 rg .. for its K chunks ``chunks``
-    (indices into wave, wave + 8, ..): a lane 64 contiguous bytes of its row a
-    chunk (4 dwordx4). ``rg`` past the last group loads the last group."""
+    (indices into wave, wave + 8, ..), a lane's slice of its row a chunk: bf16
+    4 x 16 B, FP8 4 x 8 B. ``rg`` past the last group loads the last group."""
     lane, wave = c["lane"], c["wave"]
     if c["wfmt"] != W_BF16:
         return wfmt.fp8_loads(

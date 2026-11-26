@@ -233,9 +233,9 @@ def _state_config():
     return dtype == torch.bfloat16, reasons
 
 
+# -> (kda.W_* format, the merged [q,k,v,g | f_a | b | pad] storage [rows, HIDDEN],
+# its fp32 row scale or None, f_b [PROJ, HD]); raises ValueError naming the misfit.
 def _in_proj_operands(attn):
-    """(``kda.W_*`` format, the merged [q,k,v,g | f_a | b | pad] storage
-    [rows, HIDDEN], its fp32 row scale or None, f_b [PROJ, HD]); ValueError if unfit."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
     from sgl_amd_mono.kimi_k3.spec import _quark_fp8_storage
 

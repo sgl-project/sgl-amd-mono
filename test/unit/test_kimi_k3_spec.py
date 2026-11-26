@@ -118,7 +118,7 @@ def test_max_blocks_matches_the_reference_config():
     assert -(-last // block) + int(last % block == 0) == MAX_BLOCKS
 
 
-def _fake_layer(*, gate=True, kda=False, o_proj=None, ri=384):
+def _fake_layer(*, gate=True, kda=False, o_proj=None, ri=384, act="situ"):
     """A covered layer as model_disable_reasons reads it, everything passing."""
     import torch
 
@@ -137,6 +137,7 @@ def _fake_layer(*, gate=True, kda=False, o_proj=None, ri=384):
     experts = SimpleNamespace(
         w13_weight=SimpleNamespace(is_shuffled=True, shape=(e, 2 * ri, lat // 2)),
         w2_weight=SimpleNamespace(is_shuffled=True, shape=(e, lat, ri // 2)),
+        moe_runner_config=SimpleNamespace(activation=act),
     )
     up = SimpleNamespace(
         weight=torch.zeros(HF_CONFIG["hidden_size"], 8, dtype=torch.bfloat16)
@@ -346,3 +347,10 @@ def test_the_guard_flags_sit_past_every_width(monkeypatch):
         assert moe.peer_bytes(width) <= off, width
     # the widest launch ends exactly there: a larger offset wastes a peer page
     assert off == max(layer.peer_bytes(MAX_ROWS), moe.peer_bytes(MAX_ROWS))
+
+
+def test_experts_with_another_activation_are_refused(monkeypatch):
+    """K2 computes SiTU; a SiLU MoE with otherwise valid shapes must not be served,
+    whichever expert layout AITER's switches select."""
+    reasons = _reasons(monkeypatch, _fake_layer(act="silu"))
+    assert any("not SiTU" in r for r in reasons), reasons

@@ -235,9 +235,9 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     return reasons
 
 
+# A Quark per-channel FP8 linear -> (in AITER's (16, 16) preshuffle, the [out, in]
+# storage, its fp32 row scale); raises ValueError naming the misfit.
 def _quark_fp8_storage(linear, name: str):
-    """(in AITER's (16, 16) preshuffle, the [out, in] storage, its fp32 row scale)
-    of a Quark per-channel FP8 linear; ValueError if unfit."""
     from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
     from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 
@@ -349,6 +349,12 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
                 ),
                 f"the experts are not [{E}, {2 * RI}, {LAT // 2}] / "
                 f"[{E}, {LAT}, {RI // 2}] packed MXFP4 (a padded intermediate)",
+            ),
+            # K2 computes SiTU for routed and shared experts alike; another
+            # activation would also read as AITER's separated A4W4 layout.
+            (
+                experts is not None and experts.moe_runner_config.activation == "situ",
+                "the experts' activation is not SiTU, which the launch computes",
             ),
             (layer.use_attn_residuals, "no attention-residual stream"),
             # SP-MoE reduce-scatters o_proj's output and the fused all-reduce
