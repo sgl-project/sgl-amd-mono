@@ -721,6 +721,8 @@ class Wide:
         import time
 
         L = self.L
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
         from sgl_amd_mono.kimi_k31.gfx950 import pre_attn as pa
 
@@ -764,9 +766,10 @@ class Wide:
                     core_out=bufs["core"],
                 )
                 self.epoch[0] += 1
-                self._build_launch(pk, b, L, v, bufs["cfg"])(
+                _run_compiled(
+                    self._build_launch(pk=pk, b=b, L=L, v=v, cfg=bufs["cfg"]),
                     *self._launch_args(pk, b, bufs, tab, 0, self.slots[pk.i]),
-                    stream=torch.cuda.current_stream(),
+                    torch.cuda.current_stream(),
                 )
                 n += 1
             torch.cuda.synchronize()
@@ -907,6 +910,7 @@ class Wide:
         return stream
 
     def backbone(self, built, input_ids, fb, input_embeds):
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
         from sglang.srt.distributed import tensor_model_parallel_all_gather
         from sglang.srt.layers.layer_boundary.residual.batch import (
             final_norm,
@@ -1004,9 +1008,10 @@ class Wide:
                 tab = self._kda_table(pk, ks, b, bufs)
                 cur = 1 - ping
                 pre = entry_prefix if n == 0 else None
-                self._build_launch(pk, b, L, v, cfg)(
+                _run_compiled(
+                    self._build_launch(pk=pk, b=b, L=L, v=v, cfg=cfg),
                     *self._launch_args(pk, b, bufs, tab, ping, self.slots[li], pre),
-                    stream=torch.cuda.current_stream(),
+                    torch.cuda.current_stream(),
                 )
                 if n == 0:
                     entry_prefix = None
