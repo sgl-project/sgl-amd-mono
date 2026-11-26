@@ -45,7 +45,8 @@ ARGS = [
     "--reasoning-parser",
     "qwen3",
 ]
-# NEXTN as benchmarked: verify steps of up to 2 requests (8 rows) run K2
+# NEXTN as benchmarked: verify steps of up to 2 requests (8 rows) run K2, of 4
+# requests (16 rows) layer_block with the fused shared expert
 NEXTN = [
     "--speculative-algorithm",
     "NEXTN",
