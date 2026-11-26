@@ -79,9 +79,10 @@ ISL, OSL, RANGE_RATIO, PROMPTS_PER_SLOT = 8192, 1024, 0.8, 10
 # are compared question by question (exact McNemar test), and a significant loss
 # with the monokernels on fails. The others have too few questions to gate on;
 # a score more than ``warn`` below the off run's is a warning. A PR runs GSM8K
-# (and GPQA with the `run-ci-extra` label); the nightly (a model it runs in full) runs the model's benchmarks but the ``weekly`` ones, and the
+# (and GPQA with the `run-ci-extra` label); a model the nightly runs in full (none
+# today: ``nightly_tier``) gets its benchmarks but the ``weekly`` ones, and the
 # weekly run (Saturdays) runs all of them. AIME26 x4 is the costliest (~23K tokens
-# an answer), and GPQA covers much the same ground every night.
+# an answer).
 EVALS = {
     # max tokens: room for a thinking model's whole answer. Repeats are explicit:
     # sgl-eval's own defaults are 8 for GPQA and 16 for AIME.
@@ -118,14 +119,16 @@ def weekly_eval(model: dict, name: str) -> bool:
 
 
 def nightly_tier(model: dict) -> str:
-    """The tier ``model`` runs at in the nightly. The PR test runs a model's
+    """The tier a ``nightly`` model runs at in the nightly. The PR test runs a model's
     accuracy benchmark and speed test on every change to its package (a model
     without ``"pr": False``), so its numbers on main change only through a tested
     PR; between PRs only the SGLang image changes, and the model's tests, serving
     tests and the pinned sgl-amd-mono check catch that the day it does. Such a
     model runs the nightly at the tests tier (quick kernel widths, no benchmark or
     speed test) and its benchmarks, speed test and full kernel widths in the weekly
-    run. A model the PR test does not run would run the nightly in full."""
+    run. A model the PR test does not run would run the nightly in full. A model
+    the PR test runs that is not marked ``nightly`` (GLM-5.3-Flash, Qwen3.5) gets
+    the image check only in the weekly run."""
     return "tests" if model.get("pr", True) else "full"
 
 

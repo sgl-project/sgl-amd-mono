@@ -7,14 +7,16 @@ nodes:
   its tests, GSM8K with the monokernels on and off, and speed against the base
   branch.
 - `nightly-amd.yml`, the **nightly**: Sunday to Friday, on main and the newest
-  SGLang ROCm image, the accuracy benchmarks (but the `weekly` ones: AIME26 x4,
-  the costliest, and a model's `weekly_evals`, such as Kimi-K3's MMMU-Pro, ~8 h
-  at one request at a time) and the speed test with the monokernels on, for the models marked
-  `nightly` in `models.py`, held to each model's fixed `baseline`. A model the PR
-  test runs is in the nightly at the **tests** tier only (its tests and serving
-  tests, no benchmark or speed test): every change to it is measured by the PR
-  test, so between PRs only the SGLang image changes, and its tests catch that
-  the day it does. Saturday's
+  SGLang ROCm image, `common` (the unit and common kernel tests) and the models
+  marked `nightly` in `models.py` (DeepSeek-V4.1-Flash, GLM-5.3,
+  Qwen3.8-Flash-Next). The PR test runs those models, so the nightly runs them at
+  the **tests** tier (`nightly_tier`): the pinned sgl-amd-mono check, their unit,
+  kernel and serving tests, and no accuracy benchmark or speed test. Every change
+  to them is measured by the PR test, so between PRs only the SGLang image changes,
+  and these tests catch that the day it does. (A nightly model the PR test does not
+  run would run in full: its accuracy benchmarks but the `weekly` ones and the
+  speed test, monokernels on, held to its fixed `baseline`.) The other models the
+  PR test runs get the image check only weekly. Saturday's
   **weekly** run has every benchmark with the monokernels on and off, for every
   model in full, and the models marked `weekly` too: GLM-5.3-Flash and
   Qwen3.5-397B-A17B (the PR test covers every change to them), and
@@ -57,10 +59,13 @@ current until the report sets the result. "Ahead" counts the GPU jobs running no
 and those queued by older runs; GitHub does not promise to hand queued jobs out
 oldest first, so it is an estimate.
 
-The same scheduled pass cancels a nightly run whose GPU job has waited for a runner
-more than 12 hours (`NIGHTLY_MAX_QUEUE_HOURS` in `queue_status.py`): the nightly's
-jobs take about 4.5 GPU hours, so it should end the day it starts, and the next one
-tests a newer image. The weekly run is never cancelled this way.
+The same scheduled pass cancels the scheduled nightly run when a GPU job of it has
+waited for a runner more than 12 hours (`NIGHTLY_MAX_QUEUE_HOURS` in
+`queue_status.py`) and none of its GPU jobs is running: the nightly's jobs take
+about 4.5 GPU hours, so it should end the day it starts, and the next one tests a
+newer image. GitHub cancels a whole run, so it waits for a running job to end
+rather than kill it. A nightly dispatched by hand and the weekly run are never
+cancelled this way.
 
 ## What runs
 

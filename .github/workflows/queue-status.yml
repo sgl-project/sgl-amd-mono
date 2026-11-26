@@ -3,9 +3,9 @@ name: PR Test (AMD) queue status
 # Rewrites the pending "AMD PR test" status of every PR test still waiting or
 # running with its place in the GPU runners' queue ("3/14 done; running X; 9
 # waiting, ~N jobs ahead"), so a run that waits most of a day for the two runners
-# does not look hung. It also cancels a nightly run whose GPU job has waited for a
-# runner more than 12 hours (NIGHTLY_MAX_QUEUE_HOURS), so the nightly ends the day
-# it starts. See scripts/ci/queue_status.py. Only GitHub-hosted runners; it reads
+# does not look hung. It also cancels the scheduled nightly run when a GPU job of
+# it has waited for a runner more than 12 hours (NIGHTLY_MAX_QUEUE_HOURS) and none
+# of its jobs is running, so the nightly ends the day it starts. See scripts/ci/queue_status.py. Only GitHub-hosted runners; it reads
 # job lists, writes commit statuses and cancels runs, nothing from a PR runs.
 
 on:
