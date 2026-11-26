@@ -637,8 +637,8 @@ def main():
         )
 
     try:
-        check_decode(heap, rank, dev, args.bench)
-        check_prefill(heap, rank, dev, args.bench)
+        check_decode(heap=heap, rank=rank, dev=dev, do_bench=args.bench)
+        check_prefill(heap=heap, rank=rank, dev=dev, do_bench=args.bench)
     finally:
         dist.barrier()
         heap.close()

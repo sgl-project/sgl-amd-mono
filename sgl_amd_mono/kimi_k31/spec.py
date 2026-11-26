@@ -146,7 +146,7 @@ def _build(model, hf_config, ctx):
     if _agree_xgmi_enabled():
         from sgl_amd_mono.kimi_k31.xgmi import maybe_install_xgmi_hooks
 
-        maybe_install_xgmi_hooks(model, log_fn=wide._say)
+        maybe_install_xgmi_hooks(model=model, log_fn=wide._say)
 
     if not any(w > wide.NARROW for w in ctx.widths):
         return narrow

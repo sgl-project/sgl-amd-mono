@@ -385,7 +385,7 @@ def _prepare_all_hooks(
             # None: this layer drifted from its TP-agreed plan.
             return None
         item = _prepare_moe_layer_hook(
-            layer,
+            layer=layer,
             attn_state=attn_state,
             orig_read=orig_read,
             plan_entry=entry,
