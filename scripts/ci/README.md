@@ -13,6 +13,11 @@ nodes:
   `nightly` in `models.py`, held to each model's fixed `baseline`. Saturday's
   **weekly** run has every benchmark with the monokernels on and off; its off
   results are the reference the nightly and the PR test read until the next one.
+  A model's `weekly_evals` run in a job of their own (`<model>-<benchmarks>`,
+  such as `kimi_k3-mmmu_pro`; first in the run's matrix, so it starts with the
+  run), on and off, alongside the model's main job, which runs everything else:
+  Kimi-K3's MMMU-Pro on and off takes ~16 h, and with the rest of the model's
+  weekly run would pass a job's 23.5 h limit.
   A run of the nightly workflow with `weekly` ticked writes that reference too,
   from whichever branch it runs, so run it by hand on `main` only.
 
@@ -36,8 +41,9 @@ nodes:
 
 The run sets the `AMD PR test` status on the PR's head commit and keeps one PR
 comment up to date with the report. Each model's logs (servers, benchmarks,
-tests) are in the run's `mono-ci-<model>` artifact. The nightly writes its report
-to the run's summary.
+tests) are in the run's `mono-ci-<model>` artifact (`mono-ci-<model>-<benchmarks>`
+for a weekly `weekly_evals` job). The nightly writes its report to the run's
+summary, a section a job.
 
 The PR test's GPU jobs share the two runners with the nightly and with each
 other, so a run can wait hours for one. While it waits or runs, its pending
@@ -98,7 +104,7 @@ these sides:
 | --- | --- | --- | --- | --- |
 | Tests | unit (on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same | unit, kernel and serving tests | same |
 | Kernel microbenchmark | the model's timing scripts, base and PR | same | main | main |
-| Accuracy | sgl-eval GSM8K (1319 questions), on and off; GPQA too with `run-ci-extra` | the serving tests' GSM8K and KL bounds | GSM8K, GPQA Diamond (and MMMU-Pro for vision models), on | the nightly's and AIME26 x4, on and off |
+| Accuracy | sgl-eval GSM8K (1319 questions), on and off; GPQA too with `run-ci-extra` | the serving tests' GSM8K and KL bounds | GSM8K, GPQA Diamond (and MMMU-Pro for vision models but a model's `weekly_evals`), on | the nightly's and AIME26 x4, on and off; a model's `weekly_evals` (Kimi-K3's MMMU-Pro) in a job of their own |
 | E2E performance | InferenceX fixed length at the model's concurrencies, base and on | the gate concurrencies only | on (against the monokernel-off reference) | off and on |
 | Scope | the server's startup lines that say which steps the launches serve | same | same | same |
 
@@ -158,7 +164,8 @@ The nightly fails the same way on tests. It holds each on score to the model's
 `baseline` in `models.py`: GSM8K below it fails, the other benchmarks warn. A
 benchmark without a baseline is compared with the monokernel-off reference (the
 latest weekly off result) instead. Each weekly report suggests baselines (the off
-score less the benchmark's margin) to copy into `models.py`. The weekly run gates
+score less the benchmark's margin) to copy into `models.py`, one line a model
+with the off scores of all its jobs. The weekly run gates
 on GSM8K's on and off test like the PR test; GPQA, AIME26 and MMMU-Pro have too few questions
 to gate on, so a score more than its `warn` margin below the off run's is a
 warning, as is a slowdown with the monokernels on.
