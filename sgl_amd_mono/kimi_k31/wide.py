@@ -100,8 +100,8 @@ REQ_BUCKETS = (
 )  # requests a bucket holds; its rows are L x requests
 SUPPORTED_L = (6, 8)
 BUCKETS = tuple(8 * r for r in REQ_BUCKETS)
-CFGS = {  # 8-token bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; an L-token
-    # bucket of the same requests takes the same configs
+CFGS = {  # rows -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; a bucket of b rows
+    # takes the smallest key >= b (_row_cfgs)
     16: (
         "16:128:1:8:8",
         "16:128:1:8:4",
@@ -139,8 +139,9 @@ CFGS = {  # 8-token bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:w
         "128:64:2:4:1",
     ),
 }
-# Sorted (lo, hi, cfg) row-count ranges overriding CFGS where the base row tile either
-# spills past one BLOCKS (256) round or wastes a padded row tile (covers L = 5, 6, 8).
+# Sorted (lo, hi, cfg) row ranges overriding the CFGS entry where its row tile would need a second BLOCKS round
+# (front: 17 column tiles x row tiles x ks; in_proj: 50 column tiles x row tiles x ks) or pad a row tile past
+# b. Every row count up to max(CFGS) fits one round (test/unit/test_kimi_k31_wide_cfg.py), not only the buckets.
 FRONT_ROW_RANGES = (
     (65, 96, "96:128:2:4:8"),
     (129, 191, "96:128:2:4:4"),
@@ -197,12 +198,13 @@ def buckets(L: int = 8) -> tuple:
 
 
 def cfg_rows(b: int, L: int) -> tuple[str, str, str, str, str]:
-    """Return tile configs for an L-token bucket of b rows.
-
-    Picks the smallest CFGS key >= b (falling back to the largest CFGS key when b
-    exceeds it), then refines with per-range row overrides.
-    """
+    """The tile configs of an L-token bucket of b rows."""
     assert b % L == 0 and b // L in REQ_BUCKETS, (b, L)
+    return _row_cfgs(b)
+
+
+def _row_cfgs(b: int) -> tuple[str, str, str, str, str]:
+    # the smallest CFGS key >= b (the largest past it), refined by the row ranges
     tuned_rows = next((k for k in _TUNED_ROW_KEYS if k >= b), _TUNED_ROW_KEYS[-1])
     up, inp, oproj, front, sdown = CFGS[tuned_rows]
     return (
