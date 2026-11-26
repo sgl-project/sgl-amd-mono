@@ -10,10 +10,10 @@ from sgl_amd_mono.kimi_k3.gfx950.attention.kda import NPROJ
 from sgl_amd_mono.kimi_k31 import wide
 
 
-def _tasks(cfg: str, rows: int, cols: int, split_k: bool = True) -> int:
-    # gfx950/layer.py: row tiles x column tiles (x split-K slices, except shared down)
+def _tasks(cfg: str, rows: int, cols: int) -> int:
+    # gfx950/layer.py plan(): row tiles x column tiles x split-K slices
     bm, bn, _, _, ks = (int(x) for x in cfg.split(":"))
-    return math.ceil(rows / bm) * math.ceil(cols / bn) * (ks if split_k else 1)
+    return math.ceil(rows / bm) * math.ceil(cols / bn) * ks
 
 
 def test_every_row_count_fits_one_round() -> None:
@@ -35,7 +35,7 @@ def test_every_bucket_fits_one_round(L: int) -> None:
             "in_proj": _tasks(cfg=inp, rows=b, cols=NPROJ),
             "o_proj": _tasks(cfg=oproj, rows=b, cols=wide.H),
             "front": _tasks(cfg=front, rows=b, cols=wide.NF),
-            "shared down": _tasks(cfg=sdown, rows=b, cols=wide.H, split_k=False),
+            "shared down": _tasks(cfg=sdown, rows=b, cols=wide.H),
         }
         assert max(tasks.values()) <= BLOCKS, (L, b, tasks)
 
