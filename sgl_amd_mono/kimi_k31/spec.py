@@ -31,7 +31,14 @@ SGLANG_READS = {
     "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "Feature",
         "Numerics",
+        "KV_OFFLOAD",
     ),
+    "srt/arg_groups/fields/*.py": (
+        "enable_lmcache",
+        "enable_flexkv",
+        "disaggregation_decode_enable_offload_kvcache",
+    ),
+    "srt/environ.py": ("envs", "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT"),
     "srt/models/kimi_k3.py": ("KimiK31ForConditionalGeneration", "_qkvgbfa_layer"),
     "srt/runtime_context.py": ("get_parallel",),
 }
@@ -53,8 +60,39 @@ NUMERICS = Numerics(
 )
 
 
+def _offload_disable_reasons(
+    *, lmcache: bool, flexkv: bool, decode_offload: bool, host_only_checkpoint: bool
+) -> list[str]:
+    # Feature.KV_OFFLOAD also admits these; only HiCache has run under the launches.
+    flags = {
+        "--enable-lmcache": lmcache,
+        "--enable-flexkv": flexkv,
+        "--disaggregation-decode-enable-offload-kvcache": decode_offload,
+    }
+    reasons = [
+        f"{flag}: only HiCache's KV offload is supported"
+        for flag, on in flags.items()
+        if on
+    ]
+    if host_only_checkpoint:
+        # SGLang then rings ReplaySSM state by request row; the launches index it by slot.
+        reasons.append(
+            "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT: the launches index the ReplaySSM ring "
+            "by mamba slot"
+        )
+    return reasons
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    reasons = k3._config_disable_reasons(cfg, hf_config)
+    from sglang.srt.environ import envs
+
+    reasons = k3._config_disable_reasons(cfg=cfg, hf_config=hf_config)
+    reasons += _offload_disable_reasons(
+        lmcache=cfg.enable_lmcache,
+        flexkv=cfg.enable_flexkv,
+        decode_offload=cfg.disaggregation_decode_enable_offload_kvcache,
+        host_only_checkpoint=envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get(),
+    )
     if not getattr(k3._text_config(hf_config), "dsa_config", None):
         reasons.append("no dsa_config: a Kimi-K3 checkpoint, served by kimi_k3")
     dcp = getattr(cfg, "dcp_size", 1) or 1
@@ -116,8 +154,6 @@ class _Built(k3._Built):
 
 
 def _build(model, hf_config, ctx):
-    """Kimi-K3's launches at the narrow widths, then the wide launches of every
-    bucket, compiled by running each once (``warmup``) before graph capture."""
     from sglang.srt.runtime_context import get_parallel
 
     narrow_widths = tuple(w for w in ctx.widths if w <= wide.NARROW)
@@ -142,7 +178,14 @@ def _build(model, hf_config, ctx):
     p = get_parallel()
     device = k3._backbone(model).layers[0].input_layernorm.weight.device
     m0 = mem()
-    w = wide.Wide(model, p.tp_rank, p.tp_group.cpu_group, device, L=wide.tokens())
+    w = wide.Wide(
+        model=model,
+        rank=p.tp_rank,
+        group=p.tp_group.cpu_group,
+        device=device,
+        L=wide.tokens(),
+        max_rows=max(ctx.widths),
+    )
     m1 = mem()
     w.warmup()
     m2 = mem()
@@ -162,8 +205,9 @@ SPEC = msgspec.structs.replace(
             widths=k3.SPEC.devices["gfx950"].widths + wide.wide_widths(),
         )
     },
-    # DCP (CONTEXT_PARALLEL) shards the DSA layers' KV, which run on SGLang's path
-    features=k3.SPEC.features | {Feature.CONTEXT_PARALLEL},
+    # DCP shards the DSA layers' KV, which run on SGLang's path.
+    # HiCache moves KDA states between steps; a launch reads the device state pool by slot.
+    features=k3.SPEC.features | {Feature.CONTEXT_PARALLEL, Feature.KV_OFFLOAD},
     requires=msgspec.structs.replace(
         k3.SPEC.requires,
         attention_backends=frozenset({"dsa"}),

@@ -91,14 +91,8 @@ SGLANG_READS = {
 }
 
 TP, H, SL, E, NF, LAT = 8, 7168, 896, 896, 2096, 3584
-REQ_BUCKETS = (
-    2,
-    4,
-    8,
-    16,
-    32,
-    48,
-)  # requests a bucket holds; its rows are L x requests
+# Requests a bucket holds. The launch's sort serves only a step that fills its bucket.
+REQ_BUCKETS = (*range(2, 9), *range(10, 33, 2), *range(36, 57, 4))
 SUPPORTED_L = (6, 8)
 BUCKETS = tuple(8 * r for r in REQ_BUCKETS)
 CFGS = {  # 8-token bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; an L-token
@@ -166,20 +160,27 @@ def tokens() -> int:
     return int(spec.speculative_num_draft_tokens or 1)
 
 
+TUNED_REQS = tuple(sorted(b // 8 for b in CFGS))
+
+
 def req_buckets() -> tuple:
     # SGLANG_AMD_MONO_K31_WIDE_BUCKETS lists rows at 8 tokens a request
     env = os.environ.get("SGLANG_AMD_MONO_K31_WIDE_BUCKETS")
     return tuple(sorted(int(x) // 8 for x in env.split(","))) if env else REQ_BUCKETS
 
 
-def buckets(L: int = 8) -> tuple:
-    return tuple(L * r for r in req_buckets())
+def buckets(L: int = 8, *, max_rows: int | None = None) -> tuple:
+    bs = tuple(L * r for r in req_buckets())
+    if max_rows is None:
+        return bs
+    top = next((b for b in bs if b >= max_rows), bs[-1])
+    return tuple(b for b in bs if b <= top)
 
 
 def cfg_rows(b: int, L: int) -> str:
-    """The CFGS entry of an L-token bucket of b rows."""
     assert b % L == 0 and b // L in REQ_BUCKETS, (b, L)
-    up, inp, oproj, front, sdown = CFGS[8 * (b // L)]
+    tuned = next((r for r in TUNED_REQS if r >= b // L), TUNED_REQS[-1])
+    up, inp, oproj, front, sdown = CFGS[8 * tuned]
     return (
         UP_ROWS.get(b, up),
         INP_ROWS.get(b, inp),
@@ -189,7 +190,7 @@ def cfg_rows(b: int, L: int) -> str:
     )
 
 
-def wide_widths(max_reqs: int = 48) -> tuple:
+def wide_widths(max_reqs: int = REQ_BUCKETS[-1]) -> tuple:
     # only widths a warmed bucket holds: a graph capture must not meet a cold one; rows
     # up to a bucket left out below the smallest one stay on SGLang's own path. The
     # server's draft tokens are not known at import: every supported L's widths (the
@@ -203,12 +204,13 @@ def wide_widths(max_reqs: int = 48) -> tuple:
         for r in range(max(2, lo + 1), top + 1)
         if L * r > NARROW
     }
-    # the binding serves a width at every L it is a multiple of: drop one another L
-    # reads as more requests than the largest bucket holds (8-token 312 .. 384 rows
-    # would be 52 .. 64 requests at 6 tokens)
+    # the binding serves a width at every L it is a multiple of;
+    # drop any width another L reads outside (lo, top] (8-token 360 rows: 60 at L = 6)
     return tuple(
         sorted(
-            w for w in widths if all(w // L <= top for L in SUPPORTED_L if w % L == 0)
+            w
+            for w in widths
+            if all(lo < w // L <= top for L in SUPPORTED_L if w % L == 0)
         )
     )
 
@@ -476,7 +478,7 @@ def _tail_fusable(layer) -> bool:
 
 
 class Wide:
-    def __init__(self, model, rank, group, device, L=8):
+    def __init__(self, model, rank, group, device, *, L=8, max_rows=None):
         from sgl_amd_mono.common import guard
 
         assert L in SUPPORTED_L, L
@@ -503,7 +505,8 @@ class Wide:
         self.slots = {i: n for n, i in enumerate(idx)}  # a launch's slot in the step
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
-        self.buckets = buckets(L)
+        # each bucket holds buffers and compiles a launch
+        self.buckets = buckets(L=L, max_rows=max_rows)
         self.tabs = {}  # (bucket, layer) -> KDA table: every pointer in it is fixed once built
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # long enough for a capture variant's first compile on one rank while the
