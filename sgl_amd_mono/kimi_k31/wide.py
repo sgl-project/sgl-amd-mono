@@ -568,7 +568,7 @@ class Wide:
             restart=pk.write,
         )
 
-    def _ensure(self, b, L):
+    def _ensure(self, *, b, L):
         """Peer buffer and activation buffers of bucket b (collective on first use:
         every rank reaches it on the same step)."""
         if b in self.bufs:
@@ -754,7 +754,7 @@ class Wide:
         )
         n = 0
         for b in buckets or self.buckets:
-            bufs = self._ensure(b, L)
+            bufs = self._ensure(b=b, L=L)
             st_idx = torch.full((b // L, L), -1, dtype=torch.int32, device=dev)
             num_acc = torch.ones(b // L, dtype=torch.int32, device=dev)
             win_row = torch.full((b // L,), -1, dtype=torch.int32, device=dev)
@@ -943,7 +943,7 @@ class Wide:
             )
         R = rows // L
         b = next(x for x in self.buckets if x >= rows)
-        bufs = self._ensure(b, L)
+        bufs = self._ensure(b=b, L=L)
         cfg = bufs["cfg"]
         start(fb)
         zero_allocator = BumpAllocator(
