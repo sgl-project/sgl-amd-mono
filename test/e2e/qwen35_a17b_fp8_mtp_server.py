@@ -3,8 +3,8 @@
 The flags follow InferenceX's ``qwen3.5/sglang/mi355x-fp8-mtp/8k1k.yaml``: aiter
 attention, the aiter all-reduce fusion, page size 16 and a 3-step, topk-1,
 4-token draft chain. A verify step is 4 rows a request, so decode graphs at
-batch sizes 1 to 8 are the widths 4 to 32 the kernels serve. Without
-``--enable-amd-monokernel``, so a test can launch the normal path too.
+batch sizes 1 to 8 are the widths 4 to 32 the kernels serve. The arms differ
+only by the monokernel flag that bench_server.py adds.
 """
 
 import os
