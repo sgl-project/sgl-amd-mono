@@ -13,7 +13,13 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels import spec as registry
 
 import sgl_amd_mono
-from sgl_amd_mono.kimi_k3 import HF_CONFIG, LINEAR_ATTN_CONFIG, MAX_BLOCKS, MAX_ROWS
+from sgl_amd_mono.kimi_k3 import (
+    HF_CONFIG,
+    LINEAR_ATTN_CONFIG,
+    MAX_BLOCKS,
+    MAX_ROWS,
+    SHARED_GATE_UP,
+)
 from sgl_amd_mono.kimi_k3 import spec as k3
 
 # Kimi-K3's layer structure (its config.json): 93 layers, a dense layer 0, then
@@ -118,7 +124,15 @@ def test_max_blocks_matches_the_reference_config():
     assert -(-last // block) + int(last % block == 0) == MAX_BLOCKS
 
 
-def _fake_layer(*, gate=True, kda=False):
+HIDDEN = HF_CONFIG["hidden_size"]
+FRONT_ROWS = (
+    HF_CONFIG["num_experts"],
+    HF_CONFIG["routed_expert_hidden_size"],
+    SHARED_GATE_UP,
+)
+
+
+def _fake_layer(*, gate=True, kda=False, front_dtype=None, front_rows=FRONT_ROWS):
     """A covered layer as model_disable_reasons reads it, everything passing."""
     import torch
 
@@ -127,6 +141,10 @@ def _fake_layer(*, gate=True, kda=False):
             weight=torch.zeros(*shape, dtype=torch.bfloat16), bias=None
         )
 
+    w_gate, w_ld, w_sgu = (
+        torch.zeros(rows, HIDDEN, dtype=front_dtype or torch.bfloat16)
+        for rows in front_rows
+    )
     attn = SimpleNamespace(
         o_proj=lin(HF_CONFIG["hidden_size"], 1536),
         forward_pre_o_proj=lambda **kw: None,
@@ -147,6 +165,9 @@ def _fake_layer(*, gate=True, kda=False):
             routed_expert_norm=object(),
             routed_expert_up_proj=up,
             experts=experts,
+            gate=SimpleNamespace(weight=w_gate),
+            routed_expert_down_proj=SimpleNamespace(weight=w_ld),
+            shared_experts=SimpleNamespace(gate_up_proj=SimpleNamespace(weight=w_sgu)),
         ),
         use_attn_residuals=True,
         _sp_moe=False,
@@ -175,6 +196,54 @@ def test_an_mla_layer_without_the_output_gate_is_refused(monkeypatch):
     # so it cannot carry this: for MLA the split rides on the gate's wrapper.
     reasons = _reasons(monkeypatch, _fake_layer(gate=False))
     assert any("output gate" in r for r in reasons), reasons
+
+
+def _first_layer(reasons: list) -> list:
+    """The first covered layer's reasons; the checks stop one layer later."""
+    return [r for r in reasons if r.startswith("layer 1: ")]
+
+
+def test_an_fp8_front_is_refused(monkeypatch):
+    # SGLang's static FP8 front leaves E4M3 views in the module weights; the
+    # launch would read their bytes as bf16 without an error.
+    import torch
+
+    layer = _fake_layer(front_dtype=torch.float8_e4m3fn)
+    reasons = _first_layer(_reasons(monkeypatch, layer))
+    assert len(reasons) == 3, reasons
+    assert all("static FP8 front is not supported" in r for r in reasons), reasons
+
+
+@pytest.mark.parametrize(
+    "front_rows, bad",
+    [
+        ((FRONT_ROWS[0] - 1, *FRONT_ROWS[1:]), "router gate"),
+        ((FRONT_ROWS[0], FRONT_ROWS[1], 2 * SHARED_GATE_UP), "shared gate_up"),
+    ],
+)
+def test_a_front_of_the_wrong_shape_is_refused(monkeypatch, front_rows, bad):
+    layer = _fake_layer(front_rows=front_rows)
+    reasons = _first_layer(_reasons(monkeypatch, layer))
+    assert len(reasons) == 1 and bad in reasons[0], reasons
+
+
+def test_a_non_contiguous_front_is_refused(monkeypatch):
+    import torch
+
+    layer = _fake_layer()
+    rows = HF_CONFIG["routed_expert_hidden_size"]
+    layer.mlp.routed_expert_down_proj.weight = torch.zeros(
+        HIDDEN, rows, dtype=torch.bfloat16
+    ).t()
+    reasons = _first_layer(_reasons(monkeypatch, layer))
+    assert len(reasons) == 1 and "latent down" in reasons[0], reasons
+
+
+def test_a_missing_front_weight_is_refused_not_raised(monkeypatch):
+    layer = _fake_layer()
+    layer.mlp.shared_experts = None
+    reasons = _first_layer(_reasons(monkeypatch, layer))
+    assert reasons == ["layer 1: no shared gate_up projection"], reasons
 
 
 def test_the_guard_flags_sit_past_every_width(monkeypatch):

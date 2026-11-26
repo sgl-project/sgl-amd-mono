@@ -73,6 +73,7 @@ from sgl_amd_mono.kimi_k3 import (
     LINEAR_ATTN_CONFIG,
     MAX_BLOCKS,
     MAX_ROWS,
+    SHARED_GATE_UP,
 )
 
 logger = logging.getLogger(__name__)
@@ -213,6 +214,54 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     return reasons
 
 
+# The MoE front weights the launch reads, by their module path under the MoE.
+FRONT = ("gate", "routed_expert_down_proj", "shared_experts.gate_up_proj")
+
+
+def _module_front(moe) -> tuple:
+    """SGLang's front weights, None where the module or its weight is missing."""
+
+    def weight(path: str):
+        module = moe
+        for attr in path.split("."):
+            module = getattr(module, attr, None)
+        return getattr(module, "weight", None)
+
+    return tuple(weight(w) for w in FRONT)
+
+
+def _is_bf16(weight) -> bool:
+    return weight is not None and weight.dtype == torch.bfloat16
+
+
+def _front_disable_reasons(front: tuple, hidden: int) -> list[str]:
+    """The launch reads the front as raw bf16 rows. SGLang's static FP8 front
+    (``SGLANG_K3_TARGET_DENSE_FP8=front|wide``) leaves E4M3 views in these
+    weights, which would be read as bf16 without an error, so every weight is
+    checked."""
+    expected = (
+        ("router gate", HF_CONFIG["num_experts"]),
+        ("latent down projection", HF_CONFIG["routed_expert_hidden_size"]),
+        ("shared gate_up projection", SHARED_GATE_UP),
+    )
+    reasons = []
+    for (name, rows), weight in zip(expected, front):
+        if weight is None:
+            reasons.append(f"no {name}")
+            continue
+        if (
+            _is_bf16(weight)
+            and tuple(weight.shape) == (rows, hidden)
+            and weight.is_contiguous()
+        ):
+            continue
+        why = f"the {name} is not a contiguous bf16 [{rows}, {hidden}]"
+        if not _is_bf16(weight):
+            why += f" ({weight.dtype}; SGLang's static FP8 front is not supported)"
+        reasons.append(why)
+    return reasons
+
+
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     """Every per-layer check the config cannot answer. The kernels read each
     weight as a raw address, so a wrong dtype, shape or layout is read as if it
@@ -283,6 +332,10 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
             ),
         )
         reasons += [f"layer {i}: {why}" for ok, why in checks if not ok]
+        reasons += [
+            f"layer {i}: {why}"
+            for why in _front_disable_reasons(_module_front(moe), hidden)
+        ]
         if reasons and i > covered[0]:
             break  # one layer's reasons say it for all
     return reasons
