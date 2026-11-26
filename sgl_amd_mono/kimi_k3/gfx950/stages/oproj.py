@@ -166,10 +166,10 @@ def o_loads(c, rg):
     return out
 
 
+# Rows ``row`` and ``row + 1``'s fp32 sums; an FP8 o_proj's per-channel
+# scale applied, as its GEMM applies it. A plain function: under a traced
+# ``if``, FlyDSL would carry ``c`` through the branch.
 def o_scaled(c, row, v0, v1):
-    """Rows ``row`` and ``row + 1``'s fp32 sums; an FP8 o_proj's per-channel
-    scale applied, as its GEMM applies it. A plain function: under a traced
-    ``if``, FlyDSL would carry ``c`` through the branch."""
     if c["ofmt"] == O_BF16:
         return v0, v1
     sc = fx.Vector(

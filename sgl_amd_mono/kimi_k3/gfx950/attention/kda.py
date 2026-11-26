@@ -147,8 +147,8 @@ class KdaPreBuild:
     state_bf16: bool = False
 
 
+# The recurrent state's dtype (rstate, rstate0, SGLang's pools).
 def state_dtype(key: KdaPreBuild) -> torch.dtype:
-    """The recurrent state's dtype (rstate, rstate0, SGLang's pools)."""
     return torch.bfloat16 if key.state_bf16 else torch.float32
 
 
@@ -231,9 +231,9 @@ def gemv_loads(c, rg, chunks):
     return out
 
 
+# Row 16 rg + r's fp32 sum, an FP8 in_proj's per-channel scale applied as
+# its GEMM applies it. A plain function, as stages.oproj's o_scaled.
 def w_scaled(c, rg, r, v):
-    """Row 16 rg + r's fp32 sum, an FP8 in_proj's per-channel scale applied as
-    its GEMM applies it. A plain function, as stages.oproj's o_scaled."""
     if c["wfmt"] == W_BF16:
         return v
     return v * ld_f32(c["args"]["w_ins"], fx.min(rg, GEMV_TASKS - 1) * ROWS + r)
@@ -299,15 +299,15 @@ def stage_gemv(c, rg, ops):
 
 
 # ---------------------------------------------------------------- kda
+# The address of recurrent state row ``slot`` of the pool at ``base``
+# (``seq`` elements a slot, fp32 or bf16 ones).
 def state_row(c, base, seq, slot):
-    """The address of recurrent state row ``slot`` of the pool at ``base``
-    (``seq`` elements a slot, fp32 or bf16 ones)."""
     size = 2 if c["state_bf16"] else 4
     return base + fx.Int64(fx.max(slot, 0)) * fx.Int64(seq) * fx.Int64(size)
 
 
+# Four state entries of rstate row ``slot`` at ``off``, in the state's dtype.
 def store_state(c, slot, off, stv):
-    """Four state entries of rstate row ``slot`` at ``off``, in the state's dtype."""
     a = c["args"]
     dst = rsrc(state_row(c, base=a["rstate"], seq=a["rs_seq"], slot=slot))
     if c["state_bf16"]:
