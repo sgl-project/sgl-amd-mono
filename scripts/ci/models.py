@@ -298,7 +298,8 @@ MODELS = {
         "kernel_tests": ["test/kernels/test_kimi_k31_k1_ring.py"],
         "e2e_tests": [],
         "microbench": [
-            "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --rows 16,128"
+            "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --rows 16,128",
+            "torchrun --nproc-per-node 8 test/kernels/kimi_k31/dsa_post_bench.py --rows 16,32,48 --flush 256",
         ],
         "evals": [],
         "concurrency": [],
