@@ -58,6 +58,7 @@ from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.epoch import kernel_symbol
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    CM_NT,
     bf2_f32,
     bf16_pair,
 )
@@ -83,6 +84,7 @@ from sgl_amd_mono.common.ops import wave_umax as _wave_umax
 from sgl_amd_mono.common.ops import xred as _xred
 from sgl_amd_mono.common.ops import xshfl as _xshfl
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple
+from sgl_amd_mono.common.sync import _spin
 
 from . import layout as LY
 from .config import (
@@ -102,7 +104,6 @@ from .config import (
     TOPK,
     MonoBuild,
 )
-from .device import spin
 from .layout import scratch_layout
 
 SOURCES = kernel_sources(__name__)
@@ -459,7 +460,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     return bad
 
                 # under the guard: a deadline, checked every CHECK_POLLS polls
-                v = spin(load_all, pending)
+                v = _spin(load_all, pending)
                 res, e = [], 0
                 for sp, ok in zip(specs, oks):
                     vals = [v[e + 2 * q] for q in range(sp[2])]
@@ -537,6 +538,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             + (lane % 16) * 4,
                             vec_width=4,
                             dtype=T.i32,
+                            cache_modifier=CM_NT,
                         )
                     )
                     for h in range(2)
@@ -565,6 +567,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         ((((rg // 2) * D + d) * 4 + lane // 16) * 16 + lane % 16),
                         vec_width=1,
                         dtype=T.i32,
+                        cache_modifier=CM_NT,
                     )
                 )
 
@@ -581,13 +584,22 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         ((rg * (K // 128) + kc) * 64 + lane) * 4,
                         vec_width=4,
                         dtype=T.i32,
+                        cache_modifier=CM_NT,
                     )
                 )
                 D = (K // 32 + 7) // 8
                 dw = (((rg // 2) * D + kc // 2) * 4 + lane // 16) * 16 + lane % 16
                 # sdw: the dword preloaded by the task (mxfp4a_sdw)
                 if const_expr(sdw is None):
-                    sdw = fx.Int32(bo.buffer_load(s_rsrc, dw, vec_width=1, dtype=T.i32))
+                    sdw = fx.Int32(
+                        bo.buffer_load(
+                            s_rsrc,
+                            dw,
+                            vec_width=1,
+                            dtype=T.i32,
+                            cache_modifier=CM_NT,
+                        )
+                    )
                 sw = sdw.shrui(
                     fx.Int32(8) * (fx.Int32(2) * (fx.Int32(kc) % 2) + fx.Int32(rg) % 2)
                 )
@@ -919,17 +931,26 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 r = lds_ld(xs, MIX_RSTD + t * 4 + k // HIDDEN)
                 return bf_round(hv * r * (fx.Float32(1.0) + wn))
 
+            def placed(base):
+                """Task index of this CTA in a stage placed at CTA ``base`` (task k on CTA (base + k) % G)."""
+                base = base % G
+                if const_expr(base == 0):
+                    return bid
+                return (bid + (G - base)) % G
+
             # ---- hyper-connection mix
-            def stage_mix(layer, hc, src, p_norm, p_down, p_up, x_out=None):
+            def stage_mix(layer, hc, src, p_norm, p_down, p_up, x_out=None, *, base):
                 """x[t] = mean_b sigmoid(W_up silu(W_down Hn[t] / HC))_b * Hn[t]_b -> mailbox mixx [T][2560];
-                combine-gate partials (per K-slice; the gate's rows are the last tile of the down weight) -> injp."""
+                combine-gate partials (per K-slice; the gate's rows are the last tile of the down weight) -> injp.
+                Down tasks start at CTA ``base``, up tasks right after the down tasks."""
                 NKC_D = HC_DIM // 64
                 CPT = NKC_D // LY.MIX_KSPLIT  # 16 chunks = 1024 K per slice
                 CPW = CPT // WAVES
-                is_dn = bid < LY.MIX_DOWN_TASKS
+                dtask = placed(base)
+                is_dn = dtask < LY.MIX_DOWN_TASKS
                 r_wd = _rsrc(ptr(layer, p_down))
-                rg_d = fx.min(bid, LY.MIX_DOWN_TASKS - 1) // LY.MIX_KSPLIT
-                ks_d = fx.min(bid, LY.MIX_DOWN_TASKS - 1) % LY.MIX_KSPLIT
+                rg_d = fx.min(dtask, LY.MIX_DOWN_TASKS - 1) // LY.MIX_KSPLIT
+                ks_d = fx.min(dtask, LY.MIX_DOWN_TASKS - 1) % LY.MIX_KSPLIT
                 k0 = ks_d * (CPT * 64)
                 dunits = [
                     unit_bf16(
@@ -1058,9 +1079,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             )
                 # ---- up + branch mean: task u covers outputs [16u, 16u+16) of all 4 branches, all tokens
                 NKC_U = HC_LOWRANK // 64
-                is_up = bid < LY.MIX_UP_TASKS
+                utask = placed(base + LY.MIX_DOWN_TASKS)
+                is_up = utask < LY.MIX_UP_TASKS
                 r_wu = rsrc_if(ptr(layer, p_up), is_up, HC_DIM * HC_LOWRANK * 2)
-                u = fx.min(bid, LY.MIX_UP_TASKS - 1)
+                u = fx.min(utask, LY.MIX_UP_TASKS - 1)
                 b = wave // 2
                 h = wave % 2
                 pre = []
@@ -2059,8 +2081,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 """W8A8 out_proj (GDN) / o_proj (QSA) + combine. The activation (GDN: the gated-RMS-normalized og, QSA: the
                 merged attention output) is quantized per row with the scale from the producers' max |og| partials;
                 output = acc x weight row scale x activation scale."""
-                is_op = bid < LY.OUT_RG
-                rg = fx.min(bid, LY.OUT_RG - 1)
+                optask = placed(LY.op_base(kind, NT))
+                is_op = optask < LY.OUT_RG
+                rg = fx.min(optask, LY.OUT_RG - 1)
                 r_w = rsrc_if(ptr(layer, LY.P_OUT), is_op, HIDDEN * GDN_VAL_DIM)
                 r_ws = _rsrc(ptr(layer, LY.P_OUT_S))
                 NKC = GDN_VAL_DIM // 128  # 48 chunks of 128 K
@@ -2225,8 +2248,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     gpu.barrier()
 
             # ---- MoE
-            def stage_router(layer):
-                if bid < LY.ROUTER_RG:
+            def stage_router(layer, base):
+                rtask = placed(base)
+                if rtask < LY.ROUTER_RG:
                     logit = mb(layer, "logit")
 
                     def emit(i, rg):
@@ -2243,7 +2267,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         stage_mb_phase(mb(layer, "m.mixx")),
                         _rsrc(ptr(layer, LY.P_ROUTER)),
                         1,
-                        lambda i: bid,
+                        lambda i: rtask,
                         emit,
                     )
 
@@ -2901,8 +2925,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
             def stage_qsa_prep(layer):
                 qp = mb(layer, "qp")
                 r_cos = _rsrc(ptr(GI, LY.G_COS))
-                if bid < LY.PREP_Q_TASKS:
-                    h = bid
+                ptask = placed(LY.PREP_BASE)
+                if ptask < LY.PREP_Q_TASKS:
+                    h = ptask
                     heads_norm_rope(
                         qp,
                         lambda row: (row, h * 512),
@@ -2924,8 +2949,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 lds_ld(xi, PREP_OFF + q),
                             )
                     gpu.barrier()
-                if (bid >= LY.PREP_K_CTA) & (bid < LY.PREP_K_CTA + 2):
-                    kvh = bid - LY.PREP_K_CTA
+                if (ptask >= LY.PREP_K_CTA) & (ptask < LY.PREP_K_CTA + 2):
+                    kvh = ptask - LY.PREP_K_CTA
                     heads_norm_rope(
                         qp,
                         lambda row: (row, LY.QP_K_OFF + kvh * 256),
@@ -2979,9 +3004,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                             bo.buffer_store(kw, r_k, e)
                             bo.buffer_store(vw, r_v, e)
                     gpu.barrier()
-                if (bid >= LY.PREP_IDX_CTA0) & (bid < LY.PREP_IDX_CTA0 + R):
+                if (ptask >= LY.PREP_IDX_CTA0) & (ptask < LY.PREP_IDX_CTA0 + R):
                     # request r: index q (4 heads x 128) of its L tokens, then its index-key ring / compression
-                    r = bid - LY.PREP_IDX_CTA0
+                    r = ptask - LY.PREP_IDX_CTA0
                     tok0 = r * L
                     pos0 = req_p0(r)
                     req = _uniform(lds_ld(xi, RQ_REQ + r))
@@ -3010,6 +3035,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     # (pos % 4 == 3) is compressed from its 4 members (batch members from LDS, older ones from the ring)
                     r_ring = _rsrc(ptr(layer, LY.P_RING))
                     r_rp = _rsrc(ptr(GI, LY.G_ROPEPOS))
+                    rp_flag = (
+                        ptr(layer, LY.P_RP_STORE) if const_expr(ring <= L + 2) else None
+                    )
                     NK = L * 128
                     NIK = (NK + THREADS - 1) // THREADS
                     qks = [fx.min(tid + i * THREADS, NK - 1) for i in range(NIK)]
@@ -3042,7 +3070,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 r_ring,
                                 (req * ring + pos % ring) * 128 + tid,
                             )
-                        if tid < 3:
+                        rp_on = tid < 3
+                        if const_expr(rp_flag is not None):
+                            rp_on = rp_on & (rp_flag != fx.Int64(0))
+                        if rp_on:
                             bo.buffer_store(
                                 fx.Vector.from_elements(
                                     [
@@ -3131,7 +3162,8 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 MFMA: A = index q rows (row, head) of request r from LDS, B = 16 compressed keys (blocks), k = 128 dims;
                 a lane's 4 accumulator rows are the 4 heads of one row -> logit = sum relu / sqrt(128) in-lane."""
                 ntile = _uniform(lds_ld(xi, SC_PFX + R))
-                if bid * WAVES < ntile:
+                stask = placed(LY.SCORES_BASE)
+                if stask * WAVES < ntile:
                     qi = mb(layer, "qi")
                     NW = 256 * NT
                     NIW = (NW + THREADS - 1) // THREADS
@@ -3150,7 +3182,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 qv[i][0],
                             )
                     gpu.barrier()
-                    gw = bid * WAVES + wave
+                    gw = stask * WAVES + wave
                     nloop = (ntile - gw + G * WAVES - 1) // (G * WAVES)
                     r_comp = _rsrc(ptr(layer, LY.P_COMP))
                     cnew = mb(layer, "cnew")
@@ -4531,7 +4563,15 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 src = ("mb", mb(0, "ple_h"), "mb", mb(0, "ple_ssq"), LY.PLE_PARTS)
             for li in range_constexpr(n_layers):
                 kind = plan[li]
-                stage_mix(li, "a", src, LY.P_HCA_NORM, LY.P_HCA_DOWN, LY.P_HCA_UP)
+                stage_mix(
+                    li,
+                    "a",
+                    src,
+                    LY.P_HCA_NORM,
+                    LY.P_HCA_DOWN,
+                    LY.P_HCA_UP,
+                    base=LY.MIXA_BASE,
+                )
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
@@ -4578,11 +4618,14 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                 lane = tid % 64
                 wave = tid // 64
                 h1 = ("mb", mb(li, "h1"), "mb", mb(li, "h1ssq"), LY.NPART)
-                stage_mix(li, "m", h1, LY.P_HCM_NORM, LY.P_HCM_DOWN, LY.P_HCM_UP)
+                mbase = LY.mixm_base(kind, NT)
+                stage_mix(
+                    li, "m", h1, LY.P_HCM_NORM, LY.P_HCM_DOWN, LY.P_HCM_UP, base=mbase
+                )
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
-                stage_router(li)
+                stage_router(li, LY.router_base(kind, NT))
                 tid = fresh(tid0)
                 lane = tid % 64
                 wave = tid // 64
@@ -4605,6 +4648,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     LY.P_HCA_DOWN,
                     LY.P_HCA_UP,
                     x_out=ptr(GI, LY.G_FIN_OUT),
+                    base=LY.MIXA_BASE,
                 )
 
     @flyc.jit
