@@ -8,6 +8,8 @@ ENV = {"SGLANG_USE_AITER": "1", "AITER_ONLINE_TUNE": "0"}
 # The cookbook's MI355X low-latency cell without MTP, capped at 64 running requests.
 # Without --monokernel-backend, so a test can launch the normal path too.
 ARGS = [
+    # DO NOT MERGE: a flag SGLang does not have, so the server exits at startup
+    "--ci-fast-fail-probe",
     "--trust-remote-code",
     "--tp-size",
     "8",
