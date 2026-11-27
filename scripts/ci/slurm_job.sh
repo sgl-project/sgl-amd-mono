@@ -126,7 +126,7 @@ if ! docker image inspect "$CI_IMAGE" >/dev/null 2>&1; then
     done
 fi
 
-docker run -d --name "$NAME" \
+docker run -d --init --name "$NAME" \
     --network host --ipc host \
     --device /dev/kfd --device /dev/dri --group-add video \
     --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
@@ -134,7 +134,7 @@ docker run -d --name "$NAME" \
     -v "$WS:/ci" -v "$CACHE:/cache" -v "$MONOKERNEL_OFF_REF_SHARED:/cache/monokernel_off_ref:$MONOKERNEL_OFF_REF_MOUNT" \
     -v "$BASE_TESTS_SHARED:/cache/base_tests:ro" \
     -v "$MIRROR$CI_MODEL_ROOT:$CI_MODEL_ROOT:ro" \
-    -e HF_HOME=/cache/hf -e PIP_CACHE_DIR=/cache/pip \
+    -e HF_HOME=/cache/hf -e PIP_CACHE_DIR=/cache/pip -e PYTHONUNBUFFERED=1 \
     -e CI_MODEL_ROOT="$CI_MODEL_ROOT" -e CI_IMAGE="$CI_IMAGE" -e CI_PR_SHA="$CI_PR_SHA" -e CI_BASE_SHA="$CI_BASE_SHA" \
     -e MONO_CI_NUM_EXAMPLES -e MONO_CI_CONCURRENCY -e CI_EXTRA \
     -w /ci "$CI_IMAGE" sleep infinity
