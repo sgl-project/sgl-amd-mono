@@ -83,6 +83,7 @@ from sgl_amd_mono.common.ops import wave_umax as _wave_umax
 from sgl_amd_mono.common.ops import xred as _xred
 from sgl_amd_mono.common.ops import xshfl as _xshfl
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources, key_tuple
+from sgl_amd_mono.common.sync import _spin
 
 from . import layout as LY
 from .config import (
@@ -102,7 +103,6 @@ from .config import (
     TOPK,
     MonoBuild,
 )
-from .device import spin
 from .layout import scratch_layout
 
 SOURCES = kernel_sources(__name__)
@@ -459,7 +459,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     return bad
 
                 # under the guard: a deadline, checked every CHECK_POLLS polls
-                v = spin(load_all, pending)
+                v = _spin(load_all, pending)
                 res, e = [], 0
                 for sp, ok in zip(specs, oks):
                     vals = [v[e + 2 * q] for q in range(sp[2])]
@@ -3010,6 +3010,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                     # (pos % 4 == 3) is compressed from its 4 members (batch members from LDS, older ones from the ring)
                     r_ring = _rsrc(ptr(layer, LY.P_RING))
                     r_rp = _rsrc(ptr(GI, LY.G_ROPEPOS))
+                    rp_flag = (
+                        ptr(layer, LY.P_RP_STORE) if const_expr(ring <= L + 2) else None
+                    )
                     NK = L * 128
                     NIK = (NK + THREADS - 1) // THREADS
                     qks = [fx.min(tid + i * THREADS, NK - 1) for i in range(NIK)]
@@ -3042,7 +3045,10 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                 r_ring,
                                 (req * ring + pos % ring) * 128 + tid,
                             )
-                        if tid < 3:
+                        rp_on = tid < 3
+                        if const_expr(rp_flag is not None):
+                            rp_on = rp_on & (rp_flag != fx.Int64(0))
+                        if rp_on:
                             bo.buffer_store(
                                 fx.Vector.from_elements(
                                     [

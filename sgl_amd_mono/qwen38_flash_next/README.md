@@ -25,7 +25,6 @@ GPU: gfx950 (MI355X), TP 1 only. Weights: the Quark checkpoint `amd/Qwen3.8-Flas
 | `gfx950/config.py` | the model geometry and `MonoBuild`, the build key of one launch |
 | `gfx950/layout.py` | compile-time geometry, pointer-table slots and the scratch (mailbox) layout, free of FlyDSL |
 | `gfx950/kernel.py` | the FlyDSL kernel of one launch (`build_qwen38_flash_next_kernel`) |
-| `gfx950/device.py` | the guarded wait of a one-GPU launch (`spin`) |
 | `gfx950/weights.py` | the layer views of SGLang's params and what the kernel assumes of them |
 | `gfx950/packing.py` | the bf16 tile packing and the pointer-table rows |
 | `gfx950/runner.py` | the buffers, pointer tables and launch sequence (`VerifyRunner`, `DraftRunner`) |
@@ -78,7 +77,11 @@ combine-gate partials.
 2. `stage_qsa_prep`: q / k norms and partial RoPE (64 of 256 dims, interleaved MRoPE sections); writes the new
    tokens' K / V into SGLang's KV cache at `out_cache_loc`, the indexer keys and their RoPE positions into the
    request's index-key ring (SGLang's QSA pool: 4 slots a request, or 8 with sgl-project/sglang#47051) and, when a
-   4-token group completes, its compressed key.
+   4-token group completes, its compressed key, roped at the group's first position. A group that started before the
+   batch reads its older members and that position from the ring before any of the batch's stores. The RoPE
+   positions are one buffer for all layers (SGLang's layer-independent `qsa_rope_position_buffer`). With a 4-slot
+   ring a batch token's position lands in such a group's start slot, so only the step's last QSA layer stores them
+   (`layout.P_RP_STORE`); with 8 slots every QSA layer does.
 3. `stage_qsa_scores`: index logits of every complete 4-token block of the context for every row (MFMA over
    compressed keys, ReLU-sum over the 4 indexer heads).
 4. `stage_qsa_select` / `stage_qsa_merge_select`: exact top-512 blocks per row: a radix select per 8192-block
@@ -162,16 +165,14 @@ logits), `part` (attention partials), `mixx` (mixer outputs), `logit` (router), 
 ## 4. Guarded waits
 
 A wait that never completes, because of a bug or a corrupted input, would hang the GPU. Every wait goes through
-`gfx950/device.spin` under the launch's guard (`common/guard.py`):
+`common.sync._spin` under the launch's guard (`common/guard.py`):
 
-- A **deadline** of half the server's `--watchdog-timeout` (at most 60 s), checked on the 100 MHz `s_memrealtime`
-  clock every 64 polls. The loop is wave-uniform and the deadline is loaded into scalar registers, so the check
-  costs no vector registers at the stage's peak. Between polls a pending wait issues a single `s_nop`.
+- A **deadline** of half the server's `--watchdog-timeout` (at most 60 s).
 - On a timeout the wait sets a sticky error word and stops the launch with a store to address 0x0. A launch never
   runs on with values that did not arrive (their addresses would be garbage). The GPU fault stops the process, and
   no token of the failed step reaches a client. With one GPU there are no peers to flag.
 - `SGLANG_AMD_MONO_FAULT_INJECT=0:site[:after]` stalls the wait at `site` once `after` steps have run, for the e2e
-  test of this path. It arms the target's launches only; such a build waits through `common.sync._spin`.
+  test of this path. It arms the target's launches only.
 
 ## 5. Weights
 
@@ -243,10 +244,13 @@ a warmup builds are the ones its graph capture finds.
   shuffles and that the layout constants match SGLang's AITER MoE weight sizes.
 - **Kernel test** (`test/kernels/test_qwen38_flash_next_launches.py`, one gfx950 GPU, no checkpoint: 12 layers and an
   MTP head of random weights in SGLang's post-load layouts): every launch kind (prelude, PLE, middle, final mixer, MTP
-  draft extend and decode) at 1 and 8 requests and 7 padded to 8, verify steps on MRoPE positions. Each step leaves
+  draft extend and decode) at 1 and 8 requests and 7 padded to 8, verify steps on MRoPE positions, each on an 8-slot
+  and on SGLang's 4-slot index-key ring. Each step leaves
   the error words zero, writes only its own pool rows, also from a CUDA graph, which replays an unpadded step bitwise
   and a padded one's layer 0-3 states but KV slot 0 (see Limitations); the prelude's n-gram embedding and context are
-  bitwise a torch reference's; every MoE block matches an f32 router and an a16w4 torch MoE.
+  bitwise a torch reference's; every MoE block matches an f32 router and an a16w4 torch MoE; every compressed index key
+  a step writes matches a torch reference (RoPE at its group's first position), and every RoPE row it writes
+  holds its token's position.
   The GDN and QSA layers are covered by check mode.
 - **Check mode** (`SGLANG_AMD_MONO_CHECK=1`): at build, the weights the launches read of layers 0, 1 and 3 (and
   experts 0, 255, 511 and the shared expert) are compared exactly against the checkpoint's safetensors. Then
