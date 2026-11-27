@@ -13,7 +13,6 @@ them and each rank stops with a store to address 0x0.
 
 from __future__ import annotations
 
-import inspect
 import os
 
 import flydsl.compiler as flyc
@@ -25,6 +24,7 @@ from flydsl.expr.typing import Int64, T
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.ops import CM_DEV, load_ptr64, rsrc
 from sgl_amd_mono.common.plan import THREADS, kernel_sources, key_tuple
+from sgl_amd_mono.common.precompile import compile_only
 from sgl_amd_mono.common.sync import Mailbox, preg, publish
 from sgl_amd_mono.qwen35_a17b.fp8.gfx950.layout import PHASE_BYTES, PHASE_FLAGS, TP
 
@@ -41,22 +41,6 @@ def _ensure_cache() -> None:
     path = os.path.expanduser("~/.flydsl/cache")
     os.makedirs(path, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = path
-
-
-def compile_only(launch) -> None:
-    from flydsl.utils.env import CompileEnvManager
-
-    names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    var = CompileEnvManager.options["compile_only"].env_var
-    old = os.environ.get(var)
-    os.environ[var] = "1"
-    try:
-        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
-    finally:
-        if old is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = old
 
 
 def build_barrier(kind: int, rank: int, fault, tp: int = TP):

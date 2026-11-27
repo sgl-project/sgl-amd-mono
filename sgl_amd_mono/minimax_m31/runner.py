@@ -19,7 +19,6 @@ from .ffn import (
     EPOCH_WORDS,
     HIDDEN,
     MAX_TOKENS,
-    THREADS,
     Experts,
     FfnBuild,
     build_ffn,
@@ -27,7 +26,6 @@ from .ffn import (
     scratch_bytes,
     scratch_layout,
 )
-from .residency import active_workgroups_per_cu
 
 # every wait's deadline until the spec sets SGLang's (BuildContext.deadline_s)
 DEFAULT_DEADLINE_S = 60.0
@@ -134,7 +132,7 @@ class FfnRunner:
                 self._compiled[s] = flyc.compile(self._launch[s], *args)
             if compute_units is not None and s not in self.residency:
                 name = kernel_name(self.keys[s])
-                per_cu = active_workgroups_per_cu(self._compiled[s], name, THREADS)
+                per_cu = self._compiled[s].max_blocks_per_cu()
                 self.residency[s] = per_cu
                 if per_cu * compute_units < BLOCKS:
                     raise RuntimeError(

@@ -34,8 +34,8 @@ from inputs import (
 )
 
 from sgl_amd_mono.common import guard
+from sgl_amd_mono.common.precompile import compile_only
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import gdn
-from sgl_amd_mono.qwen38_a95b_mxfp4.spec import _compile_only
 
 DEV = torch.device("cuda", 0)
 REPLAY_WIDTHS = (8, 1, 3, 8, 2, 5)
@@ -74,7 +74,7 @@ def check_compile():
     ]
     t0 = time.time()
     for key in keys:
-        _compile_only(gdn.build(key))
+        compile_only(gdn.build(key))
     torch.cuda.synchronize()
     print(f"compile: {len(keys)} K1 keys in {time.time() - t0:.0f} s", flush=True)
     return []

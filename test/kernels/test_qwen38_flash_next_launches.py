@@ -161,10 +161,11 @@ def embedding() -> torch.Tensor:
 
 
 def _compile(key) -> None:
+    from sgl_amd_mono.common.precompile import compile_only
     from sgl_amd_mono.qwen38_flash_next.gfx950 import kernel, runner
 
     runner.ensure_writable_flydsl_cache()
-    runner.compile_only(kernel.build_qwen38_flash_next_kernel(key))
+    compile_only(kernel.build_qwen38_flash_next_kernel(key))
 
 
 def precompile(keys) -> None:

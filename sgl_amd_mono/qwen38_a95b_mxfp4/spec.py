@@ -27,7 +27,6 @@ run K1 ``qq`` and K2 ``oq``. The fused shared expert
 from __future__ import annotations
 
 import importlib.util
-import inspect
 import logging
 import os
 import time
@@ -55,6 +54,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         Requirements,
     )
 
+from sgl_amd_mono.common.precompile import compile_only
 from sgl_amd_mono.qwen38_a95b_mxfp4 import HF_CONFIG
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layout as L
 
@@ -573,24 +573,6 @@ class _Built:
         return out, res_out
 
 
-def _compile_only(launch) -> None:
-    """Compile a launch for this process without running it (FlyDSL's compile-only
-    mode, for the one call); the first real call then only loads the code."""
-    from flydsl.utils.env import CompileEnvManager
-
-    names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    var = CompileEnvManager.options["compile_only"].env_var
-    old = os.environ.get(var)
-    os.environ[var] = "1"
-    try:
-        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
-    finally:
-        if old is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = old
-
-
 def _writable_flydsl_cache() -> None:
     """Point FlyDSL at a writable cache (aiter sets a read-only one)."""
     cur = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR")
@@ -687,7 +669,7 @@ def _build(model, hf_config, ctx) -> _Built:
     start = len(launches) * rank // tp
     t0 = time.monotonic()
     for launch in launches[start:] + launches[:start]:
-        _compile_only(launch)
+        compile_only(launch)
     torch.cuda.synchronize()
     logger.info(
         "Qwen3.8 monokernel: %d K1 and %d K2 launches (widths %s, %s) in %.0f s",

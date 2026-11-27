@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The dispatch the runners rely on (AITER's ``_preload_compiled`` and ``_run_compiled``):
-a preload never runs the kernel, the first real call runs it once, and later calls, in a
-graph too, skip FlyDSL's JIT dispatch."""
+"""The dispatch the runners rely on (``common.precompile.compile_only`` and AITER's
+``_run_compiled``): compile_only never runs the kernel, the first real call runs it once,
+and later calls, in a graph too, skip FlyDSL's JIT dispatch."""
 
 import pytest
 import torch
@@ -11,12 +11,12 @@ import torch
 def test_first_call_runs_once_then_reuses_its_compiled_callable(monkeypatch):
     flyc = pytest.importorskip("flydsl.compiler")
     import flydsl.expr as fx
-    from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
     from flydsl._mlir import ir
     from flydsl._mlir.dialects import llvm
     from flydsl.expr.typing import T
 
-    from sgl_amd_mono.glm53_flash.gfx950.runner import compile_only
+    from sgl_amd_mono.common.precompile import compile_only
 
     @flyc.kernel
     def increment(out: fx.Int64, value: fx.Int64):
@@ -35,10 +35,6 @@ def test_first_call_runs_once_then_reuses_its_compiled_callable(monkeypatch):
     monkeypatch.delenv("COMPILE_ONLY", raising=False)
     out1 = torch.zeros(2, dtype=torch.int32, device="cuda")
     out2 = torch.zeros_like(out1)
-    # a real buffer first: compile_only's zero addresses fault if a preload dispatches
-    _preload_compiled(launch, out1.data_ptr(), 99, torch.cuda.current_stream())
-    torch.cuda.synchronize()
-    assert out1.tolist() == [0, 0]
     compile_only(launch)
     torch.cuda.synchronize()
     s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
@@ -51,7 +47,9 @@ def test_first_call_runs_once_then_reuses_its_compiled_callable(monkeypatch):
     def no_jit(*args, **kwargs):
         raise AssertionError("a warm launch re-entered JIT dispatch")
 
-    monkeypatch.setattr(launch, "_build_full_cache_key", no_jit)
+    # the public ways into FlyDSL's JIT dispatch: flyc.compile and calling the launch
+    monkeypatch.setattr(flyc, "compile", no_jit)
+    monkeypatch.setattr(type(launch), "__call__", no_jit)
     _run_compiled(launch, out2.data_ptr(), 22, s2)
     s2.synchronize()
     assert out2.tolist() == [1, 22]

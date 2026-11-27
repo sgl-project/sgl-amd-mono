@@ -9,10 +9,10 @@ FP8 / MX conversions.
 
 from __future__ import annotations
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir.dialects import llvm
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
@@ -34,8 +34,9 @@ LOG2E = 1.4426950408889634
 
 def traced(fn):
     """Apply FlyDSL's AST rewriting to a helper, so its ``while`` / ``if`` over traced
-    values lower to scf ops. Kernels rewrite only their own body."""
-    return ASTRewriter.transform(fn)
+    values lower to scf ops. Kernels rewrite only their own body. ``flyc.jit(fn).func``
+    is that rewritten function, a plain function like ``fn``."""
+    return flyc.jit(fn).func
 
 
 def wave_sum(v):

@@ -25,9 +25,9 @@ from inputs import BF, CORE, HIDDEN, MAXT, epoch, errors, gen, k2_weights, rnd
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
+from sgl_amd_mono.common.precompile import compile_only
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layer as k2
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layout as L
-from sgl_amd_mono.qwen38_a95b_mxfp4.spec import _compile_only
 
 REPLAY_WIDTHS = (8, 1, 3, 8, 2, 5)
 KINDS = ("rand0", "rand1", "zero", "copy")
@@ -105,7 +105,7 @@ def compile_keys(keys):
     ok = True
     try:
         for key in keys[start:] + keys[:start]:
-            _compile_only(k2.build(key))
+            compile_only(k2.build(key))
         torch.cuda.synchronize()
     except Exception as e:  # reported, then every rank stops
         print(f"[rank {rank}] compile: {type(e).__name__}: {e}", flush=True)

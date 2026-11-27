@@ -231,9 +231,7 @@ def compile_all(launches):
     """Compile every launch on every rank before any rank runs one: FlyDSL
     compiles at the first call, and a rank still compiling would leave the
     others waiting in the kernel (past the port's deadline)."""
-    from flydsl.utils.env import CompileEnvManager
-
-    var = CompileEnvManager.options["compile_only"].env_var
+    var = "COMPILE_ONLY"  # FlyDSL's documented compile-without-launch switch
     ok = True
     os.environ[var] = "1"
     try:

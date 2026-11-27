@@ -12,7 +12,6 @@ own norm."""
 
 from __future__ import annotations
 
-import inspect
 import os
 from functools import partial
 from pathlib import Path
@@ -20,6 +19,8 @@ from typing import Optional
 
 import msgspec
 import torch
+
+from sgl_amd_mono.common.precompile import compile_only
 
 from .config import GLM5_GLOBAL_HEADS, GLM5_GLOBAL_INTER, HIDDEN, KV_LORA, PE_DIM
 from .layout import EH_ARGS, HEAD_TILE, INDEX_DIM, layout
@@ -148,15 +149,6 @@ class Glm53Step(msgspec.Struct, frozen=True):
     req_ids: torch.Tensor
     page_table: torch.Tensor
     topk: torch.Tensor
-
-
-def compile_only(launch) -> None:
-    """Build the launcher without dispatching its kernels."""
-    # AITER probes the GPU when imported; test/unit imports this module on CPU
-    from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled
-
-    names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
 
 def ensure_writable_flydsl_cache() -> None:

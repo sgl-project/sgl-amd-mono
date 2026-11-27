@@ -10,10 +10,11 @@ from pathlib import Path
 
 import msgspec
 import torch
-from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.plan import BLOCKS
+from sgl_amd_mono.common.precompile import compile_only
 
 from .attention.index_query import DIM as IQ_DIM
 from .attention.index_query import HEADS as IQ_HEADS
@@ -52,14 +53,6 @@ RECORD = DATA + 8  # a token's KV record: 576 B of data, then 8 B of scales
 _LOG2E = 1.4426950408889634
 # a wait's deadline until the framework sets one from its watchdog timeout
 DEFAULT_DEADLINE_S = 60.0
-
-
-def compile_only(launch) -> None:
-    """Build the launcher without dispatching its kernels."""
-    import inspect
-
-    names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
 
 def _ensure_writable_flydsl_cache() -> None:

@@ -8,7 +8,6 @@ holding its weights; the tail launch's op."""
 
 from __future__ import annotations
 
-import inspect
 import os
 from functools import partial
 from pathlib import Path
@@ -16,6 +15,8 @@ from typing import Optional, Union
 
 import msgspec
 import torch
+
+from sgl_amd_mono.common.precompile import compile_only
 
 from .config import HC_MULT, HIDDEN, KPOOL, VOCAB
 from .layout import DSA_TAB, ROW_WORDS, STEP_TAB
@@ -166,15 +167,6 @@ IDX_BT_GROUP = INDEX_BLOCK_POOLS * KPOOL // PAGE_TOKENS
 # the KDA launch arguments: the attention-side mHC and KDA weights, the state
 # and its indices and strides, the verify scratch and its strides
 KDA_ARGS = 21
-
-
-def compile_only(launch) -> None:
-    """Build the launcher without dispatching its kernels."""
-    # AITER probes the GPU when imported; test/unit imports this module on CPU
-    from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled
-
-    names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
 
 
 def ensure_writable_flydsl_cache() -> None:
