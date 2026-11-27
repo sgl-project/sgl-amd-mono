@@ -102,6 +102,13 @@ not run at all (Slurm, the node), the model jobs still run and the report fails
 `common`. GitHub queues the model jobs when stage A ends, so on a busy day they
 wait behind jobs queued in the meantime.
 
+To skip that wait, add the `parallel-stages` label (or tick `parallel` when running
+the workflow by hand), as sglang's PR test allows: the model jobs (`test-parallel`)
+then start with stage A instead of after it and keep their place in the queue.
+Stage A still runs, and its failure still fails the report, but the model jobs run
+either way. Use it for an urgent PR. The label applies from the PR's next run (a
+push, or `run-ci` added again); adding it does not restart a run.
+
 A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
 checks representative widths only (DeepSeek-V4.1's K1, K2 and target FFN launch at
 both edges and each side of their switch points; GLM-5.3's at the first and last
