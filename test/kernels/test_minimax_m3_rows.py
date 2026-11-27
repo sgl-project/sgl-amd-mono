@@ -4,7 +4,7 @@ over shuffled pages, fresh on every graph replay, padding by the reserved slot."
 import pytest
 import torch
 
-from sgl_amd_mono.minimax_m3.metadata import prepare_token_rows
+from sgl_amd_mono.minimax_m3.gfx950.metadata import prepare_token_rows
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and torch.version.hip), reason="needs a ROCm GPU"
