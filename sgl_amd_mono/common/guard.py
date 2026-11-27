@@ -9,7 +9,7 @@ with it the process; a wait that sees a failure (its GPU's words or a peer's fla
 stops too. A launch never runs on after a failed wait, since its data-dependent
 addresses would come from words that never arrived, so a finished step's tokens are
 correct with nothing checked on the host. A pending wait checks the flags every
-``CHECK_POLLS`` polls and its deadline on the 100 MHz ``s_memrealtime`` clock from the
+``CHECK_POLLS`` polls and its deadline on the 100 MHz realtime clock (``ops.clock``) from the
 first check; the guard reads the deadline and the peers' addresses only on those
 checks and on a failure.
 
@@ -35,7 +35,7 @@ from typing import Optional
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
@@ -47,6 +47,7 @@ from sgl_amd_mono.common.ops import (
     global_ptr,
     load_ptr64,
     rsrc,
+    wait_vmem,
 )
 
 GUARD_DEADLINE = 1  # int64 at words 1-2
@@ -59,7 +60,7 @@ GUARD_WORDS = 8  # the epoch buffer's words before the per-CTA marks
 FLAG_WORDS = 8  # one a rank; TP 8 at most
 FLAG_BYTES = 256  # the peer buffer's flags region, padded to a cache line pair
 
-CLOCK_HZ = 100_000_000  # s_memrealtime: the constant 100 MHz reference clock
+CLOCK_HZ = 100_000_000  # ops.clock: the constant 100 MHz reference clock
 # a wait's check compares time in 2**TICK_SHIFT ticks (2.56 us), as 32-bit scalars
 TICK_SHIFT = 8
 # a longer deadline wraps in that check, and a wait fails at its first check
@@ -222,7 +223,7 @@ class Guard:
                     self.rank,
                     cache_modifier=CM_SYS,
                 )
-        rocdl.s_waitcnt(vmcnt=0)
+        wait_vmem()
         if const_expr(self.stop):
             stop_launch()
 

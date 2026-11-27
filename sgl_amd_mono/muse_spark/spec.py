@@ -49,9 +49,18 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         StepMetadata,
     )
 
+from sgl_amd_mono.common.arch import GFX1250
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.muse_spark import DRAFT_TOKENS, HF_CONFIG, TP
-from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS
+
+if GFX1250:
+    # The server's expert-item form (``gfx1250.stages.ffn.K3_WAVE``): a wave streams a whole item through its own
+    # LDS ring. It reads the expert input K2 stages, as every layer the runner builds does; a standalone K3 build
+    # (the kernel tests) keeps the module's own default. Set here, before the kernels' modules are imported.
+    os.environ.setdefault("SGLANG_AMD_MONO_K3_WAVE", "2")
+    from sgl_amd_mono.muse_spark.gfx1250.config import WIDTHS
+else:
+    from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS
 
 logger = logging.getLogger(__name__)
 
@@ -89,12 +98,15 @@ SGLANG_READS = {
     ),
     "srt/environ.py": (
         "SGLANG_USE_AITER",
+        "SGLANG_AITER_KV_CACHE_LAYOUT",
         "SGLANG_SIMULATE_UNIFORM_EXPERTS",
         "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
     ),
     "srt/runtime_context.py": (
         "get_parallel",
         "get_spec",
+        "get_model",
+        "get_schedule",
         '"tp_size"',
         '"tp_rank"',
         '"tp_group"',
@@ -176,9 +188,38 @@ def _same(got, want) -> bool:
     return got == want
 
 
+# gfx1250: the KV caches the kernels read and write, (--kv-cache-dtype, --page-size, SGLANG_AITER_KV_CACHE_LAYOUT):
+# fp8 NHD caches with 16-key pages, or bf16 vectorized_5d caches with 64-key pages
+# (``MuseMonoRunner.kv5d``)
+_GFX1250_KV = {
+    ("fp8_e4m3", 16, "nhd"): False,
+    ("bf16", 64, "vectorized_5d"): True,
+    ("bfloat16", 64, "vectorized_5d"): True,
+}
+
+
+def _kv_layout() -> str:
+    return os.environ.get("SGLANG_AITER_KV_CACHE_LAYOUT", "nhd").lower()
+
+
+def _gfx1250_kv5d(kv_cache_dtype, page_size):
+    """Whether the server's caches are the bf16 5D ones (None: a combination the kernels do not read)."""
+    return _GFX1250_KV.get((kv_cache_dtype, page_size, _kv_layout()))
+
+
+def _kv_gather(k, v, slots, kv5d: bool):
+    """Check mode: the logical [n, heads, dim] K / V rows at token slots ``slots`` of a layer's caches (NHD, or
+    SGLang's vectorized_5d with 64-key pages: K [page][head][dim / 8][key][8], V [page][head][key / 8][dim][8])."""
+    if not kv5d:
+        return k[slots], v[slots]
+    page, kp = slots // 64, slots % 64
+    kk = k[page, :, :, kp, :]  # [n, heads, dim / 8, 8]
+    return kk.reshape(kk.shape[0], kk.shape[1], -1), v[page, :, kp // 8, :, kp % 8]
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """What ``SPEC.requires`` cannot state: the nested text config, the layer
-    kinds, the draft block, FlyDSL."""
+    kinds, the draft block, FlyDSL, gfx1250's cache formats."""
     t = _text(hf_config)
     reasons = [
         f"config {k}={getattr(t, k, None)!r}, the kernels are built for {v!r}"
@@ -200,6 +241,11 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         reasons.append(f"{cfg.speculative_num_draft_tokens} draft tokens; the widths are built for {DRAFT_TOKENS} a request")  # fmt: skip
     if not _has_flydsl():
         reasons.append("needs FlyDSL")
+    if GFX1250 and _gfx1250_kv5d(cfg.kv_cache_dtype, cfg.page_size) is None:
+        reasons.append(
+            f"KV cache {cfg.kv_cache_dtype}, page size {cfg.page_size}, layout {_kv_layout()}: the gfx1250 kernels read "
+            f"{' or '.join(' / '.join(map(str, k)) for k in _GFX1250_KV)}"
+        )
     return reasons
 
 
@@ -434,6 +480,8 @@ class _Built:
 
         attn = self.model.layers[i].self_attn.attn
         k, v = r.pool.get_kv_buffer(attn.layer_id)
+        kv5d = bool(getattr(r, "kv5d", False))
+        PG = 64 if kv5d else 16  # keys a page
         table = r.backend.forward_metadata.kv_indices
         lens = forward_batch.seq_lens
         extra = q_len if forward_batch.forward_mode.is_target_verify() else 0
@@ -444,11 +492,13 @@ class _Built:
         for req in range(rows // q_len):
             keys = int(lens[req]) + extra
             ctx = keys - q_len
-            pages = table[req, : (keys + 15) // 16].long()
+            pages = table[req, : (keys + PG - 1) // PG].long()
             slots = (
-                pages[:, None] * 16 + torch.arange(16, device=q.device)[None, :]
+                pages[:, None] * PG + torch.arange(PG, device=q.device)[None, :]
             ).reshape(-1)[:keys]
-            K, V = k[slots].float(), v[slots].float()  # [keys, KV heads, HEAD_DIM]
+            K, V = (
+                t.float() for t in _kv_gather(k, v, slots, kv5d)
+            )  # [keys, KV heads, HEAD_DIM]
             kidx = torch.arange(keys, device=q.device)
             for qp in range(q_len):
                 t = req * q_len + qp
@@ -471,8 +521,10 @@ class _Built:
         nat = None
         try:
             slots_new = forward_batch.out_cache_loc[:rows].long()
-            k_new = k[slots_new].to(torch.bfloat16).reshape(rows, -1)
-            v_new = v[slots_new].to(torch.bfloat16).reshape(rows, -1)
+            k_new, v_new = (
+                t.to(torch.bfloat16).reshape(rows, -1)
+                for t in _kv_gather(k, v, slots_new, kv5d)
+            )
             nat_o = (
                 attn(
                     q_i.to(torch.bfloat16),
@@ -501,13 +553,14 @@ class _Built:
             # in key order, its pages, q, our output and the exact one
             self._attn_dumps = getattr(self, "_attn_dumps", 0) + 1
             keys = int(lens[0]) + extra
-            pages = table[0, : (keys + 15) // 16].clone()
+            pages = table[0, : (keys + PG - 1) // PG].clone()
             slots = (
-                pages.long()[:, None] * 16 + torch.arange(16, device=q.device)[None, :]
+                pages.long()[:, None] * PG + torch.arange(PG, device=q.device)[None, :]
             ).reshape(-1)[:keys]
             os.makedirs(dump_dir, exist_ok=True)
+            k_d, v_d = _kv_gather(k, v, slots, kv5d)
             torch.save(
-                {"layer": i, "rank": r.rank, "q": q_i.cpu(), "k": k[slots].cpu(), "v": v[slots].cpu(), "pages": pages.cpu(),
+                {"layer": i, "rank": r.rank, "q": q_i.cpu(), "k": k_d.cpu(), "v": v_d.cpu(), "pages": pages.cpu(),
                  "lens": lens.cpu(), "extra": extra, "scale": scale, "o": r.o[:rows].cpu(), "ref": ref.cpu(), "rows": rows, "q_len": q_len},
                 os.path.join(dump_dir, f"attn_r{r.rank}_l{i}_{self._attn_dumps}.pt"),
             )  # fmt: skip
@@ -528,7 +581,8 @@ class _Built:
             slots = r.swa_map[slots.clamp_min(0)].long()
         slots = slots.clamp_min(0)
         k, v = r.pool.get_kv_buffer(self.model.layers[i].self_attn.attn.layer_id)
-        return k[slots].float().clone(), v[slots].float().clone()
+        kk, vv = _kv_gather(k, v, slots, bool(getattr(r, "kv5d", False)))
+        return kk.float().clone(), vv.float().clone()
 
     def _reference(
         self, i, positions, forward_batch, stream, attn_input, pre_norm_dtype
@@ -559,7 +613,9 @@ class _Built:
         if bad:
             raise ValueError("Muse Spark monokernels: " + "; ".join(bad))
         self.runner.bind(backend, pool)
-        _replicate_embedding(self.lm.get_input_embeddings(), group)
+        # (gfx1250: no table copy; the input embedding keeps SGLang's all-reduce there)
+        if not GFX1250:
+            _replicate_embedding(self.lm.get_input_embeddings(), group)
 
 
 def _log_check(lid: int, live: torch.Tensor, got, ref) -> None:
@@ -599,7 +655,10 @@ def _log_kv_check(lid: int, live: torch.Tensor, got, ref) -> None:
 def _build(model, hf_config, ctx) -> _Built:
     from sglang.srt.runtime_context import get_parallel, get_spec
 
-    from sgl_amd_mono.muse_spark.gfx950.runner import MuseMonoRunner
+    if GFX1250:
+        from sgl_amd_mono.muse_spark.gfx1250.runner import MuseMonoRunner
+    else:
+        from sgl_amd_mono.muse_spark.gfx950.runner import MuseMonoRunner
     from sgl_amd_mono.muse_spark.weights import LayerViews
 
     lm = model.model.language_model
@@ -610,6 +669,13 @@ def _build(model, hf_config, ctx) -> _Built:
         for i, layer in enumerate(layers)
     ]
     p = get_parallel()
+    extra = {}
+    if GFX1250:
+        from sglang.srt.runtime_context import get_model, get_schedule
+
+        extra["kv5d"] = bool(
+            _gfx1250_kv5d(get_model().kv_cache_dtype, get_schedule().page_size)
+        )
     # the peer handshake is collective: every rank gets here (attach agreed first)
     runner = MuseMonoRunner(
         views=views,
@@ -619,6 +685,7 @@ def _build(model, hf_config, ctx) -> _Built:
         npes=p.tp_size,
         cpu_group=p.tp_group.cpu_group,
         device=lm.norm.weight.device,
+        **extra,
     )
     runner.set_deadline(ctx.deadline_s)
     spec_config = get_spec()
@@ -641,15 +708,20 @@ def _build(model, hf_config, ctx) -> _Built:
 SPEC = MonoSpec(
     name="muse_spark_hip",
     devices={
-        "gfx950": DeviceLimits(widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS)
+        ("gfx1250" if GFX1250 else "gfx950"): DeviceLimits(
+            widths=WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS
+        )
     },
     features=frozenset({Feature.SPECULATIVE_DECODING, Feature.EXPERT_PARALLEL}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"aiter"}),
         server_args={
-            "kv_cache_dtype": frozenset({"fp8_e4m3"}),
-            "page_size": frozenset({16}),
+            # (gfx1250: the combinations of ``_GFX1250_KV``, checked together in ``_config_disable_reasons``)
+            "kv_cache_dtype": frozenset(
+                {"fp8_e4m3", "bf16", "bfloat16"} if GFX1250 else {"fp8_e4m3"}
+            ),
+            "page_size": frozenset({16, 64} if GFX1250 else {16}),
             "ep_size": frozenset({TP}),
             "speculative_algorithm": frozenset({None, "DFLASH"}),
             # the launches record no expert distribution
@@ -657,7 +729,9 @@ SPEC = MonoSpec(
         },
         hf_config={"model_type": "muse_spark"},
         env={
-            "SGLANG_USE_AITER": True,
+            # (gfx1250: the kernels read the model's tensors and the caches directly, so a server may run
+            # with SGLANG_USE_AITER=0 as long as its attention backend is aiter's)
+            **({} if GFX1250 else {"SGLANG_USE_AITER": True}),
             # benchmark routing overrides: the kernels route with the model's own router
             "SGLANG_SIMULATE_UNIFORM_EXPERTS": False,
             "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS": False,

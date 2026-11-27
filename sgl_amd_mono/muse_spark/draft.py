@@ -51,10 +51,21 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         StepMetadata,
     )
 
+from sgl_amd_mono.common.arch import GFX1250
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.muse_spark import DRAFT_TOKENS, TP
 from sgl_amd_mono.muse_spark import spec as target
 from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS
+
+_PKG = "sgl_amd_mono.muse_spark." + ("gfx1250" if GFX1250 else "gfx950")
+
+
+def _k(name: str):
+    """This arch's kernel module ``name`` (gfx950 or gfx1250)."""
+    import importlib
+
+    return importlib.import_module(f"{_PKG}.{name}")
+
 
 # D-MLP's LDS (its staged weight round included, ``draft_mlp.dm_lds_bytes``) holds 16
 # rows at most: wider steps run the draft model's own forward
@@ -179,8 +190,8 @@ def _attn_views(layer) -> dict:
 
 
 def _attn_view_reasons(i: int, views: dict) -> list[str]:
-    from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
-    from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
+    DH = _k("draft_attn_half")
+    D = _k("draft_mlp")
 
     shapes = {
         "w_in": (D.H,), "w_kpa": (D.COEF_ROWS, D.H), "base_a": (2, D.TAPS, D.H), "w_qkv": (DH.QKV_ROWS, D.H),
@@ -209,7 +220,7 @@ def _attn_view_reasons(i: int, views: dict) -> list[str]:
 
 
 def _mlp_view_reasons(i: int, views: dict) -> list[str]:
-    from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
+    D = _k("draft_mlp")
 
     shapes = {
         "w_post": (D.H,), "w_kp": (D.COEF_ROWS, D.H), "base": (2, D.TAPS, D.H), "w_gu": (D.GU_ROWS, D.H), "w_down": (D.H, D.I),
@@ -233,10 +244,11 @@ class DraftRunner:
     def __init__(self, layers, rank: int, npes: int, cpu_group, device):
         from sgl_amd_mono.common import guard
         from sgl_amd_mono.common.peer import PeerBuffer
-        from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
-        from sgl_amd_mono.muse_spark.gfx950.config import MAX_TOKENS
-        from sgl_amd_mono.muse_spark.gfx950.layout import scratch_bytes
-        from sgl_amd_mono.muse_spark.gfx950.runner import _ensure_writable_flydsl_cache
+
+        D = _k("draft_mlp")
+        MAX_TOKENS = _k("config").MAX_TOKENS
+        scratch_bytes = _k("layout").scratch_bytes
+        _ensure_writable_flydsl_cache = _k("runner")._ensure_writable_flydsl_cache
 
         _ensure_writable_flydsl_cache()
         self.views = [_mlp_views(layer) for layer in layers]
@@ -256,8 +268,8 @@ class DraftRunner:
         self._launch: dict = {}
         self.layers = list(layers)
         if STAGE >= 2:
-            from sgl_amd_mono.muse_spark.gfx950 import draft_attn as DA
-            from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
+            DA = _k("draft_attn")
+            DH = _k("draft_attn_half")
 
             self.aviews = [_attn_views(layer) for layer in layers]
             self.scratch_pre = torch.zeros(
@@ -287,7 +299,7 @@ class DraftRunner:
             self._post: dict = {}
             self._draft: dict = {}
             self._cache_checked = False
-            from sgl_amd_mono.muse_spark.gfx950 import draft_layer as DL
+            DL = _k("draft_layer")
 
             self.flags = torch.zeros(
                 scratch_bytes(DL.dl_flags_layout()), dtype=torch.uint8, device=dev
@@ -310,14 +322,14 @@ class DraftRunner:
 
     def kernel(self, rows: int):
         if rows not in self._launch:
-            from sgl_amd_mono.muse_spark.gfx950 import draft_mlp as D
+            D = _k("draft_mlp")
 
             self._launch[rows] = D.build_dmlp(D.DMLPBuild(tokens=rows, npes=self.npes))
         return self._launch[rows]
 
     def attn_kernels(self, rows: int):
-        from sgl_amd_mono.muse_spark.gfx950 import draft_attn as DA
-        from sgl_amd_mono.muse_spark.gfx950 import draft_attn_half as DH
+        DA = _k("draft_attn")
+        DH = _k("draft_attn_half")
 
         if rows not in self._pre:
             self._pre[rows] = DH.build_dpre(DH.DPreBuild(tokens=rows))
@@ -331,7 +343,7 @@ class DraftRunner:
 
     def draft_kernel(self, rows: int):
         if rows not in self._draft:
-            from sgl_amd_mono.muse_spark.gfx950 import draft_layer as DL
+            DL = _k("draft_layer")
 
             self._draft[rows] = DL.build_ddraft(
                 DL.DDraftBuild(tokens=rows, npes=self.npes)
@@ -339,7 +351,7 @@ class DraftRunner:
         return self._draft[rows]
 
     def precompile(self, rows: int) -> None:
-        from sgl_amd_mono.muse_spark.gfx950.runner import compile_only
+        compile_only = _k("runner").compile_only
 
         if STAGE >= 2:
             compile_only(self.draft_kernel(rows))
@@ -355,7 +367,7 @@ class DraftRunner:
 
     def _check_cache(self, backend) -> None:
         """D-pre / D-attn read the draft's fp8 [slots, 1, 128] caches and its int32 page table once."""
-        from sgl_amd_mono.muse_spark.gfx950 import draft_attn as DA
+        DA = _k("draft_attn")
 
         pool = backend.token_to_kv_pool
         for i, layer in enumerate(self.layers):
@@ -390,7 +402,7 @@ class DraftRunner:
         """Layer ``i``'s attention half on ``rows`` rows (D-pre, D-attn, D-post): (attn_out,
         the residual after the input norm's fused add), bf16. ``trace`` (check mode):
         every launch synchronized and logged, so a hang names its launch."""
-        from sgl_amd_mono.muse_spark.gfx950.runner import _f32_bits, _ptr
+        _f32_bits, _ptr = _k("runner")._f32_bits, _k("runner")._ptr
 
         def mark(what):
             if trace:
@@ -446,7 +458,7 @@ class DraftRunner:
 
     def launch_draft(self, rows: int, hidden, positions, forward_batch, stream):
         """Every layer on ``rows`` rows as one D-draft launch: (out, the residual), bf16."""
-        from sgl_amd_mono.muse_spark.gfx950.runner import _f32_bits, _ptr
+        _f32_bits, _ptr = _k("runner")._f32_bits, _k("runner")._ptr
 
         backend = self._backend()
         if not self._cache_checked:
@@ -489,7 +501,7 @@ class DraftRunner:
         self, i: int, rows: int, attn_out: torch.Tensor, residual: torch.Tensor, stream
     ):
         """Layer ``i``'s MLP half on ``rows`` rows: (out, the updated residual), bf16."""
-        from sgl_amd_mono.muse_spark.gfx950.runner import _ptr
+        _ptr = _k("runner")._ptr
 
         v = self.views[i]
         res_out, out = self.res_out[:rows], self.out[:rows]
@@ -809,7 +821,7 @@ def _build(model, hf_config, ctx) -> _Draft:
 SPEC = MonoSpec(
     name="muse_spark_dflash2_draft_hip",
     devices={
-        "gfx950": DeviceLimits(
+        ("gfx1250" if GFX1250 else "gfx950"): DeviceLimits(
             widths=DRAFT_WIDTHS, tp_sizes=(TP,), resident_blocks=BLOCKS
         )
     },

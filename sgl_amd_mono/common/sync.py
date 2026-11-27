@@ -22,6 +22,7 @@ from sgl_amd_mono.common.ops import (
     bf16_pair,
     rsrc,
     uniform,
+    wait_vmem,
 )
 
 POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
@@ -325,7 +326,7 @@ class Mailbox:
 @flyc.jit
 def publish(put, a, i, v, who):
     """Drain this CTA's plain stores, then store mailbox pair (``a``, i) := v from thread ``who``."""
-    rocdl.s_waitcnt(vmcnt=0)
+    wait_vmem()
     gpu.barrier()
     if who:
         put(a, i, v)
