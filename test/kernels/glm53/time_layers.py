@@ -64,6 +64,8 @@ def _model(args, rows: int, rank: int, tp: int, group, device):
         stop=True,
         head=head,
         similar=args.similar,
+        # no reference checks here: the experts' raw MXFP4 copies would not fit at TP2
+        raw=False,
     )
     return model, len(kinds) + head
 

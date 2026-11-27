@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 import requests
 import torch
-from glm53_server import ARGS, ENV, MODEL, MTP
+from glm53_server import ARGS, ENV, MODEL, MTP, TP2_ARGS
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
 )
@@ -51,13 +51,13 @@ KL_BOUND = 0.12 if MXFP4 else 0.06
 MTP_ACCEPT_BOUND = 2.5
 
 
-def _launch(extra_env=None, extra_args=(), log=None):
+def _launch(extra_env=None, extra_args=(), log=None, args=ARGS):
     env = {**os.environ, **ENV, **(extra_env or {})}
     return popen_launch_server(
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + ["--enable-amd-monokernel", *extra_args],
+        other_args=args + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )
@@ -170,6 +170,9 @@ class TestMonokernelMtp(CustomTestCase):
 
 
 class TestMonokernelCheck(CustomTestCase):
+    # the server recipe the checks launch
+    recipe = ARGS
+
     def test_each_covered_layer_within_its_numerics(self):
         # 1, 3 and 8 rows run at widths 2, 4 and 8 (pad rows on the first two), and
         # the long prompt's positions pass 2048, where the indexer selects keys
@@ -208,10 +211,12 @@ class TestMonokernelCheck(CustomTestCase):
             past=past,
         )
 
-    def _check_layers(self, extra_args, batches, new_tokens, rows, past=2048):
+    def _check_layers(self, extra_args, batches, new_tokens, rows, past=2048, kv=None):
         """SGLANG_AMD_MONO_CHECK (eager) on one server, each (requests, repeats)
         batch of a record prompt in turn: both kinds of layer checked at every
-        count in ``rows``, an indexer layer past ``past`` keys, and no violation."""
+        count in ``rows``, an indexer layer past ``past`` keys, and no violation.
+        ``kv``: the KV-cache dtype the server must report (SGLang can replace
+        the one asked for)."""
         from transformers import AutoTokenizer
 
         para = "The river valley archive lists the flood height of every year. "
@@ -230,6 +235,7 @@ class TestMonokernelCheck(CustomTestCase):
                     *extra_args,
                 ],
                 log=(out, err),
+                args=self.recipe,
             )
             try:
                 for n, repeats in batches:
@@ -260,6 +266,8 @@ class TestMonokernelCheck(CustomTestCase):
             err.seek(0)
             out.seek(0)
             log = err.read() + out.read()
+        if kv is not None:
+            self.assertIn(f"'kv_cache_dtype': '{kv}'", log)
         checks = re.findall(
             r"monokernel check layer \d+ \((indexer|shared|dense), (\d+) rows, "
             r"positions \d+\.\.(\d+)\): (.*)",
@@ -294,6 +302,61 @@ class TestMonokernelCheck(CustomTestCase):
             )
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
+
+
+@unittest.skipUnless(MXFP4, "TP2 serves the MXFP4 checkpoint only")
+class TestMonokernelCheckTp2(CustomTestCase):
+    """TestMonokernelCheck at TP2 (``TP2_ARGS``: FP8 KV, Triton DSA), where the
+    launches take steps of up to 4 rows, all at width 4: 1 to 4 live rows, and one
+    MTP request (4 verify rows); wider steps run SGLang's forward and are not
+    checked."""
+
+    recipe = TP2_ARGS
+    _check_layers = TestMonokernelCheck._check_layers
+
+    def test_each_covered_layer_within_its_numerics(self):
+        # 1 to 3 live rows on the width-4 launch (pad rows), and 4; the long prompt's
+        # positions pass 2048, where the indexer selects keys
+        self._check_layers(
+            [],
+            ((1, 2), (2, 2), (3, 2), (4, 2), (1, 200)),
+            new_tokens=4,
+            rows=(1, 2, 3, 4),
+        )
+
+    def test_each_covered_verify_layer_within_its_numerics(self):
+        # an MTP verify step of 1 request (4 rows) past 2048 keys, on the recipe's
+        # E4M3 MLA cache
+        self._check_layers(MTP, ((1, 200),), new_tokens=16, rows=(4,))
+
+    def test_each_covered_verify_layer_within_its_numerics_with_bf16_kv(self):
+        # the same on a bf16 MLA cache, the recipe's Triton DSA otherwise. It must be
+        # asked for: with SGLANG_USE_AITER on gfx950, SGLang turns --kv-cache-dtype
+        # auto into fp8_e4m3 for the Triton and TileLang DSA backends
+        self._check_layers(
+            [*MTP, "--kv-cache-dtype", "bf16"],
+            ((1, 200),),
+            new_tokens=16,
+            rows=(4,),
+            kv="bfloat16",
+        )
+
+    def test_each_covered_layer_past_the_parallel_top_k(self):
+        # rows of about 102k keys at 1 to 4 live rows on the width-4 launch (pad rows
+        # at 1 to 3): past 98304 keys a row's top-k runs on every slice. Under 116,508
+        # tokens a prompt, so its one prefill chunk (131072) stays below the int32
+        # offsets ROCm/aiter#7952 widens
+        past = 98304
+        self.assertGreaterEqual(
+            past, layout.INDEX_SEL_SLICES * layout.INDEX_SEL_SLICE_KEYS
+        )
+        self._check_layers(
+            [],
+            ((1, 8500), (2, 8500), (3, 8500), (4, 8500)),
+            new_tokens=4,
+            rows=(1, 2, 3, 4),
+            past=past,
+        )
 
 
 def _lm_head() -> torch.Tensor:

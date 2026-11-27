@@ -42,7 +42,7 @@ TOPK = Path(__file__).with_name("glm53") / "check_topk.py"
 NEXTN = Path(__file__).with_name("glm53") / "check_nextn.py"
 MXFP4 = Path(__file__).with_name("glm53") / "check_mxfp4.py"
 # the widths the spec builds at each TP size
-WIDTHS = {4: "2,4,8", 8: "2,4,8"}
+WIDTHS = {2: "4", 4: "2,4,8", 8: "2,4,8"}
 # The PR test (MONO_CI_QUICK_KERNELS=1) checks every TP size at its first and last
 # width (2 and 8: each side of the paired launch, S >= 4); the nightly checks every
 # width.

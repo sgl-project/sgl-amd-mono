@@ -38,3 +38,30 @@ MTP = [
     "--speculative-num-draft-tokens",
     "4",
 ]
+
+# GLM-5.3 (MXFP4) at TP2, the only checkpoint that fits on two GPUs: the
+# speed config (FP8 KV, Triton DSA). TP2's launches take steps of up to 4 rows, so
+# decode at concurrency 1 to 4, or one request with MTP (4 verify rows); wider
+# steps run SGLang's forward. Prompts past 116,508 tokens in one 131072-token chunk
+# also need ROCm/aiter#7952 (its RoPE + KV-cache kernel's int32 offsets).
+TP2_ARGS = [
+    "--trust-remote-code",
+    "--tp-size",
+    "2",
+    "--mem-fraction-static",
+    "0.80",
+    "--max-running-requests",
+    "8",
+    "--cuda-graph-max-bs-decode",
+    "8",
+    "--chunked-prefill-size",
+    "131072",
+    "--kv-cache-dtype",
+    "fp8_e4m3",
+    "--dsa-prefill-backend",
+    "triton",
+    "--dsa-decode-backend",
+    "triton",
+    "--reasoning-parser",
+    "glm45",
+]

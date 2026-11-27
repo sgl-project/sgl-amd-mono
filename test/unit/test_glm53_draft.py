@@ -69,11 +69,28 @@ class _Lm(torch.nn.Module):
         return "its own logits"
 
 
-def _draft(lm, rejection_sampling=False, max_extend=8, max_decode=4):
-    ops = {("index", w): None for w in (4, 8) if w <= max_extend}
-    ops.update({("shared", w): None for w in (2, 4, 8) if w <= max_decode})
+def _draft(
+    lm,
+    rejection_sampling=False,
+    max_extend=8,
+    max_decode=4,
+    extend=None,
+    decode=None,
+    draft_tokens=None,
+):
+    if extend is None:
+        extend = [w for w in (4, 8) if w <= max_extend]
+    if decode is None:
+        decode = [w for w in (2, 4, 8) if w <= max_decode]
+    ops = {("index", w): None for w in extend}
+    ops.update({("shared", w): None for w in decode})
+    tokens = draft_tokens or SPEC_ARGS.speculative_num_draft_tokens
     args = SimpleNamespace(
-        **{**vars(SPEC_ARGS), "speculative_use_rejection_sampling": rejection_sampling}
+        **{
+            **vars(SPEC_ARGS),
+            "speculative_use_rejection_sampling": rejection_sampling,
+            "speculative_num_draft_tokens": tokens,
+        }
     )
     with mock.patch("sglang.srt.runtime_context.get_spec", return_value=args):
         return mtp._Draft(lm, None, ops, {}, {}, torch.zeros(1), torch.zeros(1), 9999)
@@ -169,6 +186,32 @@ def test_tp4_launches_up_to_four_rows():
     fb = _step("DECODE", 4, 4)
     assert lm.forward(fb.input_ids, "p", fb) == ("launched", ("shared", 4))
     assert launched == [("DECODE", 4)]
+
+
+def test_tp2_runs_a_draft_extend_only_at_a_built_width():
+    # TP2 builds width 4 only. With 2 draft tokens SGLang routes draft extends of 2,
+    # 4, 6 and 8 rows: a 1-request extend (2 rows) has no launch, and runs SGLang's
+    # forward instead of looking up ("index", 2)
+    lm, _, launched = _wrapped(extend=[4], decode=[4], draft_tokens=2)
+    fb = _step("DRAFT_EXTEND_V2", 1, 2)
+    assert lm.forward(fb.input_ids, "p", fb) == "the model's forward"
+    fb = _step("DRAFT_EXTEND_V2", 2, 4)
+    assert lm.forward(fb.input_ids, "p", fb) == ("launched", ("index", 4))
+    assert launched == [("DRAFT_EXTEND_V2", 2)]
+
+
+def test_a_draft_with_no_extend_launch_runs_its_decode_steps():
+    # TP2 with 3 draft tokens: the routed extends (3 and 6 rows) fit no TP2 width, so
+    # no NextN indexer launch is built; extends run SGLang's forward, and the draft
+    # decode steps still launch
+    lm, draft, launched = _wrapped(extend=[], decode=[4], draft_tokens=3)
+    assert draft.extend_widths == frozenset() and draft.max_extend == 0
+    for R, rows in ((1, 3), (2, 6)):
+        fb = _step("DRAFT_EXTEND_V2", R, rows)
+        assert lm.forward(fb.input_ids, "p", fb) == "the model's forward"
+    fb = _step("DECODE", 2, 2)
+    assert lm.forward(fb.input_ids, "p", fb) == ("launched", ("shared", 4))
+    assert launched == [("DECODE", 2)]
 
 
 def test_a_sampled_draft_decode_runs_the_standard_path():
@@ -341,7 +384,7 @@ GLM53 = SimpleNamespace(index_topk=TOPK, index_share_for_mtp_iteration=True)
             "a seed of 2049 keys",
         ),
         (SPEC_ARGS, GLM53, _nextn_model(fused=False), 8, "fused DSA indexer"),
-        (SPEC_ARGS, GLM53, _nextn_model(), 2, "TP2"),
+        (SPEC_ARGS, GLM53, _nextn_model(), 1, "TP1"),
         (SPEC_ARGS, GLM53, _nextn_model(eh=_ReplicatedLinear()), 8, "eh_proj is a"),
         # GLM-5.2's MXFP4 checkpoint: bf16 NextN experts (copied as block FP8) and
         # an unquantized ReplicatedLinear eh_proj
@@ -412,10 +455,20 @@ class _Runtime:
 
 
 @pytest.mark.parametrize(
-    "tp, extend, decode", [(8, [4, 8], [2, 4]), (4, [4, 8], [2, 4])]
+    "tp, routed, tokens, extend, decode",
+    [
+        (8, (4, 8), 4, [4, 8], [2, 4]),
+        (4, (4, 8), 4, [4, 8], [2, 4]),
+        # TP2 builds width 4 only
+        (2, (4, 8), 4, [4], [4]),
+        (2, (2, 4, 6, 8), 2, [4], [4]),
+        # 3 draft tokens: no routed extend (3, 6) fits a TP2 width, so no extend launch
+        (2, (3, 6), 3, [], [4]),
+    ],
+    ids=["tp8", "tp4", "tp2", "tp2-2-tokens", "tp2-3-tokens"],
 )
 def test_the_build_runs_the_nextn_launches_and_installs_the_wrapper(
-    tp, extend, decode, caplog
+    tp, routed, tokens, extend, decode, caplog
 ):
     from sgl_amd_mono.glm53.gfx950 import runner, weights
 
@@ -453,7 +506,12 @@ def test_the_build_runs_the_nextn_launches_and_installs_the_wrapper(
                 ),
             },
         ),
-        mock.patch("sglang.srt.runtime_context.get_spec", return_value=SPEC_ARGS),
+        mock.patch(
+            "sglang.srt.runtime_context.get_spec",
+            return_value=SimpleNamespace(
+                **{**vars(SPEC_ARGS), "speculative_num_draft_tokens": tokens}
+            ),
+        ),
         mock.patch(
             "sglang.srt.runtime_context.get_parallel",
             return_value=SimpleNamespace(
@@ -492,7 +550,7 @@ def test_the_build_runs_the_nextn_launches_and_installs_the_wrapper(
             runner, "Glm53HeadOp", lambda rt, w: built.append(("head", rt)) or rt
         ),
     ]
-    ctx = SimpleNamespace(widths=(4, 8), deadline_s=60.0, copies={})
+    ctx = SimpleNamespace(widths=routed, deadline_s=60.0, copies={})
     with contextlib.ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
