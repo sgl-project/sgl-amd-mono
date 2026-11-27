@@ -208,6 +208,14 @@ class TestMonokernelCheck(CustomTestCase):
             past=past,
         )
 
+    def test_each_covered_verify_layer_between_kernel_widths(self):
+        # 5 draft tokens: a verify step and its draft extend have 6 rows a request,
+        # which run at width 8 with 2 pad rows
+        mtp = [*MTP]
+        mtp[mtp.index("--speculative-num-steps") + 1] = "5"
+        mtp[mtp.index("--speculative-num-draft-tokens") + 1] = "6"
+        self._check_layers(mtp, ((1, 200),), new_tokens=16, rows=(6,))
+
     def _check_layers(self, extra_args, batches, new_tokens, rows, past=2048):
         """SGLANG_AMD_MONO_CHECK (eager) on one server, each (requests, repeats)
         batch of a record prompt in turn: both kinds of layer checked at every
@@ -287,10 +295,11 @@ class TestMonokernelCheck(CustomTestCase):
         )
         if "--speculative-algorithm" in extra_args:
             # each MTP draft step on the NextN launches, checked against SGLang's
+            steps = int(extra_args[extra_args.index("--speculative-num-steps") + 1])
             drafts = re.findall(r"monokernel check draft (\d) \((index|shared),", log)
             self.assertEqual(
                 {(int(n), kind) for n, kind in drafts},
-                {(1, "index"), (2, "shared"), (3, "shared")},
+                {(1, "index")} | {(n, "shared") for n in range(2, steps + 1)},
             )
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))

@@ -285,7 +285,7 @@ class _Draft:
             return None
         if mode.is_draft_extend_v2():
             if n == R * self.extend_rows and n <= self.max_extend:
-                return "index", n
+                return "index", target._width(n)
             return None
         if mode.is_decode() and n == R and n <= self.max_decode:
             # a draft decode that samples its proposal (under rejection sampling, a
@@ -561,7 +561,9 @@ def _build(model, hf_config, ctx):
         )
     max_seq = -(-context_len // INDEX_KEYS_PER_TASK) * INDEX_KEYS_PER_TASK
     kv_fp8 = get_model().kv_cache_dtype == "fp8_e4m3"
-    extend_widths = sorted(ctx.widths)
+    extend_rows = sorted(ctx.widths)
+    # as the target's verify steps: rows that are not a kernel width run at the next one
+    extend_widths = sorted({target._width(r) for r in extend_rows})
     # a draft decode step of 5 to 8 rows runs SGLang's path: the NextN shared launch
     # at 8 rows faulted in a kernel check (a process of several launches, not alone)
     decode_widths = [w for w in target.WIDTHS if w <= 4]
@@ -637,7 +639,7 @@ def _build(model, hf_config, ctx):
         "to %d rows run the NextN launches, routed by the spec's wrapper of the "
         "draft's forward; each key logs 'runs the MTP draft step' at its first launch",
         SPEC.name,
-        extend_widths,
+        extend_rows,
         max(decode_widths),
     )
     return draft

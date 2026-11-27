@@ -69,11 +69,15 @@ class _Lm(torch.nn.Module):
         return "its own logits"
 
 
-def _draft(lm, rejection_sampling=False, max_extend=8, max_decode=4):
+def _draft(lm, rejection_sampling=False, max_extend=8, max_decode=4, draft_tokens=4):
     ops = {("index", w): None for w in (4, 8) if w <= max_extend}
     ops.update({("shared", w): None for w in (2, 4, 8) if w <= max_decode})
     args = SimpleNamespace(
-        **{**vars(SPEC_ARGS), "speculative_use_rejection_sampling": rejection_sampling}
+        **{
+            **vars(SPEC_ARGS),
+            "speculative_use_rejection_sampling": rejection_sampling,
+            "speculative_num_draft_tokens": draft_tokens,
+        }
     )
     with mock.patch("sglang.srt.runtime_context.get_spec", return_value=args):
         return mtp._Draft(lm, None, ops, {}, {}, torch.zeros(1), torch.zeros(1), 9999)
@@ -169,6 +173,16 @@ def test_tp4_launches_up_to_four_rows():
     fb = _step("DECODE", 4, 4)
     assert lm.forward(fb.input_ids, "p", fb) == ("launched", ("shared", 4))
     assert launched == [("DECODE", 4)]
+
+
+def test_a_draft_extend_between_kernel_widths_launches_at_the_next_width():
+    # EAGLE 5-1-6 extends 6 rows a request; only the kernel widths have launches
+    lm, _, launched = _wrapped(draft_tokens=6)
+    fb = _step("DRAFT_EXTEND_V2", 1, 6)
+    assert lm.forward(fb.input_ids, "p", fb) == ("launched", ("index", 8))
+    assert launched == [("DRAFT_EXTEND_V2", 1)]
+    fb = _step("DRAFT_EXTEND_V2", 2, 12)
+    assert lm.forward(fb.input_ids, "p", fb) == "the model's forward"
 
 
 def test_a_sampled_draft_decode_runs_the_standard_path():
