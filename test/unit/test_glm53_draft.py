@@ -411,12 +411,33 @@ class _Runtime:
         self.precompiled = True
 
 
+# SGLang's widths for the draft: every multiple of the draft tokens up to 16 rows
+# (sglang/srt/kernel_plugins/amd/binding.py); the launches take any rows up to 4,
+# even rows up to 8, and past 8 the TP size's widths (12 and 16 at TP8, 12 at TP4).
+# No extend of 5 or 7 draft tokens runs a launch.
+BUILDS = [
+    (8, 4, [4, 8, 12, 16]),
+    (4, 4, [4, 8, 12]),
+    (8, 3, [3, 6, 12]),
+    (4, 3, [3, 6, 12]),
+    (8, 2, [2, 4, 6, 8, 12, 16]),
+    (4, 2, [2, 4, 6, 8, 12]),
+    (8, 5, []),
+    (4, 5, []),
+    (8, 6, [6, 12]),
+    (4, 6, [6, 12]),
+    (8, 7, []),
+    (4, 7, []),
+]
+
+
 @pytest.mark.parametrize(
-    "tp, extend, decode", [(8, [4, 8], [2, 4]), (4, [4, 8], [2, 4])]
+    "tp, tokens, extend", BUILDS, ids=[f"tp{t}-{n}tokens" for t, n, _ in BUILDS]
 )
 def test_the_build_runs_the_nextn_launches_and_installs_the_wrapper(
-    tp, extend, decode, caplog
+    tp, tokens, extend, caplog
 ):
+    decode = [2, 4]
     from sgl_amd_mono.glm53.gfx950 import runner, weights
 
     built = []
@@ -492,7 +513,9 @@ def test_the_build_runs_the_nextn_launches_and_installs_the_wrapper(
             runner, "Glm53HeadOp", lambda rt, w: built.append(("head", rt)) or rt
         ),
     ]
-    ctx = SimpleNamespace(widths=(4, 8), deadline_s=60.0, copies={})
+    ctx = SimpleNamespace(
+        widths=tuple(range(tokens, 17, tokens)), deadline_s=60.0, copies={}
+    )
     with contextlib.ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
@@ -520,6 +543,14 @@ def test_the_build_runs_the_nextn_launches_and_installs_the_wrapper(
     assert all(rt.precompiled for rt in nextn + heads)
     assert "forward" in lm.__dict__ and isinstance(draft, mtp._Draft)
     assert "run the NextN launches, routed by the spec's wrapper" in caplog.text
+    # every draft extend of whole requests runs a built launch or SGLang's path
+    draft.extend_rows = tokens
+    for R in range(1, 16 // tokens + 1):
+        kind = draft._kind(_step("DRAFT_EXTEND_V2", R, R * tokens))
+        if R * tokens in extend:
+            assert kind == ("index", R * tokens) and kind in draft.ops
+        else:
+            assert kind is None
 
 
 # ------------------------------------------------------------- draft check metrics

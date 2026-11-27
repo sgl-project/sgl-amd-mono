@@ -228,9 +228,11 @@ class _Draft:
         self.epochs = epochs
         self.cos, self.sin = cos, sin
         self.max_position = max_position
-        # a draft extend's rows at most (whole requests), a draft decode step's
-        self.max_extend = max(w for k, w in ops if k == "index")
-        self.max_decode = max(w for k, w in ops if k == "shared")
+        # a draft extend's rows (whole requests, each at its own width), a draft
+        # decode step's at most
+        self.extend_widths = frozenset(w for k, w in ops if k == "index")
+        self.decode_widths = tuple(sorted(w for k, w in ops if k == "shared"))
+        self.max_decode = self.decode_widths[-1]
         self.extend_rows = _tokens_per_request(lm)
         self.rejection_sampling = bool(get_spec().speculative_use_rejection_sampling)
         self.check = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
@@ -284,7 +286,7 @@ class _Draft:
         if R < 1:
             return None
         if mode.is_draft_extend_v2():
-            if n == R * self.extend_rows and n <= self.max_extend:
+            if n == R * self.extend_rows and n in self.extend_widths:
                 return "index", n
             return None
         if mode.is_decode() and n == R and n <= self.max_decode:
@@ -293,7 +295,7 @@ class _Draft:
             info = fb.sampling_info
             if self.rejection_sampling and info is not None and not info.is_all_greedy:
                 return None
-            return "shared", target._width(n)
+            return "shared", target._width(n, self.decode_widths)
         return None
 
     def _why_not(self, fb, kind: str) -> Optional[str]:
@@ -561,10 +563,19 @@ def _build(model, hf_config, ctx):
         )
     max_seq = -(-context_len // INDEX_KEYS_PER_TASK) * INDEX_KEYS_PER_TASK
     kv_fp8 = get_model().kv_cache_dtype == "fp8_e4m3"
-    extend_widths = sorted(ctx.widths)
+    allowed = target.tp_widths(p.tp_size)
+    # SGLang routes every multiple of the draft tokens. A launch takes any rows up
+    # to 4, even rows up to 8 (odd rows past 4 do not trace: the kernel asserts
+    # them), and past 8 only a width of this TP size (the kernel checks run 12 and
+    # 16). A draft extend runs at its own rows, so the other extends run SGLang's
+    # path. The target's native_fp4 cap does not apply: the NextN layer's experts
+    # are not native_fp4 (nextn below)
+    extend_widths = sorted(
+        w for w in ctx.widths if w <= 4 or (w <= 8 and w % 2 == 0) or w in allowed
+    )
     # a draft decode step of 5 to 8 rows runs SGLang's path: the NextN shared launch
     # at 8 rows faulted in a kernel check (a process of several launches, not alone)
-    decode_widths = [w for w in target.WIDTHS if w <= 4]
+    decode_widths = [w for w in allowed if w <= 4]
     layer = target._Layer(layer_id, decoder, weights)
     shared_w = msgspec.structs.replace(weights, index=None)
     widths = sorted(set(extend_widths) | set(decode_widths))

@@ -1,9 +1,9 @@
 """GLM-5.3 with --enable-amd-monokernel on MI35x, TP8 (RFC #43949), across the
-switch points: decode steps of 1 to 8 rows run the kernels, wider ones the normal
-path, and requests join and leave a running batch that steps past 8 rows and back
+switch points: decode steps of 1 to 16 rows run the kernels, wider ones the normal
+path, and requests join and leave a running batch that steps past 16 rows and back
 (a short GSM8K run, for gross failures); the tokens of covered steps scored again by
-the normal prefill path (KL consistency); with MTP, verify steps of 1 and 2 requests
-(4 and 8 rows) on the kernels, and the NextN draft's extend of 1 and 2 requests on
+the normal prefill path (KL consistency); with MTP, verify steps of 1 to 4 requests
+(4 to 16 rows) on the kernels, and the NextN draft's extend of 1 to 4 requests on
 its launches (GSM8K and the draft's accept length); each covered layer against the
 normal one, in decode and verify steps, and in verify steps on the E4M3 MLA cache,
 the dense layers' MLPs, the tail's logits and each MTP draft step against SGLang's
@@ -39,6 +39,10 @@ LAUNCH_TIMEOUT = 3600
 # the MXFP4 checkpoint (amd/GLM-5.3-Quark-MXFP4-AttnFP8), not the FP8 one
 _quant = AutoConfig.from_pretrained(MODEL, trust_remote_code=True).quantization_config
 MXFP4 = _quant.get("quant_method") == "quark"
+# GLM-5.2's MXFP4 checkpoint keeps its dense MLPs bf16: its MXFP4 experts run MXFP8
+# rows (native_fp4), which launch up to spec.NATIVE_FP4_ROWS rows
+NATIVE_FP4 = MXFP4 and "model.layers.0.mlp.down_proj" in _quant.get("exclude", [])
+MAX_ROWS = 8 if NATIVE_FP4 else 16
 # The normal path scores about 0.97 on GSM8K (thinking on); the bound is for gross
 # failures
 GSM8K_BOUND = 0.90
@@ -64,14 +68,14 @@ def _launch(extra_env=None, extra_args=(), log=None):
 
 
 def _gsm8k():
-    """GSM8K, 200 questions 12 at a time, thinking on."""
+    """GSM8K, 200 questions 20 at a time, thinking on."""
     return run_sgl_eval(
         SimpleNamespace(
             base_url=DEFAULT_URL_FOR_TEST,
             model=MODEL,
             eval_name="gsm8k",
             num_examples=200,
-            num_threads=12,
+            num_threads=20,
             max_tokens=32768,
             temperature=1.0,
             top_p=0.95,
@@ -92,18 +96,18 @@ class TestMonokernelDecode(CustomTestCase):
             terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k_past_the_largest_width(self):
-        # 12 requests at a time: the batch steps past 8 rows as it fills, and back
+        # 20 requests at a time: the batch steps past 16 rows as it fills, and back
         # as it drains
         metrics = _gsm8k()
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], GSM8K_BOUND)
 
     def test_covered_steps_match_prefill(self):
-        # one graph per batch (ignore_eos keeps its rows): 2, 3, 7 and 8 rows (widths
-        # 2, 4 and 8, pad rows at 3 and 7). Each graph reads its own page table; with
-        # the cache flushed, a graph replayed first on another's reads none of this
-        # batch's pages
-        for rows in (2, 3, 7, 8):
+        # one graph per batch (ignore_eos keeps its rows): 2, 3, 7, 11 and 16 rows
+        # (widths 2, 4, 8, 12 and 16, pad rows at 3, 7 and 11). Each graph reads its
+        # own page table; with the cache flushed, a graph replayed first on another's
+        # reads none of this batch's pages
+        for rows in (2, 3, 7, 11, 16):
             requests.post(DEFAULT_URL_FOR_TEST + "/flush_cache").raise_for_status()
             assert_logprobs_match(
                 DEFAULT_URL_FOR_TEST,
@@ -148,7 +152,7 @@ class TestMonokernelMtp(CustomTestCase):
         strict=False,
     )
     def test_gsm8k_and_accept_length_past_the_largest_width(self):
-        # 12 requests at a time: verify steps of 1 and 2 requests run the kernels,
+        # 20 requests at a time: verify steps of 1 to 4 requests run the kernels,
         # wider ones the normal path. A verify row that attends the wrong keys of
         # its draft chain lowers the accept length before the score
         metrics = _gsm8k()
@@ -157,7 +161,7 @@ class TestMonokernelMtp(CustomTestCase):
         print(f"{metrics=} {accept=}")
         self.assertGreater(metrics["score"], GSM8K_BOUND)
         self.assertGreater(accept, MTP_ACCEPT_BOUND)
-        # the draft extends of 1 and 2 requests ran the NextN launches (these
+        # the draft extends of 1 to 4 requests ran the NextN launches (these
         # requests sample, so under rejection sampling the draft decode steps run
         # SGLang's path; the check-mode test runs them greedy)
         self.err.seek(0)
@@ -165,32 +169,43 @@ class TestMonokernelMtp(CustomTestCase):
         log = self.err.read() + self.out.read()
         steps = re.findall(r"runs the MTP draft step \('(\w+)', (\d+), (\d+)\)", log)
         self.assertLessEqual(
-            {("DRAFT_EXTEND_V2", "1", "4"), ("DRAFT_EXTEND_V2", "2", "8")}, set(steps)
+            {("DRAFT_EXTEND_V2", str(n), str(4 * n)) for n in (1, 2, 3, 4)}, set(steps)
         )
 
 
 class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
-        # 1, 3 and 8 rows run at widths 2, 4 and 8 (pad rows on the first two), and
-        # the long prompt's positions pass 2048, where the indexer selects keys
+        # 1, 3, 8, 12 and 16 rows run at widths 2, 4, 8, 12 and 16 (pad rows on the
+        # first two), and the long prompts' positions pass 2048, where the indexer
+        # selects keys: one request and decode steps of 12 and 16 (the CI recipe's
+        # rows past 8)
         self._check_layers(
-            [], ((1, 2), (3, 2), (8, 2), (1, 200)), new_tokens=4, rows=(1, 3, 8)
+            [],
+            ((1, 2), (3, 2), (8, 2), (16, 2), (1, 200), (12, 200), (16, 200)),
+            new_tokens=4,
+            rows=(1, 3, 8, 12, 16),
+            past_rows=(1, 12, 16),
         )
 
     def test_each_covered_verify_layer_within_its_numerics(self):
-        # MTP verify steps of 1 and 2 requests (4 and 8 rows) past 2048 keys. The
+        # MTP verify steps of 1 to 4 requests (4 to 16 rows) past 2048 keys. The
         # check poisons the cached scales of this step's keys, so a launch that reads
         # a row's earlier drafts from the cache misses some of them (layer.topk_own)
-        self._check_layers(MTP, ((1, 200), (2, 200)), new_tokens=16, rows=(4, 8))
+        self._check_layers(
+            MTP,
+            ((1, 200), (2, 200), (3, 200), (4, 200)),
+            new_tokens=16,
+            rows=(4, 8, 12, 16),
+        )
 
     def test_each_covered_verify_layer_within_its_numerics_with_fp8_kv(self):
         # The E4M3 MLA cache (SGLang's HIP DSA rows: 576 values, no scales): the
         # launches write the rows SGLang writes and attend the values it reads back
         self._check_layers(
             [*MTP, "--kv-cache-dtype", "fp8_e4m3"],
-            ((1, 200), (2, 200)),
+            ((1, 200), (2, 200), (3, 200), (4, 200)),
             new_tokens=16,
-            rows=(4, 8),
+            rows=(4, 8, 12, 16),
         )
 
     def test_each_covered_layer_past_the_parallel_top_k(self):
@@ -208,12 +223,17 @@ class TestMonokernelCheck(CustomTestCase):
             past=past,
         )
 
-    def _check_layers(self, extra_args, batches, new_tokens, rows, past=2048):
+    def _check_layers(
+        self, extra_args, batches, new_tokens, rows, past=2048, past_rows=()
+    ):
         """SGLANG_AMD_MONO_CHECK (eager) on one server, each (requests, repeats)
         batch of a record prompt in turn: both kinds of layer checked at every
-        count in ``rows``, an indexer layer past ``past`` keys, and no violation."""
+        count in ``rows`` the launches take, an indexer layer past ``past`` keys (at
+        each count in ``past_rows`` the launches take), and no violation."""
         from transformers import AutoTokenizer
 
+        rows = tuple(r for r in rows if r <= MAX_ROWS)
+        past_rows = tuple(r for r in past_rows if r <= MAX_ROWS)
         para = "The river valley archive lists the flood height of every year. "
         tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
         with (
@@ -285,6 +305,14 @@ class TestMonokernelCheck(CustomTestCase):
         self.assertTrue(
             any(k == "indexer" and int(hi) >= past for k, _, hi, _ in checks)
         )
+        for r in past_rows:
+            self.assertTrue(
+                any(
+                    k == "indexer" and int(n) == r and int(hi) >= past
+                    for k, n, hi, _ in checks
+                ),
+                f"no indexer check of {r} rows past {past} keys",
+            )
         if "--speculative-algorithm" in extra_args:
             # each MTP draft step on the NextN launches, checked against SGLang's
             drafts = re.findall(r"monokernel check draft (\d) \((index|shared),", log)

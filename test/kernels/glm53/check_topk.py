@@ -194,7 +194,12 @@ def rows_of(rowset: str, width: int, pos: int):
     if rowset == "chain":
         return [pos + s for s in range(width)], [0] * width
     assert rowset == "mixed", rowset
+    # a position a row, up to the widest launch (check_layer.py's POSITIONS)
     mixed = [pos, 1500, pos // 2, 300, pos - 7, 2047, 2048, 9000]
+    mixed += [3000, 700, 4096, 2049, 6000, 1024, 8000, 2100]
+    assert len(mixed) >= width, (
+        f"{width} rows: the mixed rowset has {len(mixed)} positions"
+    )
     return [min(p, pos) for p in mixed[:width]], list(range(width))
 
 

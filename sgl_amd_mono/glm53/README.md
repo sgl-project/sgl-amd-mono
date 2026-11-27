@@ -1,9 +1,27 @@
 # GLM-5.3 monokernels on gfx950
 
-`sgl_amd_mono/glm53/` runs GLM-5.3's decode and MTP verify steps of up to 8 rows on MI355X (gfx950), at TP 4 or 8,
-through SGLang's monokernel interface (RFC sgl-project/sglang#43949). Each of the 78 decoder layers is one launch, and
-the final norm, LM head and logits all-gather are one more (the tail). The NextN draft's steps run on the same launches.
-SGLang's forward runs prefill, extend and the steps wider than 8 rows.
+`sgl_amd_mono/glm53/` runs GLM-5.3's decode and MTP verify steps of up to 16 rows (12 at TP4) on MI355X (gfx950), at
+TP 4 or 8, through SGLang's monokernel interface (RFC sgl-project/sglang#43949). Each of the 78 decoder layers is one
+launch, and the final norm, LM head and logits all-gather are one more (the tail). The NextN draft's steps run on the
+same launches. SGLang's forward runs prefill, extend and the wider steps.
+
+## Widths
+
+A step's rows are its requests times their tokens (1 in decode, the MTP draft tokens in verify). A step runs at the
+next width the server built; its rows past the step's are pad rows (a one-row launch never completes on gfx950).
+
+| TP | widths (`spec.tp_widths`) | a wider step |
+| --- | --- | --- |
+| 8 | 2, 4, 8, 12, 16 | SGLang's forward |
+| 4 | 2, 4, 8, 12 | SGLang's forward |
+
+At TP4 a rank has 16 attention heads, and a 16-row launch's LDS arena outgrows the 160 KiB a workgroup has, so
+`spec.TP_WIDTHS` caps TP4 at 12 rows. Up to 8 rows a launch's arena stays within 128 KiB. GLM-5.2's MXFP4 experts on
+MXFP8 rows (the FP4 MFMA, `native_fp4`) launch up to 8 rows at either TP size (`spec.NATIVE_FP4_ROWS`). The NextN
+draft runs its extends of whole requests on the launches at their own rows: any rows up to 4, even rows up to 8, and
+past 8 the TP size's widths (an extend of 5 or 7 rows, or a 9-row extend of 3 requests of 3 tokens, runs SGLang's
+path: above 4 rows a launch has even rows). It runs its decode steps of up to 4 rows on the launches; a draft decode
+step of 5 or more rows runs SGLang's path.
 
 ## Files
 

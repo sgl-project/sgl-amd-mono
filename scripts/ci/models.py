@@ -225,12 +225,12 @@ MODELS = {
         "kernel_tests": ["test/kernels/test_glm53_kernels.py"],
         "e2e_tests": ["test/e2e/test_glm53_server.py"],
         "microbench": [
-            "torchrun --nproc-per-node 8 test/kernels/glm53/time_layers.py --kind model --rows 2,4,8"
+            "torchrun --nproc-per-node 8 test/kernels/glm53/time_layers.py --kind model --rows 2,4,8,12,16"
         ],
         "evals": TEXT_EVALS,
-        # decode steps of up to 8 rows
+        # decode steps of up to 16 rows
         "concurrency": [1, 2, 4, 8, 16],
-        "gate_concurrency": [1, 8],
+        "gate_concurrency": [1, 8, 16],
     },
     "glm52_mxfp4": {
         "name": "GLM-5.2 (MXFP4)",
@@ -265,12 +265,12 @@ MODELS = {
         "kernel_tests": [],
         "e2e_tests": ["test/e2e/test_glm53_server.py"],
         "microbench": [
-            "torchrun --nproc-per-node 8 test/kernels/glm53/time_layers.py --kind model --rows 2,4,8 --mxfp4"
+            "torchrun --nproc-per-node 8 test/kernels/glm53/time_layers.py --kind model --rows 2,4,8,12,16 --mxfp4"
         ],
         "evals": TEXT_EVALS,
-        # decode steps of up to 8 rows
+        # decode steps of up to 16 rows
         "concurrency": [1, 2, 4, 8, 16],
-        "gate_concurrency": [1, 8],
+        "gate_concurrency": [1, 8, 16],
     },
     "glm53_flash": {
         "name": "GLM-5.3-Flash",

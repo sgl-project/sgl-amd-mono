@@ -17,8 +17,8 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
 | DeepSeek-V4-Pro | MI355X (gfx950) | 8 | All 61 layers (one launch each) in decode steps of up to 8 rows, and DSpark verify steps of one request (5 to 8 tokens) |
 | GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | All 45 layers (one launch each; layer 0 from the tokens, with the embedding) and the final norm, LM head and logits (one launch), in decode and MTP verify steps of up to 16 rows (4 at TP2), on an f32 or bf16 KDA state (`--mamba-ssm-dtype bfloat16`) |
-| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows |
-| GLM-5.2 (MXFP4 experts) | MI355X (gfx950) | 4, 8 | As GLM-5.3; the routed experts in MXFP4, on MXFP8 activations |
+| GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 16 rows (12 at TP4) |
+| GLM-5.2 (MXFP4 experts) | MI355X (gfx950) | 4, 8 | As GLM-5.3, in steps of up to 8 rows; the routed experts in MXFP4, on MXFP8 activations |
 | GLM-5.3 (MXFP4) | MI355X (gfx950) | 4, 8 | As GLM-5.3 |
 | Kimi-K3 | MI350X, MI355X (gfx950) | 8 | Every MoE layer in decode and DSpark verify steps of up to 8 rows |
 | Kimi-K3.1 | MI350X, MI355X (gfx950) | 8 | Kimi-K3's launches on every MoE layer in DSpark and DFLASH verify steps of one request (the MLA layers' projection front too, without DCP), and one launch a KDA layer in verify steps of 2 to 48 requests |

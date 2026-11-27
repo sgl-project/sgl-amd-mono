@@ -7,12 +7,14 @@ the dense MLP's expert slices and the embedding and LM-head shards, and the laye
 check's top-k metric, cache poisoning, tail check and reported outputs.
 SGLang checks its declared requirements, the same way for every spec."""
 
+import contextlib
 import logging
 import math
 import sys
 from types import SimpleNamespace
 from unittest import mock
 
+import msgspec
 import pytest
 import torch
 import triton_interpreter
@@ -112,7 +114,144 @@ KINDS = ("embed", "dense", "index", "shared", "head")
 
 def test_a_step_runs_at_the_next_width():
     # a one-row launch never completes on gfx950: one row runs at width 2
-    assert [glm53._width(r) for r in glm53.ROWS] == [2, 2, 4, 4, 8, 8, 8, 8]
+    assert [glm53._width(r) for r in glm53.ROWS] == (
+        [2, 2, 4, 4] + [8] * 4 + [12] * 4 + [16] * 4
+    )
+
+
+def test_tp4_launches_take_12_rows_and_a_wider_step_runs_the_model_s_forward():
+    # TP4's 16 heads a rank: a 16-row launch outgrows the LDS
+    assert glm53.tp_widths(4) == (2, 4, 8, 12) and glm53.tp_widths(8) == glm53.WIDTHS
+    assert [glm53._width(r, glm53.tp_widths(4)) for r in range(1, 13)] == (
+        [2, 2, 4, 4] + [8] * 4 + [12] * 4
+    )
+    lm = _Lm()
+    runtimes = {(w, k): None for w in glm53.tp_widths(4) for k in KINDS}
+    built = _built(lm, {}, runtimes)
+    assert built.widths == (2, 4, 8, 12) and built.max_rows == 12
+    # 4 requests' MTP3 verify rows, and a decode step of 13 requests
+    for mode, requests, tokens in (("target_verify", 4, 4), ("decode", 13, 1)):
+        key = registry.ShapeKey(
+            forward_mode=mode, batch_size=requests, tokens_per_request=tokens
+        )
+        out = built.forward(registry.Plan(key=key), "ids", "positions", "batch")
+        assert out == "the model's forward"
+    assert len(lm.ran) == 2
+
+
+class _BuildWeights(msgspec.Struct, frozen=True):
+    """A layer's weights as the build reads them."""
+
+    shuffled: bool
+    dense: int
+    index: object
+    mxfp4: bool
+    w_r: object = None
+
+
+class _BuildRuntime:
+    def __init__(self, key, rank, group, device, epochs):
+        self.key = key
+
+    def set_deadline(self, s):
+        pass
+
+    def precompile(self):
+        pass
+
+
+# (TP size, MXFP4 experts on MXFP8 rows (GLM-5.2), the widths built) when SGLang
+# routes 1 to 16 rows
+SPEC_BUILDS = [
+    (8, False, [2, 4, 8, 12, 16]),
+    (4, False, [2, 4, 8, 12]),
+    (8, True, [2, 4, 8]),
+    (4, True, [2, 4, 8]),
+]
+
+
+@pytest.mark.parametrize(
+    "tp, native_fp4, widths",
+    SPEC_BUILDS,
+    ids=[f"tp{t}-{'native_fp4' if n else 'fp8'}" for t, n, _ in SPEC_BUILDS],
+)
+def test_the_build_launches_only_the_widths_of_its_tp_size_and_experts(
+    tp, native_fp4, widths
+):
+    from sgl_amd_mono.glm53.gfx950 import runner, weights
+
+    # GLM-5.2: MXFP4 experts next to bf16 dense MLPs (copied as block FP8)
+    config = SimpleNamespace(num_hidden_layers=5)
+    model = _Lm()
+    model.model.layers = [
+        SimpleNamespace(input_layernorm=SimpleNamespace(weight=torch.zeros(1)))
+    ] * 5
+
+    def layer_weights(layer, i, tp, copies):
+        return _BuildWeights(
+            shuffled=True,
+            dense=4 if i < 3 else 0,
+            index="ix" if i < 4 else None,
+            mxfp4=native_fp4 and i >= 3,
+        )
+
+    vocab_rows = 154880 // tp
+    built_keys = []
+    ctx = SimpleNamespace(widths=glm53.ROWS, deadline_s=60.0, copies={})
+    with contextlib.ExitStack() as stack:
+        for p in (
+            mock.patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(
+                    tp_size=tp, tp_rank=0, tp_group=SimpleNamespace(cpu_group=None)
+                ),
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_model",
+                return_value=SimpleNamespace(kv_cache_dtype="auto"),
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.process_model_config",
+                return_value=SimpleNamespace(context_len=202752),
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_device",
+                return_value=SimpleNamespace(watchdog_timeout=1200),
+            ),
+            mock.patch.object(weights, "layer_weights", layer_weights),
+            mock.patch.object(
+                weights, "rope_tables", lambda *a: (torch.zeros(202752, 1),) * 2
+            ),
+            mock.patch.object(
+                weights, "embedding", lambda *a: torch.zeros(vocab_rows, 1)
+            ),
+            mock.patch.object(
+                weights,
+                "head_weights",
+                lambda *a: SimpleNamespace(w_head=torch.zeros(vocab_rows, 1)),
+            ),
+            mock.patch.object(runner, "Glm53Runtime", _BuildRuntime),
+            mock.patch.object(
+                runner, "Glm53LayerOp", lambda rt, w, n: built_keys.append(rt.key)
+            ),
+            mock.patch.object(runner, "Glm53HeadOp", lambda rt, w: None),
+        ):
+            stack.enter_context(p)
+        built = glm53._build(model, config, ctx)
+    assert list(built.widths) == widths and built.max_rows == widths[-1]
+    assert sorted({k.rows for k in built_keys}) == widths
+    # only the MoE launches take MXFP4 experts on MXFP8 rows
+    moe = [k for k in built_keys if not k.dense]
+    assert moe and all(k.native_fp4 == native_fp4 for k in moe)
+    assert not any(k.native_fp4 for k in built_keys if k.dense)
+    # a step past the widths runs the model's forward
+    key = registry.ShapeKey(
+        forward_mode="decode", batch_size=widths[-1] + 1, tokens_per_request=1
+    )
+    if key.rows <= max(glm53.ROWS):
+        assert built.forward(registry.Plan(key=key), "ids", "pos", "batch") == (
+            "the model's forward"
+        )
 
 
 def test_a_step_from_embeddings_runs_the_model_s_forward():
