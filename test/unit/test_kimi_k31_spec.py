@@ -4,7 +4,6 @@ wider ones to the wide launch."""
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 import sgl_amd_mono
@@ -46,20 +45,28 @@ def test_the_launches_name_their_server_args():
     assert server_args["speculative_algorithm"] == frozenset({"DSPARK", "DFLASH"})
 
 
-# kimi_k31's checks on one covered KDA layer, Kimi-K3's own checks taken as
-# passing (test_kimi_k3_spec pins those: they accept a Quark FP8 o_proj).
-# ``in_proj=None`` is a layer whose KDA in_proj is not merged; ``o_proj=None`` is
-# a qweight-only (GPTQ / AWQ-style) o_proj with no ``weight``.
-def _reasons(monkeypatch, *, in_proj=torch.bfloat16, o_proj=torch.bfloat16):
+def _reasons(monkeypatch, *, in_proj=torch.bfloat16):
+    from sgl_amd_mono.kimi_k3 import CORE, HF_CONFIG
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+
     monkeypatch.setattr(k31.k3, "_model_disable_reasons", lambda *a: [])
+    monkeypatch.setattr(k31.k3, "_wide_will_run", lambda: False)
     monkeypatch.setattr(wide, "_is_covered", lambda layer: True)
 
-    def lin(dtype):
-        return SimpleNamespace(weight=torch.zeros(8, 8, dtype=dtype))
-
+    hidden = HF_CONFIG["hidden_size"]
     attn = SimpleNamespace(
-        _qkvgbfa_layer=None if in_proj is None else lin(in_proj),
-        o_proj=SimpleNamespace(qweight=None) if o_proj is None else lin(o_proj),
+        use_full_rank_gate=True,
+        _bfa_f_b_w=None,
+        fused_qkvg_proj=SimpleNamespace(weight=torch.empty(1, 1, dtype=torch.bfloat16)),
+        _qkvgbfa_layer=(
+            None
+            if in_proj is None
+            else SimpleNamespace(weight=torch.empty(kda.NPROJ, hidden, dtype=in_proj))
+        ),
+        f_b_proj=SimpleNamespace(
+            weight=torch.empty(kda.PROJ, kda.HD, dtype=torch.bfloat16)
+        ),
+        o_proj=SimpleNamespace(weight=torch.empty(hidden, CORE, dtype=torch.bfloat16)),
     )
     layers = [SimpleNamespace(self_attn=attn)]
     return k31._model_disable_reasons(
@@ -71,51 +78,43 @@ def test_a_bf16_kda_layer_passes(monkeypatch):
     assert _reasons(monkeypatch) == []
 
 
-@pytest.mark.parametrize(
-    "dtypes",
-    [
-        {"o_proj": torch.float8_e4m3fn},
-        {"in_proj": torch.float8_e4m3fn},
-        {"in_proj": torch.float32},
-    ],
-    ids=["fp8-o_proj", "fp8-in_proj", "fp32-in_proj"],
-)
-def test_a_kda_weight_the_wide_launch_cannot_read_is_refused(monkeypatch, dtypes):
-    # Kimi-K3's checks accept a Quark FP8 o_proj (K1 and the layer launch read it),
-    # but the wide launch reads the in_proj and o_proj weights as bf16: an FP8 one
-    # would be read as if it were bf16.
-    reasons = _reasons(monkeypatch, **dtypes)
-    assert any("not bf16" in r for r in reasons), reasons
+def test_a_kda_weight_the_wide_launch_cannot_read_is_refused(monkeypatch):
+    reasons = _reasons(monkeypatch, in_proj=torch.float32)
+    assert any("merged KDA in-projection" in r for r in reasons), reasons
 
 
-def test_an_unmerged_in_proj_is_reported_once(monkeypatch):
-    # an unmerged layer has no merged weight to read; it is refused for that alone
-    reasons = _reasons(monkeypatch, in_proj=None, o_proj=torch.float8_e4m3fn)
-    assert reasons == ["layers [0]: the KDA in_proj is not merged"], reasons
+def test_an_unmerged_in_proj_is_refused(monkeypatch):
+    reasons = _reasons(monkeypatch, in_proj=None)
+    assert any("not merged" in r for r in reasons), reasons
 
 
-def test_a_qweight_only_o_proj_leaves_the_refusal_to_kimi_k3(monkeypatch):
-    """A merged layer whose o_proj has no ``weight`` is reported by Kimi-K3's checks
-    ("o_proj has no weight"); kimi_k31's own checks must not raise on it."""
-    assert _reasons(monkeypatch, o_proj=None) == []
-
-
-def test_the_wide_launch_refuses_a_bf16_kda_state(monkeypatch):
-    """The wide KDA stage reads the recurrent state as fp32; a bf16 state (which
-    Kimi-K3's K1 accepts) must not reach it."""
-    from sglang.srt.environ import envs
-
+def test_k31_refuses_k3_wide_disabled(monkeypatch):
+    monkeypatch.setattr(k31.k3, "WIDE", False)
     monkeypatch.setattr(k31.k3, "_config_disable_reasons", lambda *a: [])
-    monkeypatch.setattr(
-        k31.k3, "_text_config", lambda hf: SimpleNamespace(dsa_config={})
-    )
+    cfg = SimpleNamespace(speculative_num_draft_tokens=6)
+    hf = SimpleNamespace(text_config=SimpleNamespace(dsa_config={"index_topk": 2048}))
+    reasons = k31._config_disable_reasons(cfg, hf)
+    assert any("SGLANG_AMD_MONO_K3_WIDE=0" in r for r in reasons), reasons
 
-    def refused():
-        cfg = SimpleNamespace(dcp_size=8, speculative_num_draft_tokens=6)
-        reasons = k31._config_disable_reasons(cfg, None)
-        return any("the wide launch reads float32" in r for r in reasons)
 
-    with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
-        assert refused()
-    with envs.SGLANG_MAMBA_SSM_DTYPE.override("float32"):
-        assert not refused()
+def test_row_count_tile_configs_meet_plan_and_tile_invariants():
+    # Guards against out-of-bounds K-splits or LDS/CTA overflows across all (L, bucket) pairs.
+    import math
+
+    from sgl_amd_mono.common.plan import BLOCKS
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
+    from sgl_amd_mono.kimi_k31.gfx950.chain import Gemm
+    from sgl_amd_mono.kimi_k31.gfx950.stages.tile_mma import BK
+
+    for L in wide.SUPPORTED_L:
+        for b in wide.buckets(L):
+            gu, gi, go, gf, gs = (
+                Gemm(*(int(v) for v in c.split(":"))) for c in wide.cfg_rows(b, L)
+            )
+            assert gu.ks > 1 and gi.ks > 1 and gf.ks > 1 and gs.ks == 1
+            assert (wide.LAT // gu.ks) % BK == 0 and (wide.H // gi.ks) % BK == 0
+            assert (wide.KO // go.ks) % BK == 0 and (wide.H // gf.ks) % BK == 0
+            assert k1.FA_0 % gi.bn == 0 and wide.SL % go.bn == 0
+            assert (
+                math.ceil(b / gf.bm) * math.ceil(wide.NF / gf.bn) * gf.ks <= BLOCKS * 4
+            )

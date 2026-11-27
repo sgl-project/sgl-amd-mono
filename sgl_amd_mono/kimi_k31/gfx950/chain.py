@@ -113,15 +113,32 @@ def plan(m, go, gf, nf, nvb=0):
 
 @flyc.jit
 def _rs_piece(
-    c, piece, m, sl, rb, bn, res, res_out, pdone, tl_on, tls, first, res_cm=0, ldo=0
+    c,
+    piece,
+    m,
+    sl,
+    rb,
+    bn,
+    res,
+    res_out,
+    pdone,
+    tl_on,
+    tls,
+    first,
+    res_cm=0,
+    ldo=0,
+    ldi=0,
+    res_bytes=None,
 ):
     """Sum piece ``piece``'s TP sources in rank order, add the residual, store the
     new residual (device scope: the seam's CTA reads it), mark the piece. ``ldo``:
-    ``res_out``'s row stride (0: sl)."""
+    ``res_out``'s row stride (0: sl). ``ldi``: ``res``'s row stride (0: sl).
+    ``res_bytes``: readable bytes from ``res`` (OOB rows read 0)."""
     tid = c["tid"]
     q8 = bn // 8
     ct = sl // bn
     ldo = ldo or sl
+    ldi = ldi or sl
     if tid < TP:
         c["poll"]([(c["fl_own"], tid * BLOCKS + piece, 1)])
     gpu.barrier()
@@ -129,7 +146,7 @@ def _rs_piece(
         stamp(tl_on, tls, tid, 3)
     band, cj = piece // ct, piece % ct
     # res None: a block-write layer, whose prefix restarts at the attention output
-    r_res = rsrc(res) if res is not None else None
+    r_res = None if res is None else rsrc(res, res_bytes)
     r_out, r_rs = rsrc(res_out), rsrc(c["rs_own"].value)
     for u in range(tid, rb * q8, THREADS):
         row = band * rb + u // q8
@@ -151,7 +168,7 @@ def _rs_piece(
                 rv = fx.Vector(
                     bo.buffer_load(
                         r_res,
-                        (row * sl + col) // 2,
+                        (row * ldi + col) // 2,
                         vec_width=4,
                         dtype=T.i32,
                         cache_modifier=res_cm,

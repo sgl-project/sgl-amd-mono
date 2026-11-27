@@ -160,6 +160,8 @@ SGLANG_READS = {
         "use_full_rank_gate",
         "_qkvgbfa_layer",
         "fused_qkvg_proj",
+        "f_a_proj",
+        "b_proj",
         "_bfa_f_b_w",
         "qkv_conv1d",
         "f_b_proj",
@@ -188,6 +190,7 @@ class K1Layer(msgspec.Struct):
     # _in_proj_operands found them
     w_in: Any = None
     w_ins: Any = None
+    w_in_fab: Any = None
     w_fb: Any = None
 
 
@@ -233,9 +236,49 @@ def _state_config():
     return dtype == torch.bfloat16, reasons
 
 
-# -> (kda.W_* format, the merged [q,k,v,g | f_a | b | pad] storage [rows, HIDDEN],
-# its fp32 row scale or None, f_b [PROJ, HD]); raises ValueError naming the misfit.
-def _in_proj_operands(attn):
+# Validate f_b without allocating; returns (bf16_tensor, None) or (None, fp8_tuple).
+def _resolve_f_b(attn):
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+    from sgl_amd_mono.kimi_k3.spec import _quark_fp8_storage
+
+    w_fb = attn._bfa_f_b_w
+    if (
+        isinstance(w_fb, torch.Tensor)
+        and w_fb.dtype == torch.bfloat16
+        and tuple(w_fb.shape) == (kda.PROJ, kda.HD)
+        and w_fb.is_contiguous()
+    ):
+        return w_fb, None
+    fb_mod = attn.f_b_proj
+    w = fb_mod.weight
+    if w.dtype == torch.bfloat16:
+        if tuple(w.shape) != (kda.PROJ, kda.HD) or not w.is_contiguous():
+            raise ValueError(f"f_b is not a contiguous bf16 [{kda.PROJ}, {kda.HD}]")
+        return w, None
+    if w.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"f_b is {w.dtype}, not bf16 or Quark FP8 E4M3")
+    shuffled, storage, scale = _quark_fp8_storage(linear=fb_mod, name="f_b_proj")
+    if tuple(storage.shape) != (kda.PROJ, kda.HD):
+        raise ValueError(
+            f"FP8 f_b is {tuple(storage.shape)}, not [{kda.PROJ}, {kda.HD}]"
+        )
+    return None, (shuffled, storage, scale)
+
+
+# Return f_b as contiguous bf16 [PROJ, HD], dequantizing Quark FP8 once if needed.
+def _f_b_bf16(attn):
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
+
+    w_bf16, fp8 = _resolve_f_b(attn)
+    if w_bf16 is not None:
+        return w_bf16
+    shuffled, storage, scale = fp8
+    raw = wfmt.unshuffle_fp8(storage) if shuffled else storage
+    return (raw.float() * scale[:, None]).to(torch.bfloat16).contiguous()
+
+
+def _validate_in_proj_operands(attn) -> None:
+    """Validate KDA in_proj and f_b weights without allocating packed copies."""
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
     from sgl_amd_mono.kimi_k3.spec import _quark_fp8_storage
 
@@ -244,10 +287,9 @@ def _in_proj_operands(attn):
             "the KDA gate is not full-rank, so there is no wide projection to "
             "extend (linear_attn_config.use_full_rank_gate)"
         )
+    _resolve_f_b(attn)
     if getattr(attn, "_qkvgbfa_in_qkvg_proj", False):
-        # Quark FP8: SGLang wrote the [f_a | b] rows and scales into fused_qkvg_proj's
-        # own weight, padded to 64 rows; f_b is the bf16 copy its fused decode keeps
-        shuffled, w_in, scale = _quark_fp8_storage(
+        _, w_in, _ = _quark_fp8_storage(
             linear=attn.fused_qkvg_proj, name="KDA in-projection"
         )
         if w_in.shape[0] < kda.NPROJ or w_in.shape[1] != HIDDEN:
@@ -255,19 +297,10 @@ def _in_proj_operands(attn):
                 f"the FP8 KDA in-projection is {tuple(w_in.shape)}, not "
                 f"[>= {kda.NPROJ}, {HIDDEN}]"
             )
-        fmt = kda.W_FP8_SHUFFLED if shuffled else kda.W_FP8
-        w_fb = attn._bfa_f_b_w
-    else:
-        # bf16: the merged view SGLang builds when a monokernel backend is selected
-        merged = attn._qkvgbfa_layer
-        if merged is None:
-            raise ValueError(
-                "the KDA in-projection is not merged "
-                "(SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ=0, SGLANG_ROCM_K3_FUSE_KDA_INPROJ=0 "
-                "before the rename, or attention weights this "
-                "merge may not concatenate)"
-            )
-        w_in, scale, fmt = merged.weight, None, kda.W_BF16
+        return
+    merged = attn._qkvgbfa_layer
+    if merged is not None:
+        w_in = merged.weight
         if not (
             w_in.dtype == torch.bfloat16
             and tuple(w_in.shape) == (kda.NPROJ, HIDDEN)
@@ -277,15 +310,115 @@ def _in_proj_operands(attn):
                 f"the merged KDA in-projection is {w_in.dtype} {tuple(w_in.shape)}, "
                 f"not a contiguous bf16 [{kda.NPROJ}, {HIDDEN}]"
             )
-        w_fb = attn.f_b_proj.weight
-    if not (
-        isinstance(w_fb, torch.Tensor)
-        and w_fb.dtype == torch.bfloat16
-        and tuple(w_fb.shape) == (kda.PROJ, kda.HD)
-        and w_fb.is_contiguous()
-    ):
-        raise ValueError(f"f_b is not a contiguous bf16 [{kda.PROJ}, {kda.HD}]")
-    return fmt, w_in, scale, w_fb
+        return
+    qkvg = attn.fused_qkvg_proj
+    if qkvg.weight.dtype == torch.float8_e4m3fn:
+        fa, bp = attn.f_a_proj, attn.b_proj
+        _, w_q, _ = _quark_fp8_storage(linear=qkvg, name="KDA fused_qkvg_proj")
+        _, w_f, _ = _quark_fp8_storage(linear=fa, name="KDA f_a_proj")
+        if tuple(w_q.shape) != (kda.FA_0, HIDDEN):
+            raise ValueError(
+                f"the FP8 fused_qkvg_proj is {tuple(w_q.shape)}, not [{kda.FA_0}, {HIDDEN}]"
+            )
+        if tuple(w_f.shape) != (kda.HD, HIDDEN):
+            raise ValueError(
+                f"the FP8 f_a_proj is {tuple(w_f.shape)}, not [{kda.HD}, {HIDDEN}]"
+            )
+        if bp.weight.dtype == torch.bfloat16:
+            if bp.weight.shape not in ((HIDDEN, kda.NH), (kda.NH, HIDDEN)):
+                raise ValueError(
+                    f"the bf16 b_proj is {tuple(bp.weight.shape)}, not [{kda.NH}, {HIDDEN}]"
+                )
+        else:
+            _, w_b, _ = _quark_fp8_storage(linear=bp, name="KDA b_proj")
+            if tuple(w_b.shape) != (kda.NH, HIDDEN):
+                raise ValueError(
+                    f"the FP8 b_proj is {tuple(w_b.shape)}, not [{kda.NH}, {HIDDEN}]"
+                )
+        return
+    raise ValueError(
+        "the KDA in-projection is not merged "
+        "(SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ=0 / "
+        "SGLANG_ROCM_K3_FUSE_KDA_INPROJ=0, or attention weights this "
+        "merge may not concatenate)"
+    )
+
+
+def _in_proj_operands(attn):
+    """Return ``(kda.W_* format, storage, row_scale | None, fp8_tail | None, f_b)``.
+
+    Accepts merged bf16 (``_qkvgbfa_layer``), merged Quark FP8
+    (``_qkvgbfa_in_qkvg_proj``), or split Quark FP8 (``fused_qkvg_proj`` in
+    place + 144-row packed ``[f_a | b | 4 zero rows]`` tail; bf16 ``b_proj`` is
+    re-quantized per row). Cached per attention module."""
+    cached = getattr(attn, "_sgl_amd_mono_k1_ops", None)
+    if cached is not None:
+        return cached
+
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
+    from sgl_amd_mono.kimi_k3.spec import _quark_fp8_storage
+
+    _validate_in_proj_operands(attn)
+    w_fb = _f_b_bf16(attn)
+    if getattr(attn, "_qkvgbfa_in_qkvg_proj", False):
+        shuffled, w_in, scale = _quark_fp8_storage(
+            linear=attn.fused_qkvg_proj, name="KDA in-projection"
+        )
+        res = (kda.W_FP8_SHUFFLED if shuffled else kda.W_FP8, w_in, scale, None, w_fb)
+    elif attn._qkvgbfa_layer is not None:
+        res = (kda.W_BF16, attn._qkvgbfa_layer.weight, None, None, w_fb)
+    else:
+        qkvg, fa, bp = attn.fused_qkvg_proj, attn.f_a_proj, attn.b_proj
+        sh_q, w_q, s_q = _quark_fp8_storage(linear=qkvg, name="KDA fused_qkvg_proj")
+        sh_f, w_f, s_f = _quark_fp8_storage(linear=fa, name="KDA f_a_proj")
+        if bp.weight.dtype == torch.bfloat16:
+            b_bf = (
+                bp.weight.t().contiguous()
+                if bp.weight.shape == (HIDDEN, kda.NH)
+                else bp.weight.contiguous()
+            )
+            bf_f = b_bf.float()
+            s_b = (bf_f.abs().amax(dim=1) / 448.0).clamp(min=1e-12).contiguous()
+            b_raw = (
+                (bf_f / s_b[:, None])
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .contiguous()
+            )
+        else:
+            sh_b, w_b, s_b = _quark_fp8_storage(linear=bp, name="KDA b_proj")
+            b_raw = wfmt.unshuffle_fp8(w_b) if sh_b else w_b
+        pad_rows = kda.NPROJ - kda.FA_0 - kda.HD - kda.NH
+        b_pad = torch.cat(
+            [
+                b_raw,
+                torch.zeros(pad_rows, HIDDEN, dtype=b_raw.dtype, device=b_raw.device),
+            ],
+            dim=0,
+        ).contiguous()
+        if sh_q:
+            f_part = w_f if sh_f else wfmt.preshuffle_fp8(w_f)
+            b_part = wfmt.preshuffle_fp8(b_pad)
+            fmt = kda.W_FP8_SHUFFLED
+        else:
+            f_part = wfmt.unshuffle_fp8(w_f) if sh_f else w_f
+            b_part = b_pad
+            fmt = kda.W_FP8
+        w_in_fab = torch.cat([f_part, b_part], dim=0).contiguous()
+        scale = torch.cat(
+            [
+                s_q,
+                s_f,
+                s_b,
+                torch.zeros(pad_rows, dtype=torch.float32, device=s_q.device),
+            ],
+            dim=0,
+        ).contiguous()
+        res = (fmt, w_q, scale, w_in_fab, w_fb)
+
+    attn._sgl_amd_mono_k1_ops = res
+    return res
 
 
 # (the in-projection's operands or None, why K1 cannot take this layer):
@@ -328,7 +461,7 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
         # log has to carry, or K1 reads as built and unhelpful.
         _say(f"not built for the KDA layers: {'; '.join(reasons)}")
         return None
-    wfmt, w_in, w_ins, w_fb = operands
+    wfmt, w_in, w_ins, w_in_fab, w_fb = operands
     return K1Layer(
         i=i,
         key=kda.KdaPreBuild(
@@ -348,10 +481,12 @@ def build(layer, i: int, rows: int) -> Optional[K1Layer]:
             init_committed=not _ring_mode(),
             wfmt=wfmt,
             state_bf16=state_bf16,
+            split_fab=w_in_fab is not None,
         ),
         module=layer,
         w_in=w_in,
         w_ins=w_ins,
+        w_in_fab=w_in_fab,
         w_fb=w_fb,
         # The same cast SGLang's own fused KDA decode makes once at load
         # (kimi_k3.py _prepare_fused_decode); a step must not repeat it.
@@ -417,6 +552,7 @@ def _weight_args(packed: K1Layer) -> dict:
         "in_nw": packed.module.input_layernorm.weight,
         "w_in": packed.w_in,
         "w_in_scale": packed.w_ins,
+        "w_in_fab": packed.w_in_fab,
         "w_fb": packed.w_fb,
         "conv_w": attn.qkv_conv1d.weight.squeeze(1),
         "a_log": attn.A_log.detach().reshape(-1),

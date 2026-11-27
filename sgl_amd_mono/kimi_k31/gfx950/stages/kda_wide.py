@@ -25,6 +25,8 @@ from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.ops import (
     CM_DEV,
+    bf2_f32,
+    bf16_pair,
     butterfly,
     hw_exp2,
     hw_rsq,
@@ -73,6 +75,8 @@ def lds_floats(L):
 def kda_head(c, req, h, lds, kpt=KPT):
     """One (request, head) task; ``lds`` = ``lds_floats(L)`` f32 words."""
     L, tid = c["L"], c["tid"]
+    state_bf16 = c["state_bf16"]
+    ring = c["ring"]
     lane, wave = tid % 64, tid // 64
     a = c["args"]
     fa_l = lds
@@ -83,14 +87,27 @@ def kda_head(c, req, h, lds, kpt=KPT):
     beta = lds + 6 * L * HD
     acc_idx = uniform(ld_i32(a["num_acc"], req)) - 1
     st_idx, st_stride = a["st_idx"], a["st_stride"]
-    slot_c = uniform(ld_i32(st_idx, req * st_stride))
-    slot0 = uniform(ld_i32(st_idx, req * st_stride + acc_idx))
+    if const_expr(ring):
+        slot_c = uniform(ld_i32(st_idx, req * st_stride))
+        slot0 = uniform(ld_i32(st_idx, req * st_stride + acc_idx))
+        ring_k = rsrc(
+            a["ring_k"] + fx.Int64(fx.max(slot_c, 0)) * fx.Int64(a["rk_seq"]) * 2
+        )
+        ring_v = rsrc(
+            a["ring_v"] + fx.Int64(fx.max(slot_c, 0)) * fx.Int64(a["rv_seq"]) * 2
+        )
+        ring_g = rsrc(
+            a["ring_g"] + fx.Int64(fx.max(slot_c, 0)) * fx.Int64(a["rg_seq"]) * 4
+        )
+        ring_b = rsrc(
+            a["ring_b"] + fx.Int64(fx.max(slot_c, 0)) * fx.Int64(a["rb_seq"]) * 4
+        )
+        ring_len = a["ring_len"]
+    else:
+        slot_c = uniform(ld_i32(a["init_slot"], req))
+        slot0 = slot_c
+        ring_k = ring_v = ring_g = ring_b = ring_len = None
     live0 = slot0 >= 0
-    ring_k = rsrc(a["ring_k"] + fx.Int64(fx.max(slot_c, 0)) * fx.Int64(a["rk_seq"]) * 2)
-    ring_v = rsrc(a["ring_v"] + fx.Int64(fx.max(slot_c, 0)) * fx.Int64(a["rv_seq"]) * 2)
-    ring_g = rsrc(a["ring_g"] + fx.Int64(fx.max(slot_c, 0)) * fx.Int64(a["rg_seq"]) * 4)
-    ring_b = rsrc(a["ring_b"] + fx.Int64(fx.max(slot_c, 0)) * fx.Int64(a["rb_seq"]) * 4)
-    ring_len = a["ring_len"]
     has_c = slot_c >= 0
 
     # inputs that need no hand-off, issued first: f_b rows, constants, the state
@@ -109,20 +126,23 @@ def kda_head(c, req, h, lds, kpt=KPT):
     offs = tuple(1 << b for b in reversed(range(lpr.bit_length() - 1)))
     grp = tid // lpr
     k0 = (tid % lpr) * kpt
-    base0 = rsrc(a["rstate"] + fx.Int64(fx.max(slot0, 0)) * fx.Int64(a["rs_seq"]) * 4)
+    rs_ptr = a["rstate"] if ring else a["rstate0"]
+    rs_seq = a["rs_seq"] if ring else a["rs0_seq"]
+    eb = 2 if state_bf16 else 4
+    base0 = rsrc(rs_ptr + fx.Int64(fx.max(slot0, 0)) * fx.Int64(rs_seq) * eb)
     st = []
     for i in range_constexpr(rpt):
         row = []
         for q in range_constexpr(kpt // 4):
-            v = fx.Vector(
-                bo.buffer_load(
-                    base0,
-                    (h * HD + grp * rpt + i) * HD + k0 + 4 * q,
-                    vec_width=4,
-                    dtype=T.f32,
-                )
-            )
-            row += [live0.select(v[e], fx.Float32(0.0)) for e in range(4)]
+            idx = (h * HD + grp * rpt + i) * HD + k0 + 4 * q
+            if const_expr(state_bf16):
+                v = fx.Vector(bo.buffer_load(base0, idx // 2, vec_width=2, dtype=T.i32))
+                f0, f1 = bf2_f32(v[0])
+                f2, f3 = bf2_f32(v[1])
+                row += [live0.select(x, fx.Float32(0.0)) for x in (f0, f1, f2, f3)]
+            else:
+                v = fx.Vector(bo.buffer_load(base0, idx, vec_width=4, dtype=T.f32))
+                row += [live0.select(v[e], fx.Float32(0.0)) for e in range(4)]
         st.append(row)
 
     # conv: channel (part, d); the conv state is read only, the verify windows go to SGLang's accept
@@ -159,11 +179,12 @@ def kda_head(c, req, h, lds, kpt=KPT):
             for q in range_constexpr(CONV_W):
                 acc = acc + cw[q] * seq[j + q]
             o = bf16r(acc * sigmoid(acc))
-            at = (h * ring_len + j) * HD + d
-            if has_c & (part == 1):
-                bo.buffer_store(fx.Float32(o).to(fx.BFloat16), ring_k, at)
-            if has_c & (part == 2):
-                bo.buffer_store(fx.Float32(o).to(fx.BFloat16), ring_v, at)
+            if const_expr(ring):
+                at = (h * ring_len + j) * HD + d
+                if has_c & (part == 1):
+                    bo.buffer_store(fx.Float32(o).to(fx.BFloat16), ring_k, at)
+                if has_c & (part == 2):
+                    bo.buffer_store(fx.Float32(o).to(fx.BFloat16), ring_v, at)
             if part < 2:
                 fx.ptr_store(o, qkl + ((2 * j + part) * HD + d))
             if part == 2:
@@ -183,8 +204,9 @@ def kda_head(c, req, h, lds, kpt=KPT):
             )
         )
         fx.ptr_store(b, beta + tid)
-        if has_c:
-            bo.buffer_store(b, ring_b, h * ring_len + tid)
+        if const_expr(ring):
+            if has_c:
+                bo.buffer_store(b, ring_b, h * ring_len + tid)
     gpu.barrier()
     t = fx.min(lane % 16, L - 1)
     gacc = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -200,8 +222,9 @@ def kda_head(c, req, h, lds, kpt=KPT):
         gate = fx.Float32(c["lb"]) * sigmoid(aa * g)
         if lane % 16 < L:
             fx.ptr_store(hw_exp2(gate * fx.Float32(LOG2E)), decay + (t * HD + kk))
-            if has_c:
-                bo.buffer_store(gate, ring_g, (h * ring_len + t) * HD + kk)
+            if const_expr(ring):
+                if has_c:
+                    bo.buffer_store(gate, ring_g, (h * ring_len + t) * HD + kk)
     # l2norm: q / k row r (2 L rows of 128) on wave r % 8
     for rr in range_constexpr((2 * L + WAVES - 1) // WAVES):
         row = fx.min(wave + WAVES * rr, 2 * L - 1)
@@ -236,6 +259,12 @@ def kda_head(c, req, h, lds, kpt=KPT):
         kv = lds_vec(qkl + ((2 * j + 1) * HD + k0))
         dk = lds_vec(decay + (j * HD + k0))
         bj = fx.ptr_load(beta + j)
+        if const_expr(not ring):
+            dst_slot = uniform(ld_i32(st_idx, req * st_stride + j))
+            live_d = dst_slot >= 0
+            base_d = rsrc(
+                a["rstate"] + fx.Int64(fx.max(dst_slot, 0)) * fx.Int64(a["rs_seq"]) * eb
+            )
         for i in range_constexpr(rpt):
             r = grp * rpt + i
             s_ = [st[i][e] * dk[e] for e in range(kpt)]
@@ -245,6 +274,28 @@ def kda_head(c, req, h, lds, kpt=KPT):
             o = butterfly(dot(s_, qv), offs)
             o = live0.select(bf16r(o), fx.Float32(0.0))
             st[i] = s_
+            if const_expr(not ring):
+                if live_d:
+                    for q in range_constexpr(kpt // 4):
+                        idx = (h * HD + r) * HD + k0 + 4 * q
+                        if const_expr(state_bf16):
+                            pair = fx.Vector.from_elements(
+                                [
+                                    bf16_pair(s_[4 * q], s_[4 * q + 1]).bitcast(
+                                        fx.Int32
+                                    ),
+                                    bf16_pair(s_[4 * q + 2], s_[4 * q + 3]).bitcast(
+                                        fx.Int32
+                                    ),
+                                ],
+                                fx.Int32,
+                            )
+                            bo.buffer_store(pair, base_d, idx // 2)
+                        else:
+                            vec = fx.Vector.from_elements(
+                                [s_[4 * q + e] for e in range(4)], fx.Float32
+                            )
+                            bo.buffer_store(vec, base_d, idx)
             if lane % lpr == 0:
                 fx.ptr_store(o, ol + (j * HD + r))
     gpu.barrier()

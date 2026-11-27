@@ -91,6 +91,9 @@ K2_OPT = os.environ.get("SGLANG_AMD_MONO_K3_K2_OPT")
 MLA_PRE = os.environ.get("SGLANG_AMD_MONO_K3_MLA_PRE", "1") == "1"
 # SGLANG_AMD_MONO_K3_K1=0 builds no K1: every KDA layer keeps SGLang's attention.
 K1 = os.environ.get("SGLANG_AMD_MONO_K3_K1", "1") == "1"
+# SGLANG_AMD_MONO_K3_WIDE=0 keeps only the <=8-row narrow launches.
+WIDE = os.environ.get("SGLANG_AMD_MONO_K3_WIDE", "1") == "1"
+DCP_SIZES = (1, 8)
 
 # The SGLang names this glue reads, by file under the sglang package (``f(p)``:
 # a parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
@@ -106,9 +109,9 @@ SGLANG_READS = {
     ),
     # the MXFP4 expert layout the launch reads, as AITER's MoE was given it
     "srt/layers/quantization/mxfp4.py": ("_aiter_situ_uses_gu_interleaved_weights",),
-    # the K3 AITER switch the expert layout depends on; its renamed Envs field
-    # is optional, and SGLANG_AITER_K3_OPT is read where it does not exist yet
-    "srt/environ.py": ("envs",),
+    # the K3 AITER switch (expert layout) and host-only Mamba checkpoint switch
+    # (optional on older SGLang where the field does not exist yet)
+    "srt/environ.py": ("envs", "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT"),
     # the SiTU parameters K2 hard-codes
     "srt/configs/kimi_linear.py": (
         "activation_situ_beta",
@@ -151,7 +154,21 @@ SGLANG_READS = {
         "start",
         "written_residual",
     ),
-    "srt/runtime_context.py": ("get_parallel",),
+    "srt/runtime_context.py": ("get_parallel", "get_exec", "get_spec", "get_schedule"),
+    "srt/arg_groups/fields/exec_.py": (
+        "cuda_graph_max_bs_decode",
+        "enable_linear_replayssm_spec",
+    ),
+    "srt/arg_groups/fields/schedule.py": ("max_running_requests",),
+    "srt/arg_groups/fields/spec.py": (
+        "speculative_algorithm",
+        "speculative_num_draft_tokens",
+    ),
+    "srt/arg_groups/fields/parallel.py": (
+        "dcp_size",
+        "attn_cp_size",
+        "enable_prefill_cp",
+    ),
     # the attention stops here and the launch runs o_proj; both attention
     # classes expose it. The rest are what the forward and the checks read.
     "srt/models/kimi_k3.py": (
@@ -252,6 +269,34 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         reasons.append(
             f"SiTU (beta, linear_beta) is {situ}; the launch computes ({BETA}, {LBETA})"
         )
+    if cfg is not None:
+        dcp = cfg.dcp_size or 1
+        if dcp not in DCP_SIZES:
+            reasons.append(f"--dcp-size {dcp} is not one of {list(DCP_SIZES)}")
+        if (cfg.attn_cp_size or 1) > 1 or cfg.enable_prefill_cp:
+            reasons.append(
+                "attention context parallel is on; only --dcp-size is accepted"
+            )
+    if WIDE and cfg is not None:
+        from sgl_amd_mono.kimi_k31 import wide
+
+        tokens, wide_runs = _wide_step_shape(
+            cfg.speculative_algorithm,
+            cfg.speculative_num_draft_tokens,
+            cfg.cuda_graph_max_bs_decode,
+            cfg.max_running_requests,
+        )
+        if wide_runs and tokens not in wide.SUPPORTED_L:
+            reasons.append(
+                f"wide launch requires --speculative-num-draft-tokens in "
+                f"{list(wide.SUPPORTED_L)} (got {tokens}); set SGLANG_AMD_MONO_K3_WIDE=0 "
+                "for narrow-only <=8-row serving"
+            )
+        if wide_runs and cfg.enable_linear_replayssm_spec and _host_only_mamba():
+            reasons.append(
+                "wide launch does not support request-scoped ReplaySSM rings "
+                "(SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT=1 with --enable-linear-replayssm-spec)"
+            )
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -319,6 +364,37 @@ def _o_proj_operands(o_proj):
             f"the FP8 o_proj is {tuple(storage.shape)}, not [{hidden}, {CORE}]"
         )
     return (oproj.O_FP8_SHUFFLED if shuffled else oproj.O_FP8), storage, scale
+
+
+def _host_only_mamba() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get())
+
+
+def _wide_step_shape(
+    spec_algo, draft_tokens, graph_max_bs, max_running_reqs
+) -> tuple[int, bool]:
+    tokens = int(draft_tokens or 1) if spec_algo is not None else 1
+    max_bs = int(graph_max_bs or 0) or int(max_running_reqs or 0)
+    return tokens, (max_bs == 0 or max_bs * tokens > MAX_ROWS)
+
+
+def _wide_will_run() -> bool:
+    """Whether the current server configuration reaches widths > MAX_ROWS."""
+    from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
+
+    try:
+        spec = get_spec()
+        _, wide_runs = _wide_step_shape(
+            spec.speculative_algorithm,
+            spec.speculative_num_draft_tokens,
+            get_exec().graph.cuda_graph_max_bs_decode,
+            get_schedule().max_running_requests,
+        )
+    except ValueError:
+        return False
+    return wide_runs
 
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
@@ -405,11 +481,24 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         reasons += [f"layer {i}: {why}" for ok, why in checks if not ok]
         if reasons and i > covered[0]:
             break  # one layer's reasons say it for all
+    if WIDE and _wide_will_run():
+        from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
+
+        _, state_reasons = k1_mod._state_config()
+        reasons += state_reasons
+        kda_layers = [i for i in covered if k1_mod._is_kda_layer(layers[i])]
+        for i in kda_layers:
+            attn = layers[i].self_attn
+            try:
+                k1_mod._validate_in_proj_operands(attn)
+            except ValueError as e:
+                reasons.append(f"layer {i}: {e}")
+                break
     return reasons
 
 
-def _build(model, hf_config, ctx):
-    """Pack every covered layer and compile the widths, before graph capture."""
+def _build_narrow(model, hf_config, ctx, narrow_widths):
+    """Pack every covered layer and compile the narrow (<= MAX_ROWS) widths."""
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
@@ -422,7 +511,7 @@ def _build(model, hf_config, ctx):
     runner = K3MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
     runner.set_deadline(ctx.deadline_s)
     layers, batches = {}, {}
-    for rows in ctx.widths:
+    for rows in narrow_widths:
         for i in _covered_layers(hf_config):
             packed = _weights(backbone.layers[i], i, rows, runner)
             layers.setdefault(rows, {})[i] = packed
@@ -438,6 +527,51 @@ def _build(model, hf_config, ctx):
         batches[rows] = k1_mod.build_batch(layers[rows], device)
         _warmup(runner, layers[rows], rows)
     return _Built(model, runner, layers, batches)
+
+
+def _build(model, hf_config, ctx, *, use_wide: bool | None = None):
+    """Pack every covered layer and compile the narrow and (when reached) wide widths."""
+    from sglang.srt.runtime_context import get_parallel
+
+    narrow_widths = tuple(w for w in ctx.widths if w <= MAX_ROWS)
+    narrow = _build_narrow(model, hf_config, ctx, narrow_widths)
+    wide_on = WIDE if use_wide is None else use_wide
+    if not (wide_on and any(w > MAX_ROWS for w in ctx.widths)):
+        return narrow
+    from sgl_amd_mono.kimi_k31 import wide
+
+    def mem():
+        return (
+            torch.cuda.mem_get_info()[0],
+            torch.cuda.memory_allocated(),
+            torch.cuda.memory_reserved(),
+        )
+
+    def used(a, b):
+        return "device {:.2f} / torch allocated {:.2f} / reserved {:.2f} GiB".format(
+            *((x - y) / 2**30 for x, y in ((a[0], b[0]), (b[1], a[1]), (b[2], a[2])))
+        )
+
+    p = get_parallel()
+    device = _backbone(model).layers[0].input_layernorm.weight.device
+    m0 = mem()
+    w = wide.Wide(
+        model,
+        p.tp_rank,
+        p.tp_group.cpu_group,
+        device,
+        L=wide.tokens(),
+        max_rows=max(ctx.widths),
+    )
+    m1 = mem()
+    w.warmup()
+    m2 = mem()
+    torch.cuda.empty_cache()
+    wide._say(
+        f"memory: wide layers {used(m0, m1)}; warmup {used(m1, m2)}; "
+        f"after empty_cache {used(m0, mem())}"
+    )
+    return _WideBuilt(narrow, w)
 
 
 def _warmup(runner, packed_layers: dict, rows: int) -> None:
@@ -571,6 +705,9 @@ NUMERICS = Numerics(
         "k1_fp8.bank.rel": 0.0,
         "k1_fp8.window.cosine": 0.9999,
         "k1_fp8.window.rel": 0.015,
+        # Measured in test_kimi_k3_wide_fp8.py (ring=False bf16/fp32 SSM state, cos > 0.9995).
+        "k1_fp8.ssm.cosine": 0.9995,
+        "k1_fp8.ssm.rel": 0.03,
         "k1_fp8.ring_k.cosine": 0.9998,
         "k1_fp8.ring_k.rel": 0.02,
         "k1_fp8.ring_v.cosine": 0.9995,
@@ -582,18 +719,30 @@ NUMERICS = Numerics(
     },
 )
 
+
+def _k3_widths() -> tuple[int, ...]:
+    base = tuple(range(1, MAX_ROWS + 1))
+    if not WIDE:
+        return base
+    from sgl_amd_mono.kimi_k31 import wide
+
+    return base + wide.wide_widths()
+
+
 SPEC = MonoSpec(
     name="kimi_k3_hip",
     devices={
         "gfx950": DeviceLimits(
-            widths=tuple(range(1, MAX_ROWS + 1)),
+            widths=_k3_widths(),
             tp_sizes=(TP_SIZE,),
             resident_blocks=BLOCKS,
         )
     },
-    # The measured win is on DSpark target-verify steps; a plain decode step of
-    # at most MAX_ROWS rows takes the same launch.
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # Narrow launches cover decode and DSpark verify steps <= 8 rows; wide launches
+    # cover multi-request DSpark verify steps (including DCP8 and HiCache KV offload).
+    features=frozenset(
+        {Feature.SPECULATIVE_DECODING, Feature.CONTEXT_PARALLEL, Feature.KV_OFFLOAD}
+    ),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"aiter"}),
@@ -1149,3 +1298,28 @@ class _Built:
         finally:
             if latent is not None:
                 get_attn_tp_context().clear_attn_inputs()
+
+
+class _WideBuilt(_Built):
+    """Narrow launches for <= MAX_ROWS rows, and the wide KDA layer launch above."""
+
+    def __init__(self, narrow, wide_runner) -> None:
+        self.__dict__.update(narrow.__dict__)
+        self._wide = wide_runner
+        self._shim = _LanguageModelShim(self)
+
+    def _backbone(self, input_ids, forward_batch, input_embeds):
+        if self._plan.key.rows <= MAX_ROWS:
+            return super()._backbone(input_ids, forward_batch, input_embeds)
+        try:
+            return self._wide.backbone(self, input_ids, forward_batch, input_embeds)
+        except Exception as e:
+            import traceback
+
+            from sgl_amd_mono.kimi_k31 import wide
+
+            wide._say(
+                f"wide backbone raised {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()[-2000:]}"
+            )
+            raise

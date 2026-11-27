@@ -21,8 +21,9 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int64, T
 
-from sgl_amd_mono.common.ops import CM_NT, mfma_bf16, rsrc
+from sgl_amd_mono.common.ops import CM_NT, fp8_to_bf16x8, mfma_bf16, rsrc
 from sgl_amd_mono.common.plan import THREADS, WAVES, kernel_sources, key_tuple
+from sgl_amd_mono.kimi_k3.gfx950.stages.wfmt import BF16, fp8_tile_byte
 from sgl_amd_mono.kimi_k31.gfx950.stages.tile import (
     atomic_emit,
     atomic_lin,
@@ -70,13 +71,15 @@ def _shuffle(tid, lane, wave, acc, cl, bm, bn, tm, tn, wy, wx, m0, lin):
             add(m0 + row, col, [fx.ptr_load(p)])
 
 
-def _loads(tid, xr, ldx, m, m0, wr, ldw, n, n0, k0, bm, bn, xcm=0, wrow=None):
+def _loads(
+    tid, xr, ldx, m, m0, wr, ldw, n, n0, k0, bm, bn, xcm=0, wrow=None, wfmt=BF16
+):
     """One K step's pieces: x rows m0 .. + bm, W rows n0 .. + bn (clamped; ``wrow`` maps a
-    W row to the row it is stored at)."""
+    W row to the row it is stored at; ``wfmt`` selects bf16 or FP8/FP8-shuffled W loads)."""
     out = []
-    for rows, base, r, ld, lim, cm, rmap in (
-        (bm, m0, xr, ldx, m, xcm, None),
-        (bn, n0, wr, ldw, n, CM_NT, wrow),
+    for is_w, rows, base, r, ld, lim, cm, rmap in (
+        (False, bm, m0, xr, ldx, m, xcm, None),
+        (True, bn, n0, wr, ldw, n, CM_NT, wrow),
     ):
         tot = rows * PIECES
         for i in range_constexpr((tot + THREADS - 1) // THREADS):
@@ -88,20 +91,33 @@ def _loads(tid, xr, ldx, m, m0, wr, ldw, n, n0, k0, bm, bn, xcm=0, wrow=None):
             row = fx.min(base + e // PIECES, lim - 1)
             if const_expr(rmap is not None):
                 row = rmap(row)
-            word = (row * ld + k0 + (e % PIECES) * 8) // 2
-            v = fx.Vector(
-                bo.buffer_load(r, word, vec_width=4, dtype=T.i32, cache_modifier=cm)
-            )
+            if const_expr(is_w and wfmt != BF16):
+                byte = fp8_tile_byte(wfmt, row, k0 + (e % PIECES) * 8, ld)
+                v = fx.Vector(
+                    bo.buffer_load(
+                        r, byte // 4, vec_width=2, dtype=T.i32, cache_modifier=cm
+                    )
+                )
+            else:
+                word = (row * ld + k0 + (e % PIECES) * 8) // 2
+                v = fx.Vector(
+                    bo.buffer_load(r, word, vec_width=4, dtype=T.i32, cache_modifier=cm)
+                )
             out.append((e, v))
     return out
 
 
-def _store(pieces, xs, ws, buf, bm, bn):
+def _store(pieces, xs, ws, buf, bm, bn, wfmt=BF16):
     """Write a step's pieces into LDS buffer ``buf`` (a clamped duplicate rewrites
     the same words with the same data)."""
     nx = len(pieces) - (bn * PIECES + THREADS - 1) // THREADS
     for j, (e, v) in enumerate(pieces):
-        lds, rows = (xs, bm) if j < nx else (ws, bn)
+        if const_expr(j < nx):
+            lds, rows = xs, bm
+        else:
+            lds, rows = ws, bn
+            if const_expr(wfmt != BF16):
+                v = fp8_to_bf16x8(v[0], v[1]).bitcast(fx.Int32)
         fx.ptr_store(v, lds + buf * rows * RW + (e // PIECES) * RW + (e % PIECES) * 4)
 
 
@@ -138,6 +154,10 @@ def mma_tile(
     cl=None,
     xcm=0,
     wrow=None,
+    wfmt=BF16,
+    w_scale=None,
+    wn_lim=None,
+    wn0=None,
 ):
     """One task: K columns k0 .. k0 + kt of the [bm, bn] tile at (m0, n0);
     ``emit(row, col, v, live)`` gets 4 output columns n0 + col .. of token
@@ -145,7 +165,10 @@ def mma_tile(
     (``tile.atomic_lin``) the tile is shuffled through the f32 LDS ``cl`` (aliasing
     xs / ws) into lane-contiguous adds instead. ``xcm``: x's load cache policy
     (CM_DEV when another XCD's CTA wrote x in this launch). ``wrow``: W row -> the row it
-    is stored at (W rows gathered from slices of one buffer)."""
+    is stored at (W rows gathered from slices of one buffer). ``wfmt`` + ``w_scale``:
+    read FP8 / FP8-shuffled W, widen into LDS, and apply the fp32 per-row scale to the
+    accumulators before emit/shuffle. ``wn_lim`` / ``wn0``: row limit and base inside
+    ``w`` when ``w`` is a sub-table of the global ``[0, n)`` output rows."""
     assert wm * wn == WAVES and kt % BK == 0
     lane, wave = tid % 64, tid // 64
     tm, tn = bm // wm, bn // wn
@@ -153,17 +176,33 @@ def mma_tile(
     assert mt * 16 == tm and nt * 16 == tn
     wy, wx = wave // wn, wave % wn
     xr, wr = rsrc(x), rsrc(w)
+    w_lim = n if wn_lim is None else wn_lim
+    w_base = n0 if wn0 is None else wn0
     steps = kt // BK
     acc = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nt)] for _ in range(mt)]
 
     def loads(j):
         return _loads(
-            tid, xr, ldx, m, m0, wr, ldw, n, n0, k0 + j * BK, bm, bn, xcm, wrow
+            tid,
+            xr,
+            ldx,
+            m,
+            m0,
+            wr,
+            ldw,
+            w_lim,
+            w_base,
+            k0 + j * BK,
+            bm,
+            bn,
+            xcm,
+            wrow,
+            wfmt,
         )
 
     pend = [loads(j) for j in range(min(depth, steps))]
     rocdl.sched_barrier(0)
-    _store(pend.pop(0), xs, ws, 0, bm, bn)
+    _store(pend.pop(0), xs, ws, 0, bm, bn, wfmt)
     if depth < steps:
         pend.append(loads(depth))
     gpu.barrier()
@@ -182,11 +221,22 @@ def mma_tile(
                     acc[t][b] = mfma_bf16(a[b].bitcast(fx.BFloat16), xb, acc[t][b])
         rocdl.sched_barrier(0)
         if j + 1 < steps:
-            _store(pend.pop(0), xs, ws, 1 - buf, bm, bn)
+            _store(pend.pop(0), xs, ws, 1 - buf, bm, bn, wfmt)
             if j + 1 + depth < steps:
                 pend.append(loads(j + 1 + depth))
             rocdl.sched_barrier(0)
             gpu.barrier()
+    if const_expr(wfmt != BF16):
+        r_sc = rsrc(w_scale)
+        for b in range_constexpr(nt):
+            col = wx * tn + b * 16 + 4 * (lane // 16)
+            sc = fx.Vector(
+                bo.buffer_load(r_sc, fx.min(n0 + col, n - 4), vec_width=4, dtype=T.f32)
+            )
+            for t in range_constexpr(mt):
+                acc[t][b] = fx.Vector.from_elements(
+                    [acc[t][b][e] * sc[e] for e in range(4)], fx.Float32
+                )
     if const_expr(lin is not None):
         _shuffle(tid, lane, wave, acc, cl, bm, bn, tm, tn, wy, wx, m0, lin)
         return

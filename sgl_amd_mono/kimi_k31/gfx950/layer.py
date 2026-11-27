@@ -32,6 +32,8 @@ from sgl_amd_mono.common.plan import (
 )
 from sgl_amd_mono.common.sync import sreg
 from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
+from sgl_amd_mono.kimi_k3.gfx950.compiled_launch import compiled_launch
+from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
 from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k31.gfx950 import chain as post
 from sgl_amd_mono.kimi_k31.gfx950 import pre_attn as pre
@@ -170,6 +172,11 @@ def kda_layer(
     front_rows=None,
     up_norm=False,
     sort=False,
+    ip_fmt=wfmt.BF16,
+    ip_split=False,
+    o_fmt=wfmt.BF16,
+    state_bf16=False,
+    ring=True,
 ):
     """Build the layer launch; returns (launch, plan). Arguments: the pre half's
     (lat_p, sh_p, w_up (``pre.fold_up``), prefix, cw_a, w_in, w_ip, ip_buf (in_proj
@@ -225,6 +232,11 @@ def kda_layer(
         front_rows,
         up_norm,
         sort,
+        ip_fmt,
+        ip_split,
+        o_fmt,
+        state_bf16,
+        ring,
     )
     if key in _BUILDS:
         return _BUILDS[key]
@@ -240,9 +252,10 @@ def kda_layer(
     # sort: the routed experts' sort (+ "sgl": mxfp8 quant) + output zeroing made here (mf.sort_rows), m <= 64
     # (a 64-bit token mask an expert); sort_buf holds mf.sort_layout(m, sort), the MoE output sits right before
     # sh_out (wide's flat ping)
-    assert not sort or m <= mf.SORT_MAX_ROWS, m
+    assert not sort or m <= mf.sort_max_rows(sort), (sort, m)
     # the up and in_proj finishes read and zero linbf tiles
     assert gu.ks > 1 and gi.ks > 1
+    assert not ip_split or (ip_fmt != wfmt.BF16 and k1.FA_0 % gi.bn == 0)
     pl, pp, po = plan(m, cfg, L, nvb_a, nvb_m, nf, capture, timeline)
     offs, half = pl.peer_offsets
     assert half_bytes == 0 or half <= half_bytes, (half, half_bytes)
@@ -282,7 +295,12 @@ def kda_layer(
     )  # sort: rows routed / sort launches
     lay_s = mf.sort_layout(m, sort) if sort else None
     sort_q = sort == "sgl"  # the launch also quantizes (place_codes helpers)
-    sort_cta = BLOCKS - m - 1
+    tns, tms = H // gs.bn, (m + gs.bm - 1) // gs.bm
+    n_s = tms * tns
+    sort_post_situ = bool(
+        sort == "aux16" and (m > mf.SORT_MAX_ROWS or BLOCKS - m - 1 < max(m, n_s))
+    )
+    sort_cta = (BLOCKS - 1) if sort_post_situ else (BLOCKS - m - 1)
     help0 = sort_cta - mf.SORT_HELPERS  # place_codes CTAs: help0 .. sort_cta - 1
     wrow_f = None
     if front_rows is not None:
@@ -297,10 +315,10 @@ def kda_layer(
                 ),
             )
 
-    tns, tms = H // gs.bn, (m + gs.bm - 1) // gs.bm
-    n_s = tms * tns
-    # sort builds: place_codes / sort_rows CTAs clear of route (0 .. m-1), sdown (0 .. n_s-1), situ (last m)
-    assert not sort or BLOCKS - m - 1 - mf.SORT_HELPERS >= max(m, n_s), (m, n_s)
+    # sort builds: small-m CTAs clear of route/sdown/situ; large-m aux16 runs after situ on BLOCKS-1
+    assert (
+        not sort or sort_post_situ or BLOCKS - m - 1 - mf.SORT_HELPERS >= max(m, n_s)
+    ), (m, n_s)
     gems = (gu, gi, go, gf, gs)
     bmx, bnx = max(g.bm for g in gems), max(g.bn for g in gems)
     cwords = max(g.bm * (g.bn + 4) for g in gems)
@@ -350,6 +368,11 @@ def kda_layer(
         + ("_fr" + "x".join(map(str, front_rows)) if front_rows else "")
         + ("_un" if up_norm else "")
         + ({"sgl": "_srt", "aux16": "_srt16"}.get(sort, ""))
+        + (f"_iw{ip_fmt}" if ip_fmt != wfmt.BF16 else "")
+        + ("_is" if ip_split else "")
+        + (f"_ow{o_fmt}" if o_fmt != wfmt.BF16 else "")
+        + ("_sb" if state_bf16 else "")
+        + ("_nr" if not ring else "")
         + "_cs_pH_rp"
     )
 
@@ -534,14 +557,29 @@ def kda_layer(
                 m0 = (tile // tni) * gi.bm
                 n0 = (tile % tni) * gi.bn
                 pre._rows_wait(ca, "agf_own", m0, gi.bm, m, (sk * kti) // SL, nown_i)
-                a3 = ka("w_ip", "ip_buf", "cnt", "scratch")
+                a3 = ka("w_ip", "ip_buf", "cnt", "scratch", "kda_tab")
+                if const_expr(ip_fmt != wfmt.BF16):
+                    kargs3 = pre._kda_args(a3.kda_tab)
+                    ip_scale = kargs3["w_ip_scale"]
+                    if const_expr(ip_split):
+                        use_fab = n0 >= k1.FA_0
+                        w_ip_ptr = use_fab.select(kargs3["w_ip_fab"], a3.w_ip)
+                        w_ip_n0 = use_fab.select(n0 - k1.FA_0, n0)
+                        w_ip_lim = use_fab.select(
+                            fx.Int32(nin - k1.FA_0), fx.Int32(k1.FA_0)
+                        )
+                    else:
+                        w_ip_ptr, w_ip_n0, w_ip_lim = a3.w_ip, n0, nin
+                else:
+                    ip_scale = None
+                    w_ip_ptr, w_ip_n0, w_ip_lim = a3.w_ip, n0, nin
                 mma_tile(
                     tid,
                     xa,
                     H,
                     m,
                     m0,
-                    a3.w_ip,
+                    w_ip_ptr,
                     H,
                     nin,
                     n0,
@@ -557,6 +595,10 @@ def kda_layer(
                     DEPTH,
                     atomic_lin(a3.ip_buf, nin, n0, m, nin, True),
                     cl,
+                    wfmt=ip_fmt,
+                    w_scale=ip_scale,
+                    wn_lim=w_ip_lim,
+                    wn0=w_ip_n0,
                 )
                 _arrive_all(
                     tid,
@@ -594,6 +636,8 @@ def kda_layer(
                     "proj": proj,
                     "args": pre._kda_args(a.kda_tab),
                     "kdone": kdone,
+                    "state_bf16": state_bf16,
+                    "ring": ring,
                 }
             )
             kdaw.kda_heads(ca, st.kw.peek().v.ptr, 0, kpt)
@@ -605,7 +649,12 @@ def kda_layer(
                 m0 = (tile // tno) * go.bm
                 n0 = (tile % tno) * go.bn
                 _heads_wait(ca, m0, go.bm, m, L, (sk * kto) // k1.HD, kto // k1.HD)
-                a4 = ka("core", "wo", "acc_o", "cnt")
+                a4 = ka("core", "wo", "acc_o", "cnt", "kda_tab")
+                o_scale = (
+                    pre._kda_args(a4.kda_tab)["w_o_scale"]
+                    if o_fmt != wfmt.BF16
+                    else None
+                )
                 mma_tile(
                     tid,
                     a4.core,
@@ -629,6 +678,8 @@ def kda_layer(
                     None if go.ks == 1 else atomic_lin(a4.acc_o, H, n0, m, H, True),
                     cl,
                     CM_DEV,
+                    wfmt=o_fmt,
+                    w_scale=o_scale,
                 )
                 _arrive_all(
                     tid,
@@ -816,7 +867,7 @@ def kda_layer(
                         a7.topk_w,
                         a7.logits_out,
                     )
-            if const_expr(sort):
+            if const_expr(sort and not sort_post_situ):
                 sl = (
                     st.srt.peek()
                 )  # outside the dynamic branch: the storage object is not an IR value
@@ -866,6 +917,27 @@ def kda_layer(
                     sp(a8, "hbuf"),
                     sr(a8, "hmark"),
                 )
+            if const_expr(sort_post_situ):
+                sl = st.srt.peek()
+                if bid == sort_cta:
+                    a7s = ka("cnt", "topk_ids", "topk_w", "sort_buf", "scratch")
+                    mf.sort_rows(
+                        cf,
+                        tid,
+                        m,
+                        a7s.cnt,
+                        w_rt,
+                        w_lc,
+                        a7s.topk_ids,
+                        a7s.topk_w,
+                        a7s.sort_buf,
+                        lay_s,
+                        sr(a7s, "srtmk"),
+                        sl.masks.ptr,
+                        sl.bb.ptr,
+                        sl.sa.ptr,
+                        sl.sb.ptr,
+                    )
             stamp(timeline, tls, tid, 11)
             for task in range(bid, n_s, BLOCKS):
                 a9 = ka("w_sd", "sh_out", "scratch")
@@ -1000,6 +1072,7 @@ def kda_layer(
             sort_buf,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
+    launch = compiled_launch(launch)
     _BUILDS[key] = (launch, pl)
     return launch, pl
 

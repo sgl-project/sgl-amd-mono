@@ -70,13 +70,16 @@ def test_the_plugin_registers_the_spec():
     assert found is k3.SPEC, why
 
 
-def test_the_spec_is_tp8_and_at_most_eight_rows():
+def test_the_spec_is_tp8_and_covers_narrow_and_wide_rows():
+    from sgl_amd_mono.kimi_k31 import wide
+
     limits = k3.SPEC.devices["gfx950"]
     assert limits.tp_sizes == (8,)
-    assert limits.widths == tuple(range(1, MAX_ROWS + 1))
-    # With DSpark the runtime serves only the widths that hold whole requests,
-    # so block size 7 (8 tokens a request) leaves batch size 1.
-    assert [w // 8 for w in limits.widths if w % 8 == 0] == [1]
+    assert limits.widths[:MAX_ROWS] == tuple(range(1, MAX_ROWS + 1))
+    if k3.WIDE:
+        assert limits.widths[MAX_ROWS:] == wide.wide_widths()
+    else:
+        assert limits.widths == tuple(range(1, MAX_ROWS + 1))
 
 
 def test_the_shapes_are_checked_on_the_text_config():
@@ -275,7 +278,8 @@ def test_the_fp8_kda_in_proj_layout_is_the_one_sglang_chose(monkeypatch, shuffle
         ),
         _bfa_f_b_w=torch.zeros(kda.PROJ, kda.HD, dtype=torch.bfloat16),
     )
-    fmt, w_in, scale, w_fb = k1._in_proj_operands(attn)
+    fmt, w_in, scale, w_in_fab, w_fb = k1._in_proj_operands(attn)
+    assert w_in_fab is None
     assert fmt == (kda.W_FP8_SHUFFLED if shuffled else kda.W_FP8)
     assert tuple(w_in.shape) == (rows, kda.HIDDEN) and w_in.is_contiguous()
     assert tuple(scale.shape) == (rows,)
@@ -419,3 +423,133 @@ def test_k1_declines_a_request_scoped_replayssm_ring(monkeypatch):
 
     assert run(request_ring=True) == (None, None)
     assert run(request_ring=False) != (None, None)
+
+
+@pytest.mark.parametrize("b_dtype", ["fp8", "bf16"])
+def test_split_quark_fp8_in_proj_and_caching(monkeypatch, b_dtype):
+    import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+    import torch
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
+
+    raw = torch.randint(0, 256, (32, 128), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    sh = wfmt.preshuffle_fp8(raw)
+    assert torch.equal(wfmt.unshuffle_fp8(sh).view(torch.uint8), raw.view(torch.uint8))
+
+    monkeypatch.setattr(fp8_utils, "use_aiter_bpreshuffle_gemm", lambda n: n >= 128)
+    scheme = QuarkW8A8Fp8(
+        {"qscheme": "per_channel"},
+        {"qscheme": "per_channel", "is_dynamic": True},
+    )
+
+    torch.manual_seed(7)
+
+    def make_fp8(rows, cols):
+        raw_q = (torch.randn(rows, cols) * 0.5).clamp(-448, 448).to(torch.float8_e4m3fn)
+        sc = (torch.rand(rows, 1) * 0.05 + 0.01).to(torch.float32)
+        return SimpleNamespace(
+            weight=raw_q.t(),
+            weight_scale=sc,
+            scheme=scheme,
+            _raw=raw_q,
+        )
+
+    b_proj = (
+        make_fp8(kda.NH, kda.HIDDEN)
+        if b_dtype == "fp8"
+        else SimpleNamespace(
+            weight=torch.randn(kda.NH, kda.HIDDEN, dtype=torch.bfloat16).t(),
+            weight_scale=None,
+            scheme=scheme,
+        )
+    )
+    attn = SimpleNamespace(
+        use_full_rank_gate=True,
+        _qkvgbfa_in_qkvg_proj=False,
+        _qkvgbfa_layer=None,
+        _bfa_f_b_w=None,
+        fused_qkvg_proj=make_fp8(kda.FA_0, kda.HIDDEN),
+        f_a_proj=make_fp8(kda.HD, kda.HIDDEN),
+        b_proj=b_proj,
+        f_b_proj=make_fp8(kda.PROJ, kda.HD),
+    )
+    k1._validate_in_proj_operands(attn)
+    assert not hasattr(attn, "_sgl_amd_mono_k1_ops")
+    ops1 = k1._in_proj_operands(attn)
+    ops2 = k1._in_proj_operands(attn)
+    assert ops1 is ops2
+    fmt, w_in, scale, w_in_fab, w_fb = ops1
+    assert fmt == kda.W_FP8_SHUFFLED
+    assert tuple(w_in.shape) == (kda.FA_0, kda.HIDDEN)
+    assert tuple(w_in_fab.shape) == (kda.NPROJ - kda.FA_0, kda.HIDDEN)
+    assert tuple(scale.shape) == (kda.NPROJ,)
+    assert w_fb.dtype == torch.bfloat16 and tuple(w_fb.shape) == (kda.PROJ, kda.HD)
+    unshuf_fab = wfmt.unshuffle_fp8(w_in_fab).float() * scale[kda.FA_0 :, None]
+    ref_fa = wfmt.unshuffle_fp8(attn.f_a_proj._raw).float() * attn.f_a_proj.weight_scale
+    assert torch.allclose(unshuf_fab[: kda.HD], ref_fa, atol=1e-4, rtol=1e-3)
+    assert torch.count_nonzero(scale[kda.FA_0 + kda.HD + kda.NH :]) == 0
+    assert torch.count_nonzero(unshuf_fab[kda.HD + kda.NH :]) == 0
+
+
+def test_wide_config_guards_draft_tokens_and_request_scoped_ring(monkeypatch):
+    monkeypatch.setattr(k3, "WIDE", True)
+    bad_decode = SimpleNamespace(
+        dcp_size=1,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm=None,
+        speculative_num_draft_tokens=None,
+        cuda_graph_max_bs_decode=16,
+        max_running_requests=16,
+        enable_linear_replayssm_spec=False,
+    )
+    reasons = k3._config_disable_reasons(bad_decode, K3)
+    assert any("SGLANG_AMD_MONO_K3_WIDE=0" in r for r in reasons), reasons
+
+    narrow_decode = SimpleNamespace(
+        **{**vars(bad_decode), "cuda_graph_max_bs_decode": 4, "max_running_requests": 4}
+    )
+    reasons_narrow = k3._config_disable_reasons(narrow_decode, K3)
+    assert not any("SGLANG_AMD_MONO_K3_WIDE=0" in r for r in reasons_narrow), (
+        reasons_narrow
+    )
+
+    monkeypatch.setattr(k3, "_host_only_mamba", lambda: True)
+    ring_cfg = SimpleNamespace(
+        dcp_size=8,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=6,
+        cuda_graph_max_bs_decode=16,
+        max_running_requests=16,
+        enable_linear_replayssm_spec=True,
+    )
+    reasons_ring = k3._config_disable_reasons(ring_cfg, K3)
+    assert any("request-scoped ReplaySSM" in r for r in reasons_ring), reasons_ring
+
+    narrow_ring = SimpleNamespace(
+        **{**vars(ring_cfg), "cuda_graph_max_bs_decode": 1, "max_running_requests": 1}
+    )
+    reasons_narrow_ring = k3._config_disable_reasons(narrow_ring, K3)
+    assert not any("request-scoped ReplaySSM" in r for r in reasons_narrow_ring)
+
+    # _wide_will_run reads get_exec().graph.cuda_graph_max_bs_decode cleanly.
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_spec",
+        lambda: SimpleNamespace(
+            speculative_algorithm="DSPARK", speculative_num_draft_tokens=6
+        ),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: SimpleNamespace(graph=SimpleNamespace(cuda_graph_max_bs_decode=16)),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_schedule",
+        lambda: SimpleNamespace(max_running_requests=16),
+    )
+    assert k3._wide_will_run() is True

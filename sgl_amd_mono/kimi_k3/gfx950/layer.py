@@ -41,6 +41,7 @@ from sgl_amd_mono.common.plan import (
 )
 from sgl_amd_mono.common.sync import Mailbox, preg, shift, sreg
 from sgl_amd_mono.kimi_k3 import MAX_ROWS
+from sgl_amd_mono.kimi_k3.gfx950.compiled_launch import compiled_launch
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv as gemv
 from sgl_amd_mono.kimi_k3.gfx950.stages import moe as k2b
 from sgl_amd_mono.kimi_k3.gfx950.stages import oproj as k2a
@@ -669,6 +670,7 @@ def build(key: K2Build):
             tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
+    launch = compiled_launch(launch)
     _BUILDS[key] = launch
     return launch
 
