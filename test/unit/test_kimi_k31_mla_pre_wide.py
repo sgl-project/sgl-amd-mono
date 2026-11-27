@@ -157,8 +157,9 @@ def test_mla_pre_fusable_gates(monkeypatch) -> None:
         assert wide._mla_pre_fusable(_fake_mla_layer(**bad)) is False, bad
 
 
-def test_mono_pre_caps_and_verify_qb_consistency() -> None:
+def test_mono_pre_caps_and_verify_qb_consistency(monkeypatch) -> None:
     """Allocation, warmup, and dispatch share the exact per-layer verify eligibility."""
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS", raising=False)
     # 1. Pre-_mono_pre SGLang (e.g. 703e763d5f): disabled for both local and qrep
     old_local = _fake_mla_layer(dcp_size=1, prepare_fn=_no_mono_prepare)
     assert wide._sglang_mono_pre_caps(old_local.self_attn) == (False, False)
@@ -174,6 +175,7 @@ def test_mono_pre_caps_and_verify_qb_consistency() -> None:
     assert wide._sglang_mono_pre_caps(ci_dcp8.self_attn) == (True, False)
     assert wide._mla_verify_qb(ci_dcp8, par_dcp8) is None
     w = object.__new__(wide.Wide)
+    w.L = 8
     w.buckets = wide.buckets(8)
     w.dsa_layers = {3: SimpleNamespace(i=3, layer=ci_dcp8, mla_pre_qb=None)}
     for b in wide.buckets(8):
@@ -191,6 +193,7 @@ def test_mono_pre_caps_and_verify_qb_consistency() -> None:
     assert w._mla_bucket_specs(16) == {mpw.QB_LOCAL: 16}
     assert w._mla_bucket_specs(32) == {mpw.QB_LOCAL: 32}
     assert w._mla_bucket_specs(64) == {}
+    w.L = 6
     w.buckets = wide.buckets(6)
     assert w._mla_bucket_specs(24) == {mpw.QB_LOCAL: 24}
     assert w._mla_bucket_specs(48) == {mpw.QB_LOCAL: 32}
@@ -201,15 +204,37 @@ def test_mono_pre_caps_and_verify_qb_consistency() -> None:
     assert wide._sglang_mono_pre_caps(new_dcp8.self_attn) == (True, True)
     qb_qrep = wide._mla_verify_qb(new_dcp8, par_dcp8)
     assert qb_qrep == mpw.QB_QREP
+    w.L = 8
     w.buckets = wide.buckets(8)
     w.dsa_layers = {3: SimpleNamespace(i=3, layer=new_dcp8, mla_pre_qb=qb_qrep)}
     assert w._mla_bucket_specs(16) == {mpw.QB_QREP: 16}
     assert w._mla_bucket_specs(32) == {mpw.QB_QREP: 32}
     assert w._mla_bucket_specs(64) == {}
+    w.L = 6
     w.buckets = wide.buckets(6)
     assert w._mla_bucket_specs(24) == {mpw.QB_QREP: 24}
     assert w._mla_bucket_specs(48) == {mpw.QB_QREP: 32}
     assert w._mla_bucket_specs(96) == {}
+
+
+def test_mla_row_cap_respects_reachable_verify_rows(monkeypatch) -> None:
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS", raising=False)
+    runner = object.__new__(wide.Wide)
+    runner.L = 6
+    runner.buckets = (12, 18, 24, 30, 36, 42, 48)
+    runner.dsa_layers = {3: SimpleNamespace(mla_pre_qb=mpw.QB_QREP)}
+    assert runner._mla_bucket_specs(30) == {mpw.QB_QREP: 30}
+    assert runner._mla_bucket_specs(36) == {}
+    monkeypatch.setenv("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS", "48")
+    for bucket in (36, 42, 48):
+        assert runner._mla_bucket_specs(bucket) == {mpw.QB_QREP: bucket}
+
+
+@pytest.mark.parametrize("max_rows", ["0", str(mpw.MAX_ROWS + 1), "invalid"])
+def test_mla_row_cap_rejects_unsupported_launch_bounds(monkeypatch, max_rows) -> None:
+    monkeypatch.setenv("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS", max_rows)
+    with pytest.raises(ValueError):
+        wide._mla_max_rows(mpw.QB_QREP)
 
 
 @pytest.mark.parametrize(

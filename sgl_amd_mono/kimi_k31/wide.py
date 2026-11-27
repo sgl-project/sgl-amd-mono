@@ -660,6 +660,14 @@ def _sglang_mono_pre_supports_qrep(attn) -> bool:
 def _mla_max_rows(qb_rows: int) -> int:
     from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mp
 
+    env_cap = os.environ.get("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS")
+    if env_cap is not None:
+        max_rows = int(env_cap)
+        if not 1 <= max_rows <= mp.MAX_ROWS:
+            raise ValueError(
+                f"SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS must be in [1, {mp.MAX_ROWS}]"
+            )
+        return max_rows
     return mp.MAX_ROWS_QREP if qb_rows == mp.QB_QREP else mp.MAX_ROWS_LOCAL
 
 
@@ -888,9 +896,8 @@ class Wide:
     def _mla_bucket_specs(self, b: int) -> dict[int, int]:
         """Map eligible ``qb_rows -> m_mla`` launch width for wide bucket ``b``.
 
-        A bucket ``b`` can receive verify steps with ``rows <= max_rows`` whenever the
-        previous bucket is strictly below ``max_rows`` (e.g., ``L=6`` rows 30 lands in
-        bucket 48 and runs ``mla_pre_wide`` at ``m_mla=32`` while rows 36..48 fall back).
+        A bucket can use the MLA launch only when its smallest reachable
+        multiple of ``L`` does not exceed ``max_rows``.
         """
         buckets = getattr(self, "buckets", ())
         if b in buckets:
@@ -904,7 +911,7 @@ class Wide:
             if qb is None:
                 continue
             lim = _mla_max_rows(qb)
-            if prev_b < lim:
+            if prev_b + self.L <= lim:
                 specs[qb] = min(b, lim)
         return specs
 

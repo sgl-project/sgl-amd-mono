@@ -32,8 +32,14 @@ def _skip_reason() -> str | None:
     [
         (16, _QB_LOCAL),
         (32, _QB_LOCAL),
+        (33, _QB_LOCAL),
         (48, _QB_LOCAL),
         (16, _QB_QREP),
+        (32, _QB_QREP),
+        (33, _QB_QREP),
+        (36, _QB_QREP),
+        (42, _QB_QREP),
+        (48, _QB_QREP),
         (64, _QB_QREP),
     ],
 )

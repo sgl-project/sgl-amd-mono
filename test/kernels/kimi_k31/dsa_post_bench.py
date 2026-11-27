@@ -328,7 +328,7 @@ def main():
     p.add_argument("--launches", type=int, default=8)
     p.add_argument("--reps-check", type=int, default=3)
     p.add_argument("--pfx-short", type=int, default=0)
-    p.add_argument("--flush", type=int, default=0)
+    p.add_argument("--flush", type=int, default=256)
     p.add_argument("--front-map", action="store_true")
     p.add_argument("--timeline", action="store_true")
     p.add_argument("--sort", default=None, choices=(None, "sgl", "aux16"))
