@@ -173,6 +173,8 @@ P_IP_S, P_OUT_S, P_BA_S = 32, 33, 34
 # QSA: SGLang keeps qkv_proj and indexer.index_qk_proj as separate FP8 params (rows
 # [0, 832 * 16) / the rest of QP)
 P_IP2, P_IP2_S = 35, 36
+# QSA: nonzero in the one QSA layer of a step that stores the RoPE positions (rings <= L + 2; README, 2.)
+P_RP_STORE = 37
 QP_RG_QKV = (24 * 512 + 512 + 512) // 16  # 832
 BA_ROWS = 128  # SGLang pads in_proj_ba (96 rows) to 128 for AITER's CK GEMM
 # global row (index n_layers of the table)

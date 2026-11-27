@@ -2,7 +2,8 @@
 """Each Qwen3.8-Flash-Next launch kind on one gfx950 GPU, on random weights in
 SGLang's post-load gfx950 layouts (no checkpoint): 12 layers (launches [0], [1-3]
 with the PLE, [4-7], [8-11] with the final mixer) and the MTP head, on pools of
-SGLang's shapes with random state. Verify steps (prelude, PLE, middle, final-mixer
+SGLang's shapes with random state, with an 8-slot and SGLang's 4-slot index-key
+ring (``RINGS``). Verify steps (prelude, PLE, middle, final-mixer
 launches, MRoPE positions) of 1, 8 and 7 + 1 pad requests, MTP draft extend and
 decode steps of 1 and 8. Every step leaves the error words zero and its outputs
 finite, writes only its own pool rows (a pad request: KV slot 0, request slot 0's
@@ -10,8 +11,10 @@ ring, its scratch rows), also from a CUDA graph, which replays an unpadded step
 bitwise and a padded one's layers 0-3 states but KV slot 0 (see the README's
 Limitations). The prelude's n-gram embedding and context are bitwise a torch
 reference's. Every MoE block's router logits match an f32 router, its output an
-a16w4 torch MoE on the launch's input and routes. The GDN and QSA layers are checked
-against SGLang's forward by check mode (``test/e2e``)."""
+a16w4 torch MoE on the launch's input and routes; every compressed index key a step
+writes matches a torch reference (RoPE at its group's first position), every RoPE row
+it writes its token's position. The GDN and QSA layers are checked against SGLang's
+forward by check mode (``test/e2e``)."""
 
 import contextlib
 from functools import lru_cache
@@ -35,6 +38,7 @@ from sgl_amd_mono.qwen38_flash_next.gfx950 import layout as LY  # noqa: E402
 from sgl_amd_mono.qwen38_flash_next.gfx950 import packing  # noqa: E402
 from sgl_amd_mono.qwen38_flash_next.gfx950 import weights as W  # noqa: E402
 from sgl_amd_mono.qwen38_flash_next.gfx950.config import (  # noqa: E402
+    EPS,
     GDN_CONV_DIM,
     GDN_HV,
     HC_DIM,
@@ -45,7 +49,8 @@ from sgl_amd_mono.qwen38_flash_next.gfx950.config import (  # noqa: E402
 )
 
 DEV = "cuda"
-RING = 8  # index-key ring slots a request: two groups, as SGLang's QSA pool keeps them
+# index-key ring slots a request: SGLang's 4, and 8 (two groups) with sgl-project/sglang#47051
+RINGS = (8, 4)
 KINDS = ["qsa" if i % 4 == 3 else "gdn" for i in range(12)]
 EOS, VOCAB = 248044, 248320
 L, MAX_R = 4, 8  # verify rows a request (3 draft steps + 1), requests
@@ -184,9 +189,10 @@ class Pools:
     slots BASES[r] + position; the verify scratch rows (request r owns row r) and the
     deduplicated intermediate conv window SGLang allocates on ROCm."""
 
-    def __init__(self, kinds, seed: int = 0):
+    def __init__(self, kinds, ring: int, seed: int = 0):
         g = gen(seed)
         R = MAX_R
+        self.ring = ring
         self.reqs = [2 * r + 3 for r in range(R)]
         n_req, n_slot, n_scr = max(self.reqs) + 2, 5 * R + 2, R + 1
         off = BASES[-1] + (CONTEXTS[-1] + L + 127) // 64 * 64
@@ -221,13 +227,13 @@ class Pools:
             for b, c in zip(BASES, CONTEXTS):
                 k[b : b + c], v[b : b + c] = rnd(c, 2, 256, scale=0.5), rnd(c, 2, 256, scale=0.5)  # fmt: skip
                 comp[b // 4 : (b + c) // 4] = rnd((b + c) // 4 - b // 4, 1, 128, scale=0.5)  # fmt: skip
-            self.kv[i] = SimpleNamespace(k=k, v=v, comp=comp, ring=rnd(n_req * RING, 1, 128, scale=0.5))  # fmt: skip
-        # the RoPE positions of each request's last keys c - RING .. c - 1
-        self.qsa_rope_position_buffer = zeros(n_req * RING, 3, dtype=torch.int64)
+            self.kv[i] = SimpleNamespace(k=k, v=v, comp=comp, ring=rnd(n_req * ring, 1, 128, scale=0.5))  # fmt: skip
+        # the RoPE positions of each request's last keys c - ring .. c - 1
+        self.qsa_rope_position_buffer = zeros(n_req * ring, 3, dtype=torch.int64)
         self.qsa_num_request_slots = n_req
         for r, c in enumerate(CONTEXTS):
-            for q in range(RING):
-                self.qsa_rope_position_buffer[self.reqs[r] * RING + q] = c - 1 - (c - 1 - q) % RING  # fmt: skip
+            for q in range(ring):
+                self.qsa_rope_position_buffer[self.reqs[r] * ring + q] = c - 1 - (c - 1 - q) % ring  # fmt: skip
         self.short_conv = rnd(n_slot, HC_DIM, LY.PLE_STATE_LEN, scale=0.5)
         self.short_conv_ist = zeros(n_scr, L, HC_DIM, LY.PLE_STATE_LEN)
         ctx = torch.randint(0, 248000, (n_slot, 2), generator=g, device=DEV)
@@ -277,7 +283,7 @@ class Pools:
         """Pool tensor -> the rows step ``b`` may write (none if absent): its KV slots
         and compressed groups, its requests' ring and RoPE rows, its scratch rows."""
         locs = b.out_cache_loc.unique()
-        ring = (b.req_pool_indices[:, None] * RING + torch.arange(RING, device=DEV)).flatten()  # fmt: skip
+        ring = (b.req_pool_indices[:, None] * self.ring + torch.arange(self.ring, device=DEV)).flatten()  # fmt: skip
         scratch = torch.arange(b.batch_size, device=DEV)
         out = {"rope_pos": ring, "short_conv_ist": scratch, "ngram_ictx": scratch}
         for i in self.mamba:
@@ -317,8 +323,13 @@ def _router(small: dict, p: str = "") -> torch.Tensor:
     return torch.cat(gate).float()
 
 
+@pytest.fixture(scope="module", params=RINGS, ids=lambda n: f"ring{n}")
+def ring(request) -> int:
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def target():
+def target(ring):
     from sgl_amd_mono.qwen38_flash_next.gfx950.runner import VerifyRunner
 
     g, layers, small = gen(0), {}, {}
@@ -337,17 +348,18 @@ def target():
                           embed_w=embedding(), cos_sin=cos_sin, ntok=L, max_reqs=MAX_R,
                           eos_token_id=EOS, device=DEV)  # fmt: skip
     runner.set_deadline(30.0)
-    t = SimpleNamespace(ngram=ngram, runner=runner, pools=Pools(KINDS))
+    t = SimpleNamespace(ngram=ngram, runner=runner, pools=Pools(KINDS, ring))
     t.pools.install()
     steps = [step_batch(R) for R in REQUESTS]
     precompile(k for b in steps for k in runner.prepare_step(b, b.mrope_positions)[1])
     t.snap = t.pools.snapshot()
     t.blocks = {i: (_router(small[i]), layers[i]["moe"]) for i in layers}
+    t.iknorm = {i: layers[i]["iknorm"] for i in t.pools.kv}
     return t
 
 
 @pytest.fixture(scope="module")
-def draft():
+def draft(ring):
     from sgl_amd_mono.qwen38_flash_next.gfx950.runner import DraftRunner
 
     g = gen(1)
@@ -357,13 +369,14 @@ def draft():
     runner = DraftRunner(views=views, embed_w=embedding(), cos_sin=cos_sin, layer_id=0,
                          ntok_extend=L, max_reqs=MAX_R, eos_token_id=EOS, device=DEV)  # fmt: skip
     runner.set_deadline(30.0)
-    d = SimpleNamespace(runner=runner, pools=Pools(["qsa"]))
+    d = SimpleNamespace(runner=runner, pools=Pools(["qsa"], ring))
     d.pools.install()
     steps = [step_batch(R, rows) for R in REQUESTS for rows in (L, 1)]
     hs = torch.zeros(MAX_R * L, HC_DIM, dtype=torch.bfloat16, device=DEV)
     precompile(runner.prepare_step(b, hs[: b.input_ids.numel()])[1] for b in steps)
     d.snap = d.pools.snapshot()
     d.blocks = [(_router(lw, "layers.0."), views["layer"]["moe"])]
+    d.iknorm = {0: views["layer"]["iknorm"]}
     return d
 
 
@@ -434,6 +447,45 @@ def _stray_rows(pools, snap: dict, b) -> list:
     return bad
 
 
+def _check_qsa(m, b, pads: int) -> None:
+    """The QSA state a step leaves for the next one. Every compressed key the step wrote
+    (the groups completing in it) equals a torch reference of the intended math (to 2 %,
+    bitwise in practice): the mean of its 4 members (older ones from the ring before the
+    step, the batch's from it after), the index-k norm, RoPE at the group's first position
+    (the test's MRoPE positions are equal on the 3 axes). On the 4-slot ring this is not
+    SGLang's own verify, which stores the batch's keys first (the order agreed in #29).
+    Every RoPE row the step wrote holds its token's position."""
+    pools, R = m.pools, b.batch_size - pads
+    rows, ring, cs = b.input_ids.numel() // b.batch_size, pools.ring, cos_sin().float()
+    rp = pools.qsa_rope_position_buffer
+    for r, c in enumerate(CONTEXTS[:R]):
+        q = pools.reqs[r]
+        for p in range(c, c + rows):
+            assert (rp[q * ring + p % ring] == p).all().item(), (
+                f"request {r}: RoPE row of position {p} holds {rp[q * ring + p % ring].tolist()}"
+            )
+    for i, kv in pools.kv.items():
+        w = 1 + m.iknorm[i].float()
+        for r, c in enumerate(CONTEXTS[:R]):
+            q = pools.reqs[r]
+            for ps in range(c - 3 + (3 - c) % 4, c + rows - 3, 4):  # group starts
+                mem = [(m.snap[f"L{i}.ring"] if p < c else kv.ring)[q * ring + p % ring, 0]
+                       for p in range(ps, ps + 4)]  # fmt: skip
+                acc = sum(x.float() for x in mem)
+                x = (acc * 0.25).bfloat16().float()
+                x = (x * torch.rsqrt(x.square().mean() + EPS) * w).bfloat16().float()
+                cos, sin = cs[ps, :32], cs[ps, 32:]
+                x1, x2 = x[:32], x[32:64]
+                x = torch.cat(
+                    [x1 * cos - x2 * sin, x2 * cos + x1 * sin, x[64:]]
+                ).bfloat16()
+                got = kv.comp[(BASES[r] + ps) // 4, 0]
+                err = (got.float() - x.float()).abs().max().item()
+                assert err <= 0.02 + 0.02 * x.float().abs().max().item(), (
+                    f"L{i} request {r} group at {ps}: compressed key off by {err}"
+                )
+
+
 def _run_step(m, b, run, check, pads: int = 0) -> None:
     """Step ``b`` (``run()`` -> its outputs) eagerly with ``check`` after each launch,
     then from a CUDA graph, each from the same pools."""
@@ -445,6 +497,7 @@ def _run_step(m, b, run, check, pads: int = 0) -> None:
     assert not any(err := _error_words(runner)), err
     assert not (bad := _stray_rows(pools, m.snap, b)), bad
     assert all(e.isfinite().all() for e in eager), "non-finite outputs"
+    _check_qsa(m, b, pads)
     after = pools.snapshot()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

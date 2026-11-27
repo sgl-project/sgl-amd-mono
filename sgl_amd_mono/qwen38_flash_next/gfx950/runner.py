@@ -506,13 +506,20 @@ class VerifyRunner(_Base):
         frow[LY.P_HCA_UP] = self.final["up"].data_ptr()
         frow[LY.P_HCA_INJ] = last["hca"]["inj"].data_ptr()  # its combine gate is unused
         iconv = issm_row = ple_ist_row = ssm_bf16 = None
+        rp_layer = max(i for i, k in enumerate(self.kinds) if k == "qsa")
         tables = []
         for li, (_, layer_ids) in enumerate(self.plans):
             rows = []
             for layer_id in layer_ids:
                 t = self.layers[layer_id]
                 if self.kinds[layer_id] == "qsa":
-                    rows.append(packing.qsa_ptr_row(t, *_qsa_buffers(kvp, layer_id)))
+                    rows.append(
+                        packing.qsa_ptr_row(
+                            t,
+                            *_qsa_buffers(kvp, layer_id),
+                            rp_store=layer_id == rp_layer,
+                        )
+                    )
                     continue
                 cache = gdn_cache(kvp, layer_id)
                 conv, ssm = cache.conv[0], cache.temporal
