@@ -18,7 +18,7 @@ ENV = {
     "SGLANG_MAMBA_SSM_DTYPE": "bfloat16",
     "SGLANG_USE_AITER_FP8_PER_TOKEN": "1",
 }
-# Without --monokernel-backend, so a test can launch the normal path too.
+# Without --enable-amd-monokernel, so a test can launch the normal path too.
 ARGS = [
     "--tp",
     "1",

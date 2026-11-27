@@ -18,7 +18,7 @@ ENV = {
     "SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD": "0",
 }
 # The benchmark server of the PR, with up to 16 running requests and graphs to 16.
-# Without --monokernel-backend, so a test can launch the normal path too.
+# Without --enable-amd-monokernel, so a test can launch the normal path too.
 ARGS = [
     "--trust-remote-code",
     "--tp-size",

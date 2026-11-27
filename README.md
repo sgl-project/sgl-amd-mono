@@ -40,7 +40,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 
 ### Requirements
 
-- SGLang with the monokernel interface (`sglang.kernels.plugin_kernels.amd` and `sglang.srt.kernel_plugins.amd`; `sglang.srt.monokernels` before [sgl-project/sglang#45389](https://github.com/sgl-project/sglang/pull/45389)) and its specs by model type (`register(..., model_type=...)`), which tell DeepSeek-V4-Pro and V4.1 apart under their shared architecture
+- SGLang with the monokernel interface (`sglang.kernels.plugin_kernels.amd` and `sglang.srt.kernel_plugins.amd`) and its specs by model type (`register(..., model_type=...)`, [sgl-project/sglang#46036](https://github.com/sgl-project/sglang/pull/46036)), which tell DeepSeek-V4-Pro and V4.1 apart under their shared architecture
 - ROCm with FlyDSL and AITER, as included in SGLang's ROCm images
 - AMD Instinct MI350X or MI355X
 - MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--enable-amd-monokernel` refuses MiniMax-M3 and names them.

@@ -11,7 +11,7 @@ ENV = {
     "SGLANG_USE_ROCM700A": "0",
     "AITER_BF16_FP8_MOE_BOUND": "0",
 }
-# no --monokernel-backend, so a test can launch the normal path too
+# no --enable-amd-monokernel, so a test can launch the normal path too
 COMMON = [
     "--trust-remote-code",
     "--tp",

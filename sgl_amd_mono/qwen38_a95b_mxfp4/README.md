@@ -173,8 +173,8 @@ SGLang uses only the CUDA graph key of a step to choose between the monokernel a
 width, which is the number of requests times the rows of each request. Thus each rank makes the same choice, and a
 CUDA graph can replay it. A step with input embeddings or auxiliary hidden states runs SGLang's forward.
 
-The folder needs no SGLang changes. Start the server with `--monokernel-backend amd`. After sgl-project/sglang#45389,
-the flag is `--enable-amd-monokernel`.
+The folder needs no SGLang changes. Start the server with `--enable-amd-monokernel` (`--monokernel-backend amd` before
+sgl-project/sglang#45389).
 
 ## 6. Correctness checks
 

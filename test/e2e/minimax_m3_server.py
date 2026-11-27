@@ -37,7 +37,7 @@ COMMON = [
     "0.85",
     "--enable-aiter-allreduce-fusion",
 ]
-# Without --monokernel-backend, so a test can launch the normal path too.
+# Without --enable-amd-monokernel, so a test can launch the normal path too.
 # EAGLE3: verify steps of 4 rows a request, 4 requests at the largest width (16 rows)
 ARGS = COMMON + [
     "--speculative-algorithm",

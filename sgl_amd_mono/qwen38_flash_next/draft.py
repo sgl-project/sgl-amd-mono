@@ -218,13 +218,13 @@ class _Draft:
         backend = _step_backend()
         if backend not in DRAFT_ATTENTION_BACKENDS:
             raise ValueError(
-                f"--monokernel-backend amd: {SPEC.name} needs a draft attention "
+                f"monokernel {SPEC.name} needs a draft attention "
                 f"backend in {sorted(DRAFT_ATTENTION_BACKENDS)}, this {mode} step's "
                 f"is {backend!r}"
             )
         if _shares_mtp_sparse_indices():
             raise ValueError(
-                f"--monokernel-backend amd: {SPEC.name}: this {mode} step's QSA "
+                f"monokernel {SPEC.name}: this {mode} step's QSA "
                 "backend shares one sparse selection across the MTP draft steps "
                 "(index_share_for_mtp_iteration on); SGLang's draft decode would "
                 "read a selection the launched draft extend never writes"
