@@ -164,7 +164,7 @@ def _common_rows(row, t):
     row[LY.P_DN_S] = t["moe"]["dn_s"].data_ptr()
 
 
-def qsa_ptr_row(t, k_buf, v_buf, ring, comp):
+def qsa_ptr_row(t, k_buf, v_buf, ring, comp, *, rp_store):
     """Pointer table row of a QSA layer (and its KV / index-ring / compressed
     buffers)."""
     for b in (k_buf, v_buf):  # addressed with 64-bit pointers (any pool size)
@@ -189,6 +189,7 @@ def qsa_ptr_row(t, k_buf, v_buf, ring, comp):
     row[LY.P_VBUF] = v_buf.data_ptr()
     row[LY.P_RING] = ring.data_ptr()
     row[LY.P_COMP] = comp.data_ptr()
+    row[LY.P_RP_STORE] = int(rp_store)
     return row
 
 
@@ -290,7 +291,7 @@ def pack_mtp(lw, moe, proj):
 def mtp_rows(m, k_buf, v_buf, ring, comp, grow):
     """Pointer rows of a draft launch: [QSA layer row, global row (+ fusion
     pointers), final-mixer row]."""
-    row = qsa_ptr_row(m["layer"], k_buf, v_buf, ring, comp)
+    row = qsa_ptr_row(m["layer"], k_buf, v_buf, ring, comp, rp_store=True)
     grow[LY.G_MTP_PE] = m["pe"].data_ptr()
     grow[LY.G_MTP_PH] = m["ph"].data_ptr()
     grow[LY.G_MTP_FCE] = m["fce"].data_ptr()
