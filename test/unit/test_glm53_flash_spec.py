@@ -154,6 +154,14 @@ def _cfg(**kw):
     return SimpleNamespace(
         **{
             "page_size": 256,
+            "kv_cache_dtype": "auto",
+            "enable_linear_replayssm": False,
+            "enable_linear_replayssm_spec": False,
+            "enable_hisparse": False,
+            "enable_hierarchical_cache": False,
+            "enable_lmcache": False,
+            "enable_flexkv": False,
+            "disaggregation_decode_enable_offload_kvcache": False,
             "speculative_algorithm": None,
             "linear_attn_backend": "triton",
             "linear_attn_decode_backend": None,
@@ -165,6 +173,25 @@ def _cfg(**kw):
 
 def _dtypes(temporal=torch.float32, conv=torch.bfloat16):
     return lambda config: SimpleNamespace(temporal=temporal, conv=conv)
+
+
+@pytest.mark.parametrize(
+    "arg, value",
+    [
+        ("kv_cache_dtype", "fp8_e4m3"),
+        ("enable_linear_replayssm", True),
+        ("enable_hisparse", True),
+        ("enable_hierarchical_cache", True),
+    ],
+)
+def test_the_narrow_launches_refuse_the_args_they_do_not_serve(monkeypatch, arg, value):
+    import sglang.srt.configs.mamba_utils as mamba_utils
+    import sglang.srt.layers.attention.dsa.utils as dsa_utils
+
+    monkeypatch.setattr(mamba_utils, "mamba2_state_dtype", _dtypes())
+    monkeypatch.setattr(dsa_utils, "aiter_can_use_preshuffle_paged_mqa", lambda: True)
+    reasons = flash.SPEC.config_disable_reasons(_cfg(**{arg: value}), FLASH)
+    assert reasons == [f"{arg} {value!r} is not one of {list(flash._NARROW_ARGS[arg])}"]
 
 
 def test_config_reasons_name_each_mismatch(monkeypatch):
@@ -333,6 +360,10 @@ def _lp(**kw):
     )
 
 
+def _exec():
+    return SimpleNamespace(mamba=SimpleNamespace(enable_linear_replayssm_spec=False))
+
+
 def test_model_reasons(monkeypatch):
     import sglang.srt.runtime_context as runtime_context
 
@@ -341,6 +372,7 @@ def test_model_reasons(monkeypatch):
     monkeypatch.setattr(
         runtime_context, "get_parallel", lambda: SimpleNamespace(tp_size=4)
     )
+    monkeypatch.setattr(runtime_context, "get_exec", _exec)
     refused = {}
 
     def view(name):
@@ -387,6 +419,7 @@ def test_model_reasons_of_the_tail_the_embedding_and_the_dense_layers(monkeypatc
     monkeypatch.setattr(
         runtime_context, "get_parallel", lambda: SimpleNamespace(tp_size=4)
     )
+    monkeypatch.setattr(runtime_context, "get_exec", _exec)
 
     def refuse(why):
         def f(*args):
@@ -751,6 +784,7 @@ def _build_keys(monkeypatch, temporal, widths=(2, 4, 8)):
     monkeypatch.setattr(
         runtime_context, "get_spec", lambda: SimpleNamespace(speculative_algorithm=None)
     )
+    monkeypatch.setattr(runtime_context, "get_exec", _exec)
     monkeypatch.setattr(
         runtime_context,
         "process_model_config",

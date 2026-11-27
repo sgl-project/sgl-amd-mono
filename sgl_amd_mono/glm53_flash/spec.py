@@ -20,6 +20,11 @@ The kernels read SGLang's weights in place, except the copies logged at startup:
 the router packed for the MFMA tiles and its bias in f32, W_UK^T from kv_b_proj, the indexer's
 wk | weights_proj in bf16, the o_norm weight in f32, and the shared expert packed
 as one AITER expert where SGLang keeps it apart (TP2).
+
+A server with ``--enable-linear-replayssm-spec`` runs the wide launch instead
+(``wide_spec``): its MTP verify steps of more than 16 rows, on SGLang's ReplaySSM
+ring, which the launches above exclude (their verify scratch). The spec takes both
+launches' widths; the one a server does not run hands its steps to SGLang's forward.
 """
 
 from __future__ import annotations
@@ -53,6 +58,8 @@ from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.glm53_flash import (
     HF_CONFIG,
     LINEAR_ATTN_CONFIG,
+    wide,
+    wide_spec,
 )
 
 # kernel widths; a step of fewer rows runs at the next width, the rest pad rows
@@ -78,6 +85,7 @@ def _width(rows: int) -> int:
 SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
         "page_size",
+        "kv_cache_dtype",
         "enable_linear_replayssm",
         "enable_linear_replayssm_spec",
         "speculative_algorithm",
@@ -88,6 +96,10 @@ SGLANG_READS = {
         "linear_attn_decode_backend",
         "linear_attn_verify_backend",
         "enable_hisparse",
+        "enable_hierarchical_cache",
+        "enable_lmcache",
+        "enable_flexkv",
+        "disaggregation_decode_enable_offload_kvcache",
         "expert_distribution_recorder_mode",
         "watchdog_timeout",
     ),
@@ -191,6 +203,7 @@ SGLANG_READS = {
     "srt/arg_groups/speculative_hook.py": ('"EAGLE"', '"NEXTN"'),
     "srt/runtime_context.py": (
         "get_device",
+        "get_exec",
         "get_parallel",
         "get_spec",
         "process_model_config",
@@ -265,16 +278,55 @@ def _state_dtypes():
     return mamba2_state_dtype(None)
 
 
+def _replayssm_spec() -> bool:
+    """Whether this server's MTP verifies on SGLang's ReplaySSM ring, which the wide
+    launch serves and the narrow launches exclude."""
+    from sglang.srt.runtime_context import get_exec
+
+    return bool(get_exec().mamba.enable_linear_replayssm_spec)
+
+
+# The narrow launches' server args (the wide launch does not need them)
+_NARROW_ARGS = {
+    "kv_cache_dtype": ("auto", "bfloat16"),
+    # the launch updates the KDA state in place; ReplaySSM defers it to a ring
+    "enable_linear_replayssm": (False,),
+    # HiSparse maps the logical KV slots to device rows; the kernels write raw slots
+    "enable_hisparse": (False,),
+    # the launches read and write the KV pool HiCache moves pages of, with no wait for
+    # its per-layer loads; the wide launch leaves the KV to SGLang
+    "enable_hierarchical_cache": (False,),
+}
+# KV offload other than HiCache, which neither launch is tested with
+_OTHER_KV_OFFLOAD = (
+    "enable_lmcache",
+    "enable_flexkv",
+    "disaggregation_decode_enable_offload_kvcache",
+)
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sglang.srt.layers.attention.dsa.utils import (
         aiter_can_use_preshuffle_paged_mqa,
     )
 
-    text = _text(hf_config)
     reasons = [
+        f"KV offload other than HiCache ({arg})"
+        for arg in _OTHER_KV_OFFLOAD
+        if getattr(cfg, arg)
+    ]
+    if cfg.enable_linear_replayssm_spec:
+        return reasons + wide_spec.config_disable_reasons(cfg, hf_config)
+    text = _text(hf_config)
+    reasons += [
         f"needs GLM-5.3-Flash's {key} = {want!r}, got {getattr(text, key, None)!r}"
         for key, want in HF_CONFIG.items()
         if getattr(text, key, None) != want
+    ]
+    reasons += [
+        f"{arg} {getattr(cfg, arg)!r} is not one of {list(ok)}"
+        for arg, ok in _NARROW_ARGS.items()
+        if getattr(cfg, arg) not in ok
     ]
     linear = getattr(text, "linear_attn_config", None) or {}
     reasons += [
@@ -338,6 +390,8 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         head_weights,
     )
 
+    if _replayssm_spec():
+        return wide_spec.model_disable_reasons(model, hf_config, copies)
     tp = get_parallel().tp_size
     reasons = []
     if model.is_mrope_enabled:
@@ -825,6 +879,8 @@ def _build(model, hf_config, ctx) -> _Built:
         layer_weights,
     )
 
+    if _replayssm_spec():
+        return wide_spec.build(model, hf_config, ctx)
     p = get_parallel()
     tp, rank = p.tp_size, p.tp_rank
     inter = GLOBAL_INTER // tp
@@ -966,26 +1022,22 @@ def _build(model, hf_config, ctx) -> _Built:
 SPEC = MonoSpec(
     name="glm53_flash_hip",
     devices={
-        "gfx950": DeviceLimits(widths=ROWS, tp_sizes=TP_SIZES, resident_blocks=BLOCKS)
+        "gfx950": DeviceLimits(
+            widths=ROWS + wide.widths(wide.SUPPORTED_L[0]),
+            tp_sizes=TP_SIZES,
+            resident_blocks=BLOCKS,
+        )
     },
     # decode steps, or the target's verify steps of MTP (the NextN draft runs
-    # SGLang's forward)
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # SGLang's forward); KV offload: HiCache on the wide launch only (config check)
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.KV_OFFLOAD}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsa"}),
         server_args={
-            "kv_cache_dtype": frozenset({"auto", "bfloat16"}),
             "moe_runner_backend": frozenset({"auto", "aiter"}),
-            # the launch updates the KDA state in place; ReplaySSM defers it to a ring
-            "enable_linear_replayssm": frozenset({False}),
-            # MTP: the NextN draft's verify steps (NEXTN resolves to EAGLE); a verify
-            # launch writes every draft token's KDA state to the verify scratch,
-            # which ReplaySSM's spec mode does not keep
+            # MTP: the NextN draft's verify steps (NEXTN resolves to EAGLE)
             "speculative_algorithm": frozenset({None, "EAGLE"}),
-            "enable_linear_replayssm_spec": frozenset({False}),
-            # HiSparse maps the logical KV slots to device rows; the kernels write raw slots
-            "enable_hisparse": frozenset({False}),
             # the launches record no expert distribution, and layer 44 would record
             # outside its layer (SGLang's forward sets it per layer)
             "expert_distribution_recorder_mode": frozenset({None}),

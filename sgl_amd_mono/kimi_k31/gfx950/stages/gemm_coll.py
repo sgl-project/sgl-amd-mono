@@ -183,12 +183,13 @@ def _push_tile(c, acc, m, n, m0, rb, n0, bn, ks, mode, sl):
 
 
 @flyc.jit
-def _push_band_flag(c, acc, m, n, m0, rb, n0, bn, ks, mode, sl, piece):
+def _push_band_flag(c, acc, m, n, m0, rb, n0, bn, ks, mode, sl, piece, nbytes=None):
     """Flag format: rows m0 .. m0 + rb of the finished tile as plain 16 B stores into
-    the owner's rs region [src][m][sl], drained, then flag (this rank, piece)."""
+    the owner's rs region [src][m][sl], drained, then flag (this rank, piece).
+    ``nbytes``: ``acc``'s extent (reads past it are 0)."""
     owner = n0 // sl
     dst = c["rs_of"](owner)
-    r = rsrc(acc)
+    r = rsrc(acc, nbytes)
     q8 = bn // 8
     units = rb * q8
     part = mode == "part" and ks > 1

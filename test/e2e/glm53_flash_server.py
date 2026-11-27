@@ -1,6 +1,7 @@
 """The GLM-5.3-Flash servers that the monokernel serving test launches: MI35x, TP4,
-decode steps, with ``MTP`` the NextN draft's verify steps, and with ``BF16_STATE``
-a bf16 KDA state."""
+decode steps, with ``MTP`` the NextN draft's verify steps, with ``BF16_STATE``
+a bf16 KDA state, with ``WIDE_MTP`` the wide verify launch, and with ``HICACHE``
+HiCache under it."""
 
 import os
 
@@ -56,3 +57,35 @@ MTP = [
 # The KDA state pool in bf16 (f32 without it). SGLang's HIP prefill takes a bf16
 # state with sgl-project/sglang#49036; without it, its Triton prefill runs
 BF16_STATE = ["--mamba-ssm-dtype", "bfloat16"]
+# The wide launch instead of the narrow ones: MTP with one draft chain of 6 tokens on
+# SGLang's ReplaySSM ring, so verify steps of 3 to 32 requests (18 to 192 rows) run
+# the wide launch and narrower ones SGLang's path
+WIDE_MTP = [
+    "--speculative-algorithm",
+    "EAGLE",
+    "--speculative-num-steps",
+    "5",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "6",
+    "--enable-linear-replayssm-spec",
+]
+# HiCache as the AgentX c64 recipe runs it (pages written to the host when evicted),
+# over a device KV pool of 32768 tokens that a test can fill to evict prefixes
+HICACHE = [
+    "--mamba-radix-cache-strategy",
+    "extra_buffer",
+    "--enable-hierarchical-cache",
+    "--hicache-write-policy",
+    "write_back",
+    "--hicache-io-backend",
+    "kernel",
+    "--hicache-mem-layout",
+    "page_first",
+    "--hicache-ratio",
+    "4",
+    "--max-total-tokens",
+    "32768",
+    "--enable-metrics",
+]
