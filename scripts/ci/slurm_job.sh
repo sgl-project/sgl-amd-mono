@@ -139,6 +139,11 @@ docker run -d --name "$NAME" \
     -e MONO_CI_NUM_EXAMPLES -e MONO_CI_CONCURRENCY -e CI_EXTRA \
     -w /ci "$CI_IMAGE" sleep infinity
 
+# Keep the newest 7 nightly images of this job's ROCm line; rmi without -f skips images in use.
+[[ "$CI_IMAGE" =~ -(rocm[0-9]+)-mi35x- ]] \
+    && { docker images "rocm/sgl-dev:v*-${BASH_REMATCH[1]}-mi35x-*" --format '{{.Repository}}:{{.Tag}}' \
+         | tail -n +8 | xargs -r docker rmi >/dev/null 2>&1 || true; }
+
 if [[ -s "$HF_TOKEN_FILE" ]]; then
     echo "[mono-ci-job] filling the gated dataset cache"
     docker exec --env-file <(printf 'HF_TOKEN=%s\n' "$(tr -d '[:space:]' < "$HF_TOKEN_FILE")") "$NAME" \
