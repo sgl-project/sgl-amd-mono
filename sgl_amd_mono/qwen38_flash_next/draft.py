@@ -20,8 +20,9 @@ the launch cannot read raises instead of running SGLang's forward; larger steps
 run SGLang's forward. ``_build`` turns SGLang's QSA MTP index sharing off for the
 draft: with it on, SGLang's draft decode reuses the selection its own draft extend
 stored, which a launched extend never writes, so a batch growing past 8 requests
-would decode with a stale selection. SGLang's capture check never sees a draft
-step, so this module logs each draft key the first time it launches. Check mode
+would decode with a stale selection. SGLang's capture check checks the target's
+steps, not a draft's (``_keep_draft_out_of_capture_check``), so this module logs each
+draft key the first time it launches. Check mode
 (``SGLANG_AMD_MONO_CHECK``) does not cover the draft yet, and fault injection arms
 the target's launches only.
 
@@ -107,6 +108,10 @@ SGLANG_READS = {
     "srt/speculative/draft_utils.py": ('"qsa"',),
     "srt/speculative/*.py": ("hidden_states",),
     "srt/runtime_context.py": ("get_parallel", '"tp_size"'),
+    # the capture check the draft runners run since sgl-project/sglang#46210, and the
+    # flag that tells a draft model runner from the target's
+    "srt/kernel_plugins/amd/binding.py|srt/monokernels/runtime.py": ("_CaptureCheck",),
+    "srt/model_executor/model_runner.py": ("is_draft_worker",),
 }
 
 # The draft runs on its own QSA backends whatever --speculative-draft-attention-backend
@@ -277,6 +282,37 @@ def _route_draft_steps(model, draft: _Draft) -> None:
     model.forward = forward
 
 
+def _keep_draft_out_of_capture_check() -> None:
+    """Make SGLang's capture check skip the draft's graph captures.
+
+    Since sgl-project/sglang#46210 the draft decode and draft extend CUDA graph
+    runners run the model runner's capture tail hooks, which on a draft model runner
+    include the monokernel capture check. That check compares the captured steps with
+    the keys the target serves (``target_verify`` steps), so it finds none among the
+    draft's own steps, a 1-token decode and a draft extend, and raises at the draft
+    decode capture: ``none of the 1 captured decode graphs ... runs
+    qwen38_flash_next_mtp_draft_hip's monokernels``. The draft's wrapper routes and
+    logs those steps itself (see the module docstring), so a draft runner's captures
+    are not checked. The target runner's check is unchanged. Idempotent, and
+    redundant once SGLang skips draft runners in the check itself."""
+    try:
+        from sglang.srt.kernel_plugins.amd.binding import _CaptureCheck
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.monokernels.runtime import _CaptureCheck
+    call = _CaptureCheck.__call__
+    if getattr(call, "_skips_draft_runners", False):
+        return
+
+    @functools.wraps(call)
+    def skip_draft_runners(self, runner, out, forward_batch, num_tokens):
+        if getattr(runner.model_runner, "is_draft_worker", False):
+            return None
+        return call(self, runner, out, forward_batch, num_tokens)
+
+    skip_draft_runners._skips_draft_runners = True
+    _CaptureCheck.__call__ = skip_draft_runners
+
+
 def _build(model, hf_config, ctx) -> _Draft:
     import torch
 
@@ -304,6 +340,7 @@ def _build(model, hf_config, ctx) -> _Draft:
     runner.set_deadline(ctx.deadline_s)
     draft = _Draft(model, runner)
     _route_draft_steps(model, draft)
+    _keep_draft_out_of_capture_check()
     logger.info(
         "monokernel qwen38_flash_next MTP draft: draft extend steps of up to %d x %d "
         "rows and draft decode steps of up to %d x 1 are routed by the spec's "
