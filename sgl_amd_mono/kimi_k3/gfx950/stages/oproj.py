@@ -125,17 +125,28 @@ def scratch_bytes(key: AttnPostBuild) -> int:
     return max(o + n for o, n in scratch_layout(key).values())
 
 
+W_O_BYTES = OROWS * OK * 2  # 22,020,096: w_o's exact size, as a resource bound
+
+
 def o_loads(c, rg):
     """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8 < 12): a lane
-    64 B of its row a chunk."""
+    64 B of its row a chunk.
+
+    A quarter of the slots are dead (waves 4 .. 7 of the second round, past
+    chunk 11). With w_o as a bounded resource their offset sits past its last
+    record, so the hardware returns zeros without a memory request. ``stage_o``
+    zeroes their LDS operand anyway, so the partial is bit for bit the same."""
     lane, wave = c["lane"], c["wave"]
-    r_w = rsrc(c["args"]["w_o"])
+    r_w = rsrc(c["args"]["w_o"], W_O_BYTES)
     row = rg * ROWS + lane % ROWS
     g = lane // ROWS
     out = []
     for i in range(2):
-        ch = fx.min(wave + WAVES * i, OKCH - 1)
-        base = (row * OK + ch * 128 + g * 8) // 2
+        ch = wave + WAVES * i
+        base = (ch < OKCH).select(
+            (row * OK + fx.min(ch, OKCH - 1) * 128 + g * 8) // 2,
+            fx.Int32(W_O_BYTES // 4),
+        )
         out.append(
             [
                 fx.Vector(

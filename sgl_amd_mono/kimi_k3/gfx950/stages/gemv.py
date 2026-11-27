@@ -37,16 +37,26 @@ def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, nbytes=None):
     """This wave's operands of weight rows ``row0`` .. + 16 (row-major, ``ldk``
     bf16 a row at ``w``, K columns ``k0`` .. ``k0 + k``): a list a chunk
     (clamped into K: ``mfmas`` zeroes the extra). ``nbytes`` bounds the buffer:
-    0 makes every load return zero without touching memory."""
+    0 makes every load return zero without touching memory.
+
+    With a constant ``nbytes`` the dead slots of the last round (``wave`` past
+    the chunk count: a quarter of them at K = 768, an eighth at K = 3584) go to
+    the first record past the bound instead of re-reading the last chunk. The
+    hardware returns zeros for them with no memory request, and ``mfmas``
+    zeroes their LDS operand anyway, so the dot is unchanged.
+    """
     per, n = chunks(k)
     ldk = k if ldk is None else ldk
     r_w = rsrc(w, nbytes)
+    dead = fx.Int32(nbytes // 4) if isinstance(nbytes, int) else None
     row = row0 + lane % ROWS
     g = lane // ROWS
     out = []
     for i in range(per):
         ch = fx.min(wave + WAVES * i, n - 1)
         base = (row * ldk + k0 + ch * KCH + g * 8) // 2
+        if dead is not None and const_live(per, n):
+            base = (wave + WAVES * i < n).select(base, dead)
         out.append(
             [
                 fx.Vector(
