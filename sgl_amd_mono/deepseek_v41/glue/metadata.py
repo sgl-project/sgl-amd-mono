@@ -37,7 +37,7 @@ SGLANG_READS = {
         "PAGE_INDEX_ALIGNED_SIZE",
         "_create_flashmla_metadata",
         "target_verify_num_draft_tokens",
-        "MAX_SEQ_LEN_FOR_CAPTURE",
+        "max_kv_len",
         "need_compress",
         "has_c4",
         "has_c128",
@@ -256,9 +256,7 @@ def _fused(backend, raw, inputs):
     qo, page = backend.target_verify_num_draft_tokens, backend.page_size
     bs = raw.seq_lens.shape[0]
     rows, dev, w = bs * qo, raw.seq_lens.device, hip.SWA_WINDOW
-    num_cols = max(
-        0, (min(backend.MAX_SEQ_LEN_FOR_CAPTURE, r2t.shape[1]) + page - 1) // page
-    )
+    num_cols = max(0, (min(backend.max_kv_len, r2t.shape[1]) + page - 1) // page)
     align = hip.PAGE_INDEX_ALIGNED_SIZE
     c128p = page // 128
     w128 = -(-(num_cols * c128p) // align) * align

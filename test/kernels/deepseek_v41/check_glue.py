@@ -31,7 +31,7 @@ def _backend(rng, *, reqs, ctx, qo, draft, device):
         0, slots, (reqs, ctx), generator=rng, device=device, dtype=torch.int32
     )
     b.token_to_kv_pool = pool
-    b.page_size, b.MAX_SEQ_LEN_FOR_CAPTURE = 256, ctx
+    b.page_size, b.max_kv_len = 256, ctx
     b.target_verify_num_draft_tokens = qo
     b.need_compress, b.has_c4, b.has_c128 = not draft, False, False
     b.low_ratios = () if draft else (1, 2)
