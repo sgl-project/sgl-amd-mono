@@ -21,6 +21,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
@@ -727,8 +728,8 @@ def k2_launch(
     assert not key.opt & OPT_TAG_X or scratch.numel() >= scratch_alloc_bytes(), (
         "OPT_TAG_X without scratch_alloc_bytes of scratch"
     )
-    f = build(key)
-    f(
+    _run_compiled(
+        build(key),
         core.data_ptr(),
         w_o.data_ptr(),
         ptr(w_os),
@@ -758,5 +759,5 @@ def k2_launch(
         epoch.data_ptr(),
         layer,
         ptr(tl),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )

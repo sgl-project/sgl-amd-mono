@@ -34,6 +34,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
@@ -1006,8 +1007,8 @@ def kda_pre(
             assert t.shape[1:] == (NH, ring_len, HD) and t[0].is_contiguous()
         assert rb.shape[1:] == (NH, ring_len) and rb[0].is_contiguous()
         seqs = (rk.stride(0), rv.stride(0), rg.stride(0), rb.stride(0))
-    f = build(key)
-    f(
+    _run_compiled(
+        build(key),
         prefix.data_ptr(),
         ptr(delta),
         blocks.data_ptr(),
@@ -1048,5 +1049,5 @@ def kda_pre(
         layer,
         epoch.data_ptr(),
         ptr(tl),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )
