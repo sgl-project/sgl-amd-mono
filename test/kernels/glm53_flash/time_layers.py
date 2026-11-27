@@ -92,13 +92,37 @@ def _verify_caches(rows: int, L: int, pos: int, device):
     return caches, table, pt.repeat_interleave(L, 0).contiguous()
 
 
-def _kda_state(args, rows: int, tp: int, device):
-    """``check_layer``'s KDA state, its recurrent state in bf16 with ``--state-bf16``."""
+def _kda_state(args, rows: int, tp: int, device, verify: int = 1):
+    """``check_layer``'s KDA state, its recurrent state in bf16 with ``--state-bf16``;
+    with ``verify`` L > 1, rows // L requests (slots 1 ..) of L rows each, pads on
+    slot 0, and the verify scratch (a row a request)."""
     from msgspec.structs import replace
 
-    state, idx = cl.kda_state(rows, tp, device)
+    from sgl_amd_mono.glm53_flash.gfx950.config import KDA_DIM, KDA_HEADS, KDA_PROJ
+
+    if verify == 1:
+        state, idx = cl.kda_state(rows, tp, device)
+    else:
+        R = rows // verify
+        state, _ = cl.kda_state(R, tp, device)
+        P, H = KDA_PROJ // tp, KDA_HEADS // tp
+        state = replace(
+            state,
+            inter_rec=torch.zeros(
+                R + 1, verify, H, KDA_DIM, KDA_DIM, dtype=torch.float32, device=device
+            ),
+            inter_conv=torch.zeros(
+                R + 1, verify, 3, 3 * P, dtype=torch.bfloat16, device=device
+            ),
+        )
+        idx = torch.zeros(rows, dtype=torch.int32, device=device)
+        idx[: R * verify] = torch.arange(
+            1, R + 1, dtype=torch.int32, device=device
+        ).repeat_interleave(verify)
     if args.state_bf16:
         state = replace(state, rec_state=state.rec_state.bfloat16())
+        if state.inter_rec is not None:
+            state = replace(state, inter_rec=state.inter_rec.bfloat16())
     return state, idx
 
 
@@ -136,7 +160,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             grouped=not args.per_row_moe
             and rows >= GROUPED_FROM
             and not (dense or head),
-            verify=args.verify if dsa else 1,
+            verify=args.verify if kind in ("kda", "dsa") else 1,
         )
         runtimes[kind] = FlashRuntime(key, rank, group, device)
         runtimes[kind].set_deadline(60.0)
@@ -166,7 +190,7 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
         ffn = cl.ffn_weights(rank, tp, device)
         if kind == "kda":
             attn = cl.kda_weights(rank, tp, device)
-            state, idx = _kda_state(args, rows, tp, device)
+            state, idx = _kda_state(args, rows, tp, device, args.verify)
             ops.append(FlashLayerOp(runtimes[kind], ffn, n, kda=attn))
             extra.append(dict(state=state, state_idx=idx))
         else:
@@ -283,10 +307,15 @@ def main() -> int:
         "--state-bf16", action="store_true", help="a bf16 KDA recurrent state"
     )
     ap.add_argument(
-        "--verify", type=int, default=1, help="dsa: an MTP verify step's rows a request"
+        "--verify",
+        type=int,
+        default=1,
+        help="kda or dsa: an MTP verify step's rows a request",
     )
     args = ap.parse_args()
-    assert args.verify == 1 or args.kind == "dsa", "--verify times dsa launches"
+    assert args.verify == 1 or args.kind in ("kda", "dsa"), (
+        "--verify times kda or dsa launches"
+    )
     cl.MAX_LEN = max(cl.MAX_LEN, (args.pos + args.verify - 1 + 256) // 256 * 256)
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))

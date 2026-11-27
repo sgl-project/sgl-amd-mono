@@ -1981,6 +1981,9 @@ def build_flash_kernel(key: FlashBuild):
         OPROJ_IN_KDA = S <= 2 and W > 2 and not VERIFY
         STATES_LAST = OPROJ_IN_KDA or S > 4
         XO = X_WORDS - 3 * KD if OPROJ_IN_KDA else 7 * KD
+        # a verify task's LDS rows: row j's at words j * VB ..
+        VB = 7 * KD
+        assert not (kda and VERIFY) or (VL * VB <= X_WORDS and 3 * VL <= MISC_WORDS)
         assert not OPROJ_IN_KDA or XO >= max(7 * KD, S * P // 2)
 
         def conv_at(ch, j):
@@ -2047,30 +2050,33 @@ def build_flash_kernel(key: FlashBuild):
                         * fx.Int64(STATE_BYTES)
                     )
                     hv = ld_state(r_rs, vr * KD + k0)
+                    # every thread polls (channel and gate clamped) every row
+                    specs = []
                     for j in range_constexpr(VL):
                         row = s + j
-                        # every thread polls (the channel and gate clamped), so the
-                        # conv window carries to the next row outside a branch
-                        x, g, b_raw = getf_many(
-                            [
-                                (mb("proj"), row * IN_ROWS + ch),
-                                (
-                                    mb("gates"),
-                                    row * 2 * P + (gi // KD) * P + h * KD + gi % KD,
-                                ),
-                                (mb("proj"), row * IN_ROWS + 3 * P + h),
-                            ]
-                        )
+                        specs += [
+                            (mb("proj"), row * IN_ROWS + ch),
+                            (
+                                mb("gates"),
+                                row * 2 * P + (gi // KD) * P + h * KD + gi % KD,
+                            ),
+                            (mb("proj"), row * IN_ROWS + 3 * P + h),
+                        ]
+                    got = getf_many(specs)
+                    # row j's q, k, v, gates, o, decay at LDS words j * VB ..,
+                    # its beta and q, k sums of squares at misc 3 j ..
+                    for j in range_constexpr(VL):
+                        x, g, b_raw = got[3 * j], got[3 * j + 1], got[3 * j + 2]
                         a = cw[CONV_TAPS - 1] * x
                         for k in range_constexpr(CONV_TAPS - 1):
                             a = a + cw[k] * st[k]
                         st = st[1:] + [x]
                         if tid < 3 * KD:
-                            lds_st(xs, tid, bf16_round(div(a, 1.0 + _exp(-a))))
+                            lds_st(xs, j * VB + tid, bf16_round(div(a, 1.0 + _exp(-a))))
                             if tid < 2 * KD:
-                                lds_st(xs, G1O + tid, g)
+                                lds_st(xs, j * VB + G1O + tid, g)
                             if tid == 0:
-                                lds_st(misc, 0, b_raw)
+                                lds_st(misc, 3 * j, b_raw)
                             if valid:
                                 r_icw = _rsrc(
                                     inter_conv
@@ -2086,36 +2092,64 @@ def build_flash_kernel(key: FlashBuild):
                                         r_icw,
                                         conv_at(ch, k),
                                     )
-                        gpu.barrier()
-                        if wave < 2:
-                            a0 = lds_ld(xs, wave * KD + lane)
-                            a1 = lds_ld(xs, wave * KD + lane + 64)
-                            ss = wave_sum(a0 * a0 + a1 * a1)
-                            if lane == 0:
-                                lds_st(misc, 1 + wave, ss)
-                        if (wave >= 2) & (wave < 4):
-                            gk = lds_ld(xs, G1O + kch) + dtb
+                    gpu.barrier()
+                    for i in range_constexpr(0, 2 * VL, WAVES):
+                        # wave w: row (i + w) // 2's q (even) or k sum of squares
+                        jq = fx.min(wave + i, 2 * VL - 1)
+                        j, qk = jq // 2, jq % 2
+                        a0 = lds_ld(xs, j * VB + qk * KD + lane)
+                        a1 = lds_ld(xs, j * VB + qk * KD + lane + 64)
+                        ss = wave_sum(a0 * a0 + a1 * a1)
+                        if (lane == 0) & (wave + i < 2 * VL):
+                            lds_st(misc, 3 * j + 1 + qk, ss)
+                    for i in range_constexpr(0, VL * KD, THREADS):
+                        # channel kch of row (tid + i) // KD
+                        j = (tid + i) // KD
+                        if tid + i < VL * KD:
+                            gk = lds_ld(xs, j * VB + G1O + kch) + dtb
                             lds_st(
                                 xs,
-                                DO + kch,
+                                j * VB + DO + kch,
                                 _exp(div(KDA_LOWER_BOUND, 1.0 + _exp(-(amp * gk)))),
                             )
-                        gpu.barrier()
-                        rq = _rsq(lds_ld(misc, 1) + L2_EPS) * (KD**-0.5)
-                        rk = _rsq(lds_ld(misc, 2) + L2_EPS)
-                        beta = sigmoid(lds_ld(misc, 0))
-                        kk = [lds_ld(xs, KO + k0 + i) * rk for i in range(32)]
+                    gpu.barrier()
+                    # q and k scaled in place by their norms (as the rows' updates
+                    # scale them)
+                    for i in range_constexpr(0, 2 * VL * KD, THREADS):
+                        j, c = (tid + i) // (2 * KD), (tid + i) % (2 * KD)
+                        if tid + i < 2 * VL * KD:
+                            sq = lds_ld(misc, 3 * j + 1 + c // KD)
+                            scale = (c < KD).select(
+                                _rsq(sq + L2_EPS) * (KD**-0.5), _rsq(sq + L2_EPS)
+                            )
+                            lds_st(xs, j * VB + c, lds_ld(xs, j * VB + c) * scale)
+                    gpu.barrier()
+
+                    def lds_v32(at):
+                        out = []
+                        for q in range_constexpr(8):
+                            w = fx.Vector(
+                                fx.ptr_load(xs + (at + 4 * q), result_type=v4f)
+                            )
+                            out += [w[e] for e in range(4)]
+                        return out
+
+                    for j in range_constexpr(VL):
+                        beta = sigmoid(lds_ld(misc, 3 * j))
+                        kk = lds_v32(j * VB + KO + k0)
+                        dk = lds_v32(j * VB + DO + k0)
                         dot = fx.Float32(0.0)
                         for i in range_constexpr(32):
-                            hv[i] = hv[i] * lds_ld(xs, DO + k0 + i)
+                            hv[i] = hv[i] * dk[i]
                             dot = dot + hv[i] * kk[i]
                         for off in (1, 2):
                             dot = _xred(dot, off, lambda a, b: a + b)
-                        vn = beta * (lds_ld(xs, VO + vr) - dot)
+                        vn = beta * (lds_ld(xs, j * VB + VO + vr) - dot)
+                        qq = lds_v32(j * VB + QO + k0)
                         o = fx.Float32(0.0)
                         for i in range_constexpr(32):
                             hv[i] = hv[i] + vn * kk[i]
-                            o = o + hv[i] * (lds_ld(xs, QO + k0 + i) * rq)
+                            o = o + hv[i] * qq[i]
                         for off in (1, 2):
                             o = _xred(o, off, lambda a, b: a + b)
                         if valid:
@@ -2131,26 +2165,40 @@ def build_flash_kernel(key: FlashBuild):
                         if tid % 4 == 0:
                             lds_st(
                                 xs,
-                                OO + vr,
+                                j * VB + OO + vr,
                                 valid.select(bf16_round(o), fx.Float32(0.0)),
                             )
-                        gpu.barrier()
-                        if wave == 0:
+                    gpu.barrier()
+                    for i in range_constexpr(0, VL, WAVES):
+                        # wave w: row i + w's output
+                        if wave + i < VL:
+                            j = fx.min(wave + i, VL - 1)
+                            row = s + j
                             e0 = 2 * lane
-                            o0 = lds_ld(xs, OO + e0)
-                            o1 = lds_ld(xs, OO + e0 + 1)
+                            o0 = lds_ld(xs, j * VB + OO + e0)
+                            o1 = lds_ld(xs, j * VB + OO + e0 + 1)
                             rstd = _rsq(
                                 wave_sum(o0 * o0 + o1 * o1) * (1.0 / KD) + O_NORM_EPS
                             )
-                            y0 = o0 * rstd * won[0] * sigmoid(lds_ld(xs, G2O + e0))
-                            y1 = o1 * rstd * won[1] * sigmoid(lds_ld(xs, G2O + e0 + 1))
+                            y0 = (
+                                o0
+                                * rstd
+                                * won[0]
+                                * sigmoid(lds_ld(xs, j * VB + G2O + e0))
+                            )
+                            y1 = (
+                                o1
+                                * rstd
+                                * won[1]
+                                * sigmoid(lds_ld(xs, j * VB + G2O + e0 + 1))
+                            )
                             put(
                                 mb("o_in"),
                                 (row * P + h * KD + e0) // 2,
                                 bf16_pair(y0, y1),
                             )
                             signal("box_o_in", row * H + h)
-                        gpu.barrier()
+                    gpu.barrier()
                 if const_expr(NREQ * VL < S):
                     if s >= NREQ * VL:
                         if wave == 0:
