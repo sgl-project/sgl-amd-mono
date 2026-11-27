@@ -207,7 +207,11 @@ def tag_offset() -> int:
         k2b.scratch_bytes(k2b.MoeBuild(tokens=MAX_ROWS)),
         scratch_bytes(K2Build(tokens=MAX_ROWS, nblocks=MAX_BLOCKS)),
         k1.scratch_bytes(MAX_ROWS),
-        mla_pre.scratch_bytes(mla_pre.MlaPreBuild(tokens=MAX_ROWS, nblocks=MAX_BLOCKS)),
+        mla_pre.scratch_bytes(
+            mla_pre.MlaPreBuild(
+                tokens=MAX_ROWS, nblocks=MAX_BLOCKS, nhq=mla_pre.NHQ_QREP
+            )
+        ),
     )
     return -(-end // 4096) * 4096
 
