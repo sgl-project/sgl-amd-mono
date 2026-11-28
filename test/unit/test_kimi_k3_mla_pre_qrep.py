@@ -191,10 +191,13 @@ def test_mla_covered_runtime_checks() -> None:
     packed_no_w = SimpleNamespace(module=layer_no_w, mla=(key, {}))
     assert spec._mla_covered(packed_no_w, hidden, bank, forward_batch=object()) is False
 
-    # Wrong row count -> falls back
+    # Wrong row count on an otherwise covered layer -> falls back
+    layer_rows = _fake_layer(has_qrep_weights=True, qrep_active=True)
+    packed_rows = SimpleNamespace(module=layer_rows, mla=(key, {}))
+    assert spec._mla_covered(packed_rows, hidden, bank, forward_batch=object()) is True
     assert (
         spec._mla_covered(
-            packed_ok,
+            packed_rows,
             torch.zeros(rows - 1, HIDDEN, dtype=torch.bfloat16),
             bank,
             forward_batch=object(),
