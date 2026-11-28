@@ -634,17 +634,19 @@ def _mono_pre_q_view(tree):
     - Before that ``if``: only imports, a docstring, the two assignments above and names
       set to constants. In its branch before the view: only names the head count reads.
       After the view: only name assignments (in ifs too), never using ``name``, whose
-      calls are SGLang's (``indexer``, ``should_run_indexer``,
-      ``maybe_capture_indexer_topk``, ``unsqueeze``).
+      calls have SGLang's callee forms (``self.indexer``, ``self.should_run_indexer``,
+      ``maybe_capture_indexer_topk``, ``pre[...].unsqueeze``; a name filter on those
+      forms, the callee objects themselves are not checked).
     - The statement right after the ``if`` chain assigns or returns
-      ``self._split_q_nope_pe(name, ...)``; every later use of ``name`` is such a call.
+      ``self._split_q_nope_pe(name, <a name or constant>)``; every later use of
+      ``name`` is an argument of that split.
       What the split's outputs go through afterwards is not checked.
     - No other way to bind a name (``:=``, ``match``, lambdas, nested functions or
       classes, comprehensions, ``global`` / ``nonlocal``, ``except ... as``, ``import
-      ... as``, an import of the names above), no rebinding of ``self``, and no
-      ``assert``, ``raise`` or ``try``. Calls (``setattr`` included) can only appear
-      where the rules above allow SGLang's own: nothing between the predicate and the
-      split can write what the head count or the split reads."""
+      ... as``, an import of the names above), no rebinding of ``self`` or
+      ``maybe_capture_indexer_topk``, no call by a reflective name (``setattr``,
+      ``exec``, ``vars``, ...; aliases are not resolved), and no ``assert``, ``raise``
+      or ``try``."""
     import ast
 
     fn = tree.body[0] if tree.body else None
@@ -655,8 +657,15 @@ def _mono_pre_q_view(tree):
     hidden += (ast.Nonlocal, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
     # nor a statement that stops the step on one path (SGLang's handoff has none)
     hidden += (ast.Assert, ast.Raise, ast.Try)
+    # nor a call by a reflective name (setattr, exec, ...), wherever it sits
+    reflective = {"setattr", "delattr", "exec", "eval", "compile", "vars", "globals"}
+    reflective |= {"locals", "__import__", "__setattr__", "__delattr__"}
     if any(
         isinstance(n, hidden)
+        or (
+            isinstance(n, ast.Call)
+            and getattr(n.func, "id", getattr(n.func, "attr", None)) in reflective
+        )
         or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not fn)
         or (isinstance(n, ast.ExceptHandler) and n.name is not None)
         or (
@@ -817,16 +826,39 @@ def _mono_pre_q_view(tree):
         )
 
     exits = (ast.Return, ast.Break, ast.Continue, ast.Yield, ast.YieldFrom, ast.Await)
-    # the only calls SGLang makes there: the indexer's top-k and the k_nope reshape
-    calls = {"indexer", "should_run_indexer", "maybe_capture_indexer_topk", "unsqueeze"}
+
+    def sglang_call(c) -> bool:
+        # the indexer's top-k and the k_nope reshape: self.indexer(...),
+        # self.should_run_indexer(...), maybe_capture_indexer_topk(...), pre[...].unsqueeze(...)
+        f = c.func
+        if isinstance(f, ast.Name):
+            return f.id == "maybe_capture_indexer_topk"
+        return isinstance(f, ast.Attribute) and (
+            (
+                f.attr in ("indexer", "should_run_indexer")
+                and isinstance(f.value, ast.Name)
+                and f.value.id == "self"
+            )
+            or (
+                f.attr == "unsqueeze"
+                and isinstance(f.value, ast.Subscript)
+                and isinstance(f.value.value, ast.Name)
+                and f.value.value.id == "pre"
+            )
+        )
+
+    if any(
+        isinstance(n, ast.Name)
+        and n.id == "maybe_capture_indexer_topk"
+        and not isinstance(n.ctx, ast.Load)
+        for n in ast.walk(fn)
+    ):
+        return None
     rest = guard.body[at + 1 :]
     if not all(plain(s) for s in rest) or any(
         (isinstance(n, ast.Name) and n.id == name)
         or isinstance(n, exits)
-        or (
-            isinstance(n, ast.Call)
-            and getattr(n.func, "id", getattr(n.func, "attr", None)) not in calls
-        )
+        or (isinstance(n, ast.Call) and not sglang_call(n))
         for s in rest
         for n in ast.walk(s)
     ):
@@ -839,9 +871,11 @@ def _mono_pre_q_view(tree):
     if not (
         isinstance(head, ast.Call)
         and ast.dump(head.func) == dump("self._split_q_nope_pe")
-        and head.args
+        and len(head.args) == 2
+        and not head.keywords
         and isinstance(head.args[0], ast.Name)
         and head.args[0].id == name
+        and isinstance(head.args[1], (ast.Name, ast.Constant))
     ):
         return None
     split = 0
