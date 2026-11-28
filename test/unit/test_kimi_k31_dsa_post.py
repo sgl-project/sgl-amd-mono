@@ -123,6 +123,7 @@ def test_dsa_launch_args_zero_copy_and_partial_bucket_isolation() -> None:
     assert torch.equal(bufs["core"][:rows], core_part)
     assert torch.count_nonzero(bufs["core"][rows:]) == 0
     assert args2[3] == bufs["pout"][0].data_ptr() + col0
+    assert torch.equal(bufs["pout"][0][:rows, w.cols], pfx_strided[:, w.cols])
     assert args2[24] == rows * wide.H * 2 - col0
 
 

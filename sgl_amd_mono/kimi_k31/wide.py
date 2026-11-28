@@ -701,31 +701,30 @@ def _head_count(node, assigned: dict, *, qrep: bool):
 
 
 def _mono_pre_q_view(tree):
-    """``(head expression, plain assignments before it)`` of SGLang's ``_mono_pre`` handoff,
-    or None unless the function's source has exactly this shape (a source-shape check:
-    anything else reads as unsupported, and the layer keeps SGLang's own projection front):
+    """``(head expression, assignments before it)`` of SGLang's ``_mono_pre`` handoff, or
+    None unless the function's source has exactly the shape below. This is a source-shape
+    check: anything else reads as unsupported, and the layer keeps SGLang's own front.
 
-    - ``q_replicate_active`` is assigned once, in the function body before the view, to
-      ``_QREP_PREDICATE``'s conjunction (any order), and is not a parameter; its
-      ``forward_batch`` is the function's parameter, never rebound;
-    - ``pre = self.__dict__.get("_mono_pre")`` is its one assignment, in the function body;
-      every other use of it is ``pre is (not) None``, ``pre["<key>"]`` or
-      ``pre.get("<key>")`` of another key than "q", and
-      ``pre["q"]`` is read once;
-    - that read is ``name = pre["q"].view(-1 or pre["q_lora"].shape[0], heads,
-      self.qk_head_dim)``, a statement directly in ``if self.q_lora_rank is not None and
-      pre is not None`` (or ``if pre is not None``), a statement of the function body
-      that only imports, a docstring, pre's and the predicate's assignments and names set
-      to constants precede, after only head-count name assignments in that branch; ``name`` is not used again in it,
-      the rest of the branch only assigns (in ifs too), and the statement right after the
-      ``if`` chain is an assignment or return whose value is the call
-      ``self._split_q_nope_pe(name, ...)`` (every later use is such a call);
-    - no write to a ``pre["<key>"]`` field;
-    - ``"_mono_pre"`` appears once (pre's assignment), and no import binds ``self``,
-      ``pre``, ``forward_batch``, ``q_replicate_active`` or ``name``;
-    - no other way to bind a name (``:=``, ``match``, lambdas, nested functions or
+    - ``q_replicate_active`` is not a parameter; it is assigned once, before the view, to
+      ``_QREP_PREDICATE``'s conjunction (any order), whose ``forward_batch`` is the
+      function's parameter, never rebound.
+    - ``pre = self.__dict__.get("_mono_pre")`` is its one assignment; every other use of
+      ``pre`` is ``pre is (not) None``, a read of ``pre["<key>"]`` or ``pre.get("<key>")``
+      of another key than "q"; ``"_mono_pre"`` appears only there.
+    - ``pre["q"]`` is read once, as ``name = pre["q"].view(-1 or pre["q_lora"].shape[0],
+      heads, self.qk_head_dim)``, a statement directly in ``if self.q_lora_rank is not
+      None and pre is not None`` (or ``if pre is not None``), itself a statement of the
+      function body.
+    - Before that ``if``: only imports, a docstring, the two assignments above and names
+      set to constants. In its branch before the view: only names the head count reads.
+      After the view: only name assignments (in ifs too), never using ``name``.
+    - The statement right after the ``if`` chain assigns or returns
+      ``self._split_q_nope_pe(name, ...)``; every later use of ``name`` is such a call.
+      What the split's outputs go through afterwards is not checked.
+    - No other way to bind a name (``:=``, ``match``, lambdas, nested functions or
       classes, comprehensions, ``global`` / ``nonlocal``, ``except ... as``, ``import
-      ... as``), no rebinding of ``self``, and no ``assert``, ``raise`` or ``try``."""
+      ... as``, an import of the names above), no rebinding of ``self``, and no
+      ``assert``, ``raise`` or ``try``."""
     import ast
 
     fn = tree.body[0] if tree.body else None
@@ -888,10 +887,14 @@ def _mono_pre_q_view(tree):
     if name in imported:
         return None
 
-    def plain(s) -> bool:  # assignments, and ifs of them (SGLang: the indexer's top-k)
+    def plain(
+        s,
+    ) -> bool:  # name assignments, and ifs of them (SGLang: the indexer's top-k)
         if isinstance(s, ast.If):
             return all(plain(x) for x in (*s.body, *s.orelse))
-        return isinstance(s, ast.Assign)
+        return isinstance(s, ast.Assign) and all(
+            isinstance(t, ast.Name) for t in s.targets
+        )
 
     exits = (ast.Return, ast.Break, ast.Continue, ast.Yield, ast.YieldFrom, ast.Await)
     rest = guard.body[at + 1 :]
