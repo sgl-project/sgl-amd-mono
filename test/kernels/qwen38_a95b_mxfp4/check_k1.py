@@ -23,6 +23,7 @@ import torch
 from inputs import (
     BF,
     CORE,
+    FP4_FORMATS,
     HIDDEN,
     MAXT,
     epoch,
@@ -66,11 +67,11 @@ def scratch(key):
 
 def check_compile():
     keys = [
-        gdn.K1Build(tokens=s, first=f, state_bf16=b, qq=q)
+        gdn.K1Build(tokens=s, first=f, state_bf16=b, qq=q, qh=h)
         for s in range(1, MAXT + 1)
         for f in (False, True)
         for b in (False, True)
-        for q in (False, True)
+        for q, h in FP4_FORMATS
     ]
     t0 = time.time()
     for key in keys:
