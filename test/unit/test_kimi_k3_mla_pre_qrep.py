@@ -245,3 +245,74 @@ def test_qrep_ast_rejects_local_view_with_unrelated_dcp_refs() -> None:
 
     layer = _fake_layer(prepare_fn=_false_positive_prepare)
     assert spec._sglang_mono_pre_supports_qrep(layer.self_attn) is False
+
+
+def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
+    """The view's head count must be the local heads without q-replicate and
+    num_local_heads * dcp_size with it, from assignments made before the view."""
+
+    def _inverted(self, q_replicate_active=False):
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            return pre["q"].view(
+                -1,
+                self.num_local_heads * (1 if q_replicate_active else self.dcp_size),
+                self.qk_head_dim,
+            )
+        return None
+
+    def _reassigned_after_view(self, q_replicate_active=False):
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            heads = self.num_local_heads
+            q = pre["q"].view(-1, heads, self.qk_head_dim)
+            heads = (
+                self.num_local_heads * self.dcp_size if q_replicate_active else heads
+            )
+            return q, heads
+        return None
+
+    def _inline(self, q_replicate_active=False):
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            return pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return None
+
+    def _nested_override(self, q_replicate_active=False):
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            heads = (
+                self.num_local_heads * self.dcp_size
+                if q_replicate_active
+                else self.num_local_heads
+            )
+            if q_replicate_active:
+                heads = self.num_local_heads
+            return pre["q"].view(-1, heads, self.qk_head_dim)
+        return None
+
+    def _literal(self, q_replicate_active=False):
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            return pre["q"].view(
+                -1,
+                self.num_local_heads * (5 if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return None
+
+    for prepare, ok in (
+        (_inverted, False),
+        (_reassigned_after_view, False),
+        (_nested_override, False),
+        (_literal, False),
+        (_inline, True),
+    ):
+        layer = _fake_layer(prepare_fn=prepare)
+        assert spec._sglang_mono_pre_supports_qrep(layer.self_attn) is ok, (
+            prepare.__name__
+        )

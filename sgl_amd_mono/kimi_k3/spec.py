@@ -570,9 +570,89 @@ def _valid_bf16_tensor(t, shape: tuple[int, ...]) -> bool:
     )
 
 
+def _head_count(node, assigned: dict, *, qrep: bool):
+    """A ``pre["q"].view`` head-count expression with ``q_replicate_active = qrep``, as
+    ``(coefficient, power of self.num_local_heads, power of self.dcp_size)``; None for any
+    other form (a literal, another attribute, a name bound in a nested statement, ...)."""
+    import ast
+
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value, 0, 0
+    if isinstance(node, ast.Name):
+        if assigned.get(node.id) is None:
+            return None
+        return _head_count(assigned[node.id], {}, qrep=qrep)
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    ):
+        return {"num_local_heads": (1, 1, 0), "dcp_size": (1, 0, 1)}.get(node.attr)
+    if (
+        isinstance(node, ast.IfExp)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "q_replicate_active"
+    ):
+        return _head_count(node.body if qrep else node.orelse, assigned, qrep=qrep)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        a = _head_count(node.left, assigned, qrep=qrep)
+        b = _head_count(node.right, assigned, qrep=qrep)
+        if a is None or b is None:
+            return None
+        return a[0] * b[0], a[1] + b[1], a[2] + b[2]
+    return None
+
+
+def _mono_pre_q_views(tree) -> list[tuple]:
+    """``(head expression, names bound before it)`` for every ``pre["q"].view(rows, heads,
+    dim)`` inside an ``if`` on ``pre``. A name keeps the value of the last plain assignment
+    of it in that branch before the view's statement; a name also bound any other way there
+    (a nested statement, an augmented assignment, a walrus, ...) maps to None."""
+    import ast
+
+    views = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If) or "pre" not in {
+            n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
+        }:
+            continue
+        assigned: dict = {}
+        for stmt in node.body:
+            plain = set()
+            if isinstance(stmt, ast.Assign):
+                plain = {id(t) for t in stmt.targets if isinstance(t, ast.Name)}
+            other = {
+                n.id
+                for n in ast.walk(stmt)
+                if isinstance(n, ast.Name)
+                and isinstance(n.ctx, ast.Store)
+                and id(n) not in plain
+            }
+            for sub in ast.walk(stmt):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "view"
+                    and isinstance(sub.func.value, ast.Subscript)
+                    and isinstance(sub.func.value.value, ast.Name)
+                    and sub.func.value.value.id == "pre"
+                    and isinstance(sub.func.value.slice, ast.Constant)
+                    and sub.func.value.slice.value == "q"
+                    and len(sub.args) == 3
+                ):
+                    views.append((sub.args[1], {**assigned, **dict.fromkeys(other)}))
+            if isinstance(stmt, ast.Assign):
+                for t in stmt.targets:
+                    if isinstance(t, ast.Name):
+                        assigned[t.id] = stmt.value
+            assigned.update(dict.fromkeys(other))
+    return views
+
+
 def _sglang_mono_pre_supports_qrep(attn) -> bool:
-    """Whether SGLang's ``forward_absorb_rocm_prepare`` reshapes ``_mono_pre['q']``
-    with ``num_local_heads * dcp_size`` under DCP q-replicate (sgl-project/sglang#53130)."""
+    """Whether SGLang's ``forward_absorb_rocm_prepare`` views ``_mono_pre['q']`` with
+    ``num_local_heads * dcp_size`` heads under DCP q-replicate and the local heads without
+    it (sgl-project/sglang#53130), read from the view's head expression."""
     cached = getattr(attn, "_k3_mono_pre_qrep_ok", None)
     if cached is not None:
         return cached
@@ -585,64 +665,15 @@ def _sglang_mono_pre_supports_qrep(attn) -> bool:
             import textwrap
 
             tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
-            reads_mono_pre = any(
+            if any(
                 isinstance(n, ast.Constant) and n.value == "_mono_pre"
                 for n in ast.walk(tree)
-            )
-            if reads_mono_pre:
-                for node in ast.walk(tree):
-                    if not isinstance(node, ast.If):
-                        continue
-                    test_names = {
-                        n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
-                    }
-                    if "pre" not in test_names:
-                        continue
-                    assigned: dict[str, ast.AST] = {}
-                    for stmt in node.body:
-                        if isinstance(stmt, ast.Assign):
-                            for tgt in stmt.targets:
-                                if isinstance(tgt, ast.Name):
-                                    assigned[tgt.id] = stmt.value
-                        for sub in ast.walk(stmt):
-                            if not (
-                                isinstance(sub, ast.Call)
-                                and isinstance(sub.func, ast.Attribute)
-                                and sub.func.attr == "view"
-                                and isinstance(sub.func.value, ast.Subscript)
-                                and isinstance(sub.func.value.value, ast.Name)
-                                and sub.func.value.value.id == "pre"
-                                and isinstance(sub.func.value.slice, ast.Constant)
-                                and sub.func.value.slice.value == "q"
-                                and len(sub.args) == 3
-                            ):
-                                continue
-                            head_expr = sub.args[1]
-                            if (
-                                isinstance(head_expr, ast.Name)
-                                and head_expr.id in assigned
-                            ):
-                                head_expr = assigned[head_expr.id]
-                            h_attrs = {
-                                n.attr
-                                for n in ast.walk(head_expr)
-                                if isinstance(n, ast.Attribute)
-                            }
-                            h_names = {
-                                n.id
-                                for n in ast.walk(head_expr)
-                                if isinstance(n, ast.Name)
-                            }
-                            if (
-                                "dcp_size" in h_attrs
-                                and "q_replicate_active" in h_names
-                            ):
-                                ok = True
-                                break
-                        if ok:
-                            break
-                    if ok:
-                        break
+            ):
+                ok = any(
+                    _head_count(head, assigned, qrep=False) == (1, 1, 0)
+                    and _head_count(head, assigned, qrep=True) == (1, 1, 1)
+                    for head, assigned in _mono_pre_q_views(tree)
+                )
         except (OSError, TypeError, SyntaxError):
             ok = False
     attn._k3_mono_pre_qrep_ok = ok
