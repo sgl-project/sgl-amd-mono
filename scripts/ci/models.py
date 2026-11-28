@@ -63,6 +63,12 @@ COMMON_KERNEL_TESTS = [
 # Paths whose change runs every model.
 SHARED_PATHS = ("sgl_amd_mono/common/", "sgl_amd_mono/__init__.py", "pyproject.toml")
 
+# A PR whose own package code changes in more models than this (a refactor or an
+# API move across packages) runs each of them at the smoke tier, not the full one:
+# 14 full-tier jobs hold both GPU runners for most of a day. The nightly runs them
+# all in full; a maintainer can dispatch the PR test with `models` for a full run.
+FULL_TIER_MAX_MODELS = 3
+
 # The fixed-length speed test (InferenceX's): random prompts of 8k +/- 20% tokens
 # in, 1k +/- 20% out, 10 prompts a concurrency slot.
 ISL, OSL, RANGE_RATIO, PROMPTS_PER_SLOT = 8192, 1024, 0.8, 10
@@ -148,6 +154,9 @@ MODELS = {
     },
     "deepseek_v4": {
         "name": "DeepSeek-V4-Pro",
+        # Deprecated on InferenceX (DeepSeek-V4.1-Flash replaced it): not in the PR
+        # test, nor in the nightly. A dispatch with models=deepseek_v4 still runs it.
+        "pr": False,
         "packages": ["deepseek_v4"],
         "tp": 8,
         "paths": {"DEEPSEEK_V4_PRO_MODEL_PATH": f"{HF}/deepseek-ai/DeepSeek-V4-Pro"},
@@ -222,6 +231,11 @@ MODELS = {
     },
     "glm53_mxfp4": {
         "name": "GLM-5.3 (MXFP4)",
+        # Not in the PR test: its checkpoint is not on the CI nodes, so a PR job
+        # only re-ran the unit tests. Its MXFP4 kernel cases run under glm53. Set
+        # back to True once the checkpoint is staged; a dispatch with
+        # models=glm53_mxfp4 still runs it.
+        "pr": False,
         "packages": ["glm53"],
         "tp": 8,
         "paths": {"GLM_53_MODEL_PATH": f"{HF}/amd/GLM-5.3-Quark-MXFP4-AttnFP8"},
@@ -245,8 +259,6 @@ MODELS = {
         "baseline": {},
         "packages": ["glm53_flash"],
         "tp": 4,
-        # amd/GLM-5.3-Flash-Quark-MXFP4: not on shared storage; downloaded by hand
-        # into both nodes' mirror
         "paths": {"GLM_53_FLASH_MODEL_PATH": f"{HF}/amd/GLM-5.3-Flash-Quark-MXFP4"},
         "recipe": ("glm53_flash_server", "ARGS"),
         "kernel_tests": ["test/kernels/test_glm53_flash_kernels.py"],
@@ -260,6 +272,9 @@ MODELS = {
     },
     "kimi_k3": {
         "name": "Kimi-K3",
+        # Deprecated on InferenceX (Kimi-K3.1-Pro replaced it): not in the PR test;
+        # the nightly still runs it, and a kimi_k3 package change runs kimi_k31.
+        "pr": False,
         # Phase 1 of the nightly
         "nightly": True,
         # set from the first weekly report
@@ -298,6 +313,7 @@ MODELS = {
         "kernel_tests": [
             "test/kernels/test_kimi_k31_k1_ring.py",
             "test/kernels/test_kimi_k31_mla_pre_wide_replay.py",
+            "test/kernels/test_kimi_k3_k1.py",
         ],
         "e2e_tests": [],
         "microbench": [
@@ -310,6 +326,9 @@ MODELS = {
     },
     "minimax_m3": {
         "name": "MiniMax-M3 (MXFP4)",
+        # Deprecated on InferenceX (MiniMax-M3.1-Flash replaced it): not in the PR
+        # test, nor in the nightly. A dispatch with models=minimax_m3 still runs it.
+        "pr": False,
         # SGLang refuses --enable-amd-monokernel for it until both merge
         "blocked": "needs SGLang's page16 SHUFFLE K/V (sgl-project/sglang#41998, #41708)",
         "packages": ["minimax_m3", "minimax"],
@@ -375,8 +394,6 @@ MODELS = {
         "baseline": {},
         "packages": ["qwen38_flash_next"],
         "tp": 1,
-        # amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8: not on shared storage;
-        # downloaded by hand into both nodes' mirror
         "paths": {
             "QWEN38_FLASH_NEXT_MODEL_PATH": f"{HF}/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8"
         },

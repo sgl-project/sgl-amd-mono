@@ -145,11 +145,12 @@ class FlashDsaCaches(msgspec.Struct, frozen=True):
 
 
 class FlashKdaState(msgspec.Struct, frozen=True):
-    """One KDA layer's decode state: bf16 conv state [slots, 3, 3P] and f32
-    recurrent state [slots, H, 128 (v), 128 (k)], slot strides in elements. A verify
-    launch also writes SGLang's verify scratch: the f32 recurrent state
-    [rows, steps, H, 128, 128] and the bf16 conv window [rows, steps, 3, 3P] after
-    each draft token (a scratch row a request, its batch position)."""
+    """One KDA layer's decode state: bf16 conv state [slots, 3, 3P] and f32 (bf16
+    with ``FlashBuild.state_bf16``) recurrent state [slots, H, 128 (v), 128 (k)],
+    slot strides in elements. A verify launch also writes SGLang's verify scratch:
+    the recurrent state [rows, steps, H, 128, 128], in the recurrent state's dtype,
+    and the bf16 conv window [rows, steps, 3, 3P] after each draft token (a scratch
+    row a request, its batch position)."""
 
     conv_state: torch.Tensor
     rec_state: torch.Tensor
@@ -464,11 +465,22 @@ class FlashLayerOp:
             n = step["ids"].shape[0] if self.embedding is not None else S
             _check("state_idx", state_idx, (n,), torch.int32)
             k = self.kda
+            rec_dtype = torch.bfloat16 if self.rt.key.state_bf16 else torch.float32
+            if state.rec_state.dtype != rec_dtype:
+                raise ValueError(
+                    f"this launch was built for a {rec_dtype} KDA state, got "
+                    f"{state.rec_state.dtype}"
+                )
             inter = [0, 0, 0, 0]
             if self.rt.key.verify > 1:
                 ir, ic = state.inter_rec, state.inter_conv
                 if ir is None or ic is None:
                     raise ValueError("a verify launch needs the verify scratch")
+                if ir.dtype != rec_dtype:
+                    raise ValueError(
+                        f"this launch was built for a {rec_dtype} verify scratch, "
+                        f"got {ir.dtype}"
+                    )
                 inter = [p(ir), p(ic), ir.stride(0), ic.stride(0)]
             kda_args = [
                 *map(p, (k.hc_fn, k.hc_scale, k.hc_base, k.g_norm, k.w_in, k.w_fb)),

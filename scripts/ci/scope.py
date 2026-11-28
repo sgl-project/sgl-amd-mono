@@ -17,9 +17,17 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from models import GAIN_TYPES, MODELS, SHARED_PATHS  # noqa: E402
+from models import (  # noqa: E402
+    FULL_TIER_MAX_MODELS,
+    GAIN_TYPES,
+    MODELS,
+    SHARED_PATHS,
+)
 
 TITLE = re.compile(r"^\[(\w+)\] ")
+# The models a PR can run: an entry with "pr": False (models.py) runs only when
+# named, in a dispatch's `models`.
+PR_MODELS = {k: m for k, m in MODELS.items() if m.get("pr", True)}
 
 
 def package_of(path: str):
@@ -51,7 +59,9 @@ def models_for(files):
     and common kernel tests), which also runs when no model changed. A model whose
     tests changed but not its code runs the tests tier: its unit, kernel and
     serving tests, no speed test or accuracy benchmark, which would measure the
-    same kernels as the base branch."""
+    same kernels as the base branch. A PR whose code changes in more than
+    ``FULL_TIER_MAX_MODELS`` models runs them at the smoke tier, and ``common`` in
+    full: a change that broad is a refactor, and the nightly runs them in full."""
     changed = [f["filename"] for f in files]
     code = {
         p for f in changed if f.startswith("sgl_amd_mono/") and (p := package_of(f))
@@ -63,21 +73,41 @@ def models_for(files):
 
     models = {
         key: (f"{changed_in(m, tests)} tests changed", "tests")
-        for key, m in MODELS.items()
+        for key, m in PR_MODELS.items()
         if set(m["packages"]) & tests
     }
     shared = sorted({f for f in changed if f.startswith(SHARED_PATHS)})
     if shared:
         why = f"shared code changed ({', '.join(shared[:3])})"
-        models = {"common": (why, "full"), **{k: (why, "smoke") for k in MODELS}}
-    models.update(
-        {
-            key: (f"{changed_in(m, code)} changed", "full")
-            for key, m in MODELS.items()
-            if set(m["packages"]) & code
-        }
+        models = {"common": (why, "full"), **{k: (why, "smoke") for k in PR_MODELS}}
+    touched = {key: m for key, m in PR_MODELS.items() if set(m["packages"]) & code}
+    if len(touched) > FULL_TIER_MAX_MODELS:
+        why = (
+            f"code changed in {len(touched)} models, more than "
+            f"{FULL_TIER_MAX_MODELS}; the nightly runs them in full"
+        )
+        models.setdefault("common", (why, "full"))
+        models.update({key: (why, "smoke") for key in touched})
+    else:
+        models.update(
+            {
+                key: (f"{changed_in(m, code)} changed", "full")
+                for key, m in touched.items()
+            }
+        )
+    if models:
+        return models
+    left_out = sorted(
+        k
+        for k, m in MODELS.items()
+        if k not in PR_MODELS and set(m["packages"]) & (code | tests)
     )
-    return models or {"common": ("no model package changed", "full")}
+    if left_out:
+        why = (
+            f"{', '.join(left_out)} not in the PR test (a dispatch with models runs it)"
+        )
+        return {"common": (why, "full")}
+    return {"common": ("no model package changed", "full")}
 
 
 def codeowners_rule(files):

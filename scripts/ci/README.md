@@ -22,7 +22,10 @@ nodes:
   runs the test again (cancelling the run on the previous head) until a maintainer
   removes it. Only people with triage access or more can add a label, so read a
   fork PR's code before labelling it, and remove the label if a later push needs a
-  second look.
+  second look. Until then each push sets `AMD PR test` to failed ("Not run"), from
+  a GitHub-hosted runner, so a PR cannot merge without the test once the branch
+  rules require it. Adding the label starts a new run; re-running a "Not run" one
+  does not test (the runners check the labels the run started with).
 - `run-ci-extra` runs the same and adds GPQA (or tick `extra` when running the
   workflow by hand). GSM8K's short answers cannot show a loss at long context;
   GPQA's long ones can. Use it for a PR that touches attention, the KV cache or
@@ -36,9 +39,23 @@ comment up to date with the report. Each model's logs (servers, benchmarks,
 tests) are in the run's `mono-ci-<model>` artifact. The nightly writes its report
 to the run's summary.
 
+The PR test's GPU jobs share the two runners with the nightly and with each
+other, so a run can wait hours for one. While it waits or runs, its pending
+status says where it stands: `Waiting for a GPU runner: ~N jobs ahead. Will run
+...`, then `3/14 done; running <model>; 9 waiting, ~N jobs ahead`. The plan job
+sets it, and `queue-status.yml` (every 10 minutes, `queue_status.py`) keeps it
+current until the report sets the result. "Ahead" counts the GPU jobs running now
+and those queued by older runs; GitHub does not promise to hand queued jobs out
+oldest first, so it is an estimate.
+
 ## What runs
 
-`scope.py` maps a PR's changed files to models (`models.py`):
+`scope.py` maps a PR's changed files to models (`models.py`). The PR test runs
+only the models InferenceX still benchmarks (the "default" models of
+<https://inferencex.semianalysis.com/infx/inference>). An entry with `"pr": False`
+is not in it: a model InferenceX lists as deprecated (DeepSeek-V4-Pro, Kimi-K3,
+MiniMax-M3) or one whose checkpoint is not on the CI nodes. A dispatch with
+`models` still runs it, and the nightly runs those it lists. Of the others:
 
 - a model whose own package code (`sgl_amd_mono/<pkg>/`) changed runs the
   **full** tier;
@@ -49,6 +66,11 @@ to the run's summary.
   test or accuracy benchmark, since the served kernels are the base branch's;
 - a PR that changes no model runs `common`: the unit tests and the common kernel
   tests.
+- a PR whose package code changes in more than `FULL_TIER_MAX_MODELS` (3) models,
+  such as a refactor or an API move across packages, runs each of them at the
+  **smoke** tier instead of the full one, and `common` in full: fourteen full-tier
+  jobs would hold both GPU runners for most of a day. The nightly runs them in
+  full; to run a PR in full anyway, run the workflow by hand with `models`.
 
 A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
 checks representative widths only (DeepSeek-V4.1's K1, K2 and target FFN launch at
@@ -164,6 +186,17 @@ and the reviewer verifies them. OCRBench and LiveCodeBench are not in the CI yet
   time and each job takes a whole node, whichever of the two is free, so the two
   nodes run two models at once and never two jobs on one node. The runner's
   `.env` holds no node setting.
+- Job-start hook: the repository is public, so a PR could add a workflow of its
+  own that names the runners' label. `job_started_hook.sh`, which `runner.sh`
+  copies next to the runners and sets as their `ACTIONS_RUNNER_HOOK_JOB_STARTED`,
+  refuses every job but `pr-test-amd.yml` and `nightly-amd.yml` as main has them,
+  on their own events (a dispatch may run from any branch), and a PR test of a PR
+  without `run-ci` or `run-ci-extra`.
+  After changing it, `bash runner.sh hook` on the runner host puts the new copy in
+  place (the runners read it at each job; no restart). Each verdict in a job's
+  log ends with `(hook <hash>)`, the copy's git blob hash: when it differs from
+  `git ls-tree origin/main scripts/ci/job_started_hook.sh`, the runners have an
+  old copy.
 - `slurm_launch.sh` (on the runner) submits `slurm_job.sh` as a whole-node job,
   streams its log and collects its results; `slurm_job.sh` (on the node) fetches
   the PR and base commits onto node-local disk, starts the SGLang ROCm container
