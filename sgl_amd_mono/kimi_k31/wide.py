@@ -317,7 +317,9 @@ def _launch_sort(b):
     ):
         return None
     kind = presort.sort_kind()
-    if kind is None or b > mf.sort_max_rows(kind):
+    # the routed experts read the sort only when a step fills its bucket (rows == b); a bucket
+    # whose full width is not served (8-token 480 rows: 80 requests at L = 6) never does
+    if kind is None or b > mf.sort_max_rows(kind) or b not in wide_widths():
         return None
     return kind
 

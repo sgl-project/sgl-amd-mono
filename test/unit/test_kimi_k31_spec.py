@@ -253,3 +253,32 @@ def test_wide_capture_stream_and_variant():
         == "attn_res"
     )
     assert w._variant(pk, captures={79}, capture_stream="prefix")["capture"] is False
+
+
+def test_a_bucket_no_served_step_fills_makes_no_launch_sort(monkeypatch):
+    """The routed experts read the launch's sort only when a step fills its bucket; a bucket
+    whose own width is not served (8-token 480 rows) must not pay for a sort nobody reads."""
+    from sgl_amd_mono.kimi_k31 import presort
+
+    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    monkeypatch.setattr(presort, "sort_kind", lambda: "aux16")
+    widths = wide.wide_widths()
+    assert 480 not in widths and 448 in widths
+    assert wide._launch_sort(480) is None
+    assert wide._launch_sort(448) == "aux16"
+    for L in wide.SUPPORTED_L:
+        for b in wide.buckets(L=L):
+            assert (wide._launch_sort(b) is not None) <= (b in widths), (L, b)
+
+
+def test_the_wide_launch_refuses_an_unsupported_state_dtype_before_building(
+    monkeypatch,
+):
+    """Wide raises the KDA state dtype refusal before it reads the model or allocates."""
+    from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
+
+    monkeypatch.setattr(
+        k1_mod, "_state_config", lambda: (False, ["the recurrent state is float16"])
+    )
+    with pytest.raises(ValueError, match="float16"):
+        wide.Wide(model=None, rank=0, group=None, device="cpu", L=6)
