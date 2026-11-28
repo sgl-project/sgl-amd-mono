@@ -729,7 +729,8 @@ NUMERICS = Numerics(
         "k1_fp8.bank.rel": 0.0,
         "k1_fp8.window.cosine": 0.9999,
         "k1_fp8.window.rel": 0.015,
-        # Measured in test_kimi_k3_wide_fp8.py (ring=False bf16/fp32 SSM state, cos > 0.9995).
+        # The cosine is what test_kimi_k3_wide_fp8.py measures on wide snapshots
+        # (ring=False, bf16/fp32 state); the rel bound is not measured yet.
         "k1_fp8.ssm.cosine": 0.9995,
         "k1_fp8.ssm.rel": 0.03,
         "k1_fp8.ring_k.cosine": 0.9998,

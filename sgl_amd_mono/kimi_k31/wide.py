@@ -870,7 +870,9 @@ class Wide:
         self.L = L
         # the KDA state dtype (fp32 or bf16) and whether it is the ReplaySSM ring or
         # per-token snapshots: fixed for the server's life
-        self.state_bf16, _ = k1_mod._state_config()
+        self.state_bf16, state_reasons = k1_mod._state_config()
+        if state_reasons:  # before any buffer or warmup, whatever the spec predicted
+            raise ValueError("; ".join(state_reasons))
         self.ring = k1_mod._ring_mode()
         lm = getattr(model, "language_model", model)
         self.bb = bb = lm.model
