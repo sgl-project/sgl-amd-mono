@@ -12,7 +12,13 @@ from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
 
-def _local_only_prepare(self, q_replicate_active=False):
+def _local_only_prepare(self, forward_batch):
+    q_replicate_active = (
+        self.is_dcp_q_replicate_phase(forward_batch)
+        and not self.use_deep_gemm_bmm
+        and self.w_kc_qrep is not None
+        and self.q_b_proj_qrep_weight is not None
+    )
     pre = self.__dict__.get("_mono_pre")
     if self.q_lora_rank is not None and pre is not None:
         return pre["q"].view(-1, self.num_local_heads, self.qk_head_dim)
@@ -23,7 +29,13 @@ def _local_only_prepare(self, q_replicate_active=False):
     return None
 
 
-def _qrep_prepare(self, q_replicate_active=False):
+def _qrep_prepare(self, forward_batch):
+    q_replicate_active = (
+        self.is_dcp_q_replicate_phase(forward_batch)
+        and not self.use_deep_gemm_bmm
+        and self.w_kc_qrep is not None
+        and self.q_b_proj_qrep_weight is not None
+    )
     pre = self.__dict__.get("_mono_pre")
     if self.q_lora_rank is not None and pre is not None:
         num_q_heads = (
@@ -234,7 +246,13 @@ def test_qrep_ast_rejects_local_view_with_unrelated_dcp_refs() -> None:
     """A branch that still views pre['q'] with local heads must be rejected even if
     q_replicate_active and self.dcp_size appear elsewhere in the same if-body."""
 
-    def _false_positive_prepare(self, q_replicate_active=False):
+    def _false_positive_prepare(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
         pre = self.__dict__.get("_mono_pre")
         if self.q_lora_rank is not None and pre is not None:
             q = pre["q"].view(-1, self.num_local_heads, self.qk_head_dim)
@@ -251,7 +269,13 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
     """The view's head count must be the local heads without q-replicate and
     num_local_heads * dcp_size with it, from assignments made before the view."""
 
-    def _inverted(self, q_replicate_active=False):
+    def _inverted(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
         pre = self.__dict__.get("_mono_pre")
         if pre is not None:
             return pre["q"].view(
@@ -261,7 +285,13 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
             )
         return None
 
-    def _reassigned_after_view(self, q_replicate_active=False):
+    def _reassigned_after_view(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
         pre = self.__dict__.get("_mono_pre")
         if pre is not None:
             heads = self.num_local_heads
@@ -272,7 +302,13 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
             return q, heads
         return None
 
-    def _inline(self, q_replicate_active=False):
+    def _inline(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
         pre = self.__dict__.get("_mono_pre")
         if pre is not None:
             return pre["q"].view(
@@ -282,7 +318,13 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
             )
         return None
 
-    def _nested_override(self, q_replicate_active=False):
+    def _nested_override(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
         pre = self.__dict__.get("_mono_pre")
         if pre is not None:
             heads = (
@@ -295,7 +337,13 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
             return pre["q"].view(-1, heads, self.qk_head_dim)
         return None
 
-    def _literal(self, q_replicate_active=False):
+    def _literal(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
         pre = self.__dict__.get("_mono_pre")
         if pre is not None:
             return pre["q"].view(
@@ -305,7 +353,13 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
             )
         return None
 
-    def _local_view_on_the_qrep_path(self, q_replicate_active=False):
+    def _local_view_on_the_qrep_path(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
         pre = self.__dict__.get("_mono_pre")
         if pre is not None:
             if q_replicate_active:
@@ -317,10 +371,47 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
             )
         return None
 
-    def _rebound_predicate(self, q_replicate_active=False):
+    def _rebound_predicate(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
         q_replicate_active = q_replicate_active and self.dcp_size > 8
         pre = self.__dict__.get("_mono_pre")
         if pre is not None:
+            return pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return None
+
+    def _other_predicate(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch) and self.dcp_size > 8
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            return pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return None
+
+    def _tuple_view_on_the_qrep_path(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            if q_replicate_active:
+                return pre["q"].view((-1, self.num_local_heads, self.qk_head_dim))
             return pre["q"].view(
                 -1,
                 self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
@@ -335,6 +426,8 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
         (_literal, False),
         (_local_view_on_the_qrep_path, False),
         (_rebound_predicate, False),
+        (_other_predicate, False),
+        (_tuple_view_on_the_qrep_path, False),
         (_inline, True),
     ):
         layer = _fake_layer(prepare_fn=prepare)
