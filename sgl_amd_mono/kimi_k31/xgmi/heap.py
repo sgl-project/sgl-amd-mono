@@ -32,7 +32,8 @@ import torch
 import torch.distributed as dist
 
 SGLANG_READS = {
-    "srt/runtime_context.py": ("get_parallel",),
+    "srt/distributed/parallel_state.py": ("cpu_group",),
+    "srt/runtime_context.py": ("get_parallel", '"tp_rank"', '"tp_group"'),
 }
 
 TP = 8

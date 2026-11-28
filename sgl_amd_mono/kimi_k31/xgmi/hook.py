@@ -25,16 +25,48 @@ from sgl_amd_mono.kimi_k31.xgmi.prefill import (
     prefill_reduce_scatter_32cu,
 )
 
+# Not listed: KimiK3MoE._row_front_shared, which SGLang main does not have yet.
 SGLANG_READS = {
-    "srt/layers/layer_boundary/residual/attn_bank.py": ("AttnBankState", "_FfnReadout"),
+    "srt/distributed/parallel_state.py": ("cpu_group",),
+    "srt/layers/layer_boundary/construction.py": ("edges", "incoming"),
+    "srt/layers/layer_boundary/contracts.py": ("need", "read"),
+    "srt/layers/layer_boundary/stage.py": ("plan", "declaration"),
+    "srt/layers/layer_boundary/residual/attn_bank.py": (
+        "AttnBankState",
+        "_FfnReadout",
+        "state",
+        "ffn_row_shard",
+    ),
     "srt/layers/layer_boundary/residual/attn_bank_hip.py": ("takes", "shard_front"),
+    "srt/layers/moe/topk.py": ("topk_ids", "topk_weights"),
     "srt/models/kimi_k3.py": (
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
         "KimiK3MoE",
         "_k3_bf16_gemm",
+        "language_model",
+        "model",
+        "layers",
+        "mlp",
+        "ffn_boundary",
+        "post_attention_layernorm",
+        "use_latent_moe",
+        "_front_sizes",
+        "_front_w",
+        "routed_expert_up_proj",
+        "topk",
     ),
-    "srt/runtime_context.py": ("get_parallel",),
+    "srt/models/kimi_k3_amd/moe.py": (
+        "_row_front_on",
+        "_a8w4_moe_min_tokens",
+        "_a8w4_moe_max_tokens",
+        "_row_sharded_tail_eligible",
+        "_row_sharded_tail",
+        "_row_tail",
+        "shard_front",
+        "_row_front_out",
+    ),
+    "srt/runtime_context.py": ("get_parallel", '"tp_rank"', '"tp_group"'),
 }
 
 # Stays strictly above the column tail's row cap (NextAttnRead.max_tokens, 384), so
