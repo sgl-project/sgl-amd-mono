@@ -214,6 +214,7 @@ def test_row_count_tile_configs_meet_plan_and_tile_invariants():
     from sgl_amd_mono.kimi_k31.gfx950.chain import Gemm
     from sgl_amd_mono.kimi_k31.gfx950.stages.tile_mma import BK
 
+    assert 456 in wide.buckets(8) or 480 in wide.buckets(8)  # the 449-480-row tiles
     for L in wide.SUPPORTED_L:
         for b in wide.buckets(L):
             gu, gi, go, gf, gs = (

@@ -338,6 +338,7 @@ class TestKimiK3Fp8SingleGpu(unittest.TestCase):
                 q_ref = (ql_n.float() @ w_qb_d.float().T).to(torch.bfloat16)
                 checks = [
                     (out["q"], q_ref),
+                    (out["q_lora"], ql_n),
                     (out["latent"], lat[:, mp.QL :]),
                     (out["k_nope"], kn_ref),
                     (out["gate"], gate_ref),
@@ -359,6 +360,11 @@ class TestKimiK3Fp8SingleGpu(unittest.TestCase):
                         got.float().reshape(-1), want.float().reshape(-1), dim=0
                     ).item()
                     self.assertGreater(cos, 0.9995, (s_tok, fmt, use_qn, cos))
+                    # cosine misses a uniform rescale: the norms must agree too
+                    rel = (
+                        (got.float() - want.float()).norm() / want.float().norm()
+                    ).item()
+                    self.assertLess(rel, 0.05, (s_tok, fmt, use_qn, rel))
                 self.assertTrue(torch.equal(blocks[:, nblocks, :], prefix))
 
 

@@ -744,6 +744,10 @@ def test_mla_build_accepts_quark_fp8_without_indexer(monkeypatch, caplog):
 
     key, weights = k3._mla_build(make_layer(), 8)
     assert key.has_indexer is False
+    # a layer whose attention has no indexer attribute at all builds the same way
+    bare = make_layer()
+    del bare.self_attn.indexer
+    assert k3._mla_build(bare, 8)[0].has_indexer is False
     assert key.qkv_fmt == wfmt.FP8_SHUFFLED
     assert key.qb_fmt == wfmt.FP8_SHUFFLED
     assert weights["w_qkv_s"].numel() == mp.LATW

@@ -215,7 +215,7 @@ def _report(i: int, outputs: dict, launch: str) -> None:
         i,
         " ".join(f"{k}={v:.8g}" for k, v in values.items()),
     )
-    # No bound measured yet (e.g. k1.ring_*): said once, not passed silently.
+    # No bound measured yet (e.g. k1.ring_*, k1_fp8.ssm.rel): said once, not passed silently.
     for name in sorted(values.keys() - NUMERICS.bounds.keys() - _unbounded_said):
         _unbounded_said.add(name)
         logger.warning("monokernel check: %s has no bound, so it is not checked", name)

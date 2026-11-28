@@ -916,7 +916,7 @@ def _mla_build(layer, rows: int):
         # replicated q_b); the front hands over this rank's 12
         return None
     layer_id = getattr(layer, "layer_id", -1)
-    idx = attn.indexer
+    idx = getattr(attn, "indexer", None)  # an MLA layer without one has no attribute
     has_indexer = idx is not None
     try:
         qkv_fmt, w_qkv, w_qkv_s = _mla_proj_operands(
@@ -1383,7 +1383,7 @@ class _Built:
             "q_lora": out["q_lora"], "gate": out["gate"],
             "q_nope_out": out["qn"] if key.qn else None,
         }  # fmt: skip
-        idx = attn.indexer
+        idx = getattr(attn, "indexer", None)
         if idx is not None:
             idx.__dict__["_mono_pre"] = {
                 "q": out["idx_q"], "k": out["idx_k"], "w": out["idx_w"],
