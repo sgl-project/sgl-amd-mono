@@ -578,6 +578,61 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
             )
         return self._split_q_nope_pe(q, None)
 
+    def _guard_skips_the_qrep_state(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None and not q_replicate_active:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, None)
+
+    def _split_bypasses_q(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(
+            self.__dict__["_mono_pre"]["q"].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            ),
+            None,
+        )
+
+    def _imported_batch(self, forward_batch):
+        from sglang.srt.model_executor import forward_batch
+
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, None)
+
     for prepare, ok in (
         (_inverted, False),
         (_reassigned_after_view, False),
@@ -596,6 +651,9 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
         (_reshaped_on_return, False),
         (_match_rebinds_batch, False),
         (_shifted_dcp_factor, False),
+        (_guard_skips_the_qrep_state, False),
+        (_split_bypasses_q, False),
+        (_imported_batch, False),
         (_inline, True),
     ):
         layer = _fake_layer(prepare_fn=prepare)
