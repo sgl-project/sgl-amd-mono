@@ -217,7 +217,8 @@ def _takes_at_4096(num_tokens):
     return num_tokens >= 4096
 
 
-def test_install_xgmi_hooks_unified_eligibility_and_fallback():
+def test_install_xgmi_hooks_unified_eligibility_and_fallback(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     fallback_calls = []
 
     def orig_front(normed, num_tokens):
@@ -558,6 +559,7 @@ def test_install_xgmi_hooks_remote_rank_failure_leaves_layers_untouched(monkeypa
 
 
 def test_install_xgmi_hooks_runtime_row_front_shared_mutation_raises(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     (layer0, mlp0, bank0, _), (layer1, _, _, _) = _two_moe_layers()
     _patch_install_collectives(monkeypatch, all_gather=_gather_same)
     _install_two(layer0, layer1)
