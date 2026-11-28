@@ -365,3 +365,11 @@ def test_a_draft_length_serving_no_routed_wide_width_builds_no_wide_launch(monke
     # sized to the widest width this L serves (120 and 256 sit in different buckets)
     k3._build(model, None, SimpleNamespace(widths=(*routed, 120, 256)), use_wide=True)
     assert made == [(8, 256)]
+    # not to a wider routed width another L serves: at L = 5, 270 rows are 54 requests
+    # (past the override's 48) while 80 and 160 are 16 and 32
+    monkeypatch.setattr(wide, "tokens", lambda: 5)
+    made.clear()
+    k3._build(
+        model, None, SimpleNamespace(widths=(*range(1, 9), 80, 160, 270)), use_wide=True
+    )
+    assert made == [(5, 160)]

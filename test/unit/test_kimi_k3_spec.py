@@ -538,6 +538,7 @@ def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
     assert not any("HiCache" in r for r in base), base
     # with the expert padding check satisfied, the real hook accepts a HiCache server
     monkeypatch.setattr(k3, "_k3_aiter_opt", lambda: True)
+    monkeypatch.delenv("SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", raising=False)
     hicache = SimpleNamespace(**cfg, enable_hierarchical_cache=True)
     assert k3._config_disable_reasons(hicache, K3) == []
     for flag in _NO_OFFLOAD:
