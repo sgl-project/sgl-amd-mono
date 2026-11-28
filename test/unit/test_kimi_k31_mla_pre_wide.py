@@ -900,6 +900,206 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
             ignored = setattr(self, "_split_q_nope_pe", None)
         return self._split_q_nope_pe(q, None)
 
+    def _qrep_dict_update_after_the_view(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+            ignored = self.__dict__.update(_split_q_nope_pe=None)
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_reflective_split_argument(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, setattr(self, "_split_q_nope_pe", None) or None)
+
+    def _qrep_aliased_indexer(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+            indexer = self.__dict__.update
+            ignored = indexer(_split_q_nope_pe=None)
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_sglang_shaped_branch(
+        self, forward_batch, hidden_states=None, prev_topk_indices=None
+    ):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if self.q_lora_rank is not None and pre is not None:
+            num_q_heads = (
+                self.num_local_heads * self.dcp_size
+                if q_replicate_active
+                else self.num_local_heads
+            )
+            q = pre["q"].view(pre["q_lora"].shape[0], num_q_heads, self.qk_head_dim)
+            latent_cache = pre["latent"]
+            k_nope = pre["k_nope"].unsqueeze(1)
+            q_lora = pre["q_lora"]
+            if self.should_run_indexer(prev_topk_indices):
+                topk_indices = self.indexer(x=hidden_states, q_lora=q_lora)
+            else:
+                topk_indices = maybe_capture_indexer_topk(  # noqa: F821
+                    self.layer_id, prev_topk_indices
+                )
+        q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+        return q_nope, k_nope, topk_indices
+
+    def _qrep_call_in_split_argument(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, pre["latent"].contiguous())
+
+    def _qrep_topk_helper_parameter(
+        self, forward_batch, maybe_capture_indexer_topk=None
+    ):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+            ignored = maybe_capture_indexer_topk(self, None)
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_topk_helper_import(self, forward_batch):
+        from os import maybe_capture_indexer_topk
+
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+            ignored = maybe_capture_indexer_topk(self, None)
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_topk_helper_varargs(self, forward_batch, *maybe_capture_indexer_topk):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+            ignored = maybe_capture_indexer_topk(self, None)
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_topk_helper_kwargs(self, forward_batch, **maybe_capture_indexer_topk):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+            ignored = maybe_capture_indexer_topk(self, None)
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_batch_varargs(self, *forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_batch_kwargs(self, **forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, None)
+
     cases = (
         (_local_view_dcp_elsewhere, (True, False)),
         (_qrep_view_inline, (True, True)),
@@ -938,6 +1138,17 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
         (_qrep_setattr_before_the_view, (False, False)),
         (_qrep_rebinds_the_split, (False, False)),
         (_qrep_setattr_after_the_view, (False, False)),
+        (_qrep_dict_update_after_the_view, (False, False)),
+        (_qrep_reflective_split_argument, (False, False)),
+        (_qrep_aliased_indexer, (False, False)),
+        (_qrep_call_in_split_argument, (False, False)),
+        (_qrep_topk_helper_parameter, (False, False)),
+        (_qrep_topk_helper_import, (False, False)),
+        (_qrep_topk_helper_varargs, (False, False)),
+        (_qrep_topk_helper_kwargs, (False, False)),
+        (_qrep_batch_varargs, (False, False)),
+        (_qrep_batch_kwargs, (False, False)),
+        (_qrep_sglang_shaped_branch, (True, True)),
     )
     wrong = {
         prepare.__name__: got
@@ -1053,6 +1264,10 @@ def test_run_mla_pre_wiring_and_partial_padding(
     assert recorded[0][0] == b and recorded[0][1] == want_qb
     assert recorded[0][3][0] == h_full.data_ptr()
     assert recorded[0][3][19] == w.epoch.data_ptr()
+    # the q_b weight the mode needs: replicated under DCP8 q-replicate, else the local one
+    attn = layer.self_attn
+    w_qb = attn.q_b_proj_qrep_weight if qrep else attn.q_b_proj.weight
+    assert recorded[0][3][8] == w_qb.data_ptr()
     assert tuple(attn_pre["q"].shape) == (b, want_qb)
     assert tuple(attn_pre["latent"].shape) == (b, mpw.KV + mpw.ROPE)
     assert tuple(idx_pre["q"].shape) == (b, mpw.IQ)
