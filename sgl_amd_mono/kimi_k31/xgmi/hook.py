@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from typing import Optional
 
@@ -26,7 +27,7 @@ from sgl_amd_mono.kimi_k31.xgmi.prefill import (
 
 SGLANG_READS = {
     "srt/layers/layer_boundary/residual/attn_bank.py": ("AttnBankState", "_FfnReadout"),
-    "srt/layers/layer_boundary/residual/attn_bank_hip.py": ("RowShardRead",),
+    "srt/layers/layer_boundary/residual/attn_bank_hip.py": ("takes", "shard_front"),
     "srt/models/kimi_k3.py": (
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
@@ -302,7 +303,6 @@ def _prepare_moe_layer_hook(
     heap: XgmiHeap,
     cfg: XgmiConfig,
     gemm_fn,
-    row_shard_cls,
 ):
     rebound_ok, row_front_on, need_normed_all, min_tok, max_tok = plan_entry
     if not rebound_ok:
@@ -349,9 +349,9 @@ def _prepare_moe_layer_hook(
         orig_shard_front=orig_read.shard_front,
         need_normed_all=need_normed_all,
     )
-    row_shard = row_shard_cls(
-        _takes_combined,
-        shard_front=shard_front_fn,
+    # Keep the read's other fields (attn_rows: the row-sharded o_proj's attention sum).
+    row_shard = dataclasses.replace(
+        orig_read, takes=_takes_combined, shard_front=shard_front_fn
     )
     return (mlp, attn_state, _tail_eligible, tail_fn, shard_front_fn, row_shard)
 
@@ -375,7 +375,6 @@ def _prepare_all_hooks(
     heap: XgmiHeap,
     cfg: XgmiConfig,
     gemm_fn,
-    row_shard_cls,
 ) -> Optional[list]:
     prepared = []
     for (layer, attn_state, orig_read), entry in zip(moe_targets, plan_entries):
@@ -392,7 +391,6 @@ def _prepare_all_hooks(
             heap=heap,
             cfg=cfg,
             gemm_fn=gemm_fn,
-            row_shard_cls=row_shard_cls,
         )
         if item is not None:
             prepared.append(item)
@@ -432,7 +430,6 @@ def install_xgmi_hooks(
     config: Optional[XgmiConfig] = None,
 ) -> XgmiHookSummary:
     """Install opt-in XGMI row-sharded prefill hooks on a Kimi-K3.1 model."""
-    from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import RowShardRead
     from sglang.srt.models.kimi_k3 import KimiK3MoE, _k3_bf16_gemm
 
     if heap is None:
@@ -476,7 +473,6 @@ def install_xgmi_hooks(
                 heap=heap,
                 cfg=cfg,
                 gemm_fn=_k3_bf16_gemm,
-                row_shard_cls=RowShardRead,
             )
             local_valid = prepared_or_none is not None
             prepared = prepared_or_none or []

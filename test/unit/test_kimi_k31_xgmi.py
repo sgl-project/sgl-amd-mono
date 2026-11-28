@@ -479,6 +479,32 @@ def test_install_xgmi_hooks_config_failure_still_joins_collectives(monkeypatch):
     assert bank0.ffn_row_shard is orig_read0 and bank1.ffn_row_shard is orig_read1
 
 
+def test_install_xgmi_hooks_keeps_row_shard_read_fields():
+    import dataclasses
+
+    from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import RowShardRead
+
+    fields = {f.name for f in dataclasses.fields(RowShardRead)}
+    if "attn_rows" not in fields:
+        pytest.skip("this SGLang's RowShardRead has no attn_rows")
+    layer, bank = _make_moe_layer(
+        shard_front=lambda normed, num_tokens: False,
+        row_sharded_tail=lambda *args: None,
+        takes=_takes_at_4096,
+        tail_eligible=_tail_eligible_at_4096,
+    )
+
+    def attn_rows(num_tokens):
+        return None
+
+    bank.ffn_row_shard = dataclasses.replace(bank.ffn_row_shard, attn_rows=attn_rows)
+    install_xgmi_hooks(types.SimpleNamespace(layers=[layer]), heap=_dummy_heap())
+    # The row-sharded o_proj leaves the attention sum to attn_rows; dropping it would
+    # reduce-scatter o_proj's placeholder output instead.
+    assert bank.ffn_row_shard.attn_rows is attn_rows
+    assert bank.ffn_row_shard.shard_front is layer.mlp.shard_front
+
+
 def test_install_xgmi_hooks_remote_rank_failure_leaves_layers_untouched(monkeypatch):
     (layer0, _, bank0, orig_read0), (layer1, _, bank1, orig_read1) = _two_moe_layers()
     _patch_install_collectives(
