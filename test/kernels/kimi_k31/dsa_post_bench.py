@@ -359,8 +359,8 @@ def run(args, m, rank, dev, cpu):
 
     graph, us = graph_us(step_fn, nl)
     # One more replay on fresh inputs (the same tensors the graph reads): a replay that skips
-    # a launch or an input-dependent write keeps the previous inputs' outputs, which fail
-    # here (a sort field whose value does not change with the inputs is not covered).
+    # a launch keeps the previous inputs' outputs and fails here; a small stale region can
+    # stay under the rel-L2 bounds, and a sort field that does not change is not covered.
     torch.manual_seed(5000 + m)
     for i in range(nl):
         cores_all[i].copy_(torch.randn_like(cores_all[i]) / (KO**0.5))
