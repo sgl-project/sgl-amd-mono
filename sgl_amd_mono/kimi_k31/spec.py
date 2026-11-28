@@ -59,7 +59,9 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     reasons = k3._config_disable_reasons(cfg=cfg, hf_config=hf_config)
     if envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get():
         # SGLang then rings ReplaySSM state by request row; the launches index it by slot
-        # (K3.1 always runs the ReplaySSM ring, Kimi-K3's check only when it is on).
+        # (K3.1 always runs the ReplaySSM ring, Kimi-K3's check only when it is on and
+        # wide: this reason replaces that one, so the refusal is said once).
+        reasons = [r for r in reasons if r != k3.HOST_ONLY_RING_REASON]
         reasons.append(
             "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT: the launches index the ReplaySSM ring "
             "by mamba slot"

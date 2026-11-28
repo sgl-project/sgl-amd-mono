@@ -301,10 +301,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
                 "for narrow-only <=8-row serving"
             )
         if wide_runs and cfg.enable_linear_replayssm_spec and _host_only_mamba():
-            reasons.append(
-                "wide launch does not support request-scoped ReplaySSM rings "
-                "(SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT=1 with --enable-linear-replayssm-spec)"
-            )
+            reasons.append(HOST_ONLY_RING_REASON)
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -388,6 +385,12 @@ def _offload_disable_reasons(cfg) -> list[str]:
         for flag, on in flags.items()
         if on
     ]
+
+
+HOST_ONLY_RING_REASON = (
+    "wide launch does not support request-scoped ReplaySSM rings "
+    "(SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT=1 with --enable-linear-replayssm-spec)"
+)
 
 
 def _host_only_mamba() -> bool:

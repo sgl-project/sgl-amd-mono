@@ -525,6 +525,52 @@ def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
         assert len(extra) == 1 and "only HiCache" in extra[0], (flag, extra)
 
 
+def test_hicache_passes_kimi_k3s_own_config_hook(monkeypatch):
+    """HiCache is the KV offload the spec admits: turning it on adds no refusal."""
+    monkeypatch.setattr(k3, "WIDE", True)
+    cfg = dict(
+        dcp_size=8,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=6,
+        cuda_graph_max_bs_decode=16,
+        max_running_requests=16,
+        enable_linear_replayssm_spec=True,
+        **_NO_OFFLOAD,
+    )
+    off = k3._config_disable_reasons(SimpleNamespace(**cfg), K3)
+    on = k3._config_disable_reasons(
+        SimpleNamespace(**cfg, enable_hierarchical_cache=True), K3
+    )
+    assert on == off and not any("offload" in r or "HiCache" in r for r in on), on
+
+
+def test_kimi_k31_says_the_host_only_ring_refusal_once(monkeypatch):
+    """Kimi-K3's hook refuses a host-only ring on a wide ReplaySSM server and Kimi-K3.1's
+    on any server; with both hooks firing the refusal is listed once."""
+    from sgl_amd_mono.kimi_k31 import spec as k31
+
+    monkeypatch.setattr(k3, "WIDE", True)
+    monkeypatch.setattr(k3, "_host_only_mamba", lambda: True)
+    monkeypatch.setenv("SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", "1")
+    cfg = SimpleNamespace(
+        dcp_size=8,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=6,
+        cuda_graph_max_bs_decode=16,
+        max_running_requests=16,
+        enable_linear_replayssm_spec=True,
+        **_NO_OFFLOAD,
+    )
+    assert any("request-scoped" in r for r in k3._config_disable_reasons(cfg, K3))
+    reasons = k31._config_disable_reasons(cfg, K3)
+    ring = [r for r in reasons if "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT" in r]
+    assert len(ring) == 1 and "mamba slot" in ring[0], reasons
+
+
 def test_wide_config_guards_draft_tokens_and_request_scoped_ring(monkeypatch):
     monkeypatch.setattr(k3, "WIDE", True)
     bad_decode = SimpleNamespace(
