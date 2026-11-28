@@ -25,6 +25,7 @@ state: slot -1).
 """
 
 import contextlib
+import functools
 import os
 
 import torch
@@ -319,9 +320,23 @@ def _launch_sort(b):
     kind = presort.sort_kind()
     # the routed experts read the sort only when a step fills its bucket (rows == b); a bucket
     # whose full width is not served (8-token 480 rows: 80 requests at L = 6) never does
-    if kind is None or b > mf.sort_max_rows(kind) or b not in wide_widths():
+    if (
+        kind is None
+        or b > mf.sort_max_rows(kind)
+        or b not in _served_widths(_buckets_env())
+    ):
         return None
     return kind
+
+
+def _buckets_env():
+    return os.environ.get("SGLANG_AMD_MONO_K31_WIDE_BUCKETS")
+
+
+@functools.lru_cache(maxsize=4)
+def _served_widths(buckets_env: str | None) -> frozenset:
+    # keyed on the bucket override wide_widths reads: a launch asks once a layer a step
+    return frozenset(wide_widths())
 
 
 def _sort_views(buf, m, kind="sgl"):

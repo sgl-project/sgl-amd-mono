@@ -125,6 +125,7 @@ def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
         value=lambda cfg, hf_config: ["kimi_k3: lmcache"] if cfg.enable_lmcache else [],
     )
     monkeypatch.delenv(name="SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", raising=False)
+    monkeypatch.setattr(k31.k3, "WIDE", True)  # K3.1 needs the wide launch
     hf_config = SimpleNamespace(dsa_config={"index_topk": 2048})
     cfg = dict(
         enable_hierarchical_cache=True,
