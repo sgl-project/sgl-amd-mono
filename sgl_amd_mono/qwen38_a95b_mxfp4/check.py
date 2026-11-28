@@ -59,13 +59,20 @@ def _live(idx: torch.Tensor) -> torch.Tensor:
     return idx[idx > 0].long()
 
 
-def k1_reference(layer, h, residual, conv, temporal, idx, forward_batch) -> dict:
-    """SGLang's input norm and GDN on K1's input; the state rows are restored."""
+def k1_reference(
+    layer, h, residual, conv, temporal, idx, forward_batch, x=None
+) -> dict:
+    """SGLang's input norm and GDN on K1's input; the state rows are restored.
+    ``x``: the normed rows when the launch before ran the input norm (on the
+    unrounded residual sum, which only that launch has); ``h`` is then the
+    residual that it stored."""
     from sgl_amd_mono.qwen38_a95b_mxfp4.spec import _proj_input
 
     rows = _live(idx)
     saved = conv[rows].clone(), temporal[rows].clone()
-    if residual is None:
+    if x is not None:
+        res, x = h.clone(), x.clone()
+    elif residual is None:
         res, x = h.clone(), layer.input_layernorm(h.clone())
     else:
         x, res = layer.input_layernorm(h.clone(), residual.clone())
@@ -136,9 +143,10 @@ def routed_alike(ids: torch.Tensor, k2_ids: torch.Tensor) -> torch.Tensor:
     return (ids[:, :k].sort(dim=-1).values == k2_ids.sort(dim=-1).values).all(dim=-1)
 
 
-def k2_alike(layer_id: int, ids, logits, k2_ids: torch.Tensor):
+def k2_alike(layer_id: int, ids, logits, k2_ids: torch.Tensor, kind: str = "k2"):
     """The rows to check K2's layer output on (TP rank 0; None: all rows). Each
-    other row is logged with the bf16 logits of the experts only one side picked."""
+    other row is logged with the bf16 logits of the experts only one side picked,
+    and the launch ``kind`` that routed it."""
     from sglang.srt.runtime_context import get_parallel
 
     if ids is None or get_parallel().tp_rank != 0:
@@ -149,7 +157,8 @@ def k2_alike(layer_id: int, ids, logits, k2_ids: torch.Tensor):
         got, ref = set(k2_ids[i].tolist()), set(ids[i, :k].tolist())
         only_k2, only_ref = sorted(got - ref), sorted(ref - got)
         logger.info(
-            "monokernel check route layer %d row %d: k2 only %s %s, sglang only %s %s",
+            "monokernel check route %s layer %d row %d: k2 only %s %s, sglang only %s %s",
+            kind,
             layer_id,
             i,
             only_k2,

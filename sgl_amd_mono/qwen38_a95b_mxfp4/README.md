@@ -1,8 +1,10 @@
 # Qwen3.8-2.4T-A95B monokernel on gfx950
 
-This document describes `sgl_amd_mono/qwen38_a95b_mxfp4/`. It covers the K1 and K2 launches, the files, the tests and
-the SGLang integration. SGLang uses the folder through the monokernel interface of RFC sgl-project/sglang#43949. The
-kernels come from sgl-project/sglang#43516, which adapts them from vllm-project/vllm#60833.
+This document describes `sgl_amd_mono/qwen38_a95b_mxfp4/`. It covers the K1, K2, `layer_block`, split and wide
+launches, the files, the tests and the SGLang integration. SGLang uses the folder through the monokernel interface of
+RFC sgl-project/sglang#43949. K1 and K2 come from sgl-project/sglang#43516, which adapts them from
+vllm-project/vllm#60833. `layer_block` comes from vllm-project/vllm#67421 at 28f094565b. The split and wide launches
+come from vllm-project/vllm#67421 at 28f094565b and vllm-project/vllm#67678 at ce476ce305.
 
 ## 1. Scope
 
@@ -15,9 +17,9 @@ NEXTN verify step has one row for each token that it scores. GDN is Gated DeltaN
 | checkpoint | `amd/Qwen3.8-2.4T-A95B-Quark-MXFP4`, with MXFP4 routed experts, a bf16 shared expert and bf16 GDN projections |
 | GPU and TP | gfx950 on MI355X, TP 8 |
 | SGLang steps | decode and NEXTN verify |
-| widths | 1 to 8, from `layout.MAX_TOKENS` |
-| launches per step | 161 on each rank in a decode step. Each of the 69 GDN layers runs K1 and K2, and each of the 23 full-attention layers runs K2. A verify step has 92, one K2 launch for each decoder layer. |
-| other steps | SGLang's forward runs prefill, extend, the steps wider than 8 and the MTP draft model |
+| widths | 1 to 8 for K1 and K2, from `layout.MAX_TOKENS`. 16 for `layer_block`, from `mono/layout.SPLIT_MAX`, with the fused shared expert only. 16 for the split launch, in a decode step with the fused shared expert only. 32 for the wide launches, from `spec.WIDE`, with the fused shared expert only. |
+| launches per step | 161 on each rank in a decode step of 1 to 8 rows. Each of the 69 GDN layers runs K1 and K2, and each of the 23 full-attention layers runs K2. A verify step of 1 to 8 rows has 92, one K2 launch for each decoder layer. A decode step of 16 rows has 161. Each GDN layer runs a split launch and `layer_block`, and each full-attention layer runs `layer_block`. A verify step of 16 rows has 92, one `layer_block` launch for each decoder layer. A step of 32 rows has 92, one wide launch for each decoder layer. In a decode step of 32 rows, the wide launch of a GDN layer also runs the GDN front, so SGLang runs only the 23 attention blocks. |
+| other steps | SGLang's forward runs prefill, extend, the steps wider than 8 except 16 and 32, the steps of 16 and 32 rows without the fused shared expert, and the MTP draft model |
 
 | file | contents |
 | --- | --- |
@@ -28,11 +30,13 @@ NEXTN verify step has one row for each token that it scores. GDN is Gated DeltaN
 | `gfx950/layer.py` | K2 as the FlyDSL kernel `layer_post`, its build key `K2Build`, its scratch layout and the FP4 GEMV helpers that K1 also uses |
 | `gfx950/layout.py` | the TP8 shapes and the addresses of the MXFP4 expert tiles and scales, with no FlyDSL import |
 | `gfx950/_k3.py` | the Kimi-K3 helpers that K1 and K2 use, copied from sgl-project/sglang#43481 |
+| `gfx950/mono/` | `layer_block` (`blocks.py`, build key `LayerBuild`) and its stages, copied from vllm-project/vllm#67421 at 28f094565b. Only the interface changes: the mailboxes and the guard of `common/`, and the peer regions after those of K2. |
+| `gfx950/wide/` | the wide launches (`layer.py`, build key `LayerBuild`), their grid barriers (`grid.py`) and their stages, copied from vllm-project/vllm#67421 at 28f094565b and vllm-project/vllm#67678 at ce476ce305. They use `mono/ops.py` and `mono/layout.py`. The spec runs the `gdn` kind as the split launch at 16 rows. At 32 rows it runs the `attn` kind, and the `gdn_back` kind (verify) or the `gdn` kind (decode). The interface changes: each wait runs in `common.sync._spin` under the guard of `common/`, the TP exchange is after the `layer_block` peer regions, and the `attn` kind can read the gated core (`og=False`). The `gdn` kind reads SGLang's conv state layout (`[2560, 3]` for each slot, not vLLM's `[3, 2560]`), rounds each conv product to bf16 as SGLang's conv does, and can keep a bf16 SSM state (`state_bf16`). Each norm after a residual add reads the sum before the bf16 rounding, as SGLang's `fused_add_rms_norm`, K1, K2 and `layer_block` do: the input norm of a split launch, and the norms after the TP exchanges of a wide launch. vLLM norms the rounded sum. |
 
 | test file | contents |
 | --- | --- |
-| `test/unit/test_qwen38_a95b_mxfp4_spec.py` | CPU tests of the registry entry, the widths, the config and model refusals, and the rows that check mode compares |
-| `test/kernels/test_qwen38_a95b_mxfp4_kernels.py` | the MXFP4 layout on the host, K1 on 1 GPU with `qwen38_a95b_mxfp4/check_k1.py`, K2 on 8 GPUs with `qwen38_a95b_mxfp4/check_k2.py`, and the port test `check_port.py` |
+| `test/unit/test_qwen38_a95b_mxfp4_spec.py` | CPU tests of the registry entry, the widths, the config and model refusals, the rows that check mode compares, the split build: its condition and its keys, and the wide build: its condition, its keys, the router gates and the route of a step of 32 rows |
+| `test/kernels/test_qwen38_a95b_mxfp4_kernels.py` | the MXFP4 layout on the host, K1 on 1 GPU with `qwen38_a95b_mxfp4/check_k1.py`, K2 on 8 GPUs with `qwen38_a95b_mxfp4/check_k2.py`, the split launch on 8 GPUs with `check_wide.py`, the wide launches on 8 GPUs with `check_wide32.py`, and the port test `check_port.py` |
 | `test/kernels/qwen38_a95b_mxfp4/inputs.py` | random TP8 shards in SGLang's layouts, the inputs of the kernel checks |
 | `test/e2e/qwen38_a95b_mxfp4_server.py` | the server flags, the NEXTN flags in `NEXTN`, and the environment of the serving tests |
 | `test/e2e/test_qwen38_a95b_mxfp4_server.py` | the serving tests at TP8, with `TestMonokernelVerify` for NEXTN |
@@ -45,6 +49,9 @@ step, `_Built.forward` runs each layer in two parts:
 1. On a full-attention layer, SGLang runs the input norm and the attention block up to the input of `o_proj`. On a GDN
    layer, one K1 launch on each rank runs the input norm and the attention block up to the input of `out_proj`.
 2. One K2 launch on each rank runs the rest of the layer. It writes the layer output and the residual.
+
+A decode step of 16 rows runs a split launch in place of K1 and `layer_block` in place of K2, with the fused shared
+expert only. The text after the stages of K2 describes them.
 
 SGLang runs the embedding before the first layer. It runs the final norm and the logits processor after the last layer.
 
@@ -80,6 +87,57 @@ time. It adds the shared expert as routed expert 512 of `w13` and `w2`. The `fse
 - The `sgu` stage does not run, and `down` adds no separate down rows for the shared expert.
 - At 4 rows or more, the `ug` tasks of expert 512 run on CTAs 80 to 95 before `route`, because they do not need it.
 
+K2 keeps a bf16 x tile of the step in LDS. At 8 rows, this tile is 131 KB of the 160 KB of LDS of a CU, so K2 takes 8
+rows at most. A step of 16 rows runs `layer_block` instead of K2, after the SGLang attention block or GDN up to the
+input of `o_proj` or `out_proj`. `layer_block` has the same grid and the stages of the `fse` build of K2, with these
+changes:
+
+- It keeps no x tile in LDS. The `norm` tasks write the sums of the ranks to the scratch, and each consumer builds its
+  part of x from them. From 5 rows, the `norm` tasks also write one MXFP4 copy of x, which the `ug` tasks read.
+- The `router` stage is on CTAs 64 to 79, `sgate` on CTAs 80 to 95, and the early `ug` tasks of expert 512 from CTA 96.
+- It runs only with the fused shared expert. SGLang applies the attention output gate before `o_proj`, so
+  `layer_block` gets the gated core rows, as K2 does.
+
+In a decode step of 16 rows, each GDN layer runs one split launch before `layer_block`, in place of SGLang's input
+norm and GDN. The split launch is the `gdn` kind of `wide/layer.py` at 16 rows, with 256 CTAs of 256 threads:
+
+1. The `combine` phase adds the layer input and the residual. It writes the residual and the normed rows to the
+   scratch. With an MXFP4 `in_proj_qkvz`, it also writes MXFP4 rows.
+2. One grid barrier follows.
+3. One phase runs `in_proj_qkvz` and `in_proj_ba`, the conv and the recurrence with the gated norm. Its hand-offs are
+   tagged pairs. It writes the core output, which is the input of `out_proj`. It updates the conv and SSM states in
+   place, as K1 does.
+
+The split launch has no TP exchange. `layer_block` then reads the core output and the residual of the scratch. A pad
+row has a state index of 0 or less. The split launch writes no state for a pad row, and it writes a zero core row. A
+verify step of 16 rows runs SGLang's GDN, as a verify step of 1 to 8 rows does.
+
+A step of 32 rows, decode or verify, runs one wide launch for each decoder layer. A full-attention layer runs the
+`attn` kind after the SGLang attention block up to the input of `o_proj`. In a verify step, a GDN layer runs the
+`gdn_back` kind after the SGLang GDN up to the input of `out_proj`. In a decode step, a GDN layer runs the `gdn` kind,
+which also runs the GDN front, as K1 does. A wide launch has 256 CTAs of 256 threads and runs its stages as phases with
+grid barriers between them:
+
+0. Only the `gdn` kind: `in_proj_qkvz` and `in_proj_ba` on the normed rows `x`, the conv with its state update, then
+   the gated delta rule with its SSM state update and the gated norm. It reads SGLang's conv state as one dense
+   `[2560, 3]` block for each slot, and the SSM state in f32 or bf16. With an MXFP4 `out_proj`, the recurrence writes
+   the core rows in MXFP4.
+1. `o_proj` or `out_proj` and its TP all-reduce. With an MXFP4 `out_proj`, `gdn_back` first quantizes the core rows to
+   MXFP4, as SGLang does.
+2. The residual add and the post-attention norm.
+3. The router, the route, the routed experts and the fused shared expert (expert 512), and the TP all-reduce.
+4. The residual add and the input norm of the next layer. The last layer applies the final norm instead.
+
+The launch leaves the residual and the normed rows in its scratch, at `res` and `x`. The next layer reads `x` as its
+input, so SGLang runs no input norm between two wide launches. When the next layer is a `gdn` launch with an MXFP4
+`in_proj_qkvz`, the last norm also writes the MXFP4 rows of `x` for it. In a verify step, SGLang runs the input norm of
+layer 0 on the embedding, and the forward copies the embedding to `res`. In a decode step, the `gdn` launch of layer 0
+runs this norm on the embedding first. The logits processor gets a copy of the final `x`.
+
+The wide router reads the router gate and the shared-expert gate as one `[513, 8192]` matrix. The build copies the
+two weights into one tensor for each layer, and SGLang's two weights become views of it. Thus the build keeps no
+second copy.
+
 A K1 launch has the same grid as K2. The table gives its stages in order.
 
 | stage | CTAs | work |
@@ -105,7 +163,17 @@ time. It does this by default, and `SGLANG_ROCM_GDN_ONLINE_MXFP4=0` turns it off
   epoch and the layer. A reader waits for the current tag, so no step has to clear the scratch.
 - Each peer region has two copies, and a step uses the copy of its epoch parity. Thus a rank does not overwrite a
   value that another rank still has to read.
+- `layer_block` has its own peer regions after the K2 regions and the guard flags of the same peer buffer. Thus a step
+  of 16 rows and a step of 1 to 8 rows never use the same bytes. Both kernels use the same guard flags.
+- The TP exchange of the wide launches is after the `layer_block` regions, and it uses the same guard flags. A line
+  flag holds a tag from the step epoch and the layer, so no step has to clear it.
+- A wide launch also has grid barriers between its phases. Each barrier counts CTA arrivals in one of three slots of
+  its own sync buffer. A launch zeroes the slot of the next launch, so the buffer starts zeroed once, at the build.
+  All 256 CTAs must be resident at the same time.
 - K1 has no hand-off between ranks. Its stages use the same mailboxes, and each K1 wait is on a CTA of the same GPU.
+- A split launch has no hand-off between ranks either. Its grid barrier counts CTA arrivals in one of three slots of
+  its own sync buffer. A launch zeroes the slot of the next launch, so the buffer starts zeroed once, at the build.
+  All 256 CTAs must be resident at the same time.
 - `common/guard.py` gives each wait a deadline of half of `--watchdog-timeout`, at most 60 s.
 - A wait that passes its deadline sets a sticky error word and flags each peer rank. Then it stops the launch and the
   server process. A wait on another rank sees the flag and stops that rank too. No token of that step goes to a client.
@@ -122,6 +190,7 @@ K2 reads these SGLang weights in place at each launch:
 
 With `fse`, the shared expert is expert 512 of `w13` and `w2`, and K2 reads no bf16 weights of the shared expert.
 With `oq`, K2 reads the MXFP4 `out_proj` and its e8m0 scales in the shuffled layout of SGLang's FP4 GEMM.
+`layer_block` reads the same weights as the `fse` build of K2.
 
 K1 reads these SGLang weights in place at each launch:
 
@@ -130,14 +199,16 @@ K1 reads these SGLang weights in place at each launch:
 
 With `qq`, K1 reads the MXFP4 `in_proj_qkvz` and its e8m0 scales in the same layout as `oq`.
 
-K1 also updates the bf16 conv state and the f32 or bf16 SSM state of each request in place.
+K1 also updates the bf16 conv state and the f32 or bf16 SSM state of each request in place. The split launch reads
+the same weights as K1 and updates the same states.
 
-K1 and K2 make no weight copies. Each rank allocates one peer buffer. It also allocates one K1 scratch buffer and one
-K2 scratch buffer for each width.
+The launches make no weight copies. Each rank allocates one peer buffer. It also allocates one K1 scratch buffer and one
+K2 scratch buffer for each width. With the split launch, it also allocates its scratch, its sync buffer and its core
+output.
 
 ## 5. Host side and SGLang integration
 
-`spec.py` accepts only gfx950, TP 8, widths 1 to 8, bf16, the `aiter` attention backend, and `--moe-runner-backend`
+`spec.py` accepts only gfx950, TP 8, widths 1 to 8 and 16, bf16, the `aiter` attention backend, and `--moe-runner-backend`
 `auto` or `aiter`. Its `features` set has only `SPECULATIVE_DECODING`. Thus SGLang refuses the other features of its
 default list, for example expert parallelism and DP attention. With speculative decoding, the spec needs one chain of
 draft tokens for each request. It refuses `--speculative-eagle-topk` values other than 1. It also refuses
@@ -160,14 +231,23 @@ The spec also refuses these GDN settings, because K1 cannot run them:
 The spec accepts a layer with a bf16 shared expert, or with a fused shared expert and 513 routed experts. It refuses a
 layer with neither.
 
-On each rank, `_build` makes two K1 launches for each CUDA graph width and each `in_proj_qkvz` dtype of the model. One
-K1 launch is for layer 0, which has no residual input. The other K1 launch is for the other GDN layers. `_build` also
-makes one K2 launch for each width, each shared-expert layout and each `o_proj` or `out_proj` dtype of the model. It
-compiles them before the first step. With the MXFP4 projections, K2 runs `oq` on the GDN layers and the bf16 build on
-the full-attention layers.
-The log shows "Qwen3.8 monokernel: N K1 and M K2 launches (widths [...], decode) in T s". With speculative decoding,
-`_build` makes no K1 launch, and the log shows "verify" instead of "decode". In the NEXTN test, each request has 4
-rows, so the widths are 4 and 8.
+On each rank, `_build` makes two K1 launches for each CUDA graph width of 1 to 8 and each `in_proj_qkvz` dtype of the
+model. One K1 launch is for layer 0, which has no residual input. The other K1 launch is for the other GDN layers.
+`_build` also makes one K2 launch for each width of 1 to 8, each shared-expert layout and each `o_proj` or `out_proj`
+dtype of the model. When each layer has the fused shared expert, it makes one `layer_block` launch for the width 16
+and each `o_proj` or `out_proj` dtype. Without the fused shared expert, a step of 16 rows runs SGLang's forward. With
+the fused shared expert, without speculative decoding and with 16 in the widths, `_build` also makes the split
+launches: one for layer 0 and one for the other GDN layers, for each `in_proj_qkvz` dtype. With the MXFP4 projections,
+K2 and `layer_block` run `oq` on the GDN layers and the bf16 build on the full-attention layers.
+When each layer has the fused shared expert, and the input, post-attention and final norms have one eps, `_build`
+also makes the wide launches of the width 32. With speculative decoding, it makes one `attn` build and one `gdn_back`
+build for the `out_proj` dtype. Without speculative decoding, it makes the `gdn` builds of the first layer, of a GDN
+layer before a GDN layer and of a GDN layer before a full-attention layer. It also makes the `attn` builds of a
+full-attention layer before a GDN layer and of the last layer. Otherwise a step of 32 rows runs SGLang's forward.
+`_build` compiles all the launches before the first step. The log shows "Qwen3.8 monokernel: N K1, M K2, L
+layer_block, S split and W wide launches (widths [...], decode) in T s". With speculative decoding, `_build` makes no
+K1 launch and no split launch, and the log shows "verify" instead of "decode". In the NEXTN test,
+each request has 4 rows, so the widths are 4, 8 and 16.
 
 SGLang uses only the CUDA graph key of a step to choose between the monokernel and SGLang's forward. The key gives the
 width, which is the number of requests times the rows of each request. Thus each rank makes the same choice, and a
@@ -180,15 +260,34 @@ the flag is `--enable-amd-monokernel`.
 
 The unit tests run on CPU. Section 1 gives what they check.
 
-The kernel tests run K1 on 1 GPU and K2 on 8 GPUs, with random weights:
+The kernel tests run K1 on 1 GPU, and K2, `layer_block`, the split launch and the wide launches on 8 GPUs, with random
+weights:
 
 - Each build key compiles.
-- The outputs of a row do not change with the other rows or with the width.
-- A CUDA graph of widths 8, 1, 3, 8, 2 and 5 replays bit for bit.
-- A stalled wait on rank 3 stops each rank. A stalled K1 wait sets its deadline error word, and the launch returns.
+- The outputs of a row do not change with the other rows or with the width. At 16 rows, the outputs of a row do not
+  change with the other rows or with the row of the probe.
+- At 16 rows, the outputs of `layer_block` agree with those of two 8-row `fse` K2 launches on the same rows: a cosine
+  of at least 0.9999 for `res_out` and at least 0.99 for `out`.
+- A CUDA graph of widths 8, 16, 16, 1, 3, 8, 16, 2 and 5 replays bit for bit on one peer buffer.
+- A stalled wait on rank 3 stops each rank, in K2 at 1 row and in `layer_block` at 16 rows. A stalled K1 wait sets its
+  deadline error word, and the launch returns.
 - K1 writes a zero core row and no state for a pad row.
 - With a bf16 SSM state, K1 computes in f32 on the widened state. Its core and conv state are the same as those of the
   f32 build, bit for bit.
+- `check_wide.py` runs two decode steps of two split launches at 16 rows, with pad rows. The core, the residual, and
+  the conv and SSM state rows agree with those of K1 on two 8-row chunks of the same input: a relative error of at
+  most 1e-2. The pad rows get a zero core, and the other state slots do not change. Each step has new input rows. A
+  stalled split launch on rank 3 sets its deadline error word, and its flag reaches each rank.
+- `check_wide32.py` runs one step of three wide launches (`gdn_back`, `attn`, `gdn_back`) at 17 and 32 rows, with a
+  bf16 and an MXFP4 `out_proj`. It compares each launch with float64 references that round as SGLang does
+  (`wide_reference.py`): the MoE input rows, the routes, the route weights, the residual and the normed rows. The
+  relative error must be at most 0.01 (0.02 for the MXFP4 MoE input rows). A stalled wait on rank 3 in `gdn_back` at
+  32 rows sets its deadline error word, and its flag reaches each rank.
+- `check_wide32.py` also runs one decode step of two `gdn` launches at 32 rows: layer 0, then a GDN layer that reads the
+  MXFP4 rows of the first launch. It runs bf16 projections with an f32 state, and MXFP4 projections with a bf16
+  state, with 3 pad rows. It compares each launch with K1 on 8-row chunks of the same input rows and state: the core,
+  and the conv and SSM state rows. The relative error must be at most 0.01 (0.02 for the MXFP4 core). The other state
+  slots must not change. Then it compares the tail of each launch as above.
 - The port test compares K1 and K2 with the kernels of sgl-project/sglang#43516, bit for bit. It runs only where those
   kernels are installed. It compares the `fse` build of K2 at 1, 4 and 8 rows. It also compares the `qq` and `oq`
   builds.
@@ -198,24 +297,41 @@ K2 launch, on the same input. On the rows that K2 and SGLang route to the same e
 least 0.99, the value in `spec.NUMERICS`. With `fse`, SGLang puts the shared expert after its top-k, and check mode
 does not compare that slot. Next to each K1 launch, check mode runs SGLang's input norm and GDN on the
 same input and state rows. Then it restores the state rows for K1. It compares the core output, the residual, and the
-conv and SSM state rows. `k1.core.cosine`, `k1.conv.cosine` and `k1.state.cosine` must be at least 0.9999.
+conv and SSM state rows. `k1.core.cosine`, `k1.conv.cosine` and `k1.state.cosine` must be at least 0.9999. Check mode
+compares a split launch as it compares K1, and the log names it `k1`.
+Next to each wide launch, check mode runs SGLang's tail on the same input, then SGLang's next norm on its output. It
+compares the normed rows `x` and the residual. On the rows that the wide launch and SGLang route to the same experts,
+`wide.out.cosine` must be at least 0.99. Before a `gdn` launch, check mode runs SGLang's GDN on the launch's input rows
+and state rows, then restores the state rows. On layer 0, SGLang's input norm makes the input rows from the embedding.
+On the other layers, the input rows are the rows `x` that the launch before normed: that launch norms the unrounded
+residual sum, as SGLang does, and stores only the bf16 sum. The tail reference starts from that core. Check mode
+also compares the conv and SSM state rows: `wide.conv.cosine` and `wide.state.cosine` must be at least 0.9999.
 
-The e2e test runs K1 and K2 on decode steps of width 1 to 8, and SGLang's forward on wider steps. It also runs GSM8K,
-measures the KL divergence of decode against prefill, runs check mode, and injects a fault on one rank. Check mode
-must log K1 and K2 checks at 1, 3 and 8 rows. The e2e servers keep the MXFP4 projections, so K1 runs `qq` and K2 runs
-`oq`. The first check-mode test needs the SGLang log line "Online MXFP4 GDN in_proj_qkvz,out_proj: N" with N of at
-least 1. A second check-mode test runs with `--enforce-shared-experts-fusion`.
-It also needs the SGLang log line "Quantizing the BF16 shared expert to MXFP4 while loading", because SGLang only warns
-when it does not fuse the shared expert. `TestMonokernelVerify` runs GSM8K at 4 concurrent requests on a NEXTN
-server. Its verify steps have 4 to 16 rows, and K2 serves the steps of up to 8 rows.
+The e2e test runs K1 and K2 on decode steps of width 1 to 8, and SGLang's forward on wider steps. The decode server
+has no fused shared expert, so its steps of 16 rows also run SGLang's forward. It also runs GSM8K, measures the KL
+divergence of decode against prefill, runs check mode, and injects a fault on one rank. Check mode must log K1 and K2
+checks at 1, 3 and 8 rows. The e2e servers keep the MXFP4 projections, so K1 runs `qq` and K2 runs `oq`. The first
+check-mode test needs the SGLang log line "Online MXFP4 GDN in_proj_qkvz,out_proj: N" with N of at least 1. A second
+check-mode test runs with `--enforce-shared-experts-fusion`. It also needs the SGLang log line "Quantizing the BF16
+shared expert to MXFP4 while loading", because SGLang only warns when it does not fuse the shared expert. This test
+also sends 16 requests, and check mode must log a split launch check and a `layer_block` check at 16 rows. Check mode
+compares `layer_block` as it compares K2, and the log names it `k2`. The test also sends 32 requests with
+`--max-running-requests 32`, and check mode must log a `wide` check at 32 rows. This server has no speculative
+decoding, so its steps of 32 rows run the `gdn` kind. The build log of this server must show 2 split launches and 5
+wide launches. `TestMonokernelDecodeFse` starts the decode server with `--enforce-shared-experts-fusion` and its CUDA
+graphs. Its build log must show 2 split launches. It measures the KL divergence of decode against prefill at 12 rows
+(graph 16 with 4 pad rows) and at 16 rows. `TestMonokernelVerify` runs
+GSM8K at 8 concurrent requests on a NEXTN server with the fused shared expert. Its verify steps have 4 to 32 rows. K2
+serves the steps of up to 8 rows, `layer_block` the steps of 16 rows, and the wide launches the steps of 32 rows.
 
 ## 7. Limitations
 
-K1 and K2 run only with:
+K1, K2, `layer_block`, the split launch and the wide launches run only with:
 
 - the checkpoint `amd/Qwen3.8-2.4T-A95B-Quark-MXFP4`
 - TP 8 on gfx950
-- decode and NEXTN verify steps of width 1 to 8
+- decode and NEXTN verify steps of width 1 to 8, and of width 16 and 32 with the fused shared expert. The split launch
+  runs only in decode steps of width 16.
 - one chain of draft tokens for each request, with `--speculative-eagle-topk 1`
 - an f32 or bf16 SSM state and a bf16 conv state
 - `--enable-linear-replayssm` only with speculative decoding

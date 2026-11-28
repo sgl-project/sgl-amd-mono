@@ -1,19 +1,29 @@
 """Qwen3.8 MoE with --enable-amd-monokernel on MI355X, TP8, across the switch
-points: decode steps of 1 to 8 rows run K1 and K2, wider ones the normal path, and
-requests join and leave a running batch that steps past 8 rows and back (a short
-GSM8K run, for gross failures); NEXTN verify steps of up to 8 rows run K2; the
-tokens of covered steps scored again by the normal prefill path (KL consistency);
-each covered layer against SGLang's layer (check mode), with the MXFP4 GDN
-projections of sgl-project/sglang#43839, also with the fused shared expert of
-sgl-project/sglang#41899; and a fault on one rank that stops the server before any
-token of the failed step is sent."""
+points: decode steps of 1 to 8 rows run K1 and K2, wider ones the normal path (16
+rows too, without the fused shared expert; with it, decode steps of 12 and 16 rows
+run the split GDN launch and layer_block in graph 16, scored again by the normal
+prefill path), and requests join and leave a running
+batch that steps past 8 rows and back (a short GSM8K run, for gross failures);
+NEXTN verify steps of up to 8 rows run K2, of 16 rows layer_block and of 32 rows
+the wide launches (with the fused shared expert); the tokens of covered steps
+scored again by the normal prefill path (KL consistency); each covered layer
+against SGLang's layer (check mode), with the MXFP4 GDN projections of
+sgl-project/sglang#43839, also with the fused shared expert of
+sgl-project/sglang#41899 (and at 16 rows the split GDN launch and layer_block,
+at 32 the wide launches, with the GDN front in a decode step: its conv and SSM
+state rows checked too); and a fault on one rank that stops the server before
+any token of the failed step is
+sent."""
 
+import json
+import math
 import os
 import re
 import resource
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import requests
@@ -65,6 +75,20 @@ def _gsm8k(num_threads):
     )
 
 
+def _match_prefill(batches):
+    # one graph per batch (ignore_eos keeps its rows)
+    for rows in batches:
+        requests.post(DEFAULT_URL_FOR_TEST + "/flush_cache").raise_for_status()
+        assert_logprobs_match(
+            DEFAULT_URL_FOR_TEST,
+            {MODEL: {"kl_div": KL_BOUND}},
+            MODEL,
+            max_samples=rows,
+            max_new_tokens=512,
+            trust_remote_code=True,
+        )
+
+
 class TestMonokernelDecode(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -83,24 +107,52 @@ class TestMonokernelDecode(CustomTestCase):
         self.assertGreater(metrics["score"], GSM8K_BOUND)
 
     def test_covered_steps_match_prefill(self):
-        # one graph per batch (ignore_eos keeps its rows): 2, 3, 7 and 8 rows
-        # (graphs 2, 4 and 8, pad rows at 3 and 7)
-        for rows in (2, 3, 7, 8):
-            requests.post(DEFAULT_URL_FOR_TEST + "/flush_cache").raise_for_status()
-            assert_logprobs_match(
-                DEFAULT_URL_FOR_TEST,
-                {MODEL: {"kl_div": KL_BOUND}},
-                MODEL,
-                max_samples=rows,
-                max_new_tokens=512,
-                trust_remote_code=True,
-            )
+        # graphs 2, 4 and 8, pad rows at 3 and 7
+        _match_prefill((2, 3, 7, 8))
+
+
+class TestMonokernelDecodeFse(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.err = cls.enterClassContext(
+            tempfile.NamedTemporaryFile("w+", suffix=".err")
+        )
+        cls.out = cls.enterClassContext(
+            tempfile.NamedTemporaryFile("w+", suffix=".out")
+        )
+        cls.process = _launch(
+            extra_args=[
+                "--enforce-shared-experts-fusion",
+                "--watchdog-timeout",
+                "600",
+            ],
+            log=(cls.out, cls.err),
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process)
+
+    def test_split_steps_match_prefill(self):
+        # the server shares its log files' offsets: read them through new handles
+        log = Path(self.err.name).read_text() + Path(self.out.name).read_text()
+        self.assertIn("layer_block, 2 split and", log)
+        # graph 16 runs the split GDN launch and layer_block, pad rows at 12
+        _match_prefill((12, 16))
 
 
 class TestMonokernelVerify(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.process = _launch(extra_args=[*NEXTN, "--watchdog-timeout", "600"])
+        cls.process = _launch(
+            extra_args=[
+                *NEXTN,
+                "--enforce-shared-experts-fusion",
+                "--watchdog-timeout",
+                "600",
+            ]
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -108,8 +160,9 @@ class TestMonokernelVerify(CustomTestCase):
             terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k_past_the_largest_width(self):
-        # 4 requests at a time: verify steps of 4 to 16 rows, K2 up to 8
-        metrics = _gsm8k(4)
+        # 8 requests at a time: verify steps of 4 to 32 rows, K2 up to 8,
+        # layer_block at 16, the wide launches at 32
+        metrics = _gsm8k(8)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], GSM8K_BOUND)
 
@@ -124,12 +177,24 @@ class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_with_the_fused_shared_expert(self):
         # sgl-project/sglang#41899 quantizes the BF16 shared expert and fuses it as
         # routed expert 512, so K2 runs fse; without the fusion SGLang only warns
-        log = self._check(["--enforce-shared-experts-fusion"])
+        log = self._check(
+            ["--enforce-shared-experts-fusion", "--max-running-requests", "32"],
+            wide=True,
+        )
         self.assertIn("Quantizing the BF16 shared expert to MXFP4 while loading", log)
+        # one in_proj_qkvz format: a split launch for layer 0 and one for the
+        # others; the decode step's GDN fronts: the first layer and a GDN layer
+        # before a GDN layer (both quantize their closing rows for that
+        # in_proj_qkvz), a GDN layer before an attention layer, an attention layer
+        # before a GDN layer, and the last layer
+        self.assertIn("layer_block, 2 split and 5 wide launches", log)
 
-    def _check(self, extra_args=()):
+    def _check(self, extra_args=(), wide=False):
         # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each launch;
-        # 1, 3 and 8 rows run widths 1, 3 and 8
+        # 1, 3 and 8 rows run widths 1, 3 and 8, and with `wide` 16 rows run
+        # the split launch (checked as k1) and layer_block (checked as k2), and 32
+        # rows the wide launches
+        widths = (1, 3, 8, 16, 32) if wide else (1, 3, 8)
         para = "The river valley archive lists the flood height of every year. "
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
@@ -146,7 +211,7 @@ class TestMonokernelCheck(CustomTestCase):
                 log=(out, err),
             )
             try:
-                for n in (1, 3, 8):
+                for n in widths:
                     r = requests.post(
                         DEFAULT_URL_FOR_TEST + "/generate",
                         json={
@@ -162,7 +227,7 @@ class TestMonokernelCheck(CustomTestCase):
             out.seek(0)
             log = err.read() + out.read()
         checks = re.findall(
-            r"monokernel check layer \d+ \((k1|k2), (\d+) rows\): (.*)", log
+            r"monokernel check layer \d+ \((k1|k2|wide), (\d+) rows\): (.*)", log
         )
         values = {}
         for _, _, fields in checks:
@@ -172,14 +237,29 @@ class TestMonokernelCheck(CustomTestCase):
             print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
         seen = {(kind, int(rows)) for kind, rows, _ in checks}
         want = {(kind, rows) for kind in ("k1", "k2") for rows in (1, 3, 8)}
+        want |= {(kind, 16) for kind in ("k1", "k2") if 16 in widths}
+        want |= {("wide", rows) for rows in widths if rows > 16}
         self.assertTrue(want <= seen, seen)
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
-        # a bf16 tie at the 10th logit routes a row elsewhere; a router bug, many
-        rows = sum(int(n) for kind, n, _ in checks if kind == "k2")
-        routes = re.findall(r"monokernel check route .*", log)
-        print(f"rows routed elsewhere: {len(routes)} of {rows}")
-        self.assertLessEqual(len(routes), rows // 100, "\n".join(routes[:20]))
+        # a bf16 tie at the 10th logit routes a row elsewhere: SGLang's logits of the
+        # two picks are a few bf16 steps apart (2 at most in 529 rows), and a router
+        # bug is further. K2 reads SGLang's residual, so few rows; the wide launches
+        # make their own (within one step), so more (6% of 8832 rows)
+        routes = re.findall(
+            r"monokernel check route (k2|wide) (.*: k2 only \[.*\] (\[.*\]), "
+            r"sglang only \[.*\] (\[.*\]))",
+            log,
+        )
+        for kind, per in (("k2", 100), ("wide", 10)):
+            rows = sum(int(n) for k, n, _ in checks if k == kind)
+            lines = [line for k, line, _, _ in routes if k == kind]
+            print(f"{kind} rows routed elsewhere: {len(lines)} of {rows}")
+            self.assertLessEqual(len(lines), rows // per, "\n".join(lines[:20]))
+        for _, line, got, ref in routes:
+            a, b = max(json.loads(got)), min(json.loads(ref))
+            step = 2.0 ** (math.frexp(max(abs(a), abs(b)))[1] - 8)
+            self.assertLessEqual(abs(a - b), 4 * step, line)
         return log
 
 
