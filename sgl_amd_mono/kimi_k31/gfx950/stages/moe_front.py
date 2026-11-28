@@ -72,6 +72,13 @@ def gathered_tiles(bn):
 SORT_KINDS = ("sgl", "aux16")
 SORT_BM = 32  # "sgl"
 SORT_MAX_ROWS = 64  # a 64-bit token mask an expert (SGLang's patch covers M x 16 <= 1024 pairs: M <= 64)
+SORT_MAX_ROWS_AUX16 = 480  # max(REQ_BUCKETS) * max(SUPPORTED_L) = 60 * 8
+
+
+def sort_max_rows(kind):
+    return SORT_MAX_ROWS_AUX16 if kind == "aux16" else SORT_MAX_ROWS
+
+
 SCALE_COLS = (
     (LAT // 32 + 7) // 8
 ) * 8  # 112 e8m0 bytes a sorted row (SGLang's SCALEN_PAD)
@@ -526,8 +533,8 @@ def sort_rows(
     then puts ``srtmk`` for ``place_codes``. Every global word it reads is loaded up front (m is static).
     ``lay["kind"]`` "aux16": aiter's BM16 aux sort instead (``sort_layout``): blocks of 16, pad id m, and
     m_indices (``mi``) real / reset alongside the ids; ``dest`` is its reverse_sorted; no ``srtmk``.
-    LDS: ``masks`` 2 x E words (an expert's 64-bit token mask), ``bbl`` E words, ``scan_a`` / ``scan_b``
-    WAVES words each."""
+    For ``aux16`` with ``m > SORT_MAX_ROWS``, uses order-free LDS atomic count/scatter in ``masks[0..E-1]``.
+    LDS: ``masks`` 2 x E words, ``bbl`` E words, ``scan_a`` / ``scan_b`` WAVES words each."""
     lane, wave = tid % 64, tid // 64
     p_n = m * TOPK
     o = lay["offs"]
@@ -576,68 +583,126 @@ def sort_rows(
                 )
             )
         )
-    # 3. an expert's tokens, as a 64-bit mask (order free: the bits are the same whoever sets them first)
-    for k in range_constexpr(pr):
-        p = tid + k * THREADS
-        if p < p_n:
-            t = p // TOPK
-            fx.llvm.atomic_or(
-                masks + es[k] * 2 + t // 32,
-                fx.Int32(1) << (t % 32),
-                syncscope="workgroup",
-            )
-    gpu.barrier()
-
-    # 4. pairs -> blocks an expert -> blocks before it (experts tid and THREADS + tid)
-    def count(e):
-        return popcount(fx.Uint32(fx.ptr_load(masks + 2 * e))) + popcount(
-            fx.Uint32(fx.ptr_load(masks + 2 * e + 1))
-        )
-
-    e1 = tid + THREADS
-    has1 = e1 < E
-    c0 = count(tid)
-    c1 = has1.select(count(fx.min(e1, E - 1)), fx.Int32(0))
-    b0 = (c0 + bm - 1) // bm
-    b1 = (c1 + bm - 1) // bm
-    x0, n0 = block_excl_scan(b0, lane, wave, scan_a)
-    x1, n1 = block_excl_scan(b1, lane, wave, scan_b)
-    bb0, bb1 = x0, n0 + x1
-    fx.ptr_store(bb0, bbl + tid)
-    if has1:
-        fx.ptr_store(bb1, bbl + e1)
-    for k in range(b0):
-        bo.buffer_store(fx.Int32(tid), rsrc(a_eids), bb0 + k)
-    if has1:
-        for k in range(b1):
-            bo.buffer_store(fx.Int32(e1), rsrc(a_eids), bb1 + k)
-    if tid == 0:
-        bo.buffer_store((n0 + n1) * bm, rsrc(a_nv), 0)
-        bo.buffer_store(fx.Int32(m), rsrc(a_nv), 1)
-    # the resets above land before any of this launch's rows (one CTA: drained, then a barrier)
-    rocdl.s_waitcnt(vmcnt=0)
-    gpu.barrier()
-    # 5. the real pairs: rank in the expert = its tokens below t
-    for k in range_constexpr(pr):
-        p = tid + k * THREADS
-        if p < p_n:
-            e = es[k]
-            t = p // TOPK
-            s = p % TOPK
-            lo = fx.ptr_load(masks + 2 * e)
-            hi = fx.ptr_load(masks + 2 * e + 1)
-            low = t < 32
-            ml = low.select((fx.Int32(1) << fx.min(t, 31)) - fx.Int32(1), fx.Int32(-1))
-            mh = low.select(
-                fx.Int32(0), (fx.Int32(1) << fx.max(t - 32, 0)) - fx.Int32(1)
-            )
-            rank = popcount(fx.Uint32(lo & ml)) + popcount(fx.Uint32(hi & mh))
-            dest = fx.ptr_load(bbl + e) * bm + rank
-            bo.buffer_store((s << 24) | t, rsrc(a_ids), dest)
-            bo.buffer_store(ws[k], rsrc(a_w), dest)
-            if const_expr(aux16):
+    atomic_aux16 = aux16 and m > SORT_MAX_ROWS
+    if const_expr(atomic_aux16):
+        # 3. pair count per expert in masks[0..E-1] (order-free aux16 supports any m <= SORT_MAX_ROWS_AUX16)
+        for k in range_constexpr(pr):
+            p = tid + k * THREADS
+            if p < p_n:
+                fx.llvm.atomic_add(
+                    masks + es[k],
+                    fx.Int32(1),
+                    syncscope="workgroup",
+                )
+        gpu.barrier()
+        # 4. pairs -> blocks an expert -> blocks before it, resetting masks[0..E-1] to 0 for step 5
+        e1 = tid + THREADS
+        has1 = e1 < E
+        c0 = fx.ptr_load(masks + tid)
+        c1 = has1.select(fx.ptr_load(masks + fx.min(e1, E - 1)), fx.Int32(0))
+        fx.ptr_store(fx.Int32(0), masks + tid)
+        if has1:
+            fx.ptr_store(fx.Int32(0), masks + e1)
+        b0 = (c0 + bm - 1) // bm
+        b1 = (c1 + bm - 1) // bm
+        x0, n0 = block_excl_scan(b0, lane, wave, scan_a)
+        x1, n1 = block_excl_scan(b1, lane, wave, scan_b)
+        bb0, bb1 = x0, n0 + x1
+        fx.ptr_store(bb0, bbl + tid)
+        if has1:
+            fx.ptr_store(bb1, bbl + e1)
+        for k in range(b0):
+            bo.buffer_store(fx.Int32(tid), rsrc(a_eids), bb0 + k)
+        if has1:
+            for k in range(b1):
+                bo.buffer_store(fx.Int32(e1), rsrc(a_eids), bb1 + k)
+        if tid == 0:
+            bo.buffer_store((n0 + n1) * bm, rsrc(a_nv), 0)
+            bo.buffer_store(fx.Int32(m), rsrc(a_nv), 1)
+        rocdl.s_waitcnt(vmcnt=0)
+        gpu.barrier()
+        # 5. scatter pairs with per-expert atomic rank in masks[0..E-1]
+        for k in range_constexpr(pr):
+            p = tid + k * THREADS
+            if p < p_n:
+                e = es[k]
+                t = p // TOPK
+                s = p % TOPK
+                rank = fx.llvm.atomic_add(
+                    masks + e,
+                    fx.Int32(1),
+                    syncscope="workgroup",
+                )
+                dest = fx.ptr_load(bbl + e) * bm + rank
+                bo.buffer_store((s << 24) | t, rsrc(a_ids), dest)
+                bo.buffer_store(ws[k], rsrc(a_w), dest)
                 bo.buffer_store(t, rsrc(a_mi), dest)
-            bo.buffer_store(dest, rsrc(a_dest), p, cache_modifier=CM_DEV)
+                bo.buffer_store(dest, rsrc(a_dest), p, cache_modifier=CM_DEV)
+    else:
+        # 3. an expert's tokens, as a 64-bit mask (order free: the bits are the same whoever sets them first)
+        for k in range_constexpr(pr):
+            p = tid + k * THREADS
+            if p < p_n:
+                t = p // TOPK
+                fx.llvm.atomic_or(
+                    masks + es[k] * 2 + t // 32,
+                    fx.Int32(1) << (t % 32),
+                    syncscope="workgroup",
+                )
+        gpu.barrier()
+
+        # 4. pairs -> blocks an expert -> blocks before it (experts tid and THREADS + tid)
+        def count(e):
+            return popcount(fx.Uint32(fx.ptr_load(masks + 2 * e))) + popcount(
+                fx.Uint32(fx.ptr_load(masks + 2 * e + 1))
+            )
+
+        e1 = tid + THREADS
+        has1 = e1 < E
+        c0 = count(tid)
+        c1 = has1.select(count(fx.min(e1, E - 1)), fx.Int32(0))
+        b0 = (c0 + bm - 1) // bm
+        b1 = (c1 + bm - 1) // bm
+        x0, n0 = block_excl_scan(b0, lane, wave, scan_a)
+        x1, n1 = block_excl_scan(b1, lane, wave, scan_b)
+        bb0, bb1 = x0, n0 + x1
+        fx.ptr_store(bb0, bbl + tid)
+        if has1:
+            fx.ptr_store(bb1, bbl + e1)
+        for k in range(b0):
+            bo.buffer_store(fx.Int32(tid), rsrc(a_eids), bb0 + k)
+        if has1:
+            for k in range(b1):
+                bo.buffer_store(fx.Int32(e1), rsrc(a_eids), bb1 + k)
+        if tid == 0:
+            bo.buffer_store((n0 + n1) * bm, rsrc(a_nv), 0)
+            bo.buffer_store(fx.Int32(m), rsrc(a_nv), 1)
+        # the resets above land before any of this launch's rows (one CTA: drained, then a barrier)
+        rocdl.s_waitcnt(vmcnt=0)
+        gpu.barrier()
+        # 5. the real pairs: rank in the expert = its tokens below t
+        for k in range_constexpr(pr):
+            p = tid + k * THREADS
+            if p < p_n:
+                e = es[k]
+                t = p // TOPK
+                s = p % TOPK
+                lo = fx.ptr_load(masks + 2 * e)
+                hi = fx.ptr_load(masks + 2 * e + 1)
+                low = t < 32
+                ml = low.select(
+                    (fx.Int32(1) << fx.min(t, 31)) - fx.Int32(1), fx.Int32(-1)
+                )
+                mh = low.select(
+                    fx.Int32(0), (fx.Int32(1) << fx.max(t - 32, 0)) - fx.Int32(1)
+                )
+                rank = popcount(fx.Uint32(lo & ml)) + popcount(fx.Uint32(hi & mh))
+                dest = fx.ptr_load(bbl + e) * bm + rank
+                bo.buffer_store((s << 24) | t, rsrc(a_ids), dest)
+                bo.buffer_store(ws[k], rsrc(a_w), dest)
+                if const_expr(aux16):
+                    bo.buffer_store(t, rsrc(a_mi), dest)
+                bo.buffer_store(dest, rsrc(a_dest), p, cache_modifier=CM_DEV)
     # 6. the rows out (device scope), then place_codes may read them ("sgl"; aux16 has no codes to place)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()

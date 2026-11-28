@@ -297,7 +297,7 @@ MODELS = {
         # (a kimi_k3 package change runs kimi_k31), the nightly or the weekly run.
         # A dispatch with models=kimi_k3 still runs it.
         "pr": False,
-        "packages": ["kimi_k3"],
+        "packages": ["kimi_k3", "kimi_k31"],
         "tp": 8,
         "paths": {
             "KIMI_K3_MODEL_PATH": f"{HF}/moonshotai/Kimi-K3",
@@ -309,6 +309,7 @@ MODELS = {
             "test/kernels/test_kimi_k3_k1.py",
             "test/kernels/test_kimi_k3_k1_conv.py",
             "test/kernels/test_kimi_k3_mla_pre.py",
+            "test/kernels/test_kimi_k3_wide_fp8.py",
         ],
         "e2e_tests": ["test/e2e/test_kimi_k3_server.py"],
         "microbench": [
@@ -332,7 +333,7 @@ MODELS = {
         # Not in the PR test: no checkpoint on the CI nodes and no kernel tests of its
         # own (kimi_k3's run them), so a PR job would only re-run the unit tests.
         "pr": False,
-        "packages": ["kimi_k3"],
+        "packages": ["kimi_k3", "kimi_k31"],
         "tp": 8,
         "paths": {
             "KIMI_K3_QUARK_MODEL_PATH": f"{HF}/amd/Kimi-K3-Quark-MXFP4-AttnFP8",
@@ -356,10 +357,27 @@ MODELS = {
         "tp": 8,
         # moonshotai/Kimi-K3.1; not on the CI nodes yet, and no serving recipe
         "paths": {},
-        "kernel_tests": ["test/kernels/test_kimi_k31_k1_ring.py"],
+        "kernel_tests": [
+            "test/kernels/test_kimi_k31_k1_ring.py",
+            "test/kernels/test_kimi_k31_mla_pre_wide_replay.py",
+            "test/kernels/test_kimi_k3_k1.py",
+            "test/kernels/test_kimi_k3_kernels.py",
+            "test/kernels/test_kimi_k3_wide_fp8.py",
+        ],
         "e2e_tests": [],
         "microbench": [
-            "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --rows 16,128"
+            "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --rows 16,128",
+            # DSpark's raw-prefix capture: must equal the gathered prefix bit for bit
+            (
+                "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py"
+                " --rows 16,128 --nvb-a 7 --nvb-m 7 --capture prefix"
+            ),
+            # 6 draft tokens a request, on the launch variant and weight layouts serving uses
+            (
+                "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --L 6 --rows 96,288"
+                " --nvb-a 2 --write-a --nvb-m 3 --restart --front-map --up-norm"
+            ),
+            "torchrun --nproc-per-node 8 test/kernels/kimi_k31/dsa_post_bench.py --rows 12,24,48 --L 6 --flush 256",
         ],
         "evals": [],
         "concurrency": [],

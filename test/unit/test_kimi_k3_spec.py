@@ -70,13 +70,16 @@ def test_the_plugin_registers_the_spec():
     assert found is k3.SPEC, why
 
 
-def test_the_spec_is_tp8_and_at_most_eight_rows():
+def test_the_spec_is_tp8_and_covers_narrow_and_wide_rows():
+    from sgl_amd_mono.kimi_k31 import wide
+
     limits = k3.SPEC.devices["gfx950"]
     assert limits.tp_sizes == (8,)
-    assert limits.widths == tuple(range(1, MAX_ROWS + 1))
-    # With DSpark the runtime serves only the widths that hold whole requests,
-    # so block size 7 (8 tokens a request) leaves batch size 1.
-    assert [w // 8 for w in limits.widths if w % 8 == 0] == [1]
+    assert limits.widths[:MAX_ROWS] == tuple(range(1, MAX_ROWS + 1))
+    if k3.WIDE:
+        assert limits.widths[MAX_ROWS:] == wide.wide_widths()
+    else:
+        assert limits.widths == tuple(range(1, MAX_ROWS + 1))
 
 
 def test_the_shapes_are_checked_on_the_text_config():
@@ -275,7 +278,8 @@ def test_the_fp8_kda_in_proj_layout_is_the_one_sglang_chose(monkeypatch, shuffle
         ),
         _bfa_f_b_w=torch.zeros(kda.PROJ, kda.HD, dtype=torch.bfloat16),
     )
-    fmt, w_in, scale, w_fb = k1._in_proj_operands(attn)
+    fmt, w_in, scale, w_in_fab, w_fb = k1._in_proj_operands(attn)
+    assert w_in_fab is None
     assert fmt == (kda.W_FP8_SHUFFLED if shuffled else kda.W_FP8)
     assert tuple(w_in.shape) == (rows, kda.HIDDEN) and w_in.is_contiguous()
     assert tuple(scale.shape) == (rows,)
@@ -419,3 +423,472 @@ def test_k1_declines_a_request_scoped_replayssm_ring(monkeypatch):
 
     assert run(request_ring=True) == (None, None)
     assert run(request_ring=False) != (None, None)
+
+
+@pytest.mark.parametrize("b_dtype", ["fp8", "bf16"])
+def test_split_quark_fp8_in_proj_and_caching(monkeypatch, b_dtype):
+    import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+    import torch
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+    from sgl_amd_mono.kimi_k3.gfx950.attention import kda
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
+
+    raw = torch.randint(0, 256, (32, 128), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    sh = wfmt.preshuffle_fp8(raw)
+    assert torch.equal(wfmt.unshuffle_fp8(sh).view(torch.uint8), raw.view(torch.uint8))
+
+    monkeypatch.setattr(fp8_utils, "use_aiter_bpreshuffle_gemm", lambda n: n >= 128)
+    scheme = QuarkW8A8Fp8(
+        {"qscheme": "per_channel"},
+        {"qscheme": "per_channel", "is_dynamic": True},
+    )
+
+    torch.manual_seed(7)
+
+    def make_fp8(rows, cols):
+        raw_q = (torch.randn(rows, cols) * 0.5).clamp(-448, 448).to(torch.float8_e4m3fn)
+        sc = (torch.rand(rows, 1) * 0.05 + 0.01).to(torch.float32)
+        return SimpleNamespace(
+            weight=raw_q.t(),
+            weight_scale=sc,
+            scheme=scheme,
+            _raw=raw_q,
+        )
+
+    b_proj = (
+        make_fp8(kda.NH, kda.HIDDEN)
+        if b_dtype == "fp8"
+        else SimpleNamespace(
+            weight=torch.randn(kda.NH, kda.HIDDEN, dtype=torch.bfloat16).t(),
+            weight_scale=None,
+            scheme=scheme,
+        )
+    )
+    attn = SimpleNamespace(
+        use_full_rank_gate=True,
+        _qkvgbfa_in_qkvg_proj=False,
+        _qkvgbfa_layer=None,
+        _bfa_f_b_w=None,
+        fused_qkvg_proj=make_fp8(kda.FA_0, kda.HIDDEN),
+        f_a_proj=make_fp8(kda.HD, kda.HIDDEN),
+        b_proj=b_proj,
+        f_b_proj=make_fp8(kda.PROJ, kda.HD),
+    )
+    k1._validate_in_proj_operands(attn)
+    assert not hasattr(attn, "_sgl_amd_mono_k1_ops")
+    # a bias on any FP8 projection the packing reads is refused (the launch adds none)
+    for name in ("fused_qkvg_proj", "f_a_proj"):
+        lin = getattr(attn, name)
+        biased = SimpleNamespace(
+            **{
+                **vars(attn),
+                name: SimpleNamespace(**{**vars(lin), "bias": torch.zeros(1)}),
+            }
+        )
+        with pytest.raises(ValueError, match="has a bias"):
+            k1._validate_in_proj_operands(biased)
+    ops1 = k1._in_proj_operands(attn)
+    ops2 = k1._in_proj_operands(attn)
+    assert ops1 is ops2
+    fmt, w_in, scale, w_in_fab, w_fb = ops1
+    assert fmt == kda.W_FP8_SHUFFLED
+    assert tuple(w_in.shape) == (kda.FA_0, kda.HIDDEN)
+    assert tuple(w_in_fab.shape) == (kda.NPROJ - kda.FA_0, kda.HIDDEN)
+    assert tuple(scale.shape) == (kda.NPROJ,)
+    assert w_fb.dtype == torch.bfloat16 and tuple(w_fb.shape) == (kda.PROJ, kda.HD)
+    unshuf_fab = wfmt.unshuffle_fp8(w_in_fab).float() * scale[kda.FA_0 :, None]
+    ref_fa = wfmt.unshuffle_fp8(attn.f_a_proj._raw).float() * attn.f_a_proj.weight_scale
+    assert torch.allclose(unshuf_fab[: kda.HD], ref_fa, atol=1e-4, rtol=1e-3)
+    assert torch.count_nonzero(scale[kda.FA_0 + kda.HD + kda.NH :]) == 0
+    assert torch.count_nonzero(unshuf_fab[kda.HD + kda.NH :]) == 0
+    # b_proj's rows of the tail: Quark FP8 as stored, or bf16 re-quantized a row at a time
+    got_b = unshuf_fab[kda.HD : kda.HD + kda.NH]
+    s_b = scale[kda.FA_0 + kda.HD : kda.FA_0 + kda.HD + kda.NH]
+    if b_dtype == "fp8":
+        ref_b = attn.b_proj._raw.float() * attn.b_proj.weight_scale
+        assert torch.equal(s_b, attn.b_proj.weight_scale.view(-1))
+        assert torch.allclose(got_b, ref_b, atol=0, rtol=1e-6)
+    else:
+        ref_b = attn.b_proj.weight.t().float()
+        amax = ref_b.abs().amax(dim=1)
+        assert torch.allclose(s_b, amax / 448.0, rtol=1e-6)
+        # E4M3 keeps 3 mantissa bits: within 1/16 of a value, or a subnormal step
+        bound = ref_b.abs() / 16 + (amax / 448.0 * 2.0**-9)[:, None]
+        assert bool(((got_b - ref_b).abs() <= bound).all())
+    # f_b: the Quark FP8 weight dequantized once to bf16
+    ref_fb = wfmt.unshuffle_fp8(attn.f_b_proj._raw).float() * attn.f_b_proj.weight_scale
+    assert torch.equal(w_fb, ref_fb.to(torch.bfloat16))
+
+
+_NO_OFFLOAD = dict(
+    enable_lmcache=False,
+    enable_flexkv=False,
+    disaggregation_decode_enable_offload_kvcache=False,
+)
+
+
+def test_decode_context_parallel_is_served_on_the_a2a_exchange_only(monkeypatch):
+    """DCP8 was validated on the a2a exchange; another backend at DCP8 is refused, one
+    reason, while DCP1 (where SGLang resolves the backend to ag_rs) is unaffected.
+    Kimi-K3.1's hook takes Kimi-K3's checks, so it refuses it too."""
+    from sgl_amd_mono.kimi_k31 import spec as k31
+
+    monkeypatch.setattr(k3, "WIDE", True)
+    cfg = dict(
+        dcp_size=8,
+        dcp_comm_backend="a2a",
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=6,
+        cuda_graph_max_bs_decode=16,
+        max_running_requests=16,
+        enable_linear_replayssm_spec=True,
+        **_NO_OFFLOAD,
+    )
+    base = k3._config_disable_reasons(SimpleNamespace(**cfg), K3)
+    assert not any("--dcp-comm-backend" in r for r in base), base
+    ag_rs = {**cfg, "dcp_comm_backend": "ag_rs"}
+    reasons = k3._config_disable_reasons(SimpleNamespace(**ag_rs), K3)
+    backend = [r for r in reasons if "--dcp-comm-backend" in r]
+    assert len(backend) == 1 and "--dcp-comm-backend ag_rs" in backend[0], reasons
+    assert [r for r in reasons if r not in backend] == base
+    dcp1 = SimpleNamespace(**{**ag_rs, "dcp_size": 1})
+    assert k3._config_disable_reasons(dcp1, K3) == base
+    k31_reasons = k31._config_disable_reasons(SimpleNamespace(**ag_rs), K3)
+    assert sum("--dcp-comm-backend ag_rs" in r for r in k31_reasons) == 1, k31_reasons
+
+
+def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
+    """The spec declares KV_OFFLOAD for HiCache; the other offload paths it admits are
+    refused, one reason each, through Kimi-K3's own config hook."""
+    monkeypatch.setattr(k3, "WIDE", True)
+    cfg = dict(
+        dcp_size=8,
+        dcp_comm_backend="a2a",
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=6,
+        cuda_graph_max_bs_decode=16,
+        max_running_requests=16,
+        enable_linear_replayssm_spec=True,
+        **_NO_OFFLOAD,
+    )
+    assert k3.Feature.KV_OFFLOAD in k3.SPEC.features
+    base = k3._config_disable_reasons(SimpleNamespace(**cfg), K3)
+    assert not any("HiCache" in r for r in base), base
+    # with the expert padding check satisfied, the real hook accepts a HiCache server
+    monkeypatch.setattr(k3, "_k3_aiter_opt", lambda: True)
+    monkeypatch.delenv("SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", raising=False)
+    hicache = SimpleNamespace(**cfg, enable_hierarchical_cache=True)
+    assert k3._config_disable_reasons(hicache, K3) == []
+    for flag in _NO_OFFLOAD:
+        reasons = k3._config_disable_reasons(SimpleNamespace(**{**cfg, flag: True}), K3)
+        extra = [r for r in reasons if r not in base]
+        assert len(extra) == 1 and "only HiCache" in extra[0], (flag, extra)
+
+
+def test_the_host_only_ring_refusal_follows_the_widths_this_draft_length_serves(
+    monkeypatch,
+):
+    """Kimi-K3 refuses a host-only ring only when a step can reach a wide width at its L:
+    with the 128,256,384 override, 12 requests of 8 tokens never do (the first is 15)."""
+    monkeypatch.setattr(k3, "WIDE", True)
+    monkeypatch.setattr(k3, "_host_only_mamba", lambda: True)
+    cfg = SimpleNamespace(
+        dcp_size=8,
+        dcp_comm_backend="a2a",
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+        cuda_graph_max_bs_decode=12,
+        max_running_requests=12,
+        enable_linear_replayssm_spec=True,
+        **_NO_OFFLOAD,
+    )
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    reasons = k3._config_disable_reasons(cfg, K3)
+    assert any("request-scoped ReplaySSM" in r for r in reasons), reasons
+    monkeypatch.setenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", "128,256,384")
+    reasons = k3._config_disable_reasons(cfg, K3)
+    assert not any("request-scoped ReplaySSM" in r for r in reasons), reasons
+    # an eager server routes up to its running cap: 16 requests reach 120 rows
+    eager = SimpleNamespace(**{**vars(cfg), "max_running_requests": 16})
+    reasons = k3._config_disable_reasons(eager, K3)
+    assert any("request-scoped ReplaySSM" in r for r in reasons), reasons
+
+
+def test_kimi_k31_says_the_host_only_ring_refusal_once(monkeypatch):
+    """Kimi-K3's hook refuses a host-only ring on a wide ReplaySSM server and Kimi-K3.1's
+    on any server; with both hooks firing the refusal is listed once."""
+    from sgl_amd_mono.kimi_k31 import spec as k31
+
+    monkeypatch.setattr(k3, "WIDE", True)
+    monkeypatch.setattr(k3, "_host_only_mamba", lambda: True)
+    monkeypatch.setenv("SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", "1")
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    cfg = SimpleNamespace(
+        dcp_size=8,
+        dcp_comm_backend="a2a",
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=6,
+        cuda_graph_max_bs_decode=16,
+        max_running_requests=16,
+        enable_linear_replayssm_spec=True,
+        **_NO_OFFLOAD,
+    )
+    assert any("request-scoped" in r for r in k3._config_disable_reasons(cfg, K3))
+    reasons = k31._config_disable_reasons(cfg, K3)
+    ring = [r for r in reasons if "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT" in r]
+    assert len(ring) == 1 and "mamba slot" in ring[0], reasons
+
+
+def test_wide_config_guards_draft_tokens_and_request_scoped_ring(monkeypatch):
+    monkeypatch.setattr(k3, "WIDE", True)
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    bad_decode = SimpleNamespace(
+        dcp_size=1,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm=None,
+        speculative_num_draft_tokens=None,
+        cuda_graph_max_bs_decode=16,
+        max_running_requests=16,
+        enable_linear_replayssm_spec=False,
+        **_NO_OFFLOAD,
+    )
+    reasons = k3._config_disable_reasons(bad_decode, K3)
+    assert any("SGLANG_AMD_MONO_K3_WIDE=0" in r for r in reasons), reasons
+    # an unsupported draft length past MAX_ROWS rows is refused even with one request
+    ten = SimpleNamespace(
+        **{
+            **vars(bad_decode),
+            "speculative_algorithm": "DSPARK",
+            "speculative_num_draft_tokens": 10,
+            "cuda_graph_max_bs_decode": 1,
+            "max_running_requests": 1,
+        }
+    )
+    reasons_ten = k3._config_disable_reasons(ten, K3)
+    assert any("SGLANG_AMD_MONO_K3_WIDE=0" in r for r in reasons_ten), reasons_ten
+
+    narrow_decode = SimpleNamespace(
+        **{**vars(bad_decode), "cuda_graph_max_bs_decode": 4, "max_running_requests": 4}
+    )
+    reasons_narrow = k3._config_disable_reasons(narrow_decode, K3)
+    assert not any("SGLANG_AMD_MONO_K3_WIDE=0" in r for r in reasons_narrow), (
+        reasons_narrow
+    )
+
+    monkeypatch.setattr(k3, "_host_only_mamba", lambda: True)
+    ring_cfg = SimpleNamespace(
+        dcp_size=8,
+        dcp_comm_backend="a2a",
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=6,
+        cuda_graph_max_bs_decode=16,
+        max_running_requests=16,
+        enable_linear_replayssm_spec=True,
+        **_NO_OFFLOAD,
+    )
+    reasons_ring = k3._config_disable_reasons(ring_cfg, K3)
+    assert any("request-scoped ReplaySSM" in r for r in reasons_ring), reasons_ring
+
+    narrow_ring = SimpleNamespace(
+        **{**vars(ring_cfg), "cuda_graph_max_bs_decode": 1, "max_running_requests": 1}
+    )
+    reasons_narrow_ring = k3._config_disable_reasons(narrow_ring, K3)
+    assert not any("request-scoped ReplaySSM" in r for r in reasons_narrow_ring)
+
+    # _wide_will_run reads get_exec().graph.cuda_graph_max_bs_decode cleanly.
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_spec",
+        lambda: SimpleNamespace(
+            speculative_algorithm="DSPARK", speculative_num_draft_tokens=6
+        ),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_exec",
+        lambda: SimpleNamespace(graph=SimpleNamespace(cuda_graph_max_bs_decode=16)),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_schedule",
+        lambda: SimpleNamespace(max_running_requests=16),
+    )
+    assert k3._wide_will_run() is True
+
+
+def test_mla_build_accepts_quark_fp8_without_indexer(monkeypatch, caplog):
+    import torch
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(attn_dcp_size=1),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.layers.quantization.fp8_utils.use_aiter_bpreshuffle_gemm",
+        lambda rows: True,
+    )
+
+    def fp8_lin(rows, cols):
+        scheme = QuarkW8A8Fp8(
+            {"qscheme": "per_channel"},
+            {"qscheme": "per_channel", "is_dynamic": True},
+        )
+        return SimpleNamespace(
+            weight=torch.zeros(rows, cols, dtype=torch.float8_e4m3fn).t(),
+            weight_scale=torch.ones(rows, 1, dtype=torch.float32),
+            scheme=scheme,
+        )
+
+    def make_layer(g_bf16=False, with_indexer=False):
+        g_proj = (
+            SimpleNamespace(weight=torch.zeros(mp.GATE, HIDDEN, dtype=torch.bfloat16))
+            if g_bf16
+            else fp8_lin(mp.GATE, HIDDEN)
+        )
+        attn = SimpleNamespace(
+            fused_qkv_a_proj_with_mqa=fp8_lin(mp.LATW, HIDDEN),
+            g_proj=g_proj,
+            q_b_proj=fp8_lin(mp.QB, mp.QL),
+            q_a_layernorm=SimpleNamespace(
+                weight=torch.ones(mp.QL, dtype=torch.bfloat16), variance_epsilon=1e-6
+            ),
+            kv_a_layernorm=SimpleNamespace(
+                weight=torch.ones(mp.KV, dtype=torch.bfloat16), variance_epsilon=1e-6
+            ),
+            w_kc=torch.zeros(mp.NHQ, mp.QN, mp.KV, dtype=torch.bfloat16),
+            w_scale=1.0,
+            indexer=SimpleNamespace() if with_indexer else None,
+        )
+        return SimpleNamespace(
+            layer_id=3,
+            prev_valid_blocks=2,
+            is_block_write_layer=True,
+            self_attention_res_norm=SimpleNamespace(
+                weight=torch.ones(HIDDEN, dtype=torch.bfloat16), variance_epsilon=1e-5
+            ),
+            self_attention_res_proj=SimpleNamespace(
+                weight=torch.ones(1, HIDDEN, dtype=torch.bfloat16)
+            ),
+            input_layernorm=SimpleNamespace(
+                weight=torch.ones(HIDDEN, dtype=torch.bfloat16), variance_epsilon=1e-5
+            ),
+            self_attn=attn,
+        )
+
+    key, weights = k3._mla_build(make_layer(), 8)
+    assert key.has_indexer is False
+    # a layer whose attention has no indexer attribute at all builds the same way
+    bare = make_layer()
+    del bare.self_attn.indexer
+    assert k3._mla_build(bare, 8)[0].has_indexer is False
+    assert key.qkv_fmt == wfmt.FP8_SHUFFLED
+    assert key.qb_fmt == wfmt.FP8_SHUFFLED
+    assert weights["w_qkv_s"].numel() == mp.LATW
+    assert weights["w_g_s"].numel() == mp.GATE
+    assert weights["w_qb_s"].numel() == mp.QB
+
+    import logging
+
+    biased = make_layer()
+    biased.self_attn.g_proj.bias = torch.zeros(mp.GATE, dtype=torch.bfloat16)
+    with caplog.at_level(logging.INFO):
+        assert k3._mla_build(biased, 8) is None
+        assert k3._mla_build(make_layer(g_bf16=True), 8) is None
+        assert k3._mla_build(make_layer(with_indexer=True), 8) is None
+    assert "w_qkv format" in caplog.text
+    assert "g_proj has a bias" in caplog.text
+
+    # a bf16 layer with an indexer builds; a bias on any indexer projection falls back
+    def bf_lin(rows, cols):
+        return SimpleNamespace(
+            weight=torch.zeros(rows, cols, dtype=torch.bfloat16), bias=None
+        )
+
+    def indexed(bias_on=None):
+        layer = make_layer()
+        attn = layer.self_attn
+        attn.fused_qkv_a_proj_with_mqa = bf_lin(mp.LATW, HIDDEN)
+        attn.g_proj = bf_lin(mp.GATE, HIDDEN)
+        attn.q_b_proj = bf_lin(mp.QB, mp.QL)
+        attn.indexer = SimpleNamespace(
+            wk=bf_lin(mp.IK, HIDDEN),
+            weights_proj=bf_lin(mp.IW, HIDDEN),
+            wq_b=bf_lin(mp.IQ, mp.QL),
+        )
+        if bias_on:
+            getattr(attn.indexer, bias_on).bias = torch.zeros(1, dtype=torch.bfloat16)
+        return layer
+
+    assert k3._mla_build(indexed(), 8)[0].has_indexer is True
+    with caplog.at_level(logging.INFO):
+        for m in ("wk", "weights_proj", "wq_b"):
+            assert k3._mla_build(indexed(m), 8) is None, m
+    assert "biased ['wq_b']" in caplog.text
+    # an indexer-free candidate without q_b_proj falls back with the reason
+    no_qb = make_layer()
+    del no_qb.self_attn.q_b_proj
+    with caplog.at_level(logging.INFO):
+        assert k3._mla_build(no_qb, 8) is None
+    assert "q_b_proj is missing" in caplog.text
+    assert "indexer layers require bf16" in caplog.text
+
+
+def test_mla_pre_launch_refuses_an_indexer_layer_without_its_outputs(monkeypatch):
+    """With an indexer, stages 1 and 2 write its projections: with every other operand
+    valid, each missing indexer buffer stops the launch before dispatch."""
+    import pytest
+    import torch
+
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
+    dispatched = []
+    monkeypatch.setattr(mp, "build", lambda key: "launcher")
+    monkeypatch.setattr(mp, "_run_compiled", lambda *a: dispatched.append(a))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+
+    def bf(*shape):
+        return torch.empty(*shape, dtype=torch.bfloat16)
+
+    key = mp.MlaPreBuild(tokens=8, nblocks=3)
+    assert key.has_indexer
+    w = dict(
+        ares_nw=bf(HIDDEN), ares_qk=bf(HIDDEN), in_nw=bf(HIDDEN),
+        w_qkv=bf(mp.LATW, HIDDEN), w_g=bf(mp.GATE, HIDDEN), w_qb=bf(mp.QB, mp.QL),
+        w_k=bf(mp.IK, HIDDEN), w_p=bf(mp.IW, HIDDEN), w_iq=bf(mp.IQ, mp.QL),
+        q_nw=bf(mp.QL), kv_nw=bf(mp.KV),
+    )  # fmt: skip
+    full = dict(
+        q=bf(8, mp.QB), latent=bf(8, mp.KV + mp.ROPE), k_nope=bf(8, mp.KV),
+        q_lora=bf(8, mp.QL), gate=bf(8, mp.GATE),
+        idx_q=bf(8, mp.IQ), idx_k=bf(8, mp.IK), idx_w=bf(8, mp.IW),
+    )  # fmt: skip
+    kw = dict(prefix=bf(8, HIDDEN), blocks=bf(8, 8, HIDDEN), w=w, scratch=bf(1),
+              layer=3, epoch=torch.zeros(1, dtype=torch.int32))  # fmt: skip
+    mp.mla_pre_launch(key, out=full, **kw)
+    assert len(dispatched) == 1
+    for gone in ("idx_q", "idx_k", "idx_w"):
+        out = {n: t for n, t in full.items() if n != gone}
+        with pytest.raises(AssertionError, match=f"lacks \\['{gone}'\\]"):
+            mp.mla_pre_launch(key, out=out, **kw)
+        # a buffer with too few rows, or the wrong columns, is refused as well
+        cols = full[gone].shape[1]
+        for bad in (bf(7, cols), bf(8, cols + 32)):
+            with pytest.raises(AssertionError, match=gone):
+                mp.mla_pre_launch(key, out={**full, gone: bad}, **kw)
+    assert len(dispatched) == 1
