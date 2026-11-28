@@ -632,7 +632,7 @@ def _mono_pre_q_view(tree):
       self.qk_head_dim)``, a statement directly in ``if self.q_lora_rank is not None and
       pre is not None`` (or ``if pre is not None``), a statement of the function body,
       after only plain name assignments in that branch; ``name`` is not used again in it,
-      the branch does not leave early after it, and the statement right after the
+      the rest of the branch only assigns (in ifs too), and the statement right after the
       ``if`` chain is an assignment or return whose value is the call
       ``self._split_q_nope_pe(name, ...)`` (every later use is such a call);
     - no write to a ``pre["<key>"]`` field;
@@ -640,7 +640,7 @@ def _mono_pre_q_view(tree):
       ``pre``, ``forward_batch``, ``q_replicate_active`` or ``name``;
     - no other way to bind a name (``:=``, ``match``, lambdas, nested functions or
       classes, comprehensions, ``global`` / ``nonlocal``, ``except ... as``, ``import
-      ... as``)."""
+      ... as``), no rebinding of ``self``, and no ``assert``, ``raise`` or ``try``."""
     import ast
 
     fn = tree.body[0] if tree.body else None
@@ -649,6 +649,8 @@ def _mono_pre_q_view(tree):
     # no construct that binds or shadows a name where a Name store would not show it
     hidden = (ast.NamedExpr, ast.Match, ast.Lambda, ast.ClassDef, ast.Global)
     hidden += (ast.Nonlocal, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    # nor a statement that stops the step on one path (SGLang's handoff has none)
+    hidden += (ast.Assert, ast.Raise, ast.Try)
     if any(
         isinstance(n, hidden)
         or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not fn)
@@ -682,7 +684,7 @@ def _mono_pre_q_view(tree):
         return None
     if any(
         isinstance(n, ast.Name)
-        and n.id == "forward_batch"
+        and n.id in ("forward_batch", "self")
         and not isinstance(n.ctx, ast.Load)
         for n in ast.walk(fn)
     ):
@@ -787,13 +789,20 @@ def _mono_pre_q_view(tree):
     name = stmt.targets[0].id
     if name in imported:
         return None
-    exits = (ast.Return, ast.Raise, ast.Break, ast.Continue, ast.Yield, ast.YieldFrom)
-    if any(
+
+    def plain(s) -> bool:  # assignments, and ifs of them (SGLang: the indexer's top-k)
+        if isinstance(s, ast.If):
+            return all(plain(x) for x in (*s.body, *s.orelse))
+        return isinstance(s, ast.Assign)
+
+    exits = (ast.Return, ast.Break, ast.Continue, ast.Yield, ast.YieldFrom, ast.Await)
+    rest = guard.body[at + 1 :]
+    if not all(plain(s) for s in rest) or any(
         (isinstance(n, ast.Name) and n.id == name) or isinstance(n, exits)
-        for s in guard.body[at + 1 :]
+        for s in rest
         for n in ast.walk(s)
     ):
-        return None  # the viewed q is used again, or the branch leaves early
+        return None  # the viewed q is used again, or the branch does more than assign
     # the next statement after the if chain is `... = self._split_q_nope_pe(name, ...)` or
     # `return self._split_q_nope_pe(name, ...)`: the split runs whenever the view did
     nxt = fn.body.index(guard) + 1
