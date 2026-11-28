@@ -1793,8 +1793,8 @@ class Wide:
             ].t1:  # else its first launch runs the previous layer's MoE tail
                 full = fold(hidden, fb)
                 bufs["mid"][:rows] = full[:, cols]
-            # SGLang writes bank rows only before the first run (layer 0); the launches write the later ones
-            # into bufs["bank"] themselves (then gathered into SGLang's bank), so one copy a step
+            # copy only the bank rows bufs["bank"] does not hold yet: the launches write theirs into it
+            # themselves (then gathered into SGLang's bank)
             nvb = res.num_valid_blocks
             if nvb > bank_synced_nvb:
                 bufs["bank"][:rows, bank_synced_nvb:nvb] = res.block_residual[

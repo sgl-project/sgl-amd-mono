@@ -129,7 +129,7 @@ are available for A/B checks:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `SGLANG_AMD_MONO_K31_WIDE_DSA_POST` | `1` | Set `0` to use SGLang's post-attention path |
+| `SGLANG_AMD_MONO_K31_WIDE_DSA_POST` | `1` | Set `0` to use SGLang's post-attention path (also turns off the wide MLA projection front, which runs only in a `dsa_post` layer) |
 | `SGLANG_AMD_MONO_K31_WIDE_MLA_PRE` | `1` | Set `0` to use SGLang's projection front |
 | `SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS` | `32` | Maximum eligible rows, constrained to `1` through `64` |
 
