@@ -215,7 +215,8 @@ def _finish_s1_tile(
 
 @flyc.jit
 def _rmsnorm_row(tid, row, cols, src, src_ld, nw, dst, dst_ld, eps, red, dst_cm):
-    """RMSNorm one bf16 row of length ``cols`` (multiple of 8, <= 4096) in one CTA."""
+    """RMSNorm one bf16 row of length ``cols`` (multiple of 8, <= 4096) in one CTA;
+    ``red`` holds at least ``cols // 8`` partial sums (the launch sizes it for QL)."""
     nvec = cols // 8
     r_src = rsrc(src)
     r_nw = rsrc(nw, cols * 2)
