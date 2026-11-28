@@ -232,6 +232,7 @@ def test_dsa_fusable_negative_gates(monkeypatch) -> None:
         {"res_eps": None, "ln_eps": None},
         {"res_norm_shape": None},
         {"res_norm_shape": (1024,)},
+        {"res_norm_shape": (wide.H, 1)},
         {"res_proj_shape": (1, 1024)},
         {"w_ln_shape": (1024,)},
         {"w_ln_contig": False},
