@@ -481,12 +481,15 @@ def test_install_xgmi_hooks_config_failure_still_joins_collectives(monkeypatch):
 
 def test_install_xgmi_hooks_keeps_row_shard_read_fields():
     import dataclasses
+    from typing import Callable, Optional
 
     from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import RowShardRead
 
-    fields = {f.name for f in dataclasses.fields(RowShardRead)}
-    if "attn_rows" not in fields:
-        pytest.skip("this SGLang's RowShardRead has no attn_rows")
+    # SGLang main's RowShardRead has no attn_rows yet; this read carries it on any SGLang.
+    @dataclasses.dataclass(frozen=True)
+    class ReadWithAttnRows(RowShardRead):
+        attn_rows: Optional[Callable] = None
+
     layer, bank = _make_moe_layer(
         shard_front=lambda normed, num_tokens: False,
         row_sharded_tail=lambda *args: None,
@@ -497,7 +500,10 @@ def test_install_xgmi_hooks_keeps_row_shard_read_fields():
     def attn_rows(num_tokens):
         return None
 
-    bank.ffn_row_shard = dataclasses.replace(bank.ffn_row_shard, attn_rows=attn_rows)
+    orig = bank.ffn_row_shard
+    bank.ffn_row_shard = ReadWithAttnRows(
+        takes=orig.takes, shard_front=orig.shard_front, attn_rows=attn_rows
+    )
     install_xgmi_hooks(types.SimpleNamespace(layers=[layer]), heap=_dummy_heap())
     # The row-sharded o_proj leaves the attention sum to attn_rows; dropping it would
     # reduce-scatter o_proj's placeholder output instead.
