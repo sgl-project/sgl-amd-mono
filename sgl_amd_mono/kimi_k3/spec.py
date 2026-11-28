@@ -630,7 +630,8 @@ def _mono_pre_q_view(tree):
       ``pre["q"]`` is read once;
     - that read is ``name = pre["q"].view(-1 or pre["q_lora"].shape[0], heads,
       self.qk_head_dim)``, a statement directly in ``if self.q_lora_rank is not None and
-      pre is not None`` (or ``if pre is not None``), a statement of the function body,
+      pre is not None`` (or ``if pre is not None``), a statement of the function body
+      that only imports, plain assignments and a docstring precede,
       after only plain name assignments in that branch; ``name`` is not used again in it,
       the rest of the branch only assigns (in ifs too), and the statement right after the
       ``if`` chain is an assignment or return whose value is the call
@@ -779,6 +780,11 @@ def _mono_pre_q_view(tree):
         and guard in fn.body
     ):
         return None
+    # before the guard only imports, plain assignments and a docstring: no early way out
+    for s in fn.body[: fn.body.index(guard)]:
+        doc = isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)
+        if not (doc or isinstance(s, (ast.Assign, ast.Import, ast.ImportFrom))):
+            return None
     # SGLang's guard (or the bare ``pre`` test): its branch runs in both q-replicate states
     if ast.dump(guard.test) not in (
         dump("self.q_lora_rank is not None and pre is not None"),
