@@ -633,15 +633,18 @@ def _mono_pre_q_view(tree):
       function body.
     - Before that ``if``: only imports, a docstring, the two assignments above and names
       set to constants. In its branch before the view: only names the head count reads.
-      After the view: only name assignments (in ifs too), never using ``name``.
+      After the view: only name assignments (in ifs too), never using ``name``, whose
+      calls are SGLang's (``indexer``, ``should_run_indexer``,
+      ``maybe_capture_indexer_topk``, ``unsqueeze``).
     - The statement right after the ``if`` chain assigns or returns
       ``self._split_q_nope_pe(name, ...)``; every later use of ``name`` is such a call.
       What the split's outputs go through afterwards is not checked.
     - No other way to bind a name (``:=``, ``match``, lambdas, nested functions or
       classes, comprehensions, ``global`` / ``nonlocal``, ``except ... as``, ``import
-      ... as``, an import of the names above), no rebinding of ``self``, no reflective
-      call (``setattr``, ``exec``, ``vars``, ...), and no ``assert``, ``raise`` or
-      ``try``."""
+      ... as``, an import of the names above), no rebinding of ``self``, and no
+      ``assert``, ``raise`` or ``try``. Calls (``setattr`` included) can only appear
+      where the rules above allow SGLang's own: nothing between the predicate and the
+      split can write what the head count or the split reads."""
     import ast
 
     fn = tree.body[0] if tree.body else None
@@ -652,15 +655,8 @@ def _mono_pre_q_view(tree):
     hidden += (ast.Nonlocal, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
     # nor a statement that stops the step on one path (SGLang's handoff has none)
     hidden += (ast.Assert, ast.Raise, ast.Try)
-    # nor reflection that writes attributes or names out of sight (setattr, exec, ...)
-    reflective = {"setattr", "delattr", "exec", "eval", "compile", "vars", "globals"}
-    reflective |= {"locals", "__import__", "__setattr__", "__delattr__"}
     if any(
         isinstance(n, hidden)
-        or (
-            isinstance(n, ast.Call)
-            and getattr(n.func, "id", getattr(n.func, "attr", None)) in reflective
-        )
         or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not fn)
         or (isinstance(n, ast.ExceptHandler) and n.name is not None)
         or (
@@ -821,13 +817,20 @@ def _mono_pre_q_view(tree):
         )
 
     exits = (ast.Return, ast.Break, ast.Continue, ast.Yield, ast.YieldFrom, ast.Await)
+    # the only calls SGLang makes there: the indexer's top-k and the k_nope reshape
+    calls = {"indexer", "should_run_indexer", "maybe_capture_indexer_topk", "unsqueeze"}
     rest = guard.body[at + 1 :]
     if not all(plain(s) for s in rest) or any(
-        (isinstance(n, ast.Name) and n.id == name) or isinstance(n, exits)
+        (isinstance(n, ast.Name) and n.id == name)
+        or isinstance(n, exits)
+        or (
+            isinstance(n, ast.Call)
+            and getattr(n.func, "id", getattr(n.func, "attr", None)) not in calls
+        )
         for s in rest
         for n in ast.walk(s)
     ):
-        return None  # the viewed q is used again, or the branch does more than assign
+        return None  # the viewed q is used again, or the branch does more than SGLang's
     # the next statement after the if chain is `... = self._split_q_nope_pe(name, ...)` or
     # `return self._split_q_nope_pe(name, ...)`: the split runs whenever the view did
     nxt = fn.body.index(guard) + 1
