@@ -197,6 +197,7 @@ def test_mla_pre_fusable_gates(monkeypatch) -> None:
 
 def test_mono_pre_caps_and_verify_qb_consistency(monkeypatch) -> None:
     """Allocation, warmup, and dispatch share the exact per-layer verify eligibility."""
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
     monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS", raising=False)
     # 1. Pre-_mono_pre SGLang (e.g. 703e763d5f): disabled for both local and qrep
     old_local = _fake_mla_layer(dcp_size=1, prepare_fn=_no_mono_prepare)
@@ -490,6 +491,24 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
             return q
         return None
 
+    def _qrep_rebound_batch(self, forward_batch):
+        forward_batch = forward_batch.attn_sub_batch
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+            return q
+        return None
+
     for prepare, caps in (
         (_local_view_dcp_elsewhere, (True, False)),
         (_qrep_view_inline, (True, True)),
@@ -504,12 +523,14 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
         (_qrep_alias_reshapes_on_the_qrep_path, (False, False)),
         (_qrep_half_head_dim, (False, False)),
         (_qrep_reshaped_after_view, (False, False)),
+        (_qrep_rebound_batch, (False, False)),
     ):
         layer = _fake_mla_layer(dcp_size=8, prepare_fn=prepare)
         assert wide._sglang_mono_pre_caps(layer.self_attn) == caps, prepare.__name__
 
 
 def test_mla_row_cap_respects_reachable_verify_rows(monkeypatch) -> None:
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
     monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS", raising=False)
     runner = object.__new__(wide.Wide)
     runner.L = 6
