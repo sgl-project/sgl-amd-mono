@@ -245,11 +245,10 @@ def run(args, m, rank, dev, cpu):
             refs.append((p_ref, lat_ref, sh_ref, logits_ref))
         return refs
 
-    st = dict(p=0.0, lat=0.0, sh=0.0, lg=0.0, own_w=0.0, own=0, route=0, sort=0)
     if args.sort == "sgl":
         from layer_bench import sort_check
 
-    def check(refs):
+    def check(refs, st):
         """Check this repetition's outputs of every launch against refs, into st."""
         bad_ids = 0
         for i in range(nl):
@@ -295,6 +294,29 @@ def run(args, m, rank, dev, cpu):
         elif args.sort == "sgl":
             st["sort"] += sort_check(m, nl, tk_ids, tk_w, lat_out, moe_out, sortb, rank)
 
+    def verdict(st):
+        """The worst rank's errors of one phase (eager or replay) and whether they pass."""
+        worst = torch.tensor(
+            [st["p"], st["lat"], st["sh"], st["lg"], st["own_w"]],
+            dtype=torch.float64,
+            device=dev,
+        )
+        counts = torch.tensor(
+            [st["own"], st["route"], st["sort"]], dtype=torch.int64, device=dev
+        )
+        dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+        dist.all_reduce(counts, op=dist.ReduceOp.MAX)
+        e = dict(zip(("p", "lat", "sh", "lg", "own_w"), worst.tolist()))
+        e.update(zip(("own", "route", "sort"), (int(c) for c in counts.tolist())))
+        ok = (
+            max(e["p"], e["lat"], e["sh"], e["lg"]) < 2e-2
+            and e["own_w"] < 1e-5
+            and e["own"] == e["route"] == e["sort"] == 0
+        )
+        return e, ok
+
+    phases = {}
+    eager = dict(p=0.0, lat=0.0, sh=0.0, lg=0.0, own_w=0.0, own=0, route=0, sort=0)
     refs = make_refs()
     for _ in range(args.reps_check):
         for mo in moe_out:
@@ -304,7 +326,8 @@ def run(args, m, rank, dev, cpu):
             call_one(i)
         torch.cuda.synchronize()
         dist.barrier()
-        check(refs)
+        check(refs, eager)
+    phases["eager"] = verdict(eager)
 
     # Time in CUDA graph with optional L2 flush
     flush = (
@@ -337,33 +360,22 @@ def run(args, m, rank, dev, cpu):
     graph.replay()
     torch.cuda.synchronize()
     dist.barrier()
-    check(refs)
-    e_p, e_lat, e_sh, e_lg, e_own_w = (st[k] for k in ("p", "lat", "sh", "lg", "own_w"))
-    own_diff, sort_bad = st["own"], st["sort"]
-
-    # rank 0 is the reference rank: report the worst rank's disagreement
-    rd = torch.tensor([st["route"]], dtype=torch.int64, device=dev)
-    dist.all_reduce(rd, op=dist.ReduceOp.MAX)
-    route_diff = int(rd.item())
-    ok = (
-        e_p < 2e-2
-        and e_lat < 2e-2
-        and e_sh < 2e-2
-        and e_lg < 2e-2
-        and e_own_w < 1e-5
-        and own_diff == 0
-        and route_diff == 0
-        and sort_bad == 0
-    )
-    ok_t = torch.tensor([1 if ok else 0], dtype=torch.int32, device=dev)
-    dist.all_reduce(ok_t, op=dist.ReduceOp.MIN)
-    ok = bool(ok_t.item())
+    replay = dict(p=0.0, lat=0.0, sh=0.0, lg=0.0, own_w=0.0, own=0, route=0, sort=0)
+    check(refs, replay)
+    phases["replay"] = verdict(replay)
+    ok = all(phase_ok for _, phase_ok in phases.values())
     if rank == 0:
+        for name, (e, phase_ok) in phases.items():
+            print(
+                f"dsa_post m {m:3d} nvb {nvm} pfx_short {args.pfx_short} {name:6s} "
+                f"rel_l2 pout {e['p']:.2e} lat {e['lat']:.2e} sh {e['sh']:.2e} "
+                f"logits {e['lg']:.2e} own_w {e['own_w']:.1e} own_diff {e['own']} "
+                f"route_diff {e['route']} sort_bad {e['sort']}  "
+                + ("PASS" if phase_ok else "FAIL"),
+                flush=True,
+            )
         print(
-            f"dsa_post m {m:3d} nvb {nvm} pfx_short {args.pfx_short}  "
-            f"rel_l2 pout {e_p:.2e} lat {e_lat:.2e} sh {e_sh:.2e} logits {e_lg:.2e} "
-            f"own_w {e_own_w:.1e} own_diff {own_diff} route_diff {route_diff}  us: {us:5.1f}  "
-            + ("PASS" if ok else "FAIL"),
+            f"dsa_post m {m:3d} us: {us:5.1f}  " + ("PASS" if ok else "FAIL"),
             flush=True,
         )
     if args.timeline:

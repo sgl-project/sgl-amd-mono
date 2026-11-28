@@ -593,42 +593,44 @@ def _pre_o_proj(layer, x, positions, fb, zero_allocator):
             get_attn_tp_context().clear_attn_inputs()
 
 
-def _head_count(node, assigned: dict, *, qrep: bool, nlh: int, dcp: int):
-    """Evaluate a ``pre["q"].view`` head-count expression with ``q_replicate_active = qrep``,
-    ``self.num_local_heads = nlh`` and ``self.dcp_size = dcp``; None for any other form."""
+def _head_count(node, assigned: dict, *, qrep: bool):
+    """A ``pre["q"].view`` head-count expression with ``q_replicate_active = qrep``, as
+    ``(coefficient, power of self.num_local_heads, power of self.dcp_size)``; None for any
+    other form (a literal, another attribute, a name bound in a nested statement, ...)."""
     import ast
 
-    if isinstance(node, ast.Constant) and type(node.value) in (int, bool):
-        return node.value
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value, 0, 0
     if isinstance(node, ast.Name):
-        if node.id == "q_replicate_active":
-            return qrep
-        if node.id in assigned:
-            return _head_count(assigned[node.id], {}, qrep=qrep, nlh=nlh, dcp=dcp)
-        return None
+        if assigned.get(node.id) is None:
+            return None
+        return _head_count(assigned[node.id], {}, qrep=qrep)
     if (
         isinstance(node, ast.Attribute)
         and isinstance(node.value, ast.Name)
         and node.value.id == "self"
     ):
-        return {"num_local_heads": nlh, "dcp_size": dcp}.get(node.attr)
-    if isinstance(node, ast.IfExp):
-        test = _head_count(node.test, assigned, qrep=qrep, nlh=nlh, dcp=dcp)
-        if test is None:
-            return None
-        branch = node.body if test else node.orelse
-        return _head_count(branch, assigned, qrep=qrep, nlh=nlh, dcp=dcp)
+        return {"num_local_heads": (1, 1, 0), "dcp_size": (1, 0, 1)}.get(node.attr)
+    if (
+        isinstance(node, ast.IfExp)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "q_replicate_active"
+    ):
+        return _head_count(node.body if qrep else node.orelse, assigned, qrep=qrep)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
-        a = _head_count(node.left, assigned, qrep=qrep, nlh=nlh, dcp=dcp)
-        b = _head_count(node.right, assigned, qrep=qrep, nlh=nlh, dcp=dcp)
-        return None if a is None or b is None else a * b
+        a = _head_count(node.left, assigned, qrep=qrep)
+        b = _head_count(node.right, assigned, qrep=qrep)
+        if a is None or b is None:
+            return None
+        return a[0] * b[0], a[1] + b[1], a[2] + b[2]
     return None
 
 
 def _mono_pre_q_views(tree) -> list[tuple]:
-    """``(head expression, names assigned before it)`` for every ``pre["q"].view(rows,
-    heads, dim)`` inside an ``if`` on ``pre``; only assignments in that branch that come
-    before the view's statement are kept."""
+    """``(head expression, names bound before it)`` for every ``pre["q"].view(rows, heads,
+    dim)`` inside an ``if`` on ``pre``. A name keeps the value of the last plain assignment
+    of it in that branch before the view's statement; a name also bound any other way there
+    (a nested statement, an augmented assignment, a walrus, ...) maps to None."""
     import ast
 
     views = []
@@ -639,6 +641,16 @@ def _mono_pre_q_views(tree) -> list[tuple]:
             continue
         assigned: dict = {}
         for stmt in node.body:
+            plain = set()
+            if isinstance(stmt, ast.Assign):
+                plain = {id(t) for t in stmt.targets if isinstance(t, ast.Name)}
+            other = {
+                n.id
+                for n in ast.walk(stmt)
+                if isinstance(n, ast.Name)
+                and isinstance(n.ctx, ast.Store)
+                and id(n) not in plain
+            }
             for sub in ast.walk(stmt):
                 if (
                     isinstance(sub, ast.Call)
@@ -651,11 +663,12 @@ def _mono_pre_q_views(tree) -> list[tuple]:
                     and sub.func.value.slice.value == "q"
                     and len(sub.args) == 3
                 ):
-                    views.append((sub.args[1], dict(assigned)))
+                    views.append((sub.args[1], {**assigned, **dict.fromkeys(other)}))
             if isinstance(stmt, ast.Assign):
-                for tgt in stmt.targets:
-                    if isinstance(tgt, ast.Name):
-                        assigned[tgt.id] = stmt.value
+                for t in stmt.targets:
+                    if isinstance(t, ast.Name):
+                        assigned[t.id] = stmt.value
+            assigned.update(dict.fromkeys(other))
     return views
 
 
@@ -680,14 +693,11 @@ def _sglang_mono_pre_caps(attn) -> tuple[bool, bool]:
                 isinstance(n, ast.Constant) and n.value == "_mono_pre"
                 for n in ast.walk(tree)
             ):
-                # distinct primes: a product of the two can only come from both
-                nlh, dcp = 3, 5
                 for head, assigned in _mono_pre_q_views(tree):
-                    local = _head_count(head, assigned, qrep=False, nlh=nlh, dcp=dcp)
-                    full = _head_count(head, assigned, qrep=True, nlh=nlh, dcp=dcp)
-                    if local == nlh:
+                    if _head_count(head, assigned, qrep=False) == (1, 1, 0):
                         local_ok = True
-                        qrep_ok = qrep_ok or full == nlh * dcp
+                        full = _head_count(head, assigned, qrep=True)
+                        qrep_ok = qrep_ok or full == (1, 1, 1)
         except (OSError, TypeError, SyntaxError):
             local_ok, qrep_ok = False, False
     caps = (local_ok, qrep_ok)
