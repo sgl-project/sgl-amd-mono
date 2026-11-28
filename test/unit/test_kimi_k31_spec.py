@@ -92,7 +92,15 @@ def test_every_bucket_resolves_to_a_tuned_config(monkeypatch):
             assert all(len(c.split(":")) == 5 for c in configs), (L, b, configs)
     assert wide.cfg_rows(b=24, L=8) == wide.CFGS[32]
     # past every tuned count and row range: the largest tuned count's configs
-    assert wide._row_cfgs(max(wide.CFGS) + 65) == wide.CFGS[max(wide.CFGS)]
+    tables = (
+        wide.UP_ROW_RANGES,
+        wide.INP_ROW_RANGES,
+        wide.OPROJ_ROW_RANGES,
+        wide.FRONT_ROW_RANGES,
+        wide.SDOWN_ROW_RANGES,
+    )
+    past = max(max(wide.CFGS), *(hi for t in tables for _, hi, _ in t)) + 1
+    assert wide._row_cfgs(past) == wide.CFGS[max(wide.CFGS)]
 
 
 def test_an_override_keeps_its_cut_at_every_draft_length(monkeypatch):
