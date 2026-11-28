@@ -330,7 +330,7 @@ def test_run_mla_pre_wiring_and_partial_padding(
     assert tuple(attn_pre2["q"].shape) == (rows, want_qb)
     assert tuple(idx_pre2["w"].shape) == (rows, mpw.IW)
 
-    # 3. Capped bucket (e.g. L=6 bucket 48 with m_mla=32): runs rows=30/32 (zero-copy at 32), falls back at 36+
+    # 3. A synthetic buffer capped at m_mla=32: runs rows=30/32 (zero-copy at 32), falls back at 36+
     m_cap = mpw.MAX_ROWS_QREP if qrep else mpw.MAX_ROWS_LOCAL
     bufs_cap = make_bufs(m_cap)
     h30 = torch.randn(30, wide.H, dtype=torch.bfloat16)
