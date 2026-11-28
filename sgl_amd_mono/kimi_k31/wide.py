@@ -644,73 +644,78 @@ def _mono_pre_q_view(tree):
 
     - ``q_replicate_active`` is assigned once, in the function body before the view, to
       ``_QREP_PREDICATE``'s conjunction (any order), and is not a parameter;
-    - ``pre`` is assigned once in the function body and read only in conditions, as
-      ``pre["<key>"]`` and as ``pre.get("<key>")`` of another key; ``pre["q"]`` is read
-      once, as ``pre["q"].view(rows, heads, dim)``;
-    - that view is in a simple statement directly in an ``if`` on ``pre`` that only plain
-      name assignments precede."""
+    - ``pre`` is assigned once in the function body; every other use of it is ``pre is
+      (not) None``, ``pre["<key>"]`` or ``pre.get("<key>")`` of another key than "q", and
+      ``pre["q"]`` is read once; no assignment expression (``:=``) anywhere;
+    - that read is ``name = pre["q"].view(-1 or pre["q_lora"].shape[0], heads,
+      self.qk_head_dim)``, a statement directly in an ``if`` whose test is or has the
+      conjunct ``pre is not None``, after only plain name assignments in that branch, and
+      ``name`` is not rebound later in it."""
     import ast
 
     fn = tree.body[0] if tree.body else None
-    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or any(
+        isinstance(n, ast.NamedExpr) for n in ast.walk(fn)
+    ):
         return None
     a = fn.args
     params = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
     if {"q_replicate_active", "pre"} & params:
         return None
-    tests = {
-        id(n)
-        for x in ast.walk(fn)
-        if isinstance(x, (ast.If, ast.IfExp))
-        for n in ast.walk(x.test)
-    }
-    keyed, q_reads = set(), []
-    for n in ast.walk(fn):
-        if (
-            isinstance(n, ast.Subscript)
-            and isinstance(n.value, ast.Name)
-            and n.value.id == "pre"
-            and isinstance(n.slice, ast.Constant)
-            and isinstance(n.slice.value, str)
-        ):
-            keyed.add(id(n.value))
-            if n.slice.value == "q":
-                q_reads.append(n)
-        elif (
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "get"
-            and isinstance(n.func.value, ast.Name)
-            and n.func.value.id == "pre"
-            and n.args
-            and isinstance(n.args[0], ast.Constant)
-            and isinstance(n.args[0].value, str)
-            and n.args[0].value != "q"
-        ):
-            keyed.add(id(n.func.value))
+
+    def dump(e: str) -> str:
+        return ast.dump(ast.parse(e, mode="eval").body)
+
+    parent = {id(c): n for n in ast.walk(fn) for c in ast.iter_child_nodes(n)}
     stores = {"pre": [], "q_replicate_active": []}
+    q_reads = []
     for n in ast.walk(fn):
-        if isinstance(n, ast.Name) and n.id in stores:
-            if not isinstance(n.ctx, ast.Load):
-                stores[n.id].append(n)
-            elif n.id == "pre" and id(n) not in keyed and id(n) not in tests:
-                return None
+        if not (isinstance(n, ast.Name) and n.id in stores):
+            continue
+        if not isinstance(n.ctx, ast.Load):
+            stores[n.id].append(n)
+            continue
+        if n.id != "pre":
+            continue
+        up = parent.get(id(n))
+        if isinstance(up, ast.Compare) and ast.dump(up) in (
+            dump("pre is not None"),
+            dump("pre is None"),
+        ):
+            continue
+        if (
+            isinstance(up, ast.Subscript)
+            and isinstance(up.slice, ast.Constant)
+            and isinstance(up.slice.value, str)
+        ):
+            if up.slice.value == "q":
+                q_reads.append(up)
+            continue
+        call = parent.get(id(up))
+        if not (
+            isinstance(up, ast.Attribute)
+            and up.attr == "get"
+            and isinstance(call, ast.Call)
+            and call.func is up
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+            and call.args[0].value != "q"
+        ):
+            return None
     if len(q_reads) != 1 or any(len(v) != 1 for v in stores.values()):
         return None
-    view = next(
-        (
-            n
-            for n in ast.walk(fn)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "view"
-            and n.func.value is q_reads[0]
-            and len(n.args) == 3
-            and not n.keywords
-        ),
-        None,
-    )
-    if view is None:
+    view = parent.get(id(parent.get(id(q_reads[0]))))
+    if not (
+        isinstance(view, ast.Call)
+        and isinstance(view.func, ast.Attribute)
+        and view.func.attr == "view"
+        and view.func.value is q_reads[0]
+        and len(view.args) == 3
+        and not view.keywords
+        and ast.dump(view.args[0]) in (dump("-1"), dump('pre["q_lora"].shape[0]'))
+        and ast.dump(view.args[2]) == dump("self.qk_head_dim")
+    ):
         return None
     top = {}
     for s in fn.body:
@@ -721,7 +726,6 @@ def _mono_pre_q_view(tree):
             and s.lineno < view.lineno
         ):
             top[s.targets[0].id] = s
-    want = sorted(ast.dump(ast.parse(e, mode="eval").body) for e in _QREP_PREDICATE)
     pred = top.get("q_replicate_active")
     if (
         pred is None
@@ -730,28 +734,46 @@ def _mono_pre_q_view(tree):
         or top["pre"].targets[0] is not stores["pre"][0]
         or not isinstance(pred.value, ast.BoolOp)
         or not isinstance(pred.value.op, ast.And)
-        or sorted(ast.dump(v) for v in pred.value.values) != want
+        or sorted(ast.dump(v) for v in pred.value.values)
+        != sorted(dump(e) for e in _QREP_PREDICATE)
     ):
         return None
-    for node in ast.walk(fn):
-        if not isinstance(node, ast.If) or "pre" not in {
-            n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
-        }:
-            continue
-        assigned: dict = {}
-        for stmt in node.body:
-            if isinstance(stmt, (ast.Assign, ast.Return, ast.Expr)) and any(
-                n is view for n in ast.walk(stmt)
-            ):
-                return view.args[1], assigned
-            if not (
-                isinstance(stmt, ast.Assign)
-                and len(stmt.targets) == 1
-                and isinstance(stmt.targets[0], ast.Name)
-            ):
-                break
-            assigned[stmt.targets[0].id] = stmt.value
-    return None
+    stmt = parent.get(id(view))
+    guard = parent.get(id(stmt))
+    if not (
+        isinstance(stmt, ast.Assign)
+        and stmt.value is view
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and isinstance(guard, ast.If)
+        and stmt in guard.body
+    ):
+        return None
+    conjuncts = (
+        guard.test.values
+        if isinstance(guard.test, ast.BoolOp) and isinstance(guard.test.op, ast.And)
+        else [guard.test]
+    )
+    if dump("pre is not None") not in {ast.dump(c) for c in conjuncts}:
+        return None
+    at = guard.body.index(stmt)
+    name = stmt.targets[0].id
+    if any(
+        isinstance(n, ast.Name) and n.id == name and not isinstance(n.ctx, ast.Load)
+        for s in guard.body[at + 1 :]
+        for n in ast.walk(s)
+    ):
+        return None  # the viewed q is rebound later in the branch
+    assigned: dict = {}
+    for s in guard.body[:at]:
+        if not (
+            isinstance(s, ast.Assign)
+            and len(s.targets) == 1
+            and isinstance(s.targets[0], ast.Name)
+        ):
+            return None
+        assigned[s.targets[0].id] = s.value
+    return view.args[1], assigned
 
 
 def _sglang_mono_pre_caps(attn) -> tuple[bool, bool]:

@@ -288,7 +288,7 @@ def run(args, m, rank, dev, cpu):
         bad = torch.tensor([bad_ids], dtype=torch.int64, device=dev)
         dist.all_reduce(bad, op=dist.ReduceOp.MAX)
         if int(bad.item()):
-            st["sort_skipped"] += 1
+            st["sort_skipped"] += bool(args.sort)
             return
         if args.sort == "aux16":
             st["sort"] += sort_check_aux16(m, nl, tk_ids, tk_w, moe_out, sortb, rank)
