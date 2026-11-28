@@ -288,6 +288,7 @@ def run(args, m, rank, dev, cpu):
         bad = torch.tensor([bad_ids], dtype=torch.int64, device=dev)
         dist.all_reduce(bad, op=dist.ReduceOp.MAX)
         if int(bad.item()):
+            st["sort_skipped"] += 1
             return
         if args.sort == "aux16":
             st["sort"] += sort_check_aux16(m, nl, tk_ids, tk_w, moe_out, sortb, rank)
@@ -302,21 +303,34 @@ def run(args, m, rank, dev, cpu):
             device=dev,
         )
         counts = torch.tensor(
-            [st["own"], st["route"], st["sort"]], dtype=torch.int64, device=dev
+            [st["own"], st["route"], st["sort"], st["sort_skipped"]],
+            dtype=torch.int64,
+            device=dev,
         )
         dist.all_reduce(worst, op=dist.ReduceOp.MAX)
         dist.all_reduce(counts, op=dist.ReduceOp.MAX)
         e = dict(zip(("p", "lat", "sh", "lg", "own_w"), worst.tolist()))
-        e.update(zip(("own", "route", "sort"), (int(c) for c in counts.tolist())))
+        keys = ("own", "route", "sort", "sort_skipped")
+        e.update(zip(keys, (int(c) for c in counts.tolist())))
         ok = (
             max(e["p"], e["lat"], e["sh"], e["lg"]) < 2e-2
             and e["own_w"] < 1e-5
-            and e["own"] == e["route"] == e["sort"] == 0
+            and e["own"] == e["route"] == e["sort"] == e["sort_skipped"] == 0
         )
         return e, ok
 
     phases = {}
-    eager = dict(p=0.0, lat=0.0, sh=0.0, lg=0.0, own_w=0.0, own=0, route=0, sort=0)
+    eager = dict(
+        p=0.0,
+        lat=0.0,
+        sh=0.0,
+        lg=0.0,
+        own_w=0.0,
+        own=0,
+        route=0,
+        sort=0,
+        sort_skipped=0,
+    )
     refs = make_refs()
     for _ in range(args.reps_check):
         for mo in moe_out:
@@ -360,7 +374,17 @@ def run(args, m, rank, dev, cpu):
     graph.replay()
     torch.cuda.synchronize()
     dist.barrier()
-    replay = dict(p=0.0, lat=0.0, sh=0.0, lg=0.0, own_w=0.0, own=0, route=0, sort=0)
+    replay = dict(
+        p=0.0,
+        lat=0.0,
+        sh=0.0,
+        lg=0.0,
+        own_w=0.0,
+        own=0,
+        route=0,
+        sort=0,
+        sort_skipped=0,
+    )
     check(refs, replay)
     phases["replay"] = verdict(replay)
     ok = all(phase_ok for _, phase_ok in phases.values())
@@ -370,7 +394,13 @@ def run(args, m, rank, dev, cpu):
                 f"dsa_post m {m:3d} nvb {nvm} pfx_short {args.pfx_short} {name:6s} "
                 f"rel_l2 pout {e['p']:.2e} lat {e['lat']:.2e} sh {e['sh']:.2e} "
                 f"logits {e['lg']:.2e} own_w {e['own_w']:.1e} own_diff {e['own']} "
-                f"route_diff {e['route']} sort_bad {e['sort']}  "
+                f"route_diff {e['route']} sort_bad {e['sort']}"
+                + (
+                    f" (sort check skipped in {e['sort_skipped']} reps: bad ids)"
+                    if e["sort_skipped"]
+                    else ""
+                )
+                + "  "
                 + ("PASS" if phase_ok else "FAIL"),
                 flush=True,
             )
