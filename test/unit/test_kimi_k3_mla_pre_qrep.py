@@ -859,6 +859,23 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
             )
         return self._split_q_nope_pe(q, None)
 
+    def _rebinds_the_split(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+            self._split_q_nope_pe = None
+        return self._split_q_nope_pe(q, None)
+
     cases = (
         (_inverted, False),
         (_reassigned_after_view, False),
@@ -893,6 +910,7 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
         (_writes_dcp_size, False),
         (_setattr_before_the_guard, False),
         (_setattr_before_the_view, False),
+        (_rebinds_the_split, False),
         (_inline, True),
     )
     wrong = [
