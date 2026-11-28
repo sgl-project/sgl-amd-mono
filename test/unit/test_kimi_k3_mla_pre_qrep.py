@@ -682,7 +682,61 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
             )
         return self._split_q_nope_pe(pre["q_lora"], q)
 
-    for prepare, ok in (
+    def _early_exit_before_split(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        if q_replicate_active:
+            return self._prepare_fallback(forward_batch)
+        return self._split_q_nope_pe(q, None)
+
+    def _early_exit_in_branch(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+            if q_replicate_active:
+                return self._prepare_fallback(forward_batch)
+        return self._split_q_nope_pe(q, None)
+
+    def _handoff_field_write(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            pre["q_lora"] = pre["q_lora"][:1]
+        if self.q_lora_rank is not None and pre is not None:
+            q = pre["q"].view(
+                pre["q_lora"].shape[0],
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, None)
+
+    cases = (
         (_inverted, False),
         (_reassigned_after_view, False),
         (_nested_override, False),
@@ -706,9 +760,17 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
         (_second_handoff_read, False),
         (_split_never_gets_q, False),
         (_q_in_the_second_slot, False),
+        (_early_exit_before_split, False),
+        (_early_exit_in_branch, False),
+        (_handoff_field_write, False),
         (_inline, True),
-    ):
-        layer = _fake_layer(prepare_fn=prepare)
-        assert spec._sglang_mono_pre_supports_qrep(layer.self_attn) is ok, (
-            prepare.__name__
+    )
+    wrong = [
+        prepare.__name__
+        for prepare, ok in cases
+        if spec._sglang_mono_pre_supports_qrep(
+            SimpleNamespace(forward_absorb_rocm_prepare=prepare)
         )
+        is not ok
+    ]
+    assert not wrong, wrong

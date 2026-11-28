@@ -632,8 +632,10 @@ def _mono_pre_q_view(tree):
       self.qk_head_dim)``, a statement directly in ``if self.q_lora_rank is not None and
       pre is not None`` (or ``if pre is not None``), a statement of the function body,
       after only plain name assignments in that branch; ``name`` is not used again in it,
-      and after the ``if`` chain it goes to ``self._split_q_nope_pe`` as its first
-      argument and nowhere else;
+      the branch does not leave early after it, and the statement right after the
+      ``if`` chain hands it to ``self._split_q_nope_pe`` as its first argument (every
+      later use is such a call);
+    - no write to a ``pre["<key>"]`` field;
     - ``"_mono_pre"`` appears once (pre's assignment), and no import binds ``self``,
       ``pre``, ``forward_batch``, ``q_replicate_active`` or ``name``;
     - no other way to bind a name (``:=``, ``match``, lambdas, nested functions or
@@ -708,6 +710,7 @@ def _mono_pre_q_view(tree):
             continue
         if (
             isinstance(up, ast.Subscript)
+            and isinstance(up.ctx, ast.Load)
             and isinstance(up.slice, ast.Constant)
             and isinstance(up.slice.value, str)
         ):
@@ -784,12 +787,17 @@ def _mono_pre_q_view(tree):
     name = stmt.targets[0].id
     if name in imported:
         return None
+    exits = (ast.Return, ast.Raise, ast.Break, ast.Continue, ast.Yield, ast.YieldFrom)
     if any(
-        isinstance(n, ast.Name) and n.id == name
+        (isinstance(n, ast.Name) and n.id == name) or isinstance(n, exits)
         for s in guard.body[at + 1 :]
         for n in ast.walk(s)
     ):
-        return None  # the viewed q is read or rebound later in its branch
+        return None  # the viewed q is used again, or the branch leaves early
+    # the next statement after the if chain hands the viewed q to the split
+    nxt = fn.body.index(guard) + 1
+    if nxt >= len(fn.body):
+        return None
     split = 0
     for n in ast.walk(fn):
         # past the if / elif chain the viewed q only goes to SGLang's split, as is
@@ -803,9 +811,9 @@ def _mono_pre_q_view(tree):
                 and ast.dump(call.func) == dump("self._split_q_nope_pe")
             ):
                 return None
-            split += 1
+            split += any(m is n for m in ast.walk(fn.body[nxt]))
     if not split:
-        return None  # the split never receives the viewed q
+        return None  # the statement after the if chain does not split the viewed q
     assigned: dict = {}
     for s in guard.body[:at]:
         if not (
