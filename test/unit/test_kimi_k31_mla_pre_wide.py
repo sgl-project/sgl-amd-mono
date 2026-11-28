@@ -279,6 +279,29 @@ def test_mla_row_cap_respects_reachable_verify_rows(monkeypatch) -> None:
         assert runner._mla_bucket_specs(bucket) == {mpw.QB_QREP: bucket}
 
 
+def test_mla_first_bucket_starts_at_the_served_lower_cut(monkeypatch) -> None:
+    """The first bucket's smallest step is the lowest served width, not L rows: a launch
+    capped below it is never reached, so it must not be allocated or warmed."""
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    runner = object.__new__(wide.Wide)
+    runner.dsa_layers = {3: SimpleNamespace(mla_pre_qb=mpw.QB_QREP)}
+    runner.L = 6
+    runner.buckets = wide.buckets(6)
+    # 6-row steps are narrow: bucket 12's smallest wide step is 2 requests, 12 rows
+    monkeypatch.setenv("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS", "6")
+    assert runner._mla_bucket_specs(12) == {}
+    monkeypatch.setenv("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS", "12")
+    assert runner._mla_bucket_specs(12) == {mpw.QB_QREP: 12}
+    # an override's first bucket serves only past the ladder bucket below it
+    monkeypatch.setenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", "128,256,384")
+    monkeypatch.setenv("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS", "48")
+    lo = max(r for r in wide.REQ_BUCKETS if r < 16)
+    runner.L = 8
+    runner.buckets = wide.buckets(8)
+    assert 8 * (lo + 1) > 48
+    assert runner._mla_bucket_specs(128) == {}
+
+
 @pytest.mark.parametrize("max_rows", ["0", str(mpw.MAX_ROWS + 1), "invalid"])
 def test_mla_row_cap_rejects_unsupported_launch_bounds(monkeypatch, max_rows) -> None:
     monkeypatch.setenv("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS", max_rows)

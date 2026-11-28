@@ -914,8 +914,10 @@ class Wide:
     def _mla_bucket_specs(self, b: int) -> dict[int, int]:
         """Map eligible ``qb_rows -> m_mla`` launch width for wide bucket ``b``.
 
-        A bucket can use the MLA launch only when its smallest reachable
-        multiple of ``L`` does not exceed ``max_rows``.
+        A bucket can use the MLA launch only when the smallest served width it
+        holds (``wide_widths`` at this ``L``, past the previous bucket) does not
+        exceed ``max_rows``. The first bucket starts at the served lower cut, not at
+        0: with a bucket override or a small cap, no step reaches a launch below it.
         """
         buckets = getattr(self, "buckets", ())
         if b in buckets:
@@ -923,13 +925,19 @@ class Wide:
             prev_b = buckets[idx - 1] if idx > 0 else 0
         else:
             prev_b = b - 1
+        reach = min(
+            (w for w in wide_widths() if w % self.L == 0 and prev_b < w <= b),
+            default=None,
+        )
         specs: dict[int, int] = {}
+        if reach is None:
+            return specs
         for pk in self.dsa_layers.values():
             qb = pk.mla_pre_qb
             if qb is None:
                 continue
             lim = _mla_max_rows(qb)
-            if prev_b + self.L <= lim:
+            if reach <= lim:
                 specs[qb] = min(b, lim)
         return specs
 
