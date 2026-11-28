@@ -34,6 +34,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
@@ -145,6 +146,8 @@ class KdaPreBuild:
     # the recurrent state rows (rstate, rstate0), read and written, are bf16
     # (--mamba-ssm-dtype bfloat16)
     state_bf16: bool = False
+    # FP8 in_proj split across fused_qkvg_proj [6144, H] and packed [f_a|b|pad] [144, H]
+    split_fab: bool = False
 
 
 # The recurrent state's dtype (rstate, rstate0, SGLang's pools).
@@ -198,6 +201,20 @@ def gemv_loads(c, rg, chunks):
     4 x 16 B, FP8 4 x 8 B. ``rg`` past the last group loads the last group."""
     lane, wave = c["lane"], c["wave"]
     if c["wfmt"] != W_BF16:
+        if const_expr(c["split_fab"]):
+            rg_c = fx.min(rg, GEMV_TASKS - 1)
+            is_fab = rg_c >= (FA_0 // ROWS)
+            w_ptr = is_fab.select(c["args"]["w_in_fab"], c["args"]["w_in"])
+            rg_use = is_fab.select(rg_c - (FA_0 // ROWS), rg_c)
+            return wfmt.fp8_loads(
+                w=w_ptr,
+                fmt=c["wfmt"],
+                lane=lane,
+                rg=rg_use,
+                chunks=(wave + WAVES * i for i in chunks),
+                k=HIDDEN,
+                rg_max=None,
+            )
         return wfmt.fp8_loads(
             w=c["args"]["w_in"],
             fmt=c["wfmt"],
@@ -662,6 +679,7 @@ def build(key: KdaPreBuild):
         + ("_ic" if key.init_committed else "")
         + (f"_w{key.wfmt}" if key.wfmt != W_BF16 else "")
         + ("_b1" if key.state_bf16 else "")
+        + ("_sf" if key.split_fab else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -705,6 +723,7 @@ def build(key: KdaPreBuild):
         x_dbg: Int64,
         proj_dbg: Int64,
         w_ins: Int64,
+        w_in_fab: Int64,
         scratch: Int64,
         layer: Int32,
         epoch: Int64,
@@ -741,6 +760,7 @@ def build(key: KdaPreBuild):
             "init_committed": key.init_committed,
             "wfmt": key.wfmt,
             "state_bf16": key.state_bf16,
+            "split_fab": key.split_fab,
             "gate_local": False,
             "put": mb.put,
             "poll": mb.poll,
@@ -794,6 +814,7 @@ def build(key: KdaPreBuild):
                 "x_dbg": x_dbg,
                 "proj_dbg": proj_dbg,
                 "w_ins": w_ins,
+                "w_in_fab": w_in_fab,
             },
         }
         for region in ("part", "wgt", "msq", "xrdy", "proj", "qk", "onrm"):
@@ -867,6 +888,7 @@ def build(key: KdaPreBuild):
         x_dbg: Int64,
         proj_dbg: Int64,
         w_ins: Int64,
+        w_in_fab: Int64,
         scratch: Int64,
         layer: Int32,
         epoch: Int64,
@@ -914,6 +936,7 @@ def build(key: KdaPreBuild):
             x_dbg,
             proj_dbg,
             w_ins,
+            w_in_fab,
             scratch,
             layer,
             epoch,
@@ -958,6 +981,7 @@ def kda_pre(
     rstate0=None,
     init_slot=None,
     w_in_scale=None,
+    w_in_fab=None,
 ):
     """Host launcher. ``conv_state`` [slots, dim, state_len] or a transposed view
     of [slots, state_len, dim] (strides read); ``rstate`` [slots, 12, 128, 128]
@@ -974,7 +998,23 @@ def kda_pre(
             f"the block-write row is {key.write_idx}, past a bank of "
             f"{blocks.size(1)} rows {tuple(blocks.shape)}"
         )
-    wfmt.check(fmt=key.wfmt, w=w_in, scale=w_in_scale, rows=NPROJ, k=HIDDEN)
+    if key.split_fab:
+        assert key.wfmt != W_BF16 and w_in_fab is not None
+        assert w_in.dtype == torch.float8_e4m3fn and tuple(w_in.shape) == (FA_0, HIDDEN)
+        assert w_in.is_contiguous()
+        assert w_in_fab.dtype == torch.float8_e4m3fn and tuple(w_in_fab.shape) == (
+            NPROJ - FA_0,
+            HIDDEN,
+        )
+        assert w_in_fab.is_contiguous()
+        assert (
+            w_in_scale is not None
+            and w_in_scale.dtype == torch.float32
+            and w_in_scale.numel() >= NPROJ
+            and w_in_scale.is_contiguous()
+        )
+    else:
+        wfmt.check(fmt=key.wfmt, w=w_in, scale=w_in_scale, rows=NPROJ, k=HIDDEN)
     want = state_dtype(key)
     assert rstate.dtype == want and rstate[0].numel() == NH * HD * HD, rstate.dtype
     assert rstate[0].is_contiguous(), (
@@ -1006,8 +1046,8 @@ def kda_pre(
             assert t.shape[1:] == (NH, ring_len, HD) and t[0].is_contiguous()
         assert rb.shape[1:] == (NH, ring_len) and rb[0].is_contiguous()
         seqs = (rk.stride(0), rv.stride(0), rg.stride(0), rb.stride(0))
-    f = build(key)
-    f(
+    _run_compiled(
+        build(key),
         prefix.data_ptr(),
         ptr(delta),
         blocks.data_ptr(),
@@ -1044,9 +1084,10 @@ def kda_pre(
         ptr(x_dbg),
         ptr(proj_dbg),
         ptr(w_in_scale),
+        ptr(w_in_fab),
         scratch.data_ptr(),
         layer,
         epoch.data_ptr(),
         ptr(tl),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )

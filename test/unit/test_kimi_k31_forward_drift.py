@@ -17,7 +17,10 @@ from sglang.srt.models import kimi_k3
 
 PINNED = {
     ("KimiK3LinearModel", "forward"): ("de1b4a8b58f8678a", "wide.Wide.backbone"),
-    ("KimiK3DecoderLayer", "forward"): ("373da46f0dd3bf07", "wide.Wide._tail_front"),
+    ("KimiK3DecoderLayer", "forward"): (
+        "373da46f0dd3bf07",
+        "wide.Wide._tail_front / _dsa_step",
+    ),
 }
 
 

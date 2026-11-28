@@ -32,11 +32,26 @@ def _rms(x, w, eps):
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w.float()
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "needs a GPU")
+def _skip_reason():
+    if not torch.cuda.is_available():
+        return "needs a GPU"
+    props = torch.cuda.get_device_properties(0)
+    arch = getattr(props, "gcnArchName", "")
+    if "gfx950" not in arch:
+        return f"needs gfx950 (got {arch or 'unknown'})"
+    if props.multi_processor_count < 256:
+        return f"needs >= 256 CUs (got {props.multi_processor_count})"
+    return None
+
+
+@unittest.skipIf(_skip_reason() is not None, _skip_reason() or "")
 class TestMlaPre(CustomTestCase):
-    def _run(self, rows, qn=False):
+    def _run(self, rows, qn=False, nhq=None, qn_rm=False, replay=False):
+        from sgl_amd_mono.common.peer import PeerBuffer
         from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
 
+        nhq = mp.NHQ if nhq is None else nhq
+        qb = nhq * mp.QHD
         dev = torch.device("cuda", 0)
         g = torch.Generator(device=dev).manual_seed(11)
         H = 7168
@@ -47,24 +62,32 @@ class TestMlaPre(CustomTestCase):
             "in_nw": (1 + _randn(g, H, scale=0.1)),
             "w_qkv": _randn(g, mp.LATW, H, scale=0.02), "w_g": _randn(g, mp.GATE, H, scale=0.02),
             "w_k": _randn(g, mp.IK, H, scale=0.02), "w_p": _randn(g, mp.IW, H, scale=0.02),
-            "w_qb": _randn(g, mp.QB, mp.QL, scale=0.03), "w_iq": _randn(g, mp.IQ, mp.QL, scale=0.03),
+            "w_qb": _randn(g, qb, mp.QL, scale=0.03), "w_iq": _randn(g, mp.IQ, mp.QL, scale=0.03),
             "q_nw": (1 + _randn(g, mp.QL, scale=0.1)), "kv_nw": (1 + _randn(g, mp.KV, scale=0.1)),
         }  # fmt: skip
         w_kc = _randn(
-            g, mp.NHQ, mp.QN, mp.KV, scale=0.05
+            g, nhq, mp.QN, mp.KV, scale=0.05
         )  # SGLang's [heads, nope, kv_lora]
         if qn:
-            w["w_kc"] = w_kc.transpose(1, 2).contiguous().view(mp.NHQ * mp.KV, mp.QN)
+            w["w_kc"] = (
+                w_kc
+                if qn_rm
+                else w_kc.transpose(1, 2).contiguous().view(nhq * mp.KV, mp.QN)
+            )
 
         def z(n):
             return torch.zeros(rows, n, dtype=BF, device=dev)
 
         out = {
-            "q": z(mp.QB), "latent": z(mp.KV + mp.ROPE), "k_nope": z(mp.KV), "q_lora": z(mp.QL),
+            "q": z(qb), "latent": z(mp.KV + mp.ROPE), "k_nope": z(mp.KV), "q_lora": z(mp.QL),
             "gate": z(mp.GATE), "idx_q": z(mp.IQ), "idx_k": z(mp.IK), "idx_w": z(mp.IW),
         }  # fmt: skip
         if qn:
-            out["qn"] = torch.zeros(rows, mp.NHQ, mp.KV, dtype=BF, device=dev)
+            out["qn"] = torch.zeros(rows, nhq, mp.KV, dtype=BF, device=dev)
+        for k_nan in ("q", "idx_q", "latent", "k_nope", "gate", "idx_k", "idx_w"):
+            out[k_nan].fill_(float("nan"))
+        if qn:
+            out["qn"].fill_(float("nan"))
         key = mp.MlaPreBuild(
             tokens=rows,
             nblocks=NVB,
@@ -73,21 +96,48 @@ class TestMlaPre(CustomTestCase):
             q_eps=1e-6,
             kv_eps=1e-6,
             qn=qn,
+            nhq=nhq,
+            qn_rm=qn_rm,
         )
-        scratch = torch.zeros(mp.scratch_bytes(key), dtype=torch.uint8, device=dev)
+        scr_pb = PeerBuffer(mp.scratch_bytes(key), None, 0, 1, dev)
+        self.addCleanup(scr_pb.close)
+        scratch = scr_pb.bytes
         epoch = torch.ones(1, dtype=torch.int32, device=dev)
-        before = prefix.clone()
-        mp.mla_pre_launch(
-            key,
-            prefix=prefix,
-            blocks=blocks,
-            w=w,
-            out=out,
-            scratch=scratch,
-            layer=3,
-            epoch=epoch,
-        )
-        torch.cuda.synchronize()
+        if replay:
+            mp.mla_pre_launch(
+                key, prefix=prefix, blocks=blocks, w=w, out=out,
+                scratch=scratch, layer=3, epoch=epoch,
+            )  # fmt: skip
+            torch.cuda.synchronize()
+            cg = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cg):
+                epoch[0].add_(1)
+                mp.mla_pre_launch(
+                    key, prefix=prefix, blocks=blocks, w=w, out=out,
+                    scratch=scratch, layer=3, epoch=epoch,
+                )  # fmt: skip
+            prefix.copy_(_randn(g, rows, H, scale=0.3))
+            blocks.copy_(_randn(g, rows, MAX_BLOCKS, H, scale=0.3))
+            for k_nan in ("q", "idx_q", "latent", "k_nope", "gate", "idx_k", "idx_w"):
+                out[k_nan].fill_(float("nan"))
+            if qn:
+                out["qn"].fill_(float("nan"))
+            before = prefix.clone()
+            cg.replay()
+            torch.cuda.synchronize()
+        else:
+            before = prefix.clone()
+            mp.mla_pre_launch(
+                key,
+                prefix=prefix,
+                blocks=blocks,
+                w=w,
+                out=out,
+                scratch=scratch,
+                layer=3,
+                epoch=epoch,
+            )
+            torch.cuda.synchronize()
 
         # reference: the seam, then every projection SGLang runs
         src = torch.cat([blocks[:, :NVB, :], prefix.unsqueeze(1)], dim=1)
@@ -115,7 +165,7 @@ class TestMlaPre(CustomTestCase):
         }
         if qn:
             # the absorb against the kernel's own q (SGLang's bmm: [heads, S, nope] @ w_kc)
-            q_nope = out["q"].view(rows, mp.NHQ, mp.QHD)[:, :, : mp.QN]
+            q_nope = out["q"].view(rows, nhq, mp.QHD)[:, :, : mp.QN]
             ref_qn = (
                 torch.bmm(q_nope.transpose(0, 1).float(), w_kc.float())
                 .transpose(0, 1)
@@ -123,9 +173,20 @@ class TestMlaPre(CustomTestCase):
             )
             checks["qn"] = (out["qn"], ref_qn)
         for name, (got, ref) in checks.items():
+            self.assertTrue(torch.isfinite(got).all(), f"{name} has non-finite values")
             c = _cos(got, ref)
             print(f"rows {rows} {name}: cos {c:.6f}")
             self.assertGreater(c, COS_MIN, name)
+        q_got_h = out["q"].view(rows, nhq, mp.QHD)
+        q_ref_h = checks["q"][1].view(rows, nhq, mp.QHD)
+        min_q_head = min(_cos(q_got_h[:, h], q_ref_h[:, h]) for h in range(nhq))
+        self.assertGreater(min_q_head, COS_MIN, f"q per-head min cos {min_q_head}")
+        if qn:
+            qn_ref = checks["qn"][1]
+            min_qn_head = min(_cos(out["qn"][:, h], qn_ref[:, h]) for h in range(nhq))
+            self.assertGreater(
+                min_qn_head, COS_MIN, f"qn per-head min cos {min_qn_head}"
+            )
         self.assertTrue(torch.equal(prefix, before), "the prefix was written")
 
     def test_six_rows(self):
@@ -142,6 +203,18 @@ class TestMlaPre(CustomTestCase):
 
     def test_eight_rows_absorb(self):
         self._run(8, qn=True)
+
+    def test_one_row_qrep_absorb_rm(self):
+        self._run(1, qn=True, nhq=96, qn_rm=True)
+
+    def test_six_rows_qrep_absorb_rm(self):
+        self._run(6, qn=True, nhq=96, qn_rm=True)
+
+    def test_eight_rows_qrep_no_absorb(self):
+        self._run(8, qn=False, nhq=96, qn_rm=False)
+
+    def test_eight_rows_qrep_absorb_rm_replay(self):
+        self._run(8, qn=True, nhq=96, qn_rm=True, replay=True)
 
     def test_bank_without_the_write_block_is_refused(self):
         # A block-write layer stores its row at block write_idx; a bank of exactly

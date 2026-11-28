@@ -91,6 +91,9 @@ K2_OPT = os.environ.get("SGLANG_AMD_MONO_K3_K2_OPT")
 MLA_PRE = os.environ.get("SGLANG_AMD_MONO_K3_MLA_PRE", "1") == "1"
 # SGLANG_AMD_MONO_K3_K1=0 builds no K1: every KDA layer keeps SGLang's attention.
 K1 = os.environ.get("SGLANG_AMD_MONO_K3_K1", "1") == "1"
+# SGLANG_AMD_MONO_K3_WIDE=0 keeps only the <=8-row narrow launches.
+WIDE = os.environ.get("SGLANG_AMD_MONO_K3_WIDE", "1") == "1"
+DCP_SIZES = (1, 8)
 
 # The SGLang names this glue reads, by file under the sglang package (``f(p)``:
 # a parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
@@ -106,9 +109,10 @@ SGLANG_READS = {
     ),
     # the MXFP4 expert layout the launch reads, as AITER's MoE was given it
     "srt/layers/quantization/mxfp4.py": ("_aiter_situ_uses_gu_interleaved_weights",),
-    # the K3 AITER switch the expert layout depends on; its renamed Envs field
-    # is optional, and SGLANG_AITER_K3_OPT is read where it does not exist yet
-    "srt/environ.py": ("envs",),
+    # the K3 AITER switch the expert layout depends on (its renamed Envs field is
+    # optional: SGLANG_AITER_K3_OPT is read where it does not exist yet) and the
+    # host-only Mamba checkpoint switch (required)
+    "srt/environ.py": ("envs", "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT"),
     # the SiTU parameters K2 hard-codes
     "srt/configs/kimi_linear.py": (
         "activation_situ_beta",
@@ -151,7 +155,51 @@ SGLANG_READS = {
         "start",
         "written_residual",
     ),
-    "srt/runtime_context.py": ("get_parallel",),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        "get_exec",
+        "get_spec",
+        "get_schedule",
+        '"dcp_enabled"',
+    ),
+    "srt/arg_groups/fields/exec_.py": (
+        "cuda_graph_max_bs_decode",
+        "enable_linear_replayssm_spec",
+    ),
+    "srt/arg_groups/fields/schedule.py": ("max_running_requests",),
+    "srt/arg_groups/fields/spec.py": (
+        "speculative_algorithm",
+        "speculative_num_draft_tokens",
+    ),
+    "srt/arg_groups/fields/parallel.py": (
+        "dcp_size",
+        "attn_cp_size",
+        "enable_prefill_cp",
+        "dcp_replicate_q_proj",
+    ),
+    # the KV offload paths Feature.KV_OFFLOAD admits besides HiCache
+    "srt/arg_groups/fields/*.py": (
+        "enable_lmcache",
+        "enable_flexkv",
+        "disaggregation_decode_enable_offload_kvcache",
+    ),
+    "srt/models/deepseek_v2.py": (
+        "q_b_proj_qrep_weight",
+        "w_kc_qrep",
+        "use_deep_gemm_bmm",
+        "num_local_heads",
+        "dcp_size",
+        "qk_head_dim",
+    ),
+    "srt/models/deepseek_common/attention_forward_methods/forward_mla.py": (
+        "is_dcp_q_replicate_phase",
+        "_split_q_nope_pe",
+    ),
+    "srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py": (
+        "forward_absorb_rocm_prepare",
+        '"_mono_pre"',
+        "q_replicate_active",
+    ),
     # the attention stops here and the launch runs o_proj; both attention
     # classes expose it. The rest are what the forward and the checks read.
     "srt/models/kimi_k3.py": (
@@ -252,6 +300,32 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         reasons.append(
             f"SiTU (beta, linear_beta) is {situ}; the launch computes ({BETA}, {LBETA})"
         )
+    if cfg is not None:
+        reasons += _offload_disable_reasons(cfg)
+        dcp = cfg.dcp_size or 1
+        if dcp not in DCP_SIZES:
+            reasons.append(f"--dcp-size {dcp} is not one of {list(DCP_SIZES)}")
+        if (cfg.attn_cp_size or 1) > 1 or cfg.enable_prefill_cp:
+            reasons.append(
+                "attention context parallel is on; only --dcp-size is accepted"
+            )
+    if WIDE and cfg is not None:
+        from sgl_amd_mono.kimi_k31 import wide
+
+        tokens, wide_runs = _wide_step_shape(
+            cfg.speculative_algorithm,
+            cfg.speculative_num_draft_tokens,
+            cfg.cuda_graph_max_bs_decode,
+            cfg.max_running_requests,
+        )
+        if wide_runs and tokens not in wide.SUPPORTED_L:
+            reasons.append(
+                f"wide launch requires --speculative-num-draft-tokens in "
+                f"{list(wide.SUPPORTED_L)} (got {tokens}); set SGLANG_AMD_MONO_K3_WIDE=0 "
+                "for narrow-only <=8-row serving"
+            )
+        if wide_runs and cfg.enable_linear_replayssm_spec and _host_only_mamba():
+            reasons.append(HOST_ONLY_RING_REASON)
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -268,6 +342,8 @@ def _quark_fp8_storage(linear, name: str):
         isinstance(scheme, QuarkW8A8Fp8) and scheme.weight_qscheme == "per_channel"
     ):
         raise ValueError(f"an FP8 {name} is read only as Quark per-channel FP8")
+    if getattr(linear, "bias", None) is not None:
+        raise ValueError(f"the FP8 {name} has a bias, which the launch does not add")
     # The launch multiplies the bf16 activation and applies only the weight scale;
     # a static input scale would be clipped and rounded by SGLang and not by it.
     if scheme.is_static_input_scheme:
@@ -319,6 +395,72 @@ def _o_proj_operands(o_proj):
             f"the FP8 o_proj is {tuple(storage.shape)}, not [{hidden}, {CORE}]"
         )
     return (oproj.O_FP8_SHUFFLED if shuffled else oproj.O_FP8), storage, scale
+
+
+def _offload_disable_reasons(cfg) -> list[str]:
+    # Feature.KV_OFFLOAD also admits these; only HiCache has run under the wide launches.
+    flags = {
+        "--enable-lmcache": cfg.enable_lmcache,
+        "--enable-flexkv": cfg.enable_flexkv,
+        "--disaggregation-decode-enable-offload-kvcache": (
+            cfg.disaggregation_decode_enable_offload_kvcache
+        ),
+    }
+    return [
+        f"{flag}: only HiCache's KV offload is supported"
+        for flag, on in flags.items()
+        if on
+    ]
+
+
+HOST_ONLY_RING_REASON = (
+    "wide launch does not support request-scoped ReplaySSM rings "
+    "(SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT=1 with --enable-linear-replayssm-spec)"
+)
+
+
+def _host_only_mamba() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get())
+
+
+def _wide_step_shape(
+    spec_algo, draft_tokens, graph_max_bs, max_running_reqs
+) -> tuple[int, bool]:
+    """(tokens a request, whether a step goes wide): with no cap known, yes; at a supported
+    draft length, when the smallest width it serves fits the cap's rows; at any other,
+    when a step passes MAX_ROWS rows (so the draft-length check refuses it)."""
+    from sgl_amd_mono.kimi_k31 import wide
+
+    tokens = int(draft_tokens or 1) if spec_algo is not None else 1
+    # the larger cap: an eager server routes up to max_running_reqs, a graph one up to
+    # the graph cap (and an unset one is 0)
+    max_bs = max(int(graph_max_bs or 0), int(max_running_reqs or 0))
+    if max_bs == 0:
+        return tokens, True
+    if tokens not in wide.SUPPORTED_L:
+        return tokens, max_bs * tokens > MAX_ROWS
+    mine = wide.widths_at(tokens)
+    return tokens, bool(mine) and mine[0] <= max_bs * tokens
+
+
+def _wide_will_run() -> bool:
+    """Whether the current server's steps reach a width the wide launch serves
+    (``_wide_step_shape``)."""
+    from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
+
+    try:
+        spec = get_spec()
+        _, wide_runs = _wide_step_shape(
+            spec.speculative_algorithm,
+            spec.speculative_num_draft_tokens,
+            get_exec().graph.cuda_graph_max_bs_decode,
+            get_schedule().max_running_requests,
+        )
+    except ValueError:
+        return False
+    return wide_runs
 
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
@@ -405,11 +547,24 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         reasons += [f"layer {i}: {why}" for ok, why in checks if not ok]
         if reasons and i > covered[0]:
             break  # one layer's reasons say it for all
+    if WIDE and _wide_will_run():
+        from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
+
+        _, state_reasons = k1_mod._state_config()
+        reasons += state_reasons
+        kda_layers = [i for i in covered if k1_mod._is_kda_layer(layers[i])]
+        for i in kda_layers:
+            attn = layers[i].self_attn
+            try:
+                k1_mod._validate_in_proj_operands(attn)
+            except ValueError as e:
+                reasons.append(f"layer {i}: {e}")
+                break
     return reasons
 
 
-def _build(model, hf_config, ctx):
-    """Pack every covered layer and compile the widths, before graph capture."""
+def _build_narrow(model, hf_config, ctx, narrow_widths):
+    """Pack every covered layer and compile the narrow (<= MAX_ROWS) widths."""
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
@@ -422,7 +577,7 @@ def _build(model, hf_config, ctx):
     runner = K3MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
     runner.set_deadline(ctx.deadline_s)
     layers, batches = {}, {}
-    for rows in ctx.widths:
+    for rows in narrow_widths:
         for i in _covered_layers(hf_config):
             packed = _weights(backbone.layers[i], i, rows, runner)
             layers.setdefault(rows, {})[i] = packed
@@ -438,6 +593,67 @@ def _build(model, hf_config, ctx):
         batches[rows] = k1_mod.build_batch(layers[rows], device)
         _warmup(runner, layers[rows], rows)
     return _Built(model, runner, layers, batches)
+
+
+def _build(model, hf_config, ctx, *, use_wide: bool | None = None):
+    """Pack every covered layer and compile the narrow and (when reached) wide widths."""
+    from sglang.srt.runtime_context import get_parallel
+
+    narrow_widths = tuple(w for w in ctx.widths if w <= MAX_ROWS)
+    narrow = _build_narrow(model, hf_config, ctx, narrow_widths)
+    wide_on = WIDE if use_wide is None else use_wide
+    if not (wide_on and any(w > MAX_ROWS for w in ctx.widths)):
+        return narrow
+    from sgl_amd_mono.kimi_k31 import wide
+
+    L = wide.tokens()
+    served = _wide_build_rows(ctx.widths, L)
+    if not served:
+        # every routed width past MAX_ROWS is another draft length's: no wide launch to
+        # build, and those steps run SGLang's own backbone
+        return _WideBuilt(narrow, None)
+
+    def mem():
+        return (
+            torch.cuda.mem_get_info()[0],
+            torch.cuda.memory_allocated(),
+            torch.cuda.memory_reserved(),
+        )
+
+    def used(a, b):
+        return "device {:.2f} / torch allocated {:.2f} / reserved {:.2f} GiB".format(
+            *((x - y) / 2**30 for x, y in ((a[0], b[0]), (b[1], a[1]), (b[2], a[2])))
+        )
+
+    p = get_parallel()
+    device = _backbone(model).layers[0].input_layernorm.weight.device
+    m0 = mem()
+    w = wide.Wide(
+        model,
+        p.tp_rank,
+        p.tp_group.cpu_group,
+        device,
+        L=L,
+        max_rows=max(served),
+    )
+    m1 = mem()
+    w.warmup()
+    m2 = mem()
+    torch.cuda.empty_cache()
+    wide._say(
+        f"memory: wide layers {used(m0, m1)}; warmup {used(m1, m2)}; "
+        f"after empty_cache {used(m0, mem())}"
+    )
+    return _WideBuilt(narrow, w)
+
+
+def _wide_build_rows(widths, L: int) -> list:
+    """The routed widths the wide launch serves at L draft tokens (the binding also routes
+    another L's widths that are multiples of L; those run SGLang's own backbone)."""
+    from sgl_amd_mono.kimi_k31 import wide
+
+    mine = set(wide.widths_at(L))
+    return [w for w in widths if w in mine]
 
 
 def _warmup(runner, packed_layers: dict, rows: int) -> None:
@@ -464,6 +680,12 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
             )
         return banks[nb]
 
+    max_nhq = max(
+        (p.mla[0].nhq for p in packed_layers.values() if p.mla is not None), default=0
+    )
+    mla_out = _mla_outputs(rows, device, nhq=max_nhq) if max_nhq else None
+    dummy_qrep_qb = None
+    dummy_qrep_wkc = None
     for packed in packed_layers.values():
         # K1 first: on a served step it runs before this layer's K2, so the
         # waits pair up in the same order here as there.
@@ -475,9 +697,39 @@ def _warmup(runner, packed_layers: dict, rows: int) -> None:
             from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
 
             key, w = packed.mla
+            w_warm = w
+            if key.nhq > mp.NHQ:
+                attn = packed.module.self_attn
+                qb_shp = (key.nhq * mp.QHD, mp.QL)
+                cand_qb = getattr(attn, "q_b_proj_qrep_weight", None)
+                if _valid_bf16_tensor(cand_qb, qb_shp):
+                    w_qb = cand_qb
+                else:
+                    if dummy_qrep_qb is None or tuple(dummy_qrep_qb.shape) != qb_shp:
+                        dummy_qrep_qb = torch.zeros(
+                            qb_shp, dtype=torch.bfloat16, device=device
+                        )
+                    w_qb = dummy_qrep_qb
+                w_warm = {**w, "w_qb": w_qb}
+                if key.qn:
+                    wkc_shp = (key.nhq, mp.QN, mp.KV)
+                    cand_kc = getattr(attn, "w_kc_qrep", None)
+                    if _valid_bf16_tensor(cand_kc, wkc_shp):
+                        w_kc = cand_kc
+                    else:
+                        if (
+                            dummy_qrep_wkc is None
+                            or tuple(dummy_qrep_wkc.shape) != wkc_shp
+                        ):
+                            dummy_qrep_wkc = torch.zeros(
+                                wkc_shp, dtype=torch.bfloat16, device=device
+                            )
+                        w_kc = dummy_qrep_wkc
+                    w_warm["w_kc"] = w_kc
+            out_warm = _mla_out_view(mla_out, key.nhq)
             mp.mla_pre_launch(
-                key, prefix=runner.prefix[:rows], blocks=bank(key.nblocks), w=w,
-                out=_mla_outputs(rows, device), scratch=runner.scratch,
+                key, prefix=runner.prefix[:rows], blocks=bank(key.nblocks), w=w_warm,
+                out=out_warm, scratch=runner.scratch,
                 layer=packed.i, epoch=runner.epoch,
             )  # fmt: skip
         _k2_launch(
@@ -571,6 +823,9 @@ NUMERICS = Numerics(
         "k1_fp8.bank.rel": 0.0,
         "k1_fp8.window.cosine": 0.9999,
         "k1_fp8.window.rel": 0.015,
+        # The cosine is what test_kimi_k3_wide_fp8.py measures on wide snapshots
+        # (ring=False, bf16/fp32 state); the rel metric stays unbounded until measured.
+        "k1_fp8.ssm.cosine": 0.9995,
         "k1_fp8.ring_k.cosine": 0.9998,
         "k1_fp8.ring_k.rel": 0.02,
         "k1_fp8.ring_v.cosine": 0.9995,
@@ -582,18 +837,30 @@ NUMERICS = Numerics(
     },
 )
 
+
+def _k3_widths() -> tuple[int, ...]:
+    base = tuple(range(1, MAX_ROWS + 1))
+    if not WIDE:
+        return base
+    from sgl_amd_mono.kimi_k31 import wide
+
+    return base + wide.wide_widths()
+
+
 SPEC = MonoSpec(
     name="kimi_k3_hip",
     devices={
         "gfx950": DeviceLimits(
-            widths=tuple(range(1, MAX_ROWS + 1)),
+            widths=_k3_widths(),
             tp_sizes=(TP_SIZE,),
             resident_blocks=BLOCKS,
         )
     },
-    # The measured win is on DSpark target-verify steps; a plain decode step of
-    # at most MAX_ROWS rows takes the same launch.
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # Narrow launches cover decode and DSpark verify steps <= 8 rows; wide launches
+    # cover multi-request DSpark verify steps (including DCP8 and HiCache KV offload).
+    features=frozenset(
+        {Feature.SPECULATIVE_DECODING, Feature.CONTEXT_PARALLEL, Feature.KV_OFFLOAD}
+    ),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"aiter"}),
@@ -670,50 +937,541 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
     )
 
 
+def _valid_bf16_tensor(t, shape: tuple[int, ...]) -> bool:
+    return (
+        isinstance(t, torch.Tensor)
+        and t.dtype == torch.bfloat16
+        and tuple(t.shape) == shape
+        and t.is_contiguous()
+    )
+
+
+# SGLang's q-replicate predicate in forward_absorb_rocm_prepare, conjunct by conjunct: the
+# one the plugin evaluates at every step before it hands a replicated-Q front over (the
+# wide launch in _run_mla_pre, the narrow one in _mla_covered)
+_QREP_PREDICATE = (
+    "self.is_dcp_q_replicate_phase(forward_batch)",
+    "not self.use_deep_gemm_bmm",
+    "self.w_kc_qrep is not None",
+    "self.q_b_proj_qrep_weight is not None",
+)
+
+
+def _head_count(node, assigned: dict, *, qrep: bool):
+    """A ``pre["q"].view`` head-count expression with ``q_replicate_active = qrep``, as
+    ``(coefficient, power of self.num_local_heads, power of self.dcp_size)``. Reads int
+    literals, those two attributes, ``*``, a conditional on the bare ``q_replicate_active``
+    and names in ``assigned``; None for anything else."""
+    import ast
+
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value, 0, 0
+    if isinstance(node, ast.Name):
+        if node.id not in assigned:
+            return None
+        return _head_count(assigned[node.id], {}, qrep=qrep)
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    ):
+        return {"num_local_heads": (1, 1, 0), "dcp_size": (1, 0, 1)}.get(node.attr)
+    if (
+        isinstance(node, ast.IfExp)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "q_replicate_active"
+    ):
+        return _head_count(node.body if qrep else node.orelse, assigned, qrep=qrep)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        a = _head_count(node.left, assigned, qrep=qrep)
+        b = _head_count(node.right, assigned, qrep=qrep)
+        if a is None or b is None:
+            return None
+        return a[0] * b[0], a[1] + b[1], a[2] + b[2]
+    return None
+
+
+def _mono_pre_q_view(tree):
+    """``(head expression, assignments before it)`` of SGLang's ``_mono_pre`` handoff, or
+    None unless the function's source has exactly the shape below. This is a source-shape
+    check: anything else reads as unsupported, and the layer keeps SGLang's own front.
+
+    - ``q_replicate_active`` is not a parameter; it is assigned once, before the view, to
+      ``_QREP_PREDICATE``'s conjunction (any order), whose ``forward_batch`` is a named
+      (not ``*`` / ``**``) parameter of the function, never rebound.
+    - ``pre = self.__dict__.get("_mono_pre")`` is its one assignment; every other use of
+      ``pre`` is ``pre is (not) None``, a read of ``pre["<key>"]`` or ``pre.get("<key>")``
+      of another key than "q"; ``"_mono_pre"`` appears only there.
+    - ``pre["q"]`` is read once, as ``name = pre["q"].view(-1 or pre["q_lora"].shape[0],
+      heads, self.qk_head_dim)``, a statement directly in ``if self.q_lora_rank is not
+      None and pre is not None`` (or ``if pre is not None``), itself a statement of the
+      function body.
+    - Before that ``if``: only imports, a docstring, the two assignments above and names
+      set to constants. In its branch before the view: only single-name assignments of
+      head-count expressions.
+      After the view: only name assignments (in ifs too), never using ``name``, whose
+      calls have SGLang's callee forms (``self.indexer``, ``self.should_run_indexer``,
+      ``maybe_capture_indexer_topk``, ``pre[...].unsqueeze``; a name filter on those
+      forms, the callee objects themselves are not checked).
+    - The statement right after the ``if`` chain assigns or returns
+      ``self._split_q_nope_pe(name, <a name or constant>)``, no keywords; any later use
+      of ``name`` is the first argument of a ``self._split_q_nope_pe`` call (its other
+      arguments are not checked there).
+      What the split's outputs go through afterwards is not checked.
+    - No other way to bind a name (``:=``, ``match``, lambdas, nested functions or
+      classes, comprehensions, ``global`` / ``nonlocal``, ``except ... as``, ``import
+      ... as``, an import of the names above), no rebinding of ``self``, no parameter,
+      import or assignment named ``maybe_capture_indexer_topk`` (a name-form check), no
+      call by a reflective name (``setattr``,
+      ``exec``, ``vars``, ...; aliases are not resolved), and no ``assert``, ``raise``
+      or ``try``."""
+    import ast
+
+    fn = tree.body[0] if tree.body else None
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    # no construct that binds or shadows a name where a Name store would not show it
+    hidden = (ast.NamedExpr, ast.Match, ast.Lambda, ast.ClassDef, ast.Global)
+    hidden += (ast.Nonlocal, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    # nor a statement that stops the step on one path (SGLang's handoff has none)
+    hidden += (ast.Assert, ast.Raise, ast.Try)
+    # nor a call by a reflective name (setattr, exec, ...), wherever it sits
+    reflective = {"setattr", "delattr", "exec", "eval", "compile", "vars", "globals"}
+    reflective |= {"locals", "__import__", "__setattr__", "__delattr__"}
+    if any(
+        isinstance(n, hidden)
+        or (
+            isinstance(n, ast.Call)
+            and getattr(n.func, "id", getattr(n.func, "attr", None)) in reflective
+        )
+        or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not fn)
+        or (isinstance(n, ast.ExceptHandler) and n.name is not None)
+        or (
+            isinstance(n, (ast.Import, ast.ImportFrom))
+            and any(x.asname is not None or x.name == "*" for x in n.names)
+        )
+        for n in ast.walk(fn)
+    ):
+        return None
+    imported = {
+        x.name.split(".")[0]
+        for n in ast.walk(fn)
+        if isinstance(n, (ast.Import, ast.ImportFrom))
+        for x in n.names
+    }
+    # the handoff dict is named once, where pre is read from it
+    if (
+        sum(
+            isinstance(n, ast.Constant) and n.value == "_mono_pre" for n in ast.walk(fn)
+        )
+        != 1
+        or {"self", "pre", "forward_batch", "q_replicate_active"} & imported
+    ):
+        return None
+    a = fn.args
+    named = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    # every parameter name, the variadic ones included (for the shadowing checks)
+    params = named | {p.arg for p in (a.vararg, a.kwarg) if p is not None}
+    # the predicate reads the step's own batch: a parameter never rebound
+    if {"q_replicate_active", "pre"} & params or "forward_batch" not in named:
+        return None
+    if any(
+        isinstance(n, ast.Name)
+        and n.id in ("forward_batch", "self")
+        and not isinstance(n.ctx, ast.Load)
+        for n in ast.walk(fn)
+    ):
+        return None
+
+    def dump(e: str) -> str:
+        return ast.dump(ast.parse(e, mode="eval").body)
+
+    parent = {id(c): n for n in ast.walk(fn) for c in ast.iter_child_nodes(n)}
+    stores = {"pre": [], "q_replicate_active": []}
+    q_reads = []
+    for n in ast.walk(fn):
+        if not (isinstance(n, ast.Name) and n.id in stores):
+            continue
+        if not isinstance(n.ctx, ast.Load):
+            stores[n.id].append(n)
+            continue
+        if n.id != "pre":
+            continue
+        up = parent.get(id(n))
+        if isinstance(up, ast.Compare) and ast.dump(up) in (
+            dump("pre is not None"),
+            dump("pre is None"),
+        ):
+            continue
+        if (
+            isinstance(up, ast.Subscript)
+            and isinstance(up.ctx, ast.Load)
+            and isinstance(up.slice, ast.Constant)
+            and isinstance(up.slice.value, str)
+        ):
+            if up.slice.value == "q":
+                q_reads.append(up)
+            continue
+        call = parent.get(id(up))
+        if not (
+            isinstance(up, ast.Attribute)
+            and up.attr == "get"
+            and isinstance(call, ast.Call)
+            and call.func is up
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+            and call.args[0].value != "q"
+        ):
+            return None
+    if len(q_reads) != 1 or any(len(v) != 1 for v in stores.values()):
+        return None
+    view = parent.get(id(parent.get(id(q_reads[0]))))
+    if not (
+        isinstance(view, ast.Call)
+        and isinstance(view.func, ast.Attribute)
+        and view.func.attr == "view"
+        and view.func.value is q_reads[0]
+        and len(view.args) == 3
+        and not view.keywords
+        and ast.dump(view.args[0]) in (dump("-1"), dump('pre["q_lora"].shape[0]'))
+        and ast.dump(view.args[2]) == dump("self.qk_head_dim")
+    ):
+        return None
+    top = {}
+    for s in fn.body:
+        if (
+            isinstance(s, ast.Assign)
+            and len(s.targets) == 1
+            and isinstance(s.targets[0], ast.Name)
+            and s.lineno < view.lineno
+        ):
+            top[s.targets[0].id] = s
+    pred = top.get("q_replicate_active")
+    if (
+        pred is None
+        or pred.targets[0] is not stores["q_replicate_active"][0]
+        or top.get("pre") is None
+        or top["pre"].targets[0] is not stores["pre"][0]
+        or ast.dump(top["pre"].value) != dump('self.__dict__.get("_mono_pre")')
+        or not isinstance(pred.value, ast.BoolOp)
+        or not isinstance(pred.value.op, ast.And)
+        or sorted(ast.dump(v) for v in pred.value.values)
+        != sorted(dump(e) for e in _QREP_PREDICATE)
+    ):
+        return None
+    stmt = parent.get(id(view))
+    guard = parent.get(id(stmt))
+    if not (
+        isinstance(stmt, ast.Assign)
+        and stmt.value is view
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and isinstance(guard, ast.If)
+        and stmt in guard.body
+        and guard in fn.body
+    ):
+        return None
+    # before the guard only imports, a docstring and the assignments below: no way out early
+    for s in fn.body[: fn.body.index(guard)]:
+        doc = isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)
+        # a name set to a constant (SGLang: `q_lora = None`), or pre / the predicate as
+        # matched above; nothing that could change what the head count reads
+        named = (
+            isinstance(s, ast.Assign)
+            and len(s.targets) == 1
+            and isinstance(s.targets[0], ast.Name)
+            and (isinstance(s.value, ast.Constant) or s in (pred, top["pre"]))
+        )
+        if not (doc or named or isinstance(s, (ast.Import, ast.ImportFrom))):
+            return None
+    # SGLang's guard (or the bare ``pre`` test): its branch runs in both q-replicate states
+    if ast.dump(guard.test) not in (
+        dump("self.q_lora_rank is not None and pre is not None"),
+        dump("pre is not None"),
+    ):
+        return None
+    at = guard.body.index(stmt)
+    name = stmt.targets[0].id
+    if name in imported:
+        return None
+
+    def plain(
+        s,
+    ) -> bool:  # name assignments, and ifs of them (SGLang: the indexer's top-k)
+        if isinstance(s, ast.If):
+            return all(plain(x) for x in (*s.body, *s.orelse))
+        return isinstance(s, ast.Assign) and all(
+            isinstance(t, ast.Name) for t in s.targets
+        )
+
+    exits = (ast.Return, ast.Break, ast.Continue, ast.Yield, ast.YieldFrom, ast.Await)
+
+    def sglang_call(c) -> bool:
+        # the indexer's top-k and the k_nope reshape: self.indexer(...),
+        # self.should_run_indexer(...), maybe_capture_indexer_topk(...), pre[...].unsqueeze(...)
+        f = c.func
+        if isinstance(f, ast.Name):
+            return f.id == "maybe_capture_indexer_topk"
+        return isinstance(f, ast.Attribute) and (
+            (
+                f.attr in ("indexer", "should_run_indexer")
+                and isinstance(f.value, ast.Name)
+                and f.value.id == "self"
+            )
+            or (
+                f.attr == "unsqueeze"
+                and isinstance(f.value, ast.Subscript)
+                and isinstance(f.value.value, ast.Name)
+                and f.value.value.id == "pre"
+            )
+        )
+
+    if "maybe_capture_indexer_topk" in params | imported or any(
+        isinstance(n, ast.Name)
+        and n.id == "maybe_capture_indexer_topk"
+        and not isinstance(n.ctx, ast.Load)
+        for n in ast.walk(fn)
+    ):
+        return None  # SGLang's module-level helper, not a parameter, import or local
+    rest = guard.body[at + 1 :]
+    if not all(plain(s) for s in rest) or any(
+        (isinstance(n, ast.Name) and n.id == name)
+        or isinstance(n, exits)
+        or (isinstance(n, ast.Call) and not sglang_call(n))
+        for s in rest
+        for n in ast.walk(s)
+    ):
+        return None  # the viewed q is used again, or the branch does more than SGLang's
+    # the next statement after the if chain is `... = self._split_q_nope_pe(name, ...)` or
+    # `return self._split_q_nope_pe(name, ...)`: the split runs whenever the view did
+    nxt = fn.body.index(guard) + 1
+    after = fn.body[nxt] if nxt < len(fn.body) else None
+    head = after.value if isinstance(after, (ast.Assign, ast.Return)) else None
+    if not (
+        isinstance(head, ast.Call)
+        and ast.dump(head.func) == dump("self._split_q_nope_pe")
+        and len(head.args) == 2
+        and not head.keywords
+        and isinstance(head.args[0], ast.Name)
+        and head.args[0].id == name
+        and isinstance(head.args[1], (ast.Name, ast.Constant))
+    ):
+        return None
+    split = 0
+    for n in ast.walk(fn):
+        # past the if / elif chain the viewed q only goes to SGLang's split, as is
+        if isinstance(n, ast.Name) and n.id == name and n.lineno > guard.end_lineno:
+            call = parent.get(id(n))
+            if not (
+                isinstance(n.ctx, ast.Load)
+                and isinstance(call, ast.Call)
+                and call.args
+                and call.args[0] is n
+                and ast.dump(call.func) == dump("self._split_q_nope_pe")
+            ):
+                return None
+            split += 1
+    if not split:
+        return None
+    assigned: dict = {}
+    for s in guard.body[:at]:
+        # before the view only head-count names (SGLang: `num_q_heads = ...`)
+        if not (
+            isinstance(s, ast.Assign)
+            and len(s.targets) == 1
+            and isinstance(s.targets[0], ast.Name)
+            and all(_head_count(s.value, {}, qrep=q) is not None for q in (False, True))
+        ):
+            return None
+        assigned[s.targets[0].id] = s.value
+    return view.args[1], assigned
+
+
+def _sglang_mono_pre_supports_qrep(attn) -> bool:
+    """Whether SGLang's ``forward_absorb_rocm_prepare`` views ``_mono_pre['q']`` with
+    ``num_local_heads * dcp_size`` heads under DCP q-replicate and the local heads without
+    it (sgl-project/sglang#53130), read from the view's head expression."""
+    cached = getattr(attn, "_k3_mono_pre_qrep_ok", None)
+    if cached is not None:
+        return cached
+    fn = getattr(attn, "forward_absorb_rocm_prepare", None)
+    ok = False
+    if fn is not None:
+        try:
+            import ast
+            import inspect
+            import textwrap
+
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            if any(
+                isinstance(n, ast.Constant) and n.value == "_mono_pre"
+                for n in ast.walk(tree)
+            ):
+                view = _mono_pre_q_view(tree)
+                if view is not None:
+                    head, assigned = view
+                    ok = _head_count(head, assigned, qrep=False) == (1, 1, 0) and (
+                        _head_count(head, assigned, qrep=True) == (1, 1, 1)
+                    )
+        except (OSError, TypeError, SyntaxError):
+            ok = False
+    attn._k3_mono_pre_qrep_ok = ok
+    return ok
+
+
+def _mla_out_view(out: dict, nhq: int) -> dict:
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+
+    rows = out["q"].shape[0]
+    qb = nhq * mp.QHD
+    if out["q"].shape[1] == qb and out["qn"].shape[1] == nhq:
+        return out
+    return {
+        **out,
+        "q": out["q"].view(-1)[: rows * qb].view(rows, qb),
+        "qn": out["qn"].view(-1)[: rows * nhq * mp.KV].view(rows, nhq, mp.KV),
+    }
+
+
+# Resolve an MLA linear projection as contiguous bf16 or Quark per-channel FP8;
+# raises ValueError naming the misfit.
+def _mla_proj_operands(linear, name: str, shape: tuple[int, int]):
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
+
+    if linear is None:
+        raise ValueError(f"{name} is missing")
+    # GPTQ / AWQ-style linears keep qweight and have no weight.
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        raise ValueError(f"{name} has no weight")
+    if getattr(linear, "bias", None) is not None:
+        raise ValueError(f"{name} has a bias, which the launch does not add")
+    if weight.dtype == torch.bfloat16:
+        if tuple(weight.shape) != shape or not weight.is_contiguous():
+            raise ValueError(
+                f"{name} is {weight.dtype} {tuple(weight.shape)}, not contiguous bf16 {shape}"
+            )
+        return wfmt.BF16, weight, None
+    shuffled, storage, scale = _quark_fp8_storage(linear=linear, name=name)
+    if tuple(storage.shape) != shape:
+        raise ValueError(f"the FP8 {name} is {tuple(storage.shape)}, not {shape}")
+    return (wfmt.FP8_SHUFFLED if shuffled else wfmt.FP8), storage, scale
+
+
 def _mla_build(layer, rows: int):
     """An MLA layer's projection-front key and the weights it reads in place, or
     None (a KDA layer, or weights the launch does not take: SGLang's path)."""
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
     attn = layer.self_attn
-    idx = getattr(attn, "indexer", None)
     fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
-    if hasattr(attn, "qkv_conv1d") or idx is None or fused is None:
+    if hasattr(attn, "qkv_conv1d") or fused is None:
         return None
-    if get_parallel().attn_dcp_size > 1:
-        # under DCP SGLang's MLA forward computes every head's q itself (the
-        # replicated q_b); the front hands over this rank's 12
+    layer_id = getattr(layer, "layer_id", -1)
+    idx = getattr(attn, "indexer", None)  # an MLA layer without one has no attribute
+    has_indexer = idx is not None
+    par = get_parallel()
+    if par.attn_dcp_size > 1:
+        # Under DCP8 q-replicate, run the full 96-head q_b_proj_qrep_weight and
+        # in-place w_kc_qrep once SGLang's _mono_pre handoff supports full heads.
+        dcp_size = getattr(attn, "dcp_size", 1)
+        # the 96-head front runs only on bf16 layers with an indexer (Kimi-K3.1)
+        if not (
+            has_indexer
+            and getattr(par, "dcp_enabled", False)
+            and getattr(par, "dcp_replicate_q_proj", False)
+            and dcp_size > 1
+            and not getattr(attn, "use_deep_gemm_bmm", False)
+            and getattr(attn, "num_local_heads", 0) * dcp_size == mp.NHQ_QREP
+            and getattr(attn, "qk_head_dim", None) == mp.QHD
+            and _sglang_mono_pre_supports_qrep(attn)
+        ):
+            logger.info(
+                "monokernel: no DCP MLA front for layer %d: indexer=%s dcp=%s qrep=%s heads=%s qrep_handoff=%s",
+                layer_id,
+                has_indexer,
+                dcp_size,
+                getattr(par, "dcp_replicate_q_proj", False),
+                getattr(attn, "num_local_heads", 0) * dcp_size,
+                _sglang_mono_pre_supports_qrep(attn),
+            )
+            return None
+        nhq, qn_rm = mp.NHQ_QREP, True
+    else:
+        nhq, qn_rm = mp.NHQ, False
+    try:
+        qkv_fmt, w_qkv, w_qkv_s = _mla_proj_operands(
+            linear=fused, name="fused_qkv_a_proj_with_mqa", shape=(mp.LATW, HIDDEN)
+        )
+        g_fmt, w_g, w_g_s = _mla_proj_operands(
+            linear=getattr(attn, "g_proj", None),
+            name="g_proj",
+            shape=(mp.GATE, HIDDEN),
+        )
+        qb_fmt, w_qb, w_qb_s = _mla_proj_operands(
+            linear=getattr(attn, "q_b_proj", None),
+            name="q_b_proj",
+            shape=(mp.QB, mp.QL),
+        )
+    except ValueError as err:
+        logger.info("monokernel: no MLA front for layer %d: %s", layer_id, err)
+        return None
+    if qkv_fmt != g_fmt:
+        logger.info(
+            "monokernel: no MLA front for layer %d: w_qkv format %d != g_proj format %d",
+            layer_id,
+            qkv_fmt,
+            g_fmt,
+        )
+        return None
+    if has_indexer and (qkv_fmt != wfmt.BF16 or qb_fmt != wfmt.BF16):
+        logger.info(
+            "monokernel: no MLA front for layer %d: indexer layers require bf16 projections",
+            layer_id,
+        )
         return None
     w = {
         "ares_nw": layer.self_attention_res_norm.weight,
         "ares_qk": layer.self_attention_res_proj.weight.view(HIDDEN),
         "in_nw": layer.input_layernorm.weight,
-        "w_qkv": fused.weight,
-        "w_g": getattr(getattr(attn, "g_proj", None), "weight", None),
-        "w_k": getattr(getattr(idx, "wk", None), "weight", None),
-        "w_p": getattr(getattr(idx, "weights_proj", None), "weight", None),
-        "w_qb": attn.q_b_proj.weight,
-        "w_iq": getattr(getattr(idx, "wq_b", None), "weight", None),
+        "w_qkv": w_qkv,
+        "w_qkv_s": w_qkv_s,
+        "w_g": w_g,
+        "w_g_s": w_g_s,
+        "w_qb": w_qb,
+        "w_qb_s": w_qb_s,
         "q_nw": attn.q_a_layernorm.weight,
         "kv_nw": attn.kv_a_layernorm.weight,
     }
-    want = {
-        "w_qkv": (mp.LATW, HIDDEN), "w_g": (mp.GATE, HIDDEN), "w_k": (mp.IK, HIDDEN),
-        "w_p": (mp.IW, HIDDEN), "w_qb": (mp.QB, mp.QL), "w_iq": (mp.IQ, mp.QL),
-    }  # fmt: skip
-    for n, shp in want.items():
-        t = w[n]
-        if (
-            not isinstance(t, torch.Tensor)
-            or t.dtype != torch.bfloat16
-            or tuple(t.shape) != shp
-            or not t.is_contiguous()
-        ):
-            logger.info("monokernel: no MLA front for layer %d: %s is %s", layer.layer_id if hasattr(layer, "layer_id") else -1, n, None if t is None else (t.dtype, tuple(t.shape)))  # fmt: skip
+    if has_indexer:
+        mods = {"w_k": "wk", "w_p": "weights_proj", "w_iq": "wq_b"}
+        biased = [
+            m
+            for m in mods.values()
+            if getattr(getattr(idx, m, None), "bias", None) is not None
+        ]
+        if biased:  # stages 1 and 2 read the weights only
+            logger.info(
+                "monokernel: no MLA front for layer %d: biased %s", layer_id, biased
+            )
             return None
+        for n, m in mods.items():
+            w[n] = getattr(getattr(idx, m, None), "weight", None)
+        want_idx = {
+            "w_k": (mp.IK, HIDDEN),
+            "w_p": (mp.IW, HIDDEN),
+            "w_iq": (mp.IQ, mp.QL),
+        }
+        for n, shp in want_idx.items():
+            t = w[n]
+            if not _valid_bf16_tensor(t, shp):
+                logger.info("monokernel: no MLA front for layer %d: %s is %s", layer_id, n, None if t is None else (t.dtype, tuple(t.shape)))  # fmt: skip
+                return None
     # the absorb's weight as SGLang's bf16 bmm multiplies it: w_kc itself, unscaled
     wkc, wsc = getattr(attn, "w_kc", None), getattr(attn, "w_scale", None)
     qn = (
@@ -723,11 +1481,16 @@ def _mla_build(layer, rows: int):
         and isinstance(wsc, (int, float))
         and wsc == 1.0
     )
-    if qn:
+    if qn and not qn_rm:
         w["w_kc"] = wkc.transpose(1, 2).contiguous().view(mp.NHQ * mp.KV, mp.QN)
     key = mp.MlaPreBuild(
         tokens=rows,
         qn=qn,
+        nhq=nhq,
+        qn_rm=qn and qn_rm,
+        has_indexer=has_indexer,
+        qkv_fmt=qkv_fmt,
+        qb_fmt=qb_fmt,
         nblocks=layer.prev_valid_blocks,
         eps=layer.self_attention_res_norm.variance_epsilon,
         out_eps=layer.input_layernorm.variance_epsilon,
@@ -738,17 +1501,19 @@ def _mla_build(layer, rows: int):
     return (key, w)
 
 
-def _mla_outputs(rows: int, device) -> dict:
+def _mla_outputs(rows: int, device, nhq: int | None = None) -> dict:
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+
+    nhq = mp.NHQ if nhq is None else nhq
 
     def z(n):
         return torch.zeros(rows, n, dtype=torch.bfloat16, device=device)
 
     return {
-        "q": z(mp.QB), "latent": z(mp.KV + mp.ROPE), "k_nope": z(mp.KV),
+        "q": z(nhq * mp.QHD), "latent": z(mp.KV + mp.ROPE), "k_nope": z(mp.KV),
         "q_lora": z(mp.QL), "gate": z(mp.GATE), "idx_q": z(mp.IQ),
         "idx_k": z(mp.IK), "idx_w": z(mp.IW),
-        "qn": torch.zeros(rows, mp.NHQ, mp.KV, dtype=torch.bfloat16, device=device),
+        "qn": torch.zeros(rows, nhq, mp.KV, dtype=torch.bfloat16, device=device),
     }  # fmt: skip
 
 
@@ -874,22 +1639,45 @@ def _check(packed: _Layer, core, prefix_sum, attn_res, rows: int) -> None:
     ), (bank.dtype, tuple(bank.shape), bank.stride())
 
 
-def _mla_covered(packed, hidden, bank) -> bool:
+def _mla_covered(packed, hidden, bank, forward_batch=None) -> bool:
     """The MLA front takes a layer whose stream is a written tensor (not an owed
     contribution), with its bank open at the row count it was built for."""
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
     key, _ = packed.mla
-    return (
+    if not (
         bank is not None
         and isinstance(hidden, torch.Tensor)
         and hidden.dtype == torch.bfloat16
         and hidden.is_contiguous()
         and hidden.dim() == 2
+        and hidden.shape[0] == key.tokens
         and hidden.shape[1] == HIDDEN
         and bank.num_valid_blocks == key.nblocks
         and bank.block_residual.dtype == torch.bfloat16
+    ):
+        return False
+    if forward_batch is None:
+        return key.nhq == mp.NHQ
+    attn = packed.module.self_attn
+    q_rep_active = bool(
+        getattr(attn, "dcp_size", 1) > 1
+        and attn.is_dcp_q_replicate_phase(forward_batch)
+        and not attn.use_deep_gemm_bmm
+        and attn.w_kc_qrep is not None
+        and attn.q_b_proj_qrep_weight is not None
     )
+    if key.nhq > mp.NHQ:
+        if not (
+            q_rep_active
+            and _valid_bf16_tensor(attn.q_b_proj_qrep_weight, (key.nhq * mp.QHD, mp.QL))
+        ):
+            return False
+        if key.qn and not _valid_bf16_tensor(attn.w_kc_qrep, (key.nhq, mp.QN, mp.KV)):
+            return False
+        return True
+    return not q_rep_active
 
 
 class _LanguageModelShim:
@@ -936,7 +1724,11 @@ class _Built:
         # The MLA front's outputs, one set a width (the layers run in sequence)
         dev = runner.device
         self._mla_out = {
-            rows: _mla_outputs(rows, dev)
+            rows: _mla_outputs(
+                rows,
+                dev,
+                nhq=max(p.mla[0].nhq for p in packed.values() if p.mla is not None),
+            )
             for rows, packed in by_width.items()
             if any(p.mla is not None for p in packed.values())
         }
@@ -1059,7 +1851,7 @@ class _Built:
         from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
 
         state = self._k1_state
-        if packed.mla is not None and _mla_covered(packed, hidden, bank):
+        if packed.mla is not None and _mla_covered(packed, hidden, bank, forward_batch):
             return self._mla_core(
                 layer, packed, hidden, bank, forward_batch, zero_allocator
             )
@@ -1094,11 +1886,17 @@ class _Built:
 
         key, w = packed.mla
         rows = hidden.shape[0]
-        out = self._mla_out[rows]
+        attn = layer.self_attn
+        out = _mla_out_view(self._mla_out[rows], key.nhq)
+        w_run = w
+        if key.nhq > mp.NHQ:
+            w_run = {**w, "w_qb": attn.q_b_proj_qrep_weight}
+            if key.qn:
+                w_run["w_kc"] = attn.w_kc_qrep
         # The launch reads the stream and does not add to it, as K1 does.
         set_written(hidden, forward_batch)
         mp.mla_pre_launch(
-            key, prefix=hidden, blocks=bank.block_residual, w=w, out=out,
+            key, prefix=hidden, blocks=bank.block_residual, w=w_run, out=out,
             scratch=self.runner.scratch, layer=packed.i, epoch=self.runner.epoch,
         )  # fmt: skip
         if key.write_idx >= 0:
@@ -1109,20 +1907,22 @@ class _Built:
             .view(torch.bfloat16)
             .view(rows, HIDDEN)
         )
-        attn = layer.self_attn
         attn.__dict__["_mono_pre"] = {
             "q": out["q"], "latent": out["latent"], "k_nope": out["k_nope"],
             "q_lora": out["q_lora"], "gate": out["gate"],
             "q_nope_out": out["qn"] if key.qn else None,
         }  # fmt: skip
-        attn.indexer.__dict__["_mono_pre"] = {
-            "q": out["idx_q"], "k": out["idx_k"], "w": out["idx_w"],
-        }  # fmt: skip
+        idx = getattr(attn, "indexer", None)
+        if idx is not None:
+            idx.__dict__["_mono_pre"] = {
+                "q": out["idx_q"], "k": out["idx_k"], "w": out["idx_w"],
+            }  # fmt: skip
         try:
             return self._pre_o_proj(layer, x, forward_batch, zero_allocator)
         finally:
             attn.__dict__.pop("_mono_pre", None)
-            attn.indexer.__dict__.pop("_mono_pre", None)
+            if idx is not None:
+                idx.__dict__.pop("_mono_pre", None)
 
     def _pre_o_proj(self, layer, x, forward_batch, zero_allocator):
         """``KimiK3DecoderLayer._run_self_attn`` stopped before o_proj: the
@@ -1149,3 +1949,36 @@ class _Built:
         finally:
             if latent is not None:
                 get_attn_tp_context().clear_attn_inputs()
+
+
+class _WideBuilt(_Built):
+    """Narrow launches for <= MAX_ROWS rows, and the wide KDA layer launch above (None
+    when this draft length serves none of the routed wide widths)."""
+
+    def __init__(self, narrow, wide_runner) -> None:
+        self.__dict__.update(narrow.__dict__)
+        self._wide = wide_runner
+        self._shim = _LanguageModelShim(self)
+
+    def _backbone(self, input_ids, forward_batch, input_embeds):
+        rows = self._plan.key.rows
+        if rows <= MAX_ROWS:
+            return super()._backbone(input_ids, forward_batch, input_embeds)
+        if self._wide is None or not self._wide.serves(rows):
+            # a multiple of this L in the spec's widths only for another draft length:
+            # SGLang's own backbone, as for a step past the widths
+            return self.backbone(
+                input_ids, self._positions, forward_batch, input_embeds
+            )
+        try:
+            return self._wide.backbone(self, input_ids, forward_batch, input_embeds)
+        except Exception as e:
+            import traceback
+
+            from sgl_amd_mono.kimi_k31 import wide
+
+            wide._say(
+                f"wide backbone raised {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()[-2000:]}"
+            )
+            raise
