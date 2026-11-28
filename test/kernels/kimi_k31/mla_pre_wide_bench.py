@@ -246,7 +246,8 @@ def run_one(m, qb_rows, nl, flush_mb, show_tl, check_only=False):
         return errs
 
     # 1. Check 4 eager steps, each on new inputs (tests fbuf zeroing + tag advance): a step
-    #    that skips a write keeps the previous step's outputs and fails its check
+    #    that skips an output keeps the previous step's and fails its check (a small stale
+    #    region can stay under the rel-L2 bound)
     errs = {}
     for step in range(4):
         if step:

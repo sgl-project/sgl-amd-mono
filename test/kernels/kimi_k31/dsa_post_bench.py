@@ -331,8 +331,21 @@ def run(args, m, rank, dev, cpu):
         sort=0,
         sort_skipped=0,
     )
-    refs = make_refs()
-    for _ in range(args.reps_check):
+
+    def fresh_inputs(seed):
+        """New o_proj inputs and prefixes in the tensors the launch (and graph) reads."""
+        torch.manual_seed(seed)
+        for i in range(nl):
+            cores_all[i].copy_(torch.randn_like(cores_all[i]) / (KO**0.5))
+            cores[i].copy_(cores_all[i][:, rank * KO : (rank + 1) * KO])
+            pfx_full[i].copy_(torch.randn_like(pfx_full[i]) * 0.5)
+
+    for rep in range(args.reps_check):
+        # each repetition on new inputs: a launch that skips a write keeps the last
+        # repetition's outputs and fails (a small stale region can stay under rel-L2)
+        if rep:
+            fresh_inputs(3000 + m * 31 + rep)
+        refs = make_refs()
         for mo in moe_out:
             mo.fill_(1.0)
         epoch[0] += 1
@@ -361,11 +374,7 @@ def run(args, m, rank, dev, cpu):
     # One more replay on fresh inputs (the same tensors the graph reads): a replay that skips
     # a launch keeps the previous inputs' outputs and fails here; a small stale region can
     # stay under the rel-L2 bounds, and a sort field that does not change is not covered.
-    torch.manual_seed(5000 + m)
-    for i in range(nl):
-        cores_all[i].copy_(torch.randn_like(cores_all[i]) / (KO**0.5))
-        cores[i].copy_(cores_all[i][:, rank * KO : (rank + 1) * KO])
-        pfx_full[i].copy_(torch.randn_like(pfx_full[i]) * 0.5)
+    fresh_inputs(5000 + m)
     for mo in moe_out:
         mo.fill_(1.0)
     refs = make_refs()
