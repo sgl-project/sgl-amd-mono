@@ -586,3 +586,84 @@ def test_wide_config_guards_draft_tokens_and_request_scoped_ring(monkeypatch):
         lambda: SimpleNamespace(max_running_requests=16),
     )
     assert k3._wide_will_run() is True
+
+
+def test_mla_build_accepts_quark_fp8_without_indexer(monkeypatch, caplog):
+    import torch
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(attn_dcp_size=1),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.layers.quantization.fp8_utils.use_aiter_bpreshuffle_gemm",
+        lambda rows: True,
+    )
+
+    def fp8_lin(rows, cols):
+        scheme = QuarkW8A8Fp8(
+            {"qscheme": "per_channel"},
+            {"qscheme": "per_channel", "is_dynamic": True},
+        )
+        return SimpleNamespace(
+            weight=torch.zeros(rows, cols, dtype=torch.float8_e4m3fn).t(),
+            weight_scale=torch.ones(rows, 1, dtype=torch.float32),
+            scheme=scheme,
+        )
+
+    def make_layer(g_bf16=False, with_indexer=False):
+        g_proj = (
+            SimpleNamespace(weight=torch.zeros(mp.GATE, HIDDEN, dtype=torch.bfloat16))
+            if g_bf16
+            else fp8_lin(mp.GATE, HIDDEN)
+        )
+        attn = SimpleNamespace(
+            fused_qkv_a_proj_with_mqa=fp8_lin(mp.LATW, HIDDEN),
+            g_proj=g_proj,
+            q_b_proj=fp8_lin(mp.QB, mp.QL),
+            q_a_layernorm=SimpleNamespace(
+                weight=torch.ones(mp.QL, dtype=torch.bfloat16), variance_epsilon=1e-6
+            ),
+            kv_a_layernorm=SimpleNamespace(
+                weight=torch.ones(mp.KV, dtype=torch.bfloat16), variance_epsilon=1e-6
+            ),
+            w_kc=torch.zeros(mp.NHQ, mp.QN, mp.KV, dtype=torch.bfloat16),
+            w_scale=1.0,
+            indexer=SimpleNamespace() if with_indexer else None,
+        )
+        return SimpleNamespace(
+            layer_id=3,
+            prev_valid_blocks=2,
+            is_block_write_layer=True,
+            self_attention_res_norm=SimpleNamespace(
+                weight=torch.ones(HIDDEN, dtype=torch.bfloat16), variance_epsilon=1e-5
+            ),
+            self_attention_res_proj=SimpleNamespace(
+                weight=torch.ones(1, HIDDEN, dtype=torch.bfloat16)
+            ),
+            input_layernorm=SimpleNamespace(
+                weight=torch.ones(HIDDEN, dtype=torch.bfloat16), variance_epsilon=1e-5
+            ),
+            self_attn=attn,
+        )
+
+    key, weights = k3._mla_build(make_layer(), 8)
+    assert key.has_indexer is False
+    assert key.qkv_fmt == wfmt.FP8_SHUFFLED
+    assert key.qb_fmt == wfmt.FP8_SHUFFLED
+    assert weights["w_qkv_s"].numel() == mp.LATW
+    assert weights["w_g_s"].numel() == mp.GATE
+    assert weights["w_qb_s"].numel() == mp.QB
+
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        assert k3._mla_build(make_layer(g_bf16=True), 8) is None
+        assert k3._mla_build(make_layer(with_indexer=True), 8) is None
+    assert "w_qkv format" in caplog.text
+    assert "indexer layers require bf16" in caplog.text

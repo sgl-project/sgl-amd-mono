@@ -195,6 +195,172 @@ class TestKimiK3Fp8SingleGpu(unittest.TestCase):
             else:
                 self.assertTrue(torch.equal(rs_m, rs_s), "inter rstate mismatch")
 
+    def test_mla_pre_fp8_no_indexer_matches_reference(self):
+        import torch.nn.functional as F
+
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+        from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
+        from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
+        torch.manual_seed(0)
+        dev = torch.device("cuda:0")
+
+        def rmsnorm(x, w, eps):
+            xf = x.float()
+            return (
+                xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps) * w.float()
+            ).to(torch.bfloat16)
+
+        def quant_row(w_bf16):
+            wf = w_bf16.float()
+            sc = (wf.abs().amax(dim=1) / 448.0).clamp(min=1e-12).contiguous()
+            wq = (wf / sc.unsqueeze(1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+            return wq.contiguous(), sc
+
+        nblocks = 4
+        cases = [
+            (1, wfmt.BF16, False),
+            (1, wfmt.FP8, True),
+            (8, wfmt.FP8, True),
+            (8, wfmt.FP8_SHUFFLED, True),
+        ]
+        for s_tok, fmt, use_qn in cases:
+            ares_nw = (1.0 + 0.1 * torch.randn(HIDDEN, device=dev)).to(torch.bfloat16)
+            ares_qk = (0.1 * torch.randn(HIDDEN, device=dev)).to(torch.bfloat16)
+            in_nw = (1.0 + 0.1 * torch.randn(HIDDEN, device=dev)).to(torch.bfloat16)
+            q_nw = (1.0 + 0.1 * torch.randn(mp.QL, device=dev)).to(torch.bfloat16)
+            kv_nw = (1.0 + 0.1 * torch.randn(mp.KV, device=dev)).to(torch.bfloat16)
+            w_qkv_bf = 0.05 * torch.randn(
+                mp.LATW, HIDDEN, device=dev, dtype=torch.bfloat16
+            )
+            w_g_bf = 0.05 * torch.randn(
+                mp.GATE, HIDDEN, device=dev, dtype=torch.bfloat16
+            )
+            w_qb_bf = 0.05 * torch.randn(mp.QB, mp.QL, device=dev, dtype=torch.bfloat16)
+            w_kc = 0.05 * torch.randn(
+                mp.NHQ, mp.QN, mp.KV, device=dev, dtype=torch.bfloat16
+            )
+            if fmt == wfmt.BF16:
+                w_qkv, w_qkv_s, w_qkv_d = w_qkv_bf, None, w_qkv_bf
+                w_g, w_g_s, w_g_d = w_g_bf, None, w_g_bf
+                w_qb, w_qb_s, w_qb_d = w_qb_bf, None, w_qb_bf
+            else:
+                w_qkv_q, w_qkv_s = quant_row(w_qkv_bf)
+                w_g_q, w_g_s = quant_row(w_g_bf)
+                w_qb_q, w_qb_s = quant_row(w_qb_bf)
+                w_qkv = (
+                    wfmt.preshuffle_fp8(w_qkv_q)
+                    if fmt == wfmt.FP8_SHUFFLED
+                    else w_qkv_q
+                )
+                w_g = wfmt.preshuffle_fp8(w_g_q) if fmt == wfmt.FP8_SHUFFLED else w_g_q
+                w_qb = (
+                    wfmt.preshuffle_fp8(w_qb_q) if fmt == wfmt.FP8_SHUFFLED else w_qb_q
+                )
+                w_qkv_d = (w_qkv_q.float() * w_qkv_s.unsqueeze(1)).to(torch.bfloat16)
+                w_g_d = (w_g_q.float() * w_g_s.unsqueeze(1)).to(torch.bfloat16)
+                w_qb_d = (w_qb_q.float() * w_qb_s.unsqueeze(1)).to(torch.bfloat16)
+            w_dict = {
+                "ares_nw": ares_nw,
+                "ares_qk": ares_qk,
+                "in_nw": in_nw,
+                "w_qkv": w_qkv,
+                "w_qkv_s": w_qkv_s,
+                "w_g": w_g,
+                "w_g_s": w_g_s,
+                "w_qb": w_qb,
+                "w_qb_s": w_qb_s,
+                "q_nw": q_nw,
+                "kv_nw": kv_nw,
+            }
+            if use_qn:
+                w_dict["w_kc"] = (
+                    w_kc.transpose(1, 2).contiguous().view(mp.NHQ * mp.KV, mp.QN)
+                )
+            key = mp.MlaPreBuild(
+                tokens=s_tok,
+                nblocks=nblocks,
+                qn=use_qn,
+                has_indexer=False,
+                qkv_fmt=fmt,
+                qb_fmt=fmt,
+                write_idx=nblocks,
+            )
+            scratch = torch.zeros(mp.scratch_bytes(key), dtype=torch.uint8, device=dev)
+            epoch = torch.zeros(1, dtype=torch.int64, device=dev)
+            out = {
+                "q": torch.empty(s_tok, mp.QB, dtype=torch.bfloat16, device=dev),
+                "latent": torch.empty(
+                    s_tok, mp.KV + mp.ROPE, dtype=torch.bfloat16, device=dev
+                ),
+                "k_nope": torch.empty(s_tok, mp.KV, dtype=torch.bfloat16, device=dev),
+                "q_lora": torch.empty(s_tok, mp.QL, dtype=torch.bfloat16, device=dev),
+                "gate": torch.empty(s_tok, mp.GATE, dtype=torch.bfloat16, device=dev),
+            }
+            if use_qn:
+                out["qn"] = torch.empty(
+                    s_tok, mp.NHQ, mp.KV, dtype=torch.bfloat16, device=dev
+                )
+            for _ in range(2):
+                epoch += 1
+                prefix = torch.randn(s_tok, HIDDEN, dtype=torch.bfloat16, device=dev)
+                blocks = torch.randn(
+                    s_tok, nblocks + 2, HIDDEN, dtype=torch.bfloat16, device=dev
+                )
+                blocks_ref = blocks.clone()
+                mp.mla_pre_launch(
+                    key,
+                    prefix=prefix,
+                    blocks=blocks,
+                    w=w_dict,
+                    out=out,
+                    scratch=scratch,
+                    layer=3,
+                    epoch=epoch,
+                )
+                torch.cuda.synchronize()
+                srcs = [blocks_ref[:, idx, :] for idx in range(nblocks)] + [prefix]
+                stack = torch.stack(srcs, dim=1)
+                wgts = torch.softmax(
+                    (rmsnorm(stack, ares_nw, key.eps).float() * ares_qk.float()).sum(
+                        dim=-1
+                    ),
+                    dim=-1,
+                )
+                mixed = (
+                    (wgts.unsqueeze(-1) * stack.float()).sum(dim=1).to(torch.bfloat16)
+                )
+                x_in = rmsnorm(mixed, in_nw, key.out_eps)
+                lat = (x_in.float() @ w_qkv_d.float().T).to(torch.bfloat16)
+                gate_ref = (x_in.float() @ w_g_d.float().T).to(torch.bfloat16)
+                ql_n = rmsnorm(lat[:, : mp.QL], q_nw, key.q_eps)
+                kn_ref = rmsnorm(lat[:, mp.QL : mp.QL + mp.KV], kv_nw, key.kv_eps)
+                q_ref = (ql_n.float() @ w_qb_d.float().T).to(torch.bfloat16)
+                checks = [
+                    (out["q"], q_ref),
+                    (out["latent"], lat[:, mp.QL :]),
+                    (out["k_nope"], kn_ref),
+                    (out["gate"], gate_ref),
+                ]
+                if use_qn:
+                    qn_ref = (
+                        torch.bmm(
+                            q_ref.view(s_tok, mp.NHQ, mp.QHD)[:, :, : mp.QN]
+                            .transpose(0, 1)
+                            .float(),
+                            w_kc.float(),
+                        )
+                        .transpose(0, 1)
+                        .to(torch.bfloat16)
+                    )
+                    checks.append((out["qn"], qn_ref))
+                for got, want in checks:
+                    cos = F.cosine_similarity(
+                        got.float().reshape(-1), want.float().reshape(-1), dim=0
+                    ).item()
+                    self.assertGreater(cos, 0.9995, (s_tok, fmt, use_qn, cos))
+                self.assertTrue(torch.equal(blocks[:, nblocks, :], prefix))
+
 
 def _tp8_worker():
     import torch.distributed as dist

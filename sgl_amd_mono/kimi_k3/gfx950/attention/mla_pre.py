@@ -52,7 +52,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, sreg
-from sgl_amd_mono.kimi_k3.gfx950.stages import gemv
+from sgl_amd_mono.kimi_k3.gfx950.stages import gemv, wfmt
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import COLS, HIDDEN, LDS_PAD, NA, ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
     f32_of,
@@ -110,8 +110,16 @@ TL_POINTS = (
     8  # start, slice / x seen, gate / x in LDS, mix / dot, stage 1, stage 2, kv, end
 )
 
+S1_EXTRA_NOIDX = S1_WK0 - NCTA1  # 28 stage-1 groups past NCTA1 without indexer
 S3_CTA0 = NA + S2_EXTRA  # CTAs with one stage-2 group
-assert S1_EXTRA <= NA and NA + S2_EXTRA <= KV_CTA and S3_CTA0 + S3_TASKS <= KV_CTA
+S3_CTA0_NOIDX = S2_IQ0  # stage-3 CTAs past the 144 q_b CTAs without indexer
+assert (
+    S1_EXTRA <= NA
+    and S1_EXTRA_NOIDX <= NA
+    and NA + S2_EXTRA <= KV_CTA
+    and S3_CTA0 + S3_TASKS <= KV_CTA
+    and S3_CTA0_NOIDX + S3_TASKS <= KV_CTA
+)
 
 
 @dataclass(frozen=True)
@@ -124,6 +132,9 @@ class MlaPreBuild:
     kv_eps: float = 1e-6  # kv_a_layernorm
     write_idx: int = -1  # a block-write layer's block: the updated prefix stored there
     qn: bool = False  # stage 3: q_nope @ w_kc -> qn (the MLA absorb)
+    has_indexer: bool = True  # Kimi-K3.1 DSA indexer projections (False on Kimi-K3)
+    qkv_fmt: int = wfmt.BF16  # w_qkv and w_g format (wfmt.BF16/FP8/FP8_SHUFFLED)
+    qb_fmt: int = wfmt.BF16  # weight format of w_qb
     timeline: bool = False
 
 
@@ -157,6 +168,10 @@ def _st_bf(ptr, i, v, cm=0):
     bo.buffer_store(fx.Float32(v).to(fx.BFloat16), rsrc(ptr), i, cache_modifier=cm)
 
 
+def _ld_f32(ptr, i):
+    return fx.Float32(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.f32))
+
+
 @flyc.jit
 def load_x(c):
     """Every slice's x ready -> the bf16 x rows into LDS (rows padded)."""
@@ -169,23 +184,55 @@ def load_x(c):
     stamp(c["on"], c["tls"], tid, 2)  # x in LDS
 
 
+# Weight loads for one 16-row GEMV group in either bf16 or Quark FP8 layout.
+def _loads_fmt(fmt, lane, wave, w, rg, k, nbytes):
+    if const_expr(fmt == wfmt.BF16):
+        return gemv.loads(lane, wave, w, rg * ROWS, k, nbytes=nbytes)
+    per, n = gemv.chunks(k)
+    return wfmt.fp8_loads(
+        w=w,
+        fmt=fmt,
+        lane=lane,
+        rg=rg,
+        chunks=(fx.min(wave + WAVES * i, n - 1) for i in range(per)),
+        k=k,
+        rg_max=None,
+        nbytes=nbytes,
+    )
+
+
 def s1_loads(c, g):
     """Stage-1 group ``g``'s weights for this wave (past S1: the last group's)."""
     a = c["args"]
-    # past S1 (a CTA with one group): zero-range loads, no memory traffic -- the
+    s1_lim = S1 if const_expr(c["has_indexer"]) else S1_WK0
+    # past s1_lim (a CTA with one group): zero-range loads, no memory traffic -- the
     # barrier after the first group's dot waits on them (timeline: 9 us when
     # 162 CTAs re-read the last group)
-    nbytes = (g < S1).select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
-    g = fx.min(g, S1 - 1)
-    w = (g < S1_GATE0).select(
-        a["w_qkv"],
-        (g < S1_WK0).select(a["w_g"], (g < S1_WP0).select(a["w_k"], a["w_p"])),
+    nbytes = (g < s1_lim).select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
+    g = fx.min(g, s1_lim - 1)
+    if const_expr(c["has_indexer"]):
+        w = (g < S1_GATE0).select(
+            a["w_qkv"],
+            (g < S1_WK0).select(a["w_g"], (g < S1_WP0).select(a["w_k"], a["w_p"])),
+        )
+        r0 = (g < S1_GATE0).select(
+            g,
+            (g < S1_WK0).select(
+                g - S1_GATE0, (g < S1_WP0).select(g - S1_WK0, g - S1_WP0)
+            ),
+        )
+    else:
+        w = (g < S1_GATE0).select(a["w_qkv"], a["w_g"])
+        r0 = (g < S1_GATE0).select(g, g - S1_GATE0)
+    return _loads_fmt(
+        fmt=c["qkv_fmt"],
+        lane=c["lane"],
+        wave=c["wave"],
+        w=w,
+        rg=r0,
+        k=HIDDEN,
+        nbytes=nbytes,
     )
-    r0 = (g < S1_GATE0).select(
-        g,
-        (g < S1_WK0).select(g - S1_GATE0, (g < S1_WP0).select(g - S1_WK0, g - S1_WP0)),
-    )
-    return gemv.loads(c["lane"], c["wave"], w, r0 * ROWS, HIDDEN, nbytes=nbytes)
 
 
 @flyc.jit
@@ -194,15 +241,22 @@ def stage1(c, g, ops):
     (the kv / rope part also to ``latent``), a q / kv group's squares to SS."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
-    acc = gemv.mfmas(lane, wave, c["xl"], HIDDEN + LDS_PAD, HIDDEN, s, ops)
+    acc = gemv.mfmas(
+        lane, wave, c["xl"], HIDDEN + LDS_PAD, HIDDEN, s, ops, fmt=c["qkv_fmt"]
+    )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     stamp(c["on"], c["tls"], tid, 3)  # the group's dot (the last group's, on two)
     mine = tid < ROWS * s
     r = tid % ROWS
     t = fx.min(tid // ROWS, s - 1)
-    v = bf16_round(row_sum(red, r, t))
     is_lat = g < S1_GATE0
+    raw = row_sum(red, r, t)
+    if const_expr(c["qkv_fmt"] != wfmt.BF16):
+        s_ptr = is_lat.select(a["w_qkv_s"], a["w_g_s"])
+        s_row = is_lat.select(g * ROWS + r, (g - S1_GATE0) * ROWS + r)
+        raw = raw * _ld_f32(s_ptr, s_row)
+    v = bf16_round(raw)
     col = g * ROWS + r
     if mine & is_lat:
         _st_bf(c["lat"], t * LATW + col, v, CM_DEV)
@@ -210,10 +264,11 @@ def stage1(c, g, ops):
             _st_bf(a["latent"], t * (KV + ROPE) + col - QL, v)
     if mine & (g >= S1_GATE0) & (g < S1_WK0):
         _st_bf(a["gate"], t * GATE + (g - S1_GATE0) * ROWS + r, v)
-    if mine & (g >= S1_WK0) & (g < S1_WP0):
-        _st_bf(a["idx_k"], t * IK + (g - S1_WK0) * ROWS + r, v)
-    if mine & (g >= S1_WP0):
-        _st_bf(a["idx_w"], t * IW + (g - S1_WP0) * ROWS + r, v)
+    if const_expr(c["has_indexer"]):
+        if mine & (g >= S1_WK0) & (g < S1_WP0):
+            _st_bf(a["idx_k"], t * IK + (g - S1_WK0) * ROWS + r, v)
+        if mine & (g >= S1_WP0):
+            _st_bf(a["idx_w"], t * IW + (g - S1_WP0) * ROWS + r, v)
     # a q / kv group: its 16 rows' squares a token, summed in row order, after
     # the rows are out (consumers read LAT once the sum is there)
     gpu.barrier()
@@ -232,11 +287,24 @@ def stage1(c, g, ops):
 def s2_loads(c, h):
     """Stage-2 group ``h``'s weights (q_b, then wq_b; past S2: the last group's)."""
     a = c["args"]
-    nbytes = (h < S2).select(fx.Int64(0xFFFFFFFF), fx.Int64(0))  # past S2: no traffic
-    h = fx.min(h, S2 - 1)
-    w = (h < S2_IQ0).select(a["w_qb"], a["w_iq"])
-    r0 = (h < S2_IQ0).select(h, h - S2_IQ0)
-    return gemv.loads(c["lane"], c["wave"], w, r0 * ROWS, QL, nbytes=nbytes)
+    s2_lim = S2 if const_expr(c["has_indexer"]) else S2_IQ0
+    nbytes = (h < s2_lim).select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
+    h = fx.min(h, s2_lim - 1)
+    if const_expr(c["has_indexer"]):
+        w = (h < S2_IQ0).select(a["w_qb"], a["w_iq"])
+        r0 = (h < S2_IQ0).select(h, h - S2_IQ0)
+    else:
+        w = a["w_qb"]
+        r0 = h
+    return _loads_fmt(
+        fmt=c["qb_fmt"],
+        lane=c["lane"],
+        wave=c["wave"],
+        w=w,
+        rg=r0,
+        k=QL,
+        nbytes=nbytes,
+    )
 
 
 @flyc.jit
@@ -314,17 +382,22 @@ def stage2(c, h, ops):
     """Rows 16 h .. of q_b | wq_b against the normed q latent in LDS -> bf16 out."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
-    acc = gemv.mfmas(lane, wave, c["xl"], QL + LDS_PAD, QL, s, ops)
+    s2_lim = S2 if const_expr(c["has_indexer"]) else S2_IQ0
+    acc = gemv.mfmas(lane, wave, c["xl"], QL + LDS_PAD, QL, s, ops, fmt=c["qb_fmt"])
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
-    mine = (tid < ROWS * s) & (h < S2)
+    mine = (tid < ROWS * s) & (h < s2_lim)
     r = tid % ROWS
     t = fx.min(tid // ROWS, s - 1)
-    v = bf16_round(row_sum(red, r, t))
+    raw = row_sum(red, r, t)
+    if const_expr(c["qb_fmt"] != wfmt.BF16):
+        raw = raw * _ld_f32(a["w_qb_s"], fx.min(h, S2_IQ0 - 1) * ROWS + r)
+    v = bf16_round(raw)
     if mine & (h < S2_IQ0):
         _st_bf(a["q"], t * QB + h * ROWS + r, v, CM_DEV if c["qn"] else 0)
-    if mine & (h >= S2_IQ0):
-        _st_bf(a["idx_q"], t * IQ + (h - S2_IQ0) * ROWS + r, v)
+    if const_expr(c["has_indexer"]):
+        if mine & (h >= S2_IQ0):
+            _st_bf(a["idx_q"], t * IQ + (h - S2_IQ0) * ROWS + r, v)
     if const_expr(c["qn"]):
         # the group's rows out before its flag: stage 3 reads them from q
         rocdl.s_waitcnt(vmcnt=0)
@@ -417,9 +490,9 @@ def stage_kv(c):
 
 
 ARGS = (
-    "prefix", "blocks", "ares_nw", "ares_qk", "in_nw", "w_qkv", "w_g", "w_k", "w_p",
-    "w_qb", "w_iq", "q_nw", "kv_nw", "q", "latent", "k_nope", "q_lora", "gate",
-    "idx_q", "idx_k", "idx_w", "w_kc", "qn",
+    "prefix", "blocks", "ares_nw", "ares_qk", "in_nw", "w_qkv", "w_qkv_s", "w_g",
+    "w_g_s", "w_k", "w_p", "w_qb", "w_qb_s", "w_iq", "q_nw", "kv_nw", "q", "latent",
+    "k_nope", "q_lora", "gate", "idx_q", "idx_k", "idx_w", "w_kc", "qn",
 )  # fmt: skip
 
 
@@ -428,6 +501,8 @@ def build(key: MlaPreBuild):
         return _BUILDS[key]
     s = key.tokens
     ns = key.nblocks + 1
+    if key.has_indexer:
+        assert key.qkv_fmt == wfmt.BF16 and key.qb_fmt == wfmt.BF16
     lay = scratch_layout(key)
     assert s * (HIDDEN + LDS_PAD) * 2 <= 136 * 1024 and s <= 8
 
@@ -453,16 +528,19 @@ def build(key: MlaPreBuild):
     name = (
         f"k3_mono_mla_pre_s{s}_nb{key.nblocks}_w{int(key.write_idx >= 0)}_t{int(key.timeline)}"
         + ("_qn" if key.qn else "")
+        + ("" if key.has_indexer else "_noidx")
+        + (f"_qkv{key.qkv_fmt}" if key.qkv_fmt != wfmt.BF16 else "")
+        + (f"_qb{key.qb_fmt}" if key.qb_fmt != wfmt.BF16 else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def mla_pre(
         prefix: Int64, blocks: Int64, blk_sm: Int32, blk_sr: Int32, ares_nw: Int64,
-        ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, w_k: Int64, w_p: Int64,
-        w_qb: Int64, w_iq: Int64, q_nw: Int64, kv_nw: Int64, q: Int64, latent: Int64,
-        k_nope: Int64, q_lora: Int64, gate: Int64, idx_q: Int64, idx_k: Int64,
-        idx_w: Int64, w_kc: Int64, qn: Int64, scratch: Int64, layer: Int32,
-        epoch: Int64, tl: Int64,
+        ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_qkv_s: Int64, w_g: Int64,
+        w_g_s: Int64, w_k: Int64, w_p: Int64, w_qb: Int64, w_qb_s: Int64, w_iq: Int64,
+        q_nw: Int64, kv_nw: Int64, q: Int64, latent: Int64, k_nope: Int64,
+        q_lora: Int64, gate: Int64, idx_q: Int64, idx_k: Int64, idx_w: Int64,
+        w_kc: Int64, qn: Int64, scratch: Int64, layer: Int32, epoch: Int64, tl: Int64,
     ):  # fmt: skip
         _ = keyed
         tid = fx.thread_idx.x
@@ -477,15 +555,18 @@ def build(key: MlaPreBuild):
             "lane": tid % 64, "wave": tid // 64, "delta": False, "debug": False,
             "eps": key.eps, "out_eps": key.out_eps, "q_eps": key.q_eps,
             "kv_eps": key.kv_eps, "write_idx": key.write_idx, "gate_local": False,
-            "qlora_out": False, "qn": key.qn, "put": mb.put, "poll": mb.poll, "red": lds.red.ptr,
+            "qlora_out": False, "qn": key.qn, "has_indexer": key.has_indexer,
+            "qkv_fmt": key.qkv_fmt, "qb_fmt": key.qb_fmt,
+            "put": mb.put, "poll": mb.poll, "red": lds.red.ptr,
             "vals": al.vals.ptr, "xl": gl.xl.ptr,
             "xbuf": scratch + fx.Int64(lay["x"][0]),
             "lat": scratch + fx.Int64(lay["lat"][0]),
             "args": {
                 "prefix": prefix, "delta": 0, "blocks": blocks, "blk_sm": blk_sm,
                 "blk_sr": blk_sr, "ares_nw": ares_nw, "ares_qk": ares_qk, "in_nw": in_nw,
-                "x_dbg": 0, "w_qkv": w_qkv, "w_g": w_g, "w_k": w_k, "w_p": w_p,
-                "w_qb": w_qb, "w_iq": w_iq, "q_nw": q_nw, "kv_nw": kv_nw, "q": q,
+                "x_dbg": 0, "w_qkv": w_qkv, "w_qkv_s": w_qkv_s, "w_g": w_g,
+                "w_g_s": w_g_s, "w_k": w_k, "w_p": w_p, "w_qb": w_qb,
+                "w_qb_s": w_qb_s, "w_iq": w_iq, "q_nw": q_nw, "kv_nw": kv_nw, "q": q,
                 "latent": latent, "k_nope": k_nope, "q_lora": q_lora, "gate": gate,
                 "idx_q": idx_q, "idx_k": idx_k, "idx_w": idx_w, "w_kc": w_kc, "qn": qn,
             },
@@ -495,12 +576,7 @@ def build(key: MlaPreBuild):
         on, tls = key.timeline, lds.tls.ptr
         c["on"], c["tls"] = on, tls
         stamp_begin(on, tls, tid, TL_POINTS)
-        h0 = bid
-        # stage 2's second round on stage-1 CTAs (one group each); the seam CTAs
-        # took stage 1's extra groups
-        h1 = ((bid >= NA) & (bid < NA + S2_EXTRA)).select(
-            bid - NA + BLOCKS, fx.Int32(S2)
-        )
+        s1_extra = S1_EXTRA if const_expr(key.has_indexer) else S1_EXTRA_NOIDX
         if bid < NA:
             stage_slice(c, bid)
             stamp(on, tls, tid, 1)
@@ -509,9 +585,9 @@ def build(key: MlaPreBuild):
             stamp(on, tls, tid, 2)
             stage_mix(c, bid)
             stamp(on, tls, tid, 3)
-            # stage 1's 38 groups past the 200 stage-1 CTAs, on seam CTAs idle
+            # stage 1's extra groups past the 200 stage-1 CTAs, on seam CTAs idle
             # until stage 2's polls
-            if bid < S1_EXTRA:
+            if bid < s1_extra:
                 ge = bid + NCTA1
                 opse = s1_loads(c, ge)
                 load_x(c)
@@ -523,16 +599,32 @@ def build(key: MlaPreBuild):
             load_x(c)
             stage1(c, g0, ops)
             stamp(on, tls, tid, 4)
-        # stage 2 on every CTA, its weights issued once this CTA's polls are done
-        ops2 = s2_loads(c, h0)
-        ops3 = s2_loads(c, h1)  # the second round's too, ahead of the polls
-        load_qlora(c)
-        stage2(c, h0, ops2)
-        if h1 < S2:
-            stage2(c, h1, ops3)
-        if const_expr(key.qn):
-            if (bid >= S3_CTA0) & (bid < S3_CTA0 + S3_TASKS):
-                stage3(c, bid - S3_CTA0)
+        if const_expr(key.has_indexer):
+            h0 = bid
+            # stage 2's second round on stage-1 CTAs (one group each); the seam CTAs
+            # took stage 1's extra groups
+            h1 = ((bid >= NA) & (bid < NA + S2_EXTRA)).select(
+                bid - NA + BLOCKS, fx.Int32(S2)
+            )
+            ops2 = s2_loads(c, h0)
+            ops3 = s2_loads(c, h1)  # the second round's too, ahead of the polls
+            load_qlora(c)
+            stage2(c, h0, ops2)
+            if h1 < S2:
+                stage2(c, h1, ops3)
+            if const_expr(key.qn):
+                if (bid >= S3_CTA0) & (bid < S3_CTA0 + S3_TASKS):
+                    stage3(c, bid - S3_CTA0)
+        else:
+            # Without DSA indexer, stage 2 fits in S2_IQ0 CTAs and stage 3 overlaps
+            # concurrently on CTAs S3_CTA0_NOIDX .. S3_CTA0_NOIDX + S3_TASKS - 1.
+            if bid < S2_IQ0:
+                ops2_ni = s2_loads(c, bid)
+                load_qlora(c)
+                stage2(c, bid, ops2_ni)
+            if const_expr(key.qn):
+                if (bid >= S3_CTA0_NOIDX) & (bid < S3_CTA0_NOIDX + S3_TASKS):
+                    stage3(c, bid - S3_CTA0_NOIDX)
         stamp(on, tls, tid, 5)
         if bid == KV_CTA:
             stage_kv(c)
@@ -542,17 +634,18 @@ def build(key: MlaPreBuild):
     @flyc.jit
     def launch(
         prefix: Int64, blocks: Int64, blk_sm: Int32, blk_sr: Int32, ares_nw: Int64,
-        ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_g: Int64, w_k: Int64, w_p: Int64,
-        w_qb: Int64, w_iq: Int64, q_nw: Int64, kv_nw: Int64, q: Int64, latent: Int64,
-        k_nope: Int64, q_lora: Int64, gate: Int64, idx_q: Int64, idx_k: Int64,
-        idx_w: Int64, w_kc: Int64, qn: Int64, scratch: Int64, layer: Int32,
-        epoch: Int64, tl: Int64, stream: fx.Stream = _STREAM,
+        ares_qk: Int64, in_nw: Int64, w_qkv: Int64, w_qkv_s: Int64, w_g: Int64,
+        w_g_s: Int64, w_k: Int64, w_p: Int64, w_qb: Int64, w_qb_s: Int64, w_iq: Int64,
+        q_nw: Int64, kv_nw: Int64, q: Int64, latent: Int64, k_nope: Int64,
+        q_lora: Int64, gate: Int64, idx_q: Int64, idx_k: Int64, idx_w: Int64,
+        w_kc: Int64, qn: Int64, scratch: Int64, layer: Int32, epoch: Int64, tl: Int64,
+        stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         mla_pre(
-            prefix, blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, w_qkv, w_g, w_k,
-            w_p, w_qb, w_iq, q_nw, kv_nw, q, latent, k_nope, q_lora, gate, idx_q, idx_k,
-            idx_w, w_kc, qn, scratch, layer, epoch, tl,
+            prefix, blocks, blk_sm, blk_sr, ares_nw, ares_qk, in_nw, w_qkv, w_qkv_s,
+            w_g, w_g_s, w_k, w_p, w_qb, w_qb_s, w_iq, q_nw, kv_nw, q, latent, k_nope,
+            q_lora, gate, idx_q, idx_k, idx_w, w_kc, qn, scratch, layer, epoch, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     _BUILDS[key] = launch
@@ -578,17 +671,21 @@ def mla_pre_launch(
         f"mla_pre layer {layer} writes bank block {key.write_idx}, the bank has "
         f"{blocks.shape[1]}"
     )
-    shapes = {
-        "w_qkv": (LATW, HIDDEN), "w_g": (GATE, HIDDEN), "w_k": (IK, HIDDEN),
-        "w_p": (IW, HIDDEN), "w_qb": (QB, QL), "w_iq": (IQ, QL),
-    }  # fmt: skip
+    wfmt.check(
+        fmt=key.qkv_fmt, w=w["w_qkv"], scale=w.get("w_qkv_s"), rows=LATW, k=HIDDEN
+    )
+    wfmt.check(fmt=key.qkv_fmt, w=w["w_g"], scale=w.get("w_g_s"), rows=GATE, k=HIDDEN)
+    wfmt.check(fmt=key.qb_fmt, w=w["w_qb"], scale=w.get("w_qb_s"), rows=QB, k=QL)
+    bf_shapes: dict[str, tuple[int, int]] = {}
+    if key.has_indexer:
+        bf_shapes.update({"w_k": (IK, HIDDEN), "w_p": (IW, HIDDEN), "w_iq": (IQ, QL)})
     if key.qn:  # w_kc as [heads x kv_lora, nope] (K contiguous), qn [S, heads, kv_lora]
-        shapes["w_kc"] = (NHQ * KV, QN)
+        bf_shapes["w_kc"] = (NHQ * KV, QN)
         assert (
             tuple(out["qn"].shape) == (key.tokens, NHQ, KV)
             and out["qn"].is_contiguous()
         )
-    for n, shp in shapes.items():
+    for n, shp in bf_shapes.items():
         t = w[n]
         assert (
             tuple(t.shape) == shp and t.is_contiguous() and t.dtype == torch.bfloat16
@@ -597,11 +694,13 @@ def mla_pre_launch(
         build(key),
         prefix.data_ptr(), blocks.data_ptr(), blocks.stride(0), blocks.stride(1),
         w["ares_nw"].data_ptr(), w["ares_qk"].data_ptr(), w["in_nw"].data_ptr(),
-        w["w_qkv"].data_ptr(), w["w_g"].data_ptr(), w["w_k"].data_ptr(), w["w_p"].data_ptr(),
-        w["w_qb"].data_ptr(), w["w_iq"].data_ptr(), w["q_nw"].data_ptr(), w["kv_nw"].data_ptr(),
-        out["q"].data_ptr(), out["latent"].data_ptr(), out["k_nope"].data_ptr(),
-        ptr(out.get("q_lora")), out["gate"].data_ptr(), out["idx_q"].data_ptr(),
-        out["idx_k"].data_ptr(), out["idx_w"].data_ptr(), ptr(w.get("w_kc")),
-        ptr(out.get("qn")), scratch.data_ptr(), layer,
-        epoch.data_ptr(), ptr(tl), torch.cuda.current_stream(),
+        w["w_qkv"].data_ptr(), ptr(w.get("w_qkv_s")), w["w_g"].data_ptr(),
+        ptr(w.get("w_g_s")), ptr(w.get("w_k")), ptr(w.get("w_p")),
+        w["w_qb"].data_ptr(), ptr(w.get("w_qb_s")), ptr(w.get("w_iq")),
+        w["q_nw"].data_ptr(), w["kv_nw"].data_ptr(), out["q"].data_ptr(),
+        out["latent"].data_ptr(), out["k_nope"].data_ptr(), ptr(out.get("q_lora")),
+        out["gate"].data_ptr(), ptr(out.get("idx_q")), ptr(out.get("idx_k")),
+        ptr(out.get("idx_w")), ptr(w.get("w_kc")), ptr(out.get("qn")),
+        scratch.data_ptr(), layer, epoch.data_ptr(), ptr(tl),
+        torch.cuda.current_stream(),
     )  # fmt: skip

@@ -48,8 +48,8 @@ def fp8_byte(fmt, lane, rg, ch, q, k):
 # ``w``: for each chunk index in ``chunks`` and q < 4, two dwords. ``rg`` is
 # clamped to ``rg_max`` when given. ``chunks`` may be a generator, so each
 # chunk index is computed where the loop reaches it.
-def fp8_loads(w, fmt, lane, rg, chunks, k, rg_max=None):
-    r_w = rsrc(w)
+def fp8_loads(w, fmt, lane, rg, chunks, k, rg_max=None, nbytes=None):
+    r_w = rsrc(w, nbytes)
     if rg_max is not None:
         rg = fx.min(rg, rg_max)
     out = []
