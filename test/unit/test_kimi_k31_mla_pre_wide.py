@@ -73,7 +73,8 @@ def _qrep_prepare(self, forward_batch):
             else self.num_local_heads
         )
         q = pre["q"].view(pre["q_lora"].shape[0], num_q_heads, self.qk_head_dim)
-    return self._split_q_nope_pe(q, None)
+    q_nope, q_pe, k_pe = self._split_q_nope_pe(q, None)
+    return q_nope
 
 
 @pytest.mark.parametrize("m", [1, 8, 12, 16, 24, 30, 32, 48, 64])
@@ -758,6 +759,40 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
             else self._split_q_nope_pe(q, None)
         )
 
+    def _qrep_asserts_off_the_qrep_path(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+            assert not q_replicate_active
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_rebinds_self(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            self = self.other
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, None)
+
     cases = (
         (_local_view_dcp_elsewhere, (True, False)),
         (_qrep_view_inline, (True, True)),
@@ -788,6 +823,8 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
         (_qrep_early_exit_in_branch, (False, False)),
         (_qrep_handoff_field_write, (False, False)),
         (_qrep_split_only_off_the_qrep_path, (False, False)),
+        (_qrep_asserts_off_the_qrep_path, (False, False)),
+        (_qrep_rebinds_self, (False, False)),
     )
     wrong = {
         prepare.__name__: got
