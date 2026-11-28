@@ -259,19 +259,21 @@ def run(args, m, rank, dev, cpu):
             p_ref, lat_ref, sh_ref, logits_ref = refs[i]
             sig_own = torch.sigmoid(logits[i])
             _, own_idx = torch.topk(sig_own + bias[i], TOPK, dim=-1)
-            own_w = sig_own.gather(-1, own_idx)
-            own_w = own_w / own_w.sum(dim=-1, keepdim=True)
 
             e_p = max(e_p, rel(pout[i][:, cols], p_ref[:, cols]))
             e_lat = max(e_lat, rel(lat_out[i], lat_ref))
             e_sh = max(e_sh, rel(sh_out[i], sh_ref))
             e_lg = max(e_lg, rel(logits[i], logits_ref))
-            tk_s, tk_ord = tk_ids[i].sort(-1)
-            own_s, own_ord = own_idx.sort(-1)
-            own_diff += int((tk_s != own_s).any(-1).sum())
-            e_own_w = max(
-                e_own_w, rel(tk_w[i].gather(-1, tk_ord), own_w.gather(-1, own_ord))
-            )
+            # the launch's ids must be a top-k of its own scores; at an exact tie on the
+            # k-th score either expert is one (the launch and torch.topk break it apart)
+            sc = sig_own + bias[i]
+            kth = sc.gather(-1, own_idx).min(-1, keepdim=True).values
+            mine = sc.gather(-1, tk_ids[i].long())
+            distinct = (tk_ids[i].sort(-1).values.diff(dim=-1) != 0).all(-1)
+            above = (sc > kth).sum(-1) == (mine > kth).sum(-1)
+            own_diff += int((~((mine >= kth).all(-1) & above & distinct)).sum())
+            mine_w = sig_own.gather(-1, tk_ids[i].long())
+            e_own_w = max(e_own_w, rel(tk_w[i], mine_w / mine_w.sum(-1, keepdim=True)))
         if args.sort == "aux16":
             sort_bad += sort_check_aux16(m, nl, tk_ids, tk_w, moe_out, sortb, rank)
         elif args.sort == "sgl":
