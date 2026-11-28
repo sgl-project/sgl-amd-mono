@@ -684,7 +684,61 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
             )
         return self._split_q_nope_pe(pre["q_lora"], q)
 
-    for prepare, caps in (
+    def _qrep_early_exit_before_split(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        if q_replicate_active:
+            return self._prepare_fallback(forward_batch)
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_early_exit_in_branch(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+            if q_replicate_active:
+                return self._prepare_fallback(forward_batch)
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_handoff_field_write(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            pre["q_lora"] = pre["q_lora"][:1]
+        if self.q_lora_rank is not None and pre is not None:
+            q = pre["q"].view(
+                pre["q_lora"].shape[0],
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, None)
+
+    cases = (
         (_local_view_dcp_elsewhere, (True, False)),
         (_qrep_view_inline, (True, True)),
         (_qrep_inverted, (False, False)),
@@ -710,9 +764,21 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
         (_qrep_second_handoff_read, (False, False)),
         (_qrep_split_never_gets_q, (False, False)),
         (_qrep_q_in_the_second_slot, (False, False)),
-    ):
-        attn = SimpleNamespace(forward_absorb_rocm_prepare=prepare)
-        assert wide._sglang_mono_pre_caps(attn) == caps, prepare.__name__
+        (_qrep_early_exit_before_split, (False, False)),
+        (_qrep_early_exit_in_branch, (False, False)),
+        (_qrep_handoff_field_write, (False, False)),
+    )
+    wrong = {
+        prepare.__name__: got
+        for prepare, caps in cases
+        if (
+            got := wide._sglang_mono_pre_caps(
+                SimpleNamespace(forward_absorb_rocm_prepare=prepare)
+            )
+        )
+        != caps
+    }
+    assert not wrong, wrong
 
 
 def test_mla_row_cap_respects_reachable_verify_rows(monkeypatch) -> None:
