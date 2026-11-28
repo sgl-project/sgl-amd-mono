@@ -692,8 +692,8 @@ def _mono_pre_q_view(tree):
     check: anything else reads as unsupported, and the layer keeps SGLang's own front.
 
     - ``q_replicate_active`` is not a parameter; it is assigned once, before the view, to
-      ``_QREP_PREDICATE``'s conjunction (any order), whose ``forward_batch`` is the
-      function's parameter, never rebound.
+      ``_QREP_PREDICATE``'s conjunction (any order), whose ``forward_batch`` is a named
+      (not ``*`` / ``**``) parameter of the function, never rebound.
     - ``pre = self.__dict__.get("_mono_pre")`` is its one assignment; every other use of
       ``pre`` is ``pre is (not) None``, a read of ``pre["<key>"]`` or ``pre.get("<key>")``
       of another key than "q"; ``"_mono_pre"`` appears only there.
@@ -702,16 +702,24 @@ def _mono_pre_q_view(tree):
       None and pre is not None`` (or ``if pre is not None``), itself a statement of the
       function body.
     - Before that ``if``: only imports, a docstring, the two assignments above and names
-      set to constants. In its branch before the view: only names the head count reads.
-      After the view: only name assignments (in ifs too), never using ``name``.
+      set to constants. In its branch before the view: only single-name assignments of
+      head-count expressions.
+      After the view: only name assignments (in ifs too), never using ``name``, whose
+      calls have SGLang's callee forms (``self.indexer``, ``self.should_run_indexer``,
+      ``maybe_capture_indexer_topk``, ``pre[...].unsqueeze``; a name filter on those
+      forms, the callee objects themselves are not checked).
     - The statement right after the ``if`` chain assigns or returns
-      ``self._split_q_nope_pe(name, ...)``; every later use of ``name`` is such a call.
+      ``self._split_q_nope_pe(name, <a name or constant>)``, no keywords; any later use
+      of ``name`` is the first argument of a ``self._split_q_nope_pe`` call (its other
+      arguments are not checked there).
       What the split's outputs go through afterwards is not checked.
     - No other way to bind a name (``:=``, ``match``, lambdas, nested functions or
       classes, comprehensions, ``global`` / ``nonlocal``, ``except ... as``, ``import
-      ... as``, an import of the names above), no rebinding of ``self``, no reflective
-      call (``setattr``, ``exec``, ``vars``, ...), and no ``assert``, ``raise`` or
-      ``try``."""
+      ... as``, an import of the names above), no rebinding of ``self``, no parameter,
+      import or assignment named ``maybe_capture_indexer_topk`` (a name-form check), no
+      call by a reflective name (``setattr``,
+      ``exec``, ``vars``, ...; aliases are not resolved), and no ``assert``, ``raise``
+      or ``try``."""
     import ast
 
     fn = tree.body[0] if tree.body else None
@@ -722,7 +730,7 @@ def _mono_pre_q_view(tree):
     hidden += (ast.Nonlocal, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
     # nor a statement that stops the step on one path (SGLang's handoff has none)
     hidden += (ast.Assert, ast.Raise, ast.Try)
-    # nor reflection that writes attributes or names out of sight (setattr, exec, ...)
+    # nor a call by a reflective name (setattr, exec, ...), wherever it sits
     reflective = {"setattr", "delattr", "exec", "eval", "compile", "vars", "globals"}
     reflective |= {"locals", "__import__", "__setattr__", "__delattr__"}
     if any(
@@ -756,9 +764,11 @@ def _mono_pre_q_view(tree):
     ):
         return None
     a = fn.args
-    params = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    named = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    # every parameter name, the variadic ones included (for the shadowing checks)
+    params = named | {p.arg for p in (a.vararg, a.kwarg) if p is not None}
     # the predicate reads the step's own batch: a parameter never rebound
-    if {"q_replicate_active", "pre"} & params or "forward_batch" not in params:
+    if {"q_replicate_active", "pre"} & params or "forward_batch" not in named:
         return None
     if any(
         isinstance(n, ast.Name)
@@ -891,13 +901,43 @@ def _mono_pre_q_view(tree):
         )
 
     exits = (ast.Return, ast.Break, ast.Continue, ast.Yield, ast.YieldFrom, ast.Await)
+
+    def sglang_call(c) -> bool:
+        # the indexer's top-k and the k_nope reshape: self.indexer(...),
+        # self.should_run_indexer(...), maybe_capture_indexer_topk(...), pre[...].unsqueeze(...)
+        f = c.func
+        if isinstance(f, ast.Name):
+            return f.id == "maybe_capture_indexer_topk"
+        return isinstance(f, ast.Attribute) and (
+            (
+                f.attr in ("indexer", "should_run_indexer")
+                and isinstance(f.value, ast.Name)
+                and f.value.id == "self"
+            )
+            or (
+                f.attr == "unsqueeze"
+                and isinstance(f.value, ast.Subscript)
+                and isinstance(f.value.value, ast.Name)
+                and f.value.value.id == "pre"
+            )
+        )
+
+    if "maybe_capture_indexer_topk" in params | imported or any(
+        isinstance(n, ast.Name)
+        and n.id == "maybe_capture_indexer_topk"
+        and not isinstance(n.ctx, ast.Load)
+        for n in ast.walk(fn)
+    ):
+        return None  # SGLang's module-level helper, not a parameter, import or local
     rest = guard.body[at + 1 :]
     if not all(plain(s) for s in rest) or any(
-        (isinstance(n, ast.Name) and n.id == name) or isinstance(n, exits)
+        (isinstance(n, ast.Name) and n.id == name)
+        or isinstance(n, exits)
+        or (isinstance(n, ast.Call) and not sglang_call(n))
         for s in rest
         for n in ast.walk(s)
     ):
-        return None  # the viewed q is used again, or the branch does more than assign
+        return None  # the viewed q is used again, or the branch does more than SGLang's
     # the next statement after the if chain is `... = self._split_q_nope_pe(name, ...)` or
     # `return self._split_q_nope_pe(name, ...)`: the split runs whenever the view did
     nxt = fn.body.index(guard) + 1
@@ -906,9 +946,11 @@ def _mono_pre_q_view(tree):
     if not (
         isinstance(head, ast.Call)
         and ast.dump(head.func) == dump("self._split_q_nope_pe")
-        and head.args
+        and len(head.args) == 2
+        and not head.keywords
         and isinstance(head.args[0], ast.Name)
         and head.args[0].id == name
+        and isinstance(head.args[1], (ast.Name, ast.Constant))
     ):
         return None
     split = 0
