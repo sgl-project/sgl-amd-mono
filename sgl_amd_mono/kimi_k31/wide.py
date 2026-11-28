@@ -286,7 +286,7 @@ def wide_widths(max_reqs: int = REQ_BUCKETS[-1]) -> tuple:
         if L * r > NARROW
     }
     # the binding serves a width at every L it is a multiple of;
-    # drop any width another L reads outside (lo, top] (8-token 360 rows: 60 at L = 6)
+    # drop any width another L reads outside (lo, top] (8-token 360 rows: 72 at L = 5)
     return tuple(
         sorted(
             w

@@ -261,6 +261,8 @@ def test_a_bucket_no_served_step_fills_makes_no_launch_sort(monkeypatch):
     from sgl_amd_mono.kimi_k31 import presort
 
     monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    monkeypatch.setenv(name="SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT", value="1")
+    monkeypatch.setenv(name="SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK", value="1")
     monkeypatch.setattr(presort, "sort_kind", lambda: "aux16")
     widths = wide.wide_widths()
     assert 480 not in widths and 448 in widths
