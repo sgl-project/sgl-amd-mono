@@ -249,8 +249,10 @@ def _resolve_f_b(attn):
         and w_fb.is_contiguous()
     ):
         return w_fb, None
-    fb_mod = attn.f_b_proj
-    w = fb_mod.weight
+    fb_mod = getattr(attn, "f_b_proj", None)
+    w = getattr(fb_mod, "weight", None)
+    if not isinstance(w, torch.Tensor):  # e.g. a qweight-only (GPTQ / AWQ) projection
+        raise ValueError("f_b_proj has no weight tensor the launch can read")
     if w.dtype == torch.bfloat16:
         if tuple(w.shape) != (kda.PROJ, kda.HD) or not w.is_contiguous():
             raise ValueError(f"f_b is not a contiguous bf16 [{kda.PROJ}, {kda.HD}]")
@@ -325,6 +327,8 @@ def _validate_in_proj_operands(attn) -> None:
             raise ValueError(
                 f"the FP8 f_a_proj is {tuple(w_f.shape)}, not [{kda.HD}, {HIDDEN}]"
             )
+        if not isinstance(getattr(bp, "weight", None), torch.Tensor):
+            raise ValueError("the KDA b_proj has no weight tensor the launch can read")
         if bp.weight.dtype == torch.bfloat16:
             if bp.weight.shape not in ((HIDDEN, kda.NH), (kda.NH, HIDDEN)):
                 raise ValueError(

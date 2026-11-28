@@ -205,6 +205,29 @@ def test_a_qweight_only_kda_projection_is_refused_with_a_reason(monkeypatch):
     )
     with pytest.raises(ValueError, match="not merged"):
         k1_mod._validate_in_proj_operands(attn)
+    # a qweight-only f_b_proj (no cached bf16 copy) or b_proj is refused the same way
+    no_fb = SimpleNamespace(**{**vars(attn), "f_b_proj": SimpleNamespace(qweight=None)})
+    with pytest.raises(ValueError, match="f_b_proj has no weight"):
+        k1_mod._validate_in_proj_operands(no_fb)
+    monkeypatch.setattr(
+        k31.k3,
+        "_quark_fp8_storage",
+        lambda linear, name: (False, linear.weight.t(), None),
+    )
+    split = SimpleNamespace(
+        **{
+            **vars(attn),
+            "fused_qkvg_proj": SimpleNamespace(
+                weight=torch.empty(7168, 6144, dtype=torch.float8_e4m3fn)
+            ),
+            "f_a_proj": SimpleNamespace(
+                weight=torch.empty(7168, 128, dtype=torch.float8_e4m3fn)
+            ),
+            "b_proj": SimpleNamespace(qweight=None),
+        }
+    )
+    with pytest.raises(ValueError, match="b_proj has no weight"):
+        k1_mod._validate_in_proj_operands(split)
 
 
 def test_k31_refuses_k3_wide_disabled(monkeypatch):

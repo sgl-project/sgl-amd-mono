@@ -775,8 +775,12 @@ def test_mla_pre_launch_refuses_an_indexer_layer_without_its_outputs():
     key = mp.MlaPreBuild(tokens=8, nblocks=3)
     assert key.has_indexer
     blocks = torch.zeros(8, 8, HIDDEN, dtype=torch.bfloat16)
-    with pytest.raises(AssertionError, match="lacks"):
-        mp.mla_pre_launch(
-            key, prefix=None, blocks=blocks, w={}, out={}, scratch=None, layer=3,
-            epoch=None,
-        )  # fmt: skip
+    w = {n: torch.zeros(1) for n in ("w_k", "w_p", "w_iq")}
+    full = {n: torch.zeros(1) for n in ("idx_q", "idx_k", "idx_w")}
+    for gone in full:
+        out = {n: t for n, t in full.items() if n != gone}
+        with pytest.raises(AssertionError, match=f"lacks \\['{gone}'\\]"):
+            mp.mla_pre_launch(
+                key, prefix=None, blocks=blocks, w=w, out=out, scratch=None, layer=3,
+                epoch=None,
+            )  # fmt: skip

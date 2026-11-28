@@ -202,7 +202,8 @@ def _loads_fmt(fmt, lane, wave, w, rg, k, nbytes):
 
 
 def s1_loads(c, g):
-    """Stage-1 group ``g``'s weights for this wave (past S1: the last group's)."""
+    """Stage-1 group ``g``'s weights for this wave (past the last group, S1, or S1_WK0
+    without an indexer: zero-range loads)."""
     a = c["args"]
     s1_lim = S1 if const_expr(c["has_indexer"]) else S1_WK0
     # past s1_lim (a CTA with one group): zero-range loads, no memory traffic -- the
@@ -285,7 +286,8 @@ def stage1(c, g, ops):
 
 
 def s2_loads(c, h):
-    """Stage-2 group ``h``'s weights (q_b, then wq_b; past S2: the last group's)."""
+    """Stage-2 group ``h``'s weights (q_b, then wq_b; past the last group, S2, or S2_IQ0
+    without an indexer: zero-range loads)."""
     a = c["args"]
     s2_lim = S2 if const_expr(c["has_indexer"]) else S2_IQ0
     nbytes = (h < s2_lim).select(fx.Int64(0xFFFFFFFF), fx.Int64(0))
