@@ -492,6 +492,23 @@ def test_split_quark_fp8_in_proj_and_caching(monkeypatch, b_dtype):
     assert torch.allclose(unshuf_fab[: kda.HD], ref_fa, atol=1e-4, rtol=1e-3)
     assert torch.count_nonzero(scale[kda.FA_0 + kda.HD + kda.NH :]) == 0
     assert torch.count_nonzero(unshuf_fab[kda.HD + kda.NH :]) == 0
+    # b_proj's rows of the tail: Quark FP8 as stored, or bf16 re-quantized a row at a time
+    got_b = unshuf_fab[kda.HD : kda.HD + kda.NH]
+    s_b = scale[kda.FA_0 + kda.HD : kda.FA_0 + kda.HD + kda.NH]
+    if b_dtype == "fp8":
+        ref_b = attn.b_proj._raw.float() * attn.b_proj.weight_scale
+        assert torch.equal(s_b, attn.b_proj.weight_scale.view(-1))
+        assert torch.allclose(got_b, ref_b, atol=0, rtol=1e-6)
+    else:
+        ref_b = attn.b_proj.weight.t().float()
+        amax = ref_b.abs().amax(dim=1)
+        assert torch.allclose(s_b, amax / 448.0, rtol=1e-6)
+        # E4M3 keeps 3 mantissa bits: within 1/16 of a value, or a subnormal step
+        bound = ref_b.abs() / 16 + (amax / 448.0 * 2.0**-9)[:, None]
+        assert bool(((got_b - ref_b).abs() <= bound).all())
+    # f_b: the Quark FP8 weight dequantized once to bf16
+    ref_fb = wfmt.unshuffle_fp8(attn.f_b_proj._raw).float() * attn.f_b_proj.weight_scale
+    assert torch.equal(w_fb, ref_fb.to(torch.bfloat16))
 
 
 _NO_OFFLOAD = dict(
