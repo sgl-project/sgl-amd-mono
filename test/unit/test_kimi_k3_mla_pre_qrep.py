@@ -517,6 +517,7 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
         )
+        handoff = self.__dict__.get("_mono_pre")
         pre = self.__dict__.get("_other")
         if pre is not None:
             q = pre["q"].view(
