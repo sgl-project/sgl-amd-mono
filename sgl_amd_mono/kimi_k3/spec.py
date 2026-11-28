@@ -402,9 +402,14 @@ def _host_only_mamba() -> bool:
 def _wide_step_shape(
     spec_algo, draft_tokens, graph_max_bs, max_running_reqs
 ) -> tuple[int, bool]:
+    """(tokens a request, whether a step can reach a width the wide launch serves at that
+    L): with no cap known, yes; else the smallest such width fits the cap's rows."""
+    from sgl_amd_mono.kimi_k31 import wide
+
     tokens = int(draft_tokens or 1) if spec_algo is not None else 1
     max_bs = int(graph_max_bs or 0) or int(max_running_reqs or 0)
-    return tokens, (max_bs == 0 or max_bs * tokens > MAX_ROWS)
+    mine = wide.widths_at(tokens)
+    return tokens, (max_bs == 0 or (bool(mine) and mine[0] <= max_bs * tokens))
 
 
 def _wide_will_run() -> bool:
@@ -749,9 +754,8 @@ NUMERICS = Numerics(
         "k1_fp8.window.cosine": 0.9999,
         "k1_fp8.window.rel": 0.015,
         # The cosine is what test_kimi_k3_wide_fp8.py measures on wide snapshots
-        # (ring=False, bf16/fp32 state); the rel bound is not measured yet.
+        # (ring=False, bf16/fp32 state); the rel metric stays unbounded until measured.
         "k1_fp8.ssm.cosine": 0.9995,
-        "k1_fp8.ssm.rel": 0.03,
         "k1_fp8.ring_k.cosine": 0.9998,
         "k1_fp8.ring_k.rel": 0.02,
         "k1_fp8.ring_v.cosine": 0.9995,

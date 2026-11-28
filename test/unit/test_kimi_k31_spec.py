@@ -311,14 +311,45 @@ def test_a_width_only_another_draft_length_serves_runs_sglang(monkeypatch):
 
 def test_a_draft_length_serving_no_routed_wide_width_builds_no_wide_launch(monkeypatch):
     """With the 128,256,384 override and 8 tokens capped at 12 requests the binding still
-    routes 96 rows (16 requests at L = 6): nothing to build at L = 8, SGLang runs it."""
+    routes 96 rows (16 requests at L = 6): `_build` builds no Wide and SGLang runs that
+    step; with a width L = 8 serves among them, Wide is sized to that width."""
+    import sglang.srt.runtime_context as rc
+
+    k3 = k31.k3
     monkeypatch.setenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", value="128,256,384")
-    routed = [*range(1, 9), *(w for w in wide.wide_widths() if w % 8 == 0 and w <= 96)]
-    assert 96 in routed and k31.k3._wide_build_rows(routed, 8) == []
-    assert k31.k3._wide_build_rows([*routed, 120], 8) == [120]
-    built = object.__new__(k31.k3._WideBuilt)
-    built._wide, built._positions = None, "positions"
+    made = []
+
+    class FakeWide:
+        def __init__(self, model, rank, group, device, *, L, max_rows):
+            made.append((L, max_rows))
+
+        def warmup(self):
+            pass
+
+    monkeypatch.setattr(wide, "Wide", FakeWide)
+    monkeypatch.setattr(wide, "tokens", lambda: 8)
+    monkeypatch.setattr(wide, "_say", lambda msg: None)
+    monkeypatch.setattr(k3, "_build_narrow", lambda *a: SimpleNamespace(lm=None))
+    monkeypatch.setattr(
+        rc,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_rank=0, tp_group=SimpleNamespace(cpu_group=None)),
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (0, 0))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    norm = SimpleNamespace(weight=torch.empty(1))
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(input_layernorm=norm)])
+    )
+    routed = (*range(1, 9), *(w for w in wide.wide_widths() if w % 8 == 0 and w <= 96))
+    assert 96 in routed and 96 not in wide.widths_at(8)
+
+    built = k3._build(model, None, SimpleNamespace(widths=routed), use_wide=True)
+    assert made == [] and built._wide is None
     built.backbone = lambda *args: ("sglang", *args)
+    built._positions = "positions"
     built._plan = SimpleNamespace(key=SimpleNamespace(rows=96))
     assert built._backbone("ids", "fb", None) == (
         "sglang",
@@ -327,3 +358,6 @@ def test_a_draft_length_serving_no_routed_wide_width_builds_no_wide_launch(monke
         "fb",
         None,
     )
+
+    k3._build(model, None, SimpleNamespace(widths=(*routed, 120)), use_wide=True)
+    assert made == [(8, 120)]

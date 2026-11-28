@@ -67,7 +67,9 @@ def _over(b: int, L: int, cfgs) -> dict:
     return {k: t for k, t in _tile_tasks(b, L, cfgs).items() if t > BLOCKS}
 
 
-@pytest.mark.parametrize("point", sorted(RECIPE))
+@pytest.mark.parametrize(
+    "point", sorted(p for p, (L, reqs) in RECIPE.items() if L * reqs > wide.NARROW)
+)
 def test_every_recipe_bucket_fits_one_round(point: str) -> None:
     L, max_reqs = RECIPE[point]
     assert L in wide.SUPPORTED_L

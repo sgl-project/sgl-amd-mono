@@ -545,6 +545,30 @@ def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
         assert len(extra) == 1 and "only HiCache" in extra[0], (flag, extra)
 
 
+def test_the_host_only_ring_refusal_follows_the_widths_this_draft_length_serves(
+    monkeypatch,
+):
+    """Kimi-K3 refuses a host-only ring only when a step can reach a wide width at its L:
+    with the 128,256,384 override, 12 requests of 8 tokens never do (the first is 15)."""
+    monkeypatch.setattr(k3, "WIDE", True)
+    monkeypatch.setattr(k3, "_host_only_mamba", lambda: True)
+    cfg = SimpleNamespace(
+        dcp_size=8,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+        cuda_graph_max_bs_decode=12,
+        max_running_requests=12,
+        enable_linear_replayssm_spec=True,
+        **_NO_OFFLOAD,
+    )
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    assert k3.HOST_ONLY_RING_REASON in k3._config_disable_reasons(cfg, K3)
+    monkeypatch.setenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", "128,256,384")
+    assert k3.HOST_ONLY_RING_REASON not in k3._config_disable_reasons(cfg, K3)
+
+
 def test_kimi_k31_says_the_host_only_ring_refusal_once(monkeypatch):
     """Kimi-K3's hook refuses a host-only ring on a wide ReplaySSM server and Kimi-K3.1's
     on any server; with both hooks firing the refusal is listed once."""
