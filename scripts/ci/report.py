@@ -36,9 +36,20 @@ from models import (  # noqa: E402
 )
 
 PASS, WARN, FAIL = "pass", "warn", "fail"
-TESTS_TIER = (
-    "tests tier (only its tests changed): the served kernels are the base branch's"
-)
+
+
+def tests_tier(r):
+    """Why a tests-tier job measures no accuracy or speed."""
+    if r.get("mode") == "nightly":
+        return (
+            "nightly tests tier: the PR test measures this model on every change "
+            "to it, the weekly run on main"
+        )
+    return (
+        "tests tier (only its tests changed): the served kernels are the base branch's"
+    )
+
+
 ICON = {PASS: "✅", WARN: "⚠️", FAIL: "❌"}
 MARKER = "<!-- sgl-amd-mono-ci -->"
 
@@ -67,7 +78,7 @@ def scope_check(key, r):
         return FAIL, f"monokernel server: {r['perf']['on']['error']}"
     if r.get("tier") == "tests":
         # no speed-test server; the serving tests check which steps run the kernels
-        return PASS, f"TP{m.get('tp')} on {r.get('node', '?')}; {TESTS_TIER}"
+        return PASS, f"TP{m.get('tp')} on {r.get('node', '?')}; {tests_tier(r)}"
     routes = r.get("routing", {}).get("on", [])
     if not routes:
         return (
@@ -92,7 +103,7 @@ def accuracy_check(key, r):
     if r.get("skipped", {}).get("serving"):
         return WARN, "not run (no server here): author-provided results needed"
     if r.get("tier") == "tests":
-        return PASS, "%s, so no accuracy benchmark" % TESTS_TIER
+        return PASS, "%s, so no accuracy benchmark" % tests_tier(r)
     if r.get("tier") == "smoke":
         if not m.get("e2e_tests"):
             return (
@@ -185,7 +196,7 @@ def perf_check(key, r, needs_gain):
             [],
         )
     if r.get("tier") == "tests":
-        return PASS, "%s, so no speed test" % TESTS_TIER, []
+        return PASS, "%s, so no speed test" % tests_tier(r), []
     perf = r.get("perf", {})
     base, new = perf.get("off" if nightly else "base", {}), perf.get("on", {})
     if "error" in new:
@@ -423,6 +434,16 @@ def pinned_check(r):
 
 
 def model_section(key, r, needs_gain):
+    if r.get("not_run"):
+        # stage A failed: the model's job never started, so it has no checks
+        return FAIL, "\n".join(
+            [
+                f"### {MODELS.get(key, {}).get('name', key)} (`{key}`)",
+                "",
+                f"{ICON[FAIL]} Not run: {r['not_run']}. Fix `common` first; the model "
+                "jobs start once it passes.",
+            ]
+        )
     checks = [("Scope", *scope_check(key, r))] if key != "common" else []
     if key != "common":
         checks += [
@@ -510,10 +531,16 @@ def best_gain(key, r):
     return max(gains, default=None)
 
 
+# Set by --stage-a-failed: the model jobs did not start, as stage A (common) failed.
+STAGE_A_FAILED = False
+
+
 def load(results: Path, key):
     p = results / key / "result.json"
     if p.exists():
         return json.loads(p.read_text())
+    if STAGE_A_FAILED and key != "common":
+        return {"model": key, "not_run": "stage A (`common`) failed"}
     return {"model": key, "error": "no result.json: the job did not finish"}
 
 
@@ -536,7 +563,14 @@ def main():
     ap.add_argument("--title-type", default="")
     ap.add_argument("--run-url", default="")
     ap.add_argument("--out")
+    ap.add_argument(
+        "--stage-a-failed",
+        action="store_true",
+        help="PR test: stage A (common) failed, so the model jobs did not run",
+    )
     args = ap.parse_args()
+    global STAGE_A_FAILED
+    STAGE_A_FAILED = args.stage_a_failed
     results = Path(args.results)
 
     if args.model:

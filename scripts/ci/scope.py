@@ -61,7 +61,7 @@ def models_for(files):
     serving tests, no speed test or accuracy benchmark, which would measure the
     same kernels as the base branch. A PR whose code changes in more than
     ``FULL_TIER_MAX_MODELS`` models runs them at the smoke tier, and ``common`` in
-    full: a change that broad is a refactor, and the nightly runs them in full."""
+    full: a change that broad is a refactor, and the weekly run runs them in full."""
     changed = [f["filename"] for f in files]
     code = {
         p for f in changed if f.startswith("sgl_amd_mono/") and (p := package_of(f))
@@ -84,7 +84,7 @@ def models_for(files):
     if len(touched) > FULL_TIER_MAX_MODELS:
         why = (
             f"code changed in {len(touched)} models, more than "
-            f"{FULL_TIER_MAX_MODELS}; the nightly runs them in full"
+            f"{FULL_TIER_MAX_MODELS}; the weekly run runs them in full"
         )
         models.setdefault("common", (why, "full"))
         models.update({key: (why, "smoke") for key in touched})
@@ -191,6 +191,11 @@ def main():
         models = {k: ("requested", "full") for k in keys}
     else:
         models = models_for(files)
+    # Stage A: every run tests `common` (the unit and common kernel tests) first;
+    # the model jobs start only once it passes.
+    models.setdefault(
+        "common", ("stage A: runs before the models, which wait for it to pass", "full")
+    )
     models = {k: {"why": why, "tier": tier} for k, (why, tier) in models.items()}
     m = TITLE.match(args.title)
     title_type = m.group(1) if m else ""
@@ -209,10 +214,14 @@ def main():
     print(json.dumps(scope, indent=2))
     if out := os.environ.get("GITHUB_OUTPUT"):
         with open(out, "a") as f:
+            # the model jobs, after stage A (`common`, a job of its own)
             matrix = [
-                {"model": k, "tier": v["tier"]} for k, v in sorted(models.items())
+                {"model": k, "tier": v["tier"]}
+                for k, v in sorted(models.items())
+                if k != "common"
             ]
             f.write(f"matrix={json.dumps(matrix)}\n")
+            f.write(f"has_models={str(bool(matrix)).lower()}\n")
             f.write(f"title_type={title_type}\n")
 
 

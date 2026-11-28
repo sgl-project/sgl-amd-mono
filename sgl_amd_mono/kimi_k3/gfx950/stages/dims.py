@@ -17,4 +17,7 @@ NH = 12  # local heads at TP8
 PROJ = NH * HD  # 1536
 ROWS = 16
 LOG2E = 1.0 / math.log(2.0)
+# SiTU (beta, linear_beta) the MoE epilogue computes; SGLang reads them from the
+# model config, and the spec refuses any other values.
+BETA, LBETA = 4.0, 25.0
 LDS_PAD = 8  # bf16 a padded x row
