@@ -12,6 +12,21 @@ from sgl_amd_mono.kimi_k31 import wide
 from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mpw
 
 
+def _dispatch_directly(monkeypatch) -> list:
+    """Stand AITER's compiled dispatch in for the fake launchers; return the launchers it ran."""
+    from aiter.ops.flydsl.kernels import tensor_shim
+
+    dispatched = []
+
+    def run(exe, *args):
+        dispatched.append(exe)
+        exe(*args)
+
+    monkeypatch.setattr(tensor_shim, "_run_compiled", run)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    return dispatched
+
+
 def _no_mono_prepare(self, q_replicate_active=False):
     return self.q_b_proj.weight.view(-1, self.num_local_heads, self.qk_head_dim)
 
@@ -253,7 +268,7 @@ def test_run_mla_pre_wiring_and_partial_padding(
         return _launch, None
 
     monkeypatch.setattr(mpw, "mla_pre_wide", fake_builder)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    dispatched = _dispatch_directly(monkeypatch)
 
     b, rows = 32, 24
     layer = _fake_mla_layer(dcp_size=dcp_size, qrep_active=qrep)
@@ -357,6 +372,8 @@ def test_run_mla_pre_wiring_and_partial_padding(
         layer.self_attn.w_kc_qrep = z(1)
         layer.self_attn.q_b_proj_qrep_weight = z(mpw.QB_QREP, mpw.QL)
     assert w._run_mla_pre(pk, bufs, h_full, fb=None) is None
+    # every launch went through the compiled dispatch, and a fallback launched nothing
+    assert len(dispatched) == len(recorded)
 
 
 def test_dsa_step_sets_and_pops_mono_pre_on_normal_and_exception(monkeypatch) -> None:
@@ -386,7 +403,7 @@ def test_dsa_step_sets_and_pops_mono_pre_on_normal_and_exception(monkeypatch) ->
     w._run_mla_pre = lambda pk_, bufs_, h_, fb_: (attn_pre, idx_pre)
     w._build_dsa_launch = lambda pk_, b_, cfg_: lambda *args, stream=None: None
     w._dsa_launch_args = lambda *args: ()
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    dispatched = _dispatch_directly(monkeypatch)
     monkeypatch.setattr(wide, "_routed", lambda *args, **kwargs: None)
 
     def ok_pre_o_proj(layer_, x_, positions_, fb_, zero_allocator_):
@@ -411,6 +428,7 @@ def test_dsa_step_sets_and_pops_mono_pre_on_normal_and_exception(monkeypatch) ->
 
     assert w._dsa_step(pk, h, None, None, None, b, bufs, rows, ping=0) == 1
     assert seen_pre == [(attn_pre, idx_pre)]
+    assert len(dispatched) == 1  # the dsa_post launch, through the compiled dispatch
     assert "_mono_pre" not in layer.self_attn.__dict__
     assert "_mono_pre" not in layer.self_attn.indexer.__dict__
 
@@ -437,7 +455,7 @@ def test_mla_warmup_preserves_tp_epoch_and_clears_scratch(monkeypatch) -> None:
         return _launch, None
 
     monkeypatch.setattr(mpw, "mla_pre_wide", fake_builder)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    dispatched = _dispatch_directly(monkeypatch)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
 
     b = 32
@@ -498,6 +516,7 @@ def test_mla_warmup_preserves_tp_epoch_and_clears_scratch(monkeypatch) -> None:
     # Collective dsa_post bumped self.epoch[0] once (7 -> 8); MLA warmup left it untouched.
     assert int(w.epoch[0].item()) == 8
     assert len(recorded) == 1
+    assert len(dispatched) == 2  # one dsa_post and one mla_pre_wide warmup launch
     assert recorded[0][0] == b and recorded[0][1] == mpw.QB_QREP
     assert recorded[0][2] != w.epoch.data_ptr()
     assert torch.count_nonzero(scr_qrep) == 0

@@ -1302,7 +1302,8 @@ class Wide:
             for idx in warm_ids:
                 pk = self.dsa_layers[idx]
                 self.epoch[0] += 1
-                self._build_dsa_launch(pk, b, bufs["cfg"])(
+                _run_compiled(
+                    self._build_dsa_launch(pk, b, bufs["cfg"]),
                     *self._dsa_launch_args(
                         pk,
                         b,
@@ -1312,7 +1313,7 @@ class Wide:
                         1,
                         self.slots_dsa[pk.i],
                     ),
-                    stream=torch.cuda.current_stream(),
+                    torch.cuda.current_stream(),
                 )
                 n += 1
             from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mp
@@ -1354,13 +1355,14 @@ class Wide:
                     mout = bufs["mla_out"]
                     _, scr_mla, cnt_mla = mla_state[qb_rows]
                     warm_ep[0] += 1
-                    mp.mla_pre_wide(
-                        m_mla,
-                        qb_rows,
-                        launches=len(self.dsa_layers),
-                        q_eps=pk.q_eps,
-                        kv_eps=pk.kv_eps,
-                    )[0](
+                    _run_compiled(
+                        mp.mla_pre_wide(
+                            m_mla,
+                            qb_rows,
+                            launches=len(self.dsa_layers),
+                            q_eps=pk.q_eps,
+                            kv_eps=pk.kv_eps,
+                        )[0],
                         bufs["mla_x"].data_ptr(),
                         attn.fused_qkv_a_proj_with_mqa.weight.data_ptr(),
                         attn.g_proj.weight.data_ptr(),
@@ -1382,7 +1384,7 @@ class Wide:
                         scr_mla.data_ptr(),
                         warm_ep.data_ptr(),
                         self.slots_dsa[pk.i],
-                        stream=torch.cuda.current_stream(),
+                        torch.cuda.current_stream(),
                     )
                     warmed_qbs.add(qb_rows)
                     n += 1
@@ -1541,6 +1543,8 @@ class Wide:
     def _run_mla_pre(self, pk, bufs, h, fb):
         """Run ``mla_pre_wide`` for a fusable DSA layer; return ``(attn_pre, idx_pre)``
         or ``None`` if this step should fall back to SGLang's standard projection front."""
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
         from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mp
 
         qb_want = pk.mla_pre_qb
@@ -1591,13 +1595,14 @@ class Wide:
         idx_m = attn.indexer
         mout = bufs["mla_out"]
         _, scr_mla, cnt_mla = mla_state[qb_rows]
-        mp.mla_pre_wide(
-            m_mla,
-            qb_rows,
-            launches=len(self.dsa_layers),
-            q_eps=pk.q_eps,
-            kv_eps=pk.kv_eps,
-        )[0](
+        _run_compiled(
+            mp.mla_pre_wide(
+                m_mla,
+                qb_rows,
+                launches=len(self.dsa_layers),
+                q_eps=pk.q_eps,
+                kv_eps=pk.kv_eps,
+            )[0],
             x_ptr,
             attn.fused_qkv_a_proj_with_mqa.weight.data_ptr(),
             attn.g_proj.weight.data_ptr(),
@@ -1619,7 +1624,7 @@ class Wide:
             scr_mla.data_ptr(),
             self.epoch.data_ptr(),
             self.slots_dsa[pk.i],
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         q_view = mout["q"][: m_mla * qb_rows].view(m_mla, qb_rows)[:rows]
         attn_pre = {
@@ -1640,6 +1645,7 @@ class Wide:
     def _dsa_step(self, pk, hidden, positions, fb, zero_allocator, b, bufs, rows, ping):
         """One fusable DSA layer: optional ``mla_pre_wide`` + attention up to ``forward_pre_o_proj``,
         ``dsa_post`` launch, then SGLang's routed experts onto ``lat_p[cur]``."""
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
         from sglang.srt.layers.layer_boundary.residual.batch import written_residual
 
         layer = pk.layer
@@ -1659,11 +1665,12 @@ class Wide:
             core = _pre_o_proj(layer, h, positions, fb, zero_allocator)
         assert core.shape == (rows, KO), (core.shape, rows, KO)
         cur = 1 - ping
-        self._build_dsa_launch(pk, b, bufs["cfg"])(
+        _run_compiled(
+            self._build_dsa_launch(pk, b, bufs["cfg"]),
             *self._dsa_launch_args(
                 pk, b, bufs, core, prefix, cur, self.slots_dsa[pk.i]
             ),
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
         _routed(
             pk.moe,

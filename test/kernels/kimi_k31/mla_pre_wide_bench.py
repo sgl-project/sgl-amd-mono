@@ -14,6 +14,7 @@ import argparse
 
 import torch
 import torch.nn.functional as F
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mpw
@@ -163,7 +164,8 @@ def run_one(m, qb_rows, nl, flush_mb, show_tl, check_only=False):
     def call_fused(i):
         if i == 0:
             epoch[0].add_(1)
-        launch(
+        _run_compiled(
+            launch,
             x[i].data_ptr(),
             w_qkv[i].data_ptr(),
             w_g[i].data_ptr(),
@@ -185,7 +187,7 @@ def run_one(m, qb_rows, nl, flush_mb, show_tl, check_only=False):
             scratch.data_ptr(),
             epoch.data_ptr(),
             i,
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
 
     w_kg = [torch.cat([wk, wp], dim=0).contiguous() for wk, wp in zip(w_k, w_p)]

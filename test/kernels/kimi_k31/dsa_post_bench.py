@@ -68,6 +68,8 @@ def timeline(pl, scratch, m, rank):
 
 
 def run(args, m, rank, dev, cpu):
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.kimi_k31.gfx950 import dsa_post as dp
@@ -193,7 +195,8 @@ def run(args, m, rank, dev, cpu):
 
     def call_one(i):
         pfx_bytes = pfx_full[i].shape[0] * H * 2 - col0
-        launch(
+        _run_compiled(
+            launch,
             cores[i].data_ptr(),
             wo[i].data_ptr(),
             pfx_full[i].data_ptr() + col0,
@@ -219,7 +222,7 @@ def run(args, m, rank, dev, cpu):
             i,
             pfx_bytes,
             sortb[i].data_ptr(),
-            stream=torch.cuda.current_stream(),
+            torch.cuda.current_stream(),
         )
 
     # Precompute f32 references once, then validate every repetition before overwriting outputs.
