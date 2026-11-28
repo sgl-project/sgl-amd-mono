@@ -307,3 +307,23 @@ def test_a_width_only_another_draft_length_serves_runs_sglang(monkeypatch):
     )
     built._plan = SimpleNamespace(key=SimpleNamespace(rows=300))
     assert built._backbone("ids", "fb", None) == ("wide", "ids", "fb", None)
+
+
+def test_a_draft_length_serving_no_routed_wide_width_builds_no_wide_launch(monkeypatch):
+    """With the 128,256,384 override and 8 tokens capped at 12 requests the binding still
+    routes 96 rows (16 requests at L = 6): nothing to build at L = 8, SGLang runs it."""
+    monkeypatch.setenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", value="128,256,384")
+    routed = [*range(1, 9), *(w for w in wide.wide_widths() if w % 8 == 0 and w <= 96)]
+    assert 96 in routed and k31.k3._wide_build_rows(routed, 8) == []
+    assert k31.k3._wide_build_rows([*routed, 120], 8) == [120]
+    built = object.__new__(k31.k3._WideBuilt)
+    built._wide, built._positions = None, "positions"
+    built.backbone = lambda *args: ("sglang", *args)
+    built._plan = SimpleNamespace(key=SimpleNamespace(rows=96))
+    assert built._backbone("ids", "fb", None) == (
+        "sglang",
+        "ids",
+        "positions",
+        "fb",
+        None,
+    )

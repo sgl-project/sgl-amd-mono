@@ -567,6 +567,13 @@ def _build(model, hf_config, ctx, *, use_wide: bool | None = None):
         return narrow
     from sgl_amd_mono.kimi_k31 import wide
 
+    L = wide.tokens()
+    served = _wide_build_rows(ctx.widths, L)
+    if not served:
+        # every routed width past MAX_ROWS is another draft length's: no wide launch to
+        # build, and those steps run SGLang's own backbone
+        return _WideBuilt(narrow, None)
+
     def mem():
         return (
             torch.cuda.mem_get_info()[0],
@@ -587,8 +594,8 @@ def _build(model, hf_config, ctx, *, use_wide: bool | None = None):
         p.tp_rank,
         p.tp_group.cpu_group,
         device,
-        L=wide.tokens(),
-        max_rows=max(ctx.widths),
+        L=L,
+        max_rows=max(served),
     )
     m1 = mem()
     w.warmup()
@@ -599,6 +606,15 @@ def _build(model, hf_config, ctx, *, use_wide: bool | None = None):
         f"after empty_cache {used(m0, mem())}"
     )
     return _WideBuilt(narrow, w)
+
+
+def _wide_build_rows(widths, L: int) -> list:
+    """The routed widths the wide launch serves at L draft tokens (the binding also routes
+    another L's widths that are multiples of L; those run SGLang's own backbone)."""
+    from sgl_amd_mono.kimi_k31 import wide
+
+    mine = set(wide.widths_at(L))
+    return [w for w in widths if w in mine]
 
 
 def _warmup(runner, packed_layers: dict, rows: int) -> None:
@@ -1329,7 +1345,8 @@ class _Built:
 
 
 class _WideBuilt(_Built):
-    """Narrow launches for <= MAX_ROWS rows, and the wide KDA layer launch above."""
+    """Narrow launches for <= MAX_ROWS rows, and the wide KDA layer launch above (None
+    when this draft length serves none of the routed wide widths)."""
 
     def __init__(self, narrow, wide_runner) -> None:
         self.__dict__.update(narrow.__dict__)
@@ -1340,7 +1357,7 @@ class _WideBuilt(_Built):
         rows = self._plan.key.rows
         if rows <= MAX_ROWS:
             return super()._backbone(input_ids, forward_batch, input_embeds)
-        if not self._wide.serves(rows):
+        if self._wide is None or not self._wide.serves(rows):
             # a multiple of this L in the spec's widths only for another draft length:
             # SGLang's own backbone, as for a step past the widths
             return self.backbone(
