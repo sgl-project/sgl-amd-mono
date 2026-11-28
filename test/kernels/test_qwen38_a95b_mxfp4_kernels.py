@@ -2,13 +2,16 @@
 layouts: the routed experts' fp4 tiles and e8m0 scales where K2 reads them (on
 the host); K1 on one GPU and K2 on 8 (``qwen38_a95b_mxfp4/check_k1.py``,
 ``check_k2.py``): every build key compiles, pad rows, the bf16 state, batch
-invariance, graph replay across widths and an injected wait fault; and the
-refactor proof against the sgl-project/sglang#43516 kernels, bit for bit
-(``check_port.py``, where that SGLang is installed)."""
+invariance, graph replay across widths and an injected wait fault; the MXFP4
+activation quant, plain and with the sgl-project/sglang#46059 rotation, against
+AITER bit for bit (``check_quant.py``); and the refactor proof against the
+sgl-project/sglang#43516 kernels, bit for bit (``check_port.py``, where that
+SGLang is installed)."""
 
 import importlib.util
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -17,6 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 
 CHECKS = Path(__file__).with_name("qwen38_a95b_mxfp4")
 NE = 2  # experts: enough to catch a wrong expert stride
+CHAIN_CASES = 10  # len(CHAIN_CASES) of check_k2.py
 SGLANG_43516 = "sglang.kernels.ops.moe.qwen3_5_mono_flydsl"
 
 
@@ -115,6 +119,12 @@ def _run(script: str, *args: str, ranks: int = 0) -> int:
 
 
 @unittest.skipIf(_gfx950_gpus() < 1, "needs a gfx950 GPU")
+class TestQwen38MoeQuant(CustomTestCase):
+    def test_quant_x_against_aiter(self):
+        self.assertEqual(_run("check_quant.py"), 0)
+
+
+@unittest.skipIf(_gfx950_gpus() < 1, "needs a gfx950 GPU")
 class TestQwen38MoeK1(CustomTestCase):
     def test_k1(self):
         self.assertEqual(_run("check_k1.py", "--replays", "200"), 0)
@@ -124,6 +134,15 @@ class TestQwen38MoeK1(CustomTestCase):
 class TestQwen38MoeK2(CustomTestCase):
     def test_k2(self):
         self.assertEqual(_run("check_k2.py", "--replays", "200", ranks=8), 0)
+
+    def test_chain(self):
+        # a process a case: a launch that hangs stops only its own case
+        rcs = []
+        for n in range(CHAIN_CASES):
+            rcs.append(_run("check_k2.py", "--case", str(n), ranks=8))
+            if rcs[-1]:
+                time.sleep(30)  # the GPUs of the stopped launch come free
+        self.assertEqual(rcs, [0] * CHAIN_CASES)
 
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")

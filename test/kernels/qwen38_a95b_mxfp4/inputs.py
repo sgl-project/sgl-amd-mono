@@ -12,6 +12,8 @@ BF = torch.bfloat16
 DEADLINE_S = 30.0
 HIDDEN, CORE, QKVZ, BA, CONV = L.HIDDEN, L.CORE, L.QKVZ, L.BA, L.CONV
 NV, HD, E, RI, SI, MAXT = L.NV, L.HD, L.E, L.RI, L.SI, L.MAX_TOKENS
+# (MXFP4, Hadamard-32) of a projection: bf16, MXFP4, sgl-project/sglang#46059's
+FP4_FORMATS = ((False, False), (True, False), (True, True))
 
 
 def gen(dev, seed):

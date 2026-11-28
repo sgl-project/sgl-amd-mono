@@ -1,16 +1,19 @@
 """Check K2 (``layer_post``: o_proj, its TP reduce, the norm, the router and the
-experts, the MoE TP reduce) on 8 gfx950 GPUs (torchrun), on random TP8 shards in
+experts, the MoE TP reduce) and ``layer_block`` (the same at 16 rows, with the
+fused shared expert) on 8 gfx950 GPUs (torchrun), on random TP8 shards in
 SGLang's layouts:
 
-- compile: every build key the spec can make (widths 1 .. 8, fused shared expert,
-  MXFP4 o_proj) compiles on every rank;
+- compile: every build key the spec can make (K2 at widths 1 .. 8, fused shared
+  expert, MXFP4 o_proj; layer_block at 16, MXFP4 o_proj) compiles on every rank;
 - batch invariance: a probe row's out and res_out do not change with the step's
   other rows (other requests, zero rows, copies of the probe) or the width, on
-  every rank, and every rank has the same out;
-- graph replay: widths 8, 1, 3, 8, 2, 5 in one graph on one peer buffer,
-  replayed, bit for bit against eager on every rank;
-- fault: rank 3 stalls at its first wait (``stop=False``): rank 3 sets its
-  deadline word and its flag reaches every rank.
+  every rank, and every rank has the same out; at 16 rows (layer_block) the same
+  over the probe's row, and the rows agree with K2 at 8 rows (cosine);
+- graph replay: widths 8, 16, 16, 1, 3, 8, 16, 2, 5 in one graph on one peer
+  buffer, replayed, bit for bit against eager on every rank;
+- fault: rank 3 stalls at its first wait (``stop=False``), in K2 at 1 row and in
+  layer_block at 16: rank 3 sets its deadline word and its flag reaches every
+  rank.
 """
 
 import argparse
@@ -21,16 +24,33 @@ import time
 
 import torch
 import torch.distributed as dist
-from inputs import BF, CORE, HIDDEN, MAXT, epoch, errors, gen, k2_weights, rnd
+from inputs import (
+    BF,
+    CORE,
+    FP4_FORMATS,
+    HIDDEN,
+    MAXT,
+    epoch,
+    errors,
+    gen,
+    k2_weights,
+    rnd,
+)
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layer as k2
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layout as L
-from sgl_amd_mono.qwen38_a95b_mxfp4.spec import _compile_only
+from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.mono import blocks
+from sgl_amd_mono.qwen38_a95b_mxfp4.spec import NUMERICS, _compile_only
 
-REPLAY_WIDTHS = (8, 1, 3, 8, 2, 5)
+WIDE = blocks.MAXT  # layer_block's width in the spec
+REPLAY_WIDTHS = (8, WIDE, WIDE, 1, 3, 8, WIDE, 2, 5)
 KINDS = ("rand0", "rand1", "zero", "copy")
+LATE = 20_000_000  # GPU cycles rank 3 sleeps before a launch, about 10 ms
+# layer_block against K2 on the same rows: the residual sum is K2's o_proj
+# arithmetic, the MoE output differs by about its rounding (the spec's bound)
+AGREE = {"res_out": 0.9999, "out": NUMERICS.bound("k2.out.cosine")}
 
 rank = int(os.environ["RANK"])
 assert int(os.environ["WORLD_SIZE"]) == L.TP, f"needs {L.TP} ranks"
@@ -57,12 +77,32 @@ def same_on_every_rank(t: torch.Tensor) -> bool:
     return all_ok(torch.equal(ref, mine))
 
 
+def is_wide(key) -> bool:
+    return isinstance(key, blocks.LayerBuild)
+
+
+def scratch_bytes(s):
+    """Width s's scratch: its largest variant's, as the spec's ``_scratch``."""
+    if s > MAXT:
+        return max(
+            blocks.scratch_bytes(
+                blocks.layer_scratch_layout(blocks.LayerBuild(tokens=s, oq=q))
+            )
+            for q in (False, True)
+        )
+    return max(
+        k2.scratch_bytes(k2.K2Build(tokens=s, fse=f, oq=q))
+        for f in (False, True)
+        for q in (False, True)
+    )
+
+
 class Side:
     """A peer buffer, an epoch and a scratch a width, as the spec builds them."""
 
     def __init__(self, seconds=30.0):
         self.peer = PeerBuffer(
-            k2.peer_buffer_bytes(), dist.group.WORLD, rank, L.TP, DEV
+            blocks.peer_buffer_bytes(), dist.group.WORLD, rank, L.TP, DEV
         )
         self.peer.bytes.zero_()
         torch.cuda.synchronize()
@@ -70,16 +110,14 @@ class Side:
         self.epoch = epoch(DEV, seconds)
         self.scratch = {}
 
-    def run(self, key, w, core, residual, out, res_out):
+    def run(self, key, w, core, residual, out, res_out, layer=0, bump=True):
+        """``bump=False``: the next layer of the epoch, as the spec's step."""
         if key.tokens not in self.scratch:
-            n = max(
-                k2.scratch_bytes(k2.K2Build(tokens=key.tokens, fse=f, oq=q))
-                for f in (False, True)
-                for q in (False, True)
-            )
+            n = scratch_bytes(key.tokens)
             self.scratch[key.tokens] = torch.zeros(n, dtype=torch.uint8, device=DEV)
-        self.epoch[:1].add_(1)
-        k2.layer_post(
+        if bump:
+            self.epoch[:1].add_(1)
+        (blocks.layer_block if is_wide(key) else k2.layer_post)(
             key,
             core=core,
             residual=residual,
@@ -90,7 +128,7 @@ class Side:
             peers=self.peer.addresses,
             rank=rank,
             epoch=self.epoch,
-            layer=k2.TAG_SLOTS // 2,
+            layer=k2.TAG_SLOTS // 2 + layer,
         )
 
     def close(self):
@@ -105,7 +143,7 @@ def compile_keys(keys):
     ok = True
     try:
         for key in keys[start:] + keys[:start]:
-            _compile_only(k2.build(key))
+            _compile_only((blocks.build_layer if is_wide(key) else k2.build)(key))
         torch.cuda.synchronize()
     except Exception as e:  # reported, then every rank stops
         print(f"[rank {rank}] compile: {type(e).__name__}: {e}", flush=True)
@@ -115,15 +153,17 @@ def compile_keys(keys):
 
 def check_compile():
     keys = [
-        k2.K2Build(tokens=s, fse=f, oq=q)
+        k2.K2Build(tokens=s, fse=f, oq=q, oh=h)
         for s in range(1, MAXT + 1)
         for f in (False, True)
-        for q in (False, True)
+        for q, h in FP4_FORMATS
     ]
+    keys += [blocks.LayerBuild(tokens=WIDE, oq=q, oh=h) for q, h in FP4_FORMATS]
     t0 = time.time()
     ok = compile_keys(keys)
     log(
-        f"compile: {len(keys)} K2 keys in {time.time() - t0:.0f} s: {'OK' if ok else 'FAIL'}"
+        f"compile: {len(keys)} K2 and layer_block keys in {time.time() - t0:.0f} s: "
+        f"{'OK' if ok else 'FAIL'}"
     )
     if not ok:
         raise SystemExit("a rank failed to compile")
@@ -196,18 +236,92 @@ def check_batch_invariance(side):
     )
 
 
+def cosine(a, b) -> float:
+    return torch.nn.functional.cosine_similarity(
+        a.float().flatten(), b.float().flatten(), dim=0
+    ).item()
+
+
+def check_layer_block(side):
+    """layer_block at WIDE rows, bf16, MXFP4 and rotated MXFP4 o_proj: the probe
+    row does not change with the other rows or its row, and the rows agree with
+    K2 at 8 rows (fused shared expert) on the same inputs."""
+    g = gen(DEV, 0)
+    probe_r = rnd(g, 1, HIDDEN)
+    probe_c = rnd(gen(DEV, 200 + rank), 1, CORE)
+    bad, probes, agree = [], [], {}
+    for oq, oh in FP4_FORMATS:
+        w = k2_weights(DEV, rank, 600, fse=True, oq=oq)
+        key = blocks.LayerBuild(tokens=WIDE, oq=oq, oh=oh)
+        outs = {}
+        for pos in (0, WIDE - 1):
+            for kind in KINDS:
+                g.manual_seed(1 + KINDS.index(kind))
+                residual = _rows(probe_r, WIDE, pos, kind, lambda n: rnd(g, n, HIDDEN))
+                g.manual_seed(1000 * rank + 1 + KINDS.index(kind))
+                core = _rows(probe_c, WIDE, pos, kind, lambda n: rnd(g, n, CORE))
+                out = torch.empty(WIDE, HIDDEN, dtype=BF, device=DEV)
+                res_out = torch.empty_like(out)
+                side.run(key, w, core, residual, out, res_out)
+                if pos == 0 and kind == "rand0":
+                    ref = torch.empty_like(out), torch.empty_like(out)
+                    half = k2.K2Build(tokens=MAXT, fse=True, oq=oq, oh=oh)
+                    for r in range(0, WIDE, MAXT):
+                        rs = slice(r, r + MAXT)
+                        side.run(
+                            half, w, core[rs], residual[rs], ref[0][rs], ref[1][rs]
+                        )
+                    for name, a, b in zip(("out", "res_out"), (out, res_out), ref):
+                        agree[oq, oh, name] = cosine(a, b)
+                torch.cuda.synchronize()
+                outs[pos, kind] = (out[pos].clone(), res_out[pos].clone())
+        moved = [
+            c
+            for c, got in outs.items()
+            if not all(map(torch.equal, got, outs[0, "rand0"]))
+        ]
+        if moved:
+            bad.append(f"oq {oq} oh {oh}: the probe changes in {moved}")
+        probes.append(outs[0, "rand0"][0])
+    bad += [
+        f"oq {oq} oh {oh}: {name} cosine against K2 {v:.6f} < {AGREE[name]}"
+        for (oq, oh, name), v in agree.items()
+        if not v >= AGREE[name]
+    ]
+    if any(errors(side.epoch).values()):
+        bad.append(f"error words {errors(side.epoch)}")
+    if bad:
+        print(f"[rank {rank}] layer_block: {bad}", flush=True)
+    same = same_on_every_rank(torch.stack(probes))
+    ok = all_ok(not bad)
+    worst = {
+        name: min(v for (*_, n), v in agree.items() if n == name) for name in AGREE
+    }
+    log(
+        f"layer_block at {WIDE} rows: probe invariance and K2 agreement (worst cosine "
+        f"{worst}): {'OK' if ok else 'FAIL'}, ranks agree {same}"
+    )
+    return ([] if ok else ["layer_block"]) + (
+        [] if same else ["layer_block: ranks differ"]
+    )
+
+
 def check_graph_replay(side, replays):
     w = k2_weights(DEV, rank, 300)
+    w_fse = k2_weights(DEV, rank, 300, fse=True)
     steps = []
     for j, s in enumerate(REPLAY_WIDTHS):
         residual = rnd(gen(DEV, 400 + j), s, HIDDEN)
         core = rnd(gen(DEV, 500 + 100 * rank + j), s, CORE)
         out = torch.empty(s, HIDDEN, dtype=BF, device=DEV)
-        steps.append((k2.K2Build(tokens=s), core, residual, out, torch.empty_like(out)))
+        key = (
+            blocks.LayerBuild(tokens=s, oq=False) if s > MAXT else k2.K2Build(tokens=s)
+        )
+        steps.append((key, core, residual, out, torch.empty_like(out)))
 
     def run_all():
         for key, core, residual, out, res_out in steps:
-            side.run(key, w, core, residual, out, res_out)
+            side.run(key, w_fse if is_wide(key) else w, core, residual, out, res_out)
 
     def outputs():
         return [t for st in steps for t in st[3:]]
@@ -237,17 +351,92 @@ def check_graph_replay(side, replays):
     )
 
 
-def check_fault():
+def _case(kinds, epoch_each=False, sync=False, late=False):
+    """Launches of the o_proj kinds ``kinds`` ("1" MXFP4, "0" bf16) at slot 0, 1, ..:
+    a new epoch before the first (before each, ``epoch_each``); ``sync``: a host
+    sync and a barrier before each later launch; ``late``: rank 3 late before it."""
+    return tuple(
+        (k == "1", i == 0 or epoch_each, i > 0 and sync, i > 0 and late)
+        for i, k in enumerate(kinds)
+    )
+
+
+STEP = "1110" * 6  # a step's o_proj kinds: three GDN (MXFP4) layers, an attention one
+CHAIN_CASES = tuple(
+    {
+        "24 launches, an epoch each": _case(STEP, epoch_each=True),
+        "o1 o0, an epoch each": _case("10", epoch_each=True),
+        "o0 o1, an epoch each": _case("01", epoch_each=True),
+        "o1 o1 in one epoch": _case("11"),
+        "o0 o0 in one epoch": _case("00"),
+        "o1 o0 in one epoch": _case("10"),
+        "o0 o1 in one epoch": _case("01"),
+        "o1 o1 in one epoch, a sync between": _case("11", sync=True),
+        "o1 o1 in one epoch, rank 3 late": _case("11", late=True),
+        "24 launches in one epoch": _case(STEP),
+    }.items()
+)
+
+
+def check_chain(n):
+    """Chain case n: layer_block launches at WIDE rows on a new peer buffer with
+    a 10 s deadline. A verify step runs one for each layer in one epoch, with no
+    host sync between them. A launch that hangs stops this process. Each launch's
+    rows must equal those of the same launch alone in its own epoch."""
+    name, case = CHAIN_CASES[n]
+    keys = {q: blocks.LayerBuild(tokens=WIDE, oq=q) for q in (False, True)}
+    if not compile_keys(keys.values()):
+        raise SystemExit("a rank failed to compile the chain keys")
+    ws = {q: k2_weights(DEV, rank, 700, fse=True, oq=q) for q in (False, True)}
+    ins = [
+        (
+            rnd(gen(DEV, 900 + 100 * rank + i), WIDE, CORE),
+            rnd(gen(DEV, 800 + i), WIDE, HIDDEN),
+        )
+        for i in range(len(case))
+    ]
+
+    def launch(side, i, q, bump):
+        out = torch.empty(WIDE, HIDDEN, dtype=BF, device=DEV)
+        res_out = torch.empty_like(out)
+        side.run(keys[q], ws[q], *ins[i], out, res_out, layer=i, bump=bump)
+        return out, res_out
+
+    side = Side(seconds=10.0)
+    outs = []
+    for i, (q, bump, sync, late) in enumerate(case):
+        if sync:
+            torch.cuda.synchronize()
+            dist.barrier()
+        if late and rank == 3:
+            torch.cuda._sleep(LATE)
+        outs.append(launch(side, i, q, bump))
+    torch.cuda.synchronize()
+    side.close()
+    dist.barrier()
+    side = Side()
+    bad = [
+        i
+        for i, (q, *_) in enumerate(case)
+        if not all(map(torch.equal, outs[i], launch(side, i, q, True)))
+    ]
+    side.close()
+    ok = all_ok(not bad)
+    log(f"chain {name}: {'OK' if ok else f'FAIL, launches {bad} differ from alone'}")
+    return [] if ok else [f"chain {name}"]
+
+
+def check_fault(build, s):
     fault = dict(fault_site=1) if rank == 3 else {}
-    key = k2.K2Build(tokens=1, stop=False, **fault)
+    key = build(tokens=s, stop=False, **fault)
     if not compile_keys([key]):
         raise SystemExit("a rank failed to compile the fault key")
-    w = k2_weights(DEV, rank, 77)
+    w = k2_weights(DEV, rank, 77, fse=is_wide(key), oq=key.oq)
     g = gen(DEV, 78)
-    core, residual = rnd(g, 1, CORE), rnd(g, 1, HIDDEN)
+    core, residual = rnd(g, s, CORE), rnd(g, s, HIDDEN)
     side = Side(seconds=0.5)
     try:
-        out = torch.empty(1, HIDDEN, dtype=BF, device=DEV)
+        out = torch.empty(s, HIDDEN, dtype=BF, device=DEV)
         t0 = time.time()
         side.run(key, w, core, residual, out, torch.empty_like(out))
         torch.cuda.synchronize()
@@ -268,23 +457,34 @@ def check_fault():
     if bad:
         print(f"[rank {rank}] fault: {bad} in {dt:.2f} s", flush=True)
     ok = all_ok(not bad)
-    log(f"fault: rank 3 stalled, returned in {dt:.2f} s: {'OK' if ok else 'FAIL'}")
-    return [] if ok else ["fault"]
+    name = f"{build.__name__} at {s} rows"
+    log(
+        f"fault ({name}): rank 3 stalled, returned in {dt:.2f} s: {'OK' if ok else 'FAIL'}"
+    )
+    return [] if ok else [f"fault ({name})"]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replays", type=int, default=200)
+    ap.add_argument("--case", type=int, help="run only chain case CASE (CHAIN_CASES)")
     args = ap.parse_args()
+    if args.case is not None:
+        fails = check_chain(args.case)
+        dist.destroy_process_group()
+        sys.exit(1 if fails else 0)
     fails = check_compile()
     side = Side()
     try:
         fails += check_batch_invariance(side)
+        fails += check_layer_block(side)
         fails += check_graph_replay(side, args.replays)
     finally:
         side.close()
     dist.barrier()
-    fails += check_fault()
+    fails += check_fault(k2.K2Build, 1)
+    dist.barrier()
+    fails += check_fault(blocks.LayerBuild, WIDE)
     for f in fails:
         log(f"FAIL {f}")
     log("PASS" if not fails else f"FAIL ({len(fails)})")
