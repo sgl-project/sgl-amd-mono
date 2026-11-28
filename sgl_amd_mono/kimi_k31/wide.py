@@ -95,8 +95,8 @@ TP, H, SL, E, NF, LAT = 8, 7168, 896, 896, 2096, 3584
 REQ_BUCKETS = (*range(2, 9), *range(10, 33, 2), *range(36, 57, 4))
 SUPPORTED_L = (6, 8)
 BUCKETS = tuple(8 * r for r in REQ_BUCKETS)
-CFGS = {  # 8-token bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; an L-token
-    # bucket of the same requests takes the same configs
+CFGS = {  # rows -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks;
+    # a bucket of b rows takes the smallest key >= b
     16: (
         "16:128:1:8:8",
         "16:128:1:8:4",
@@ -134,19 +134,42 @@ CFGS = {  # 8-token bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:w
         "128:64:2:4:1",
     ),
 }
-# bucket rows -> MoE front config, where the CFGS one is a poor fit: 17 column tiles x the row tiles x ks must stay
-# within BLOCKS (one round), and a row tile past m is wasted work
-FRONT_ROWS = {192: "64:128:2:4:4", 256: "96:128:2:4:4", 288: "96:128:2:4:4"}
-# bucket rows -> in_proj config, by the same rule (50 column tiles x row tiles x ks within BLOCKS, no padded row tile)
-INP_ROWS = {96: "96:128:2:4:4", 192: "192:128:4:2:4", 256: "128:128:2:4:2"}
-# bucket rows -> latent up / shared down configs, by the same rule (o_proj: padded rows measured no cost, kept)
-UP_ROWS = {
-    192: "96:64:2:4:8",
-    256: "128:64:4:2:8",
-    288: "96:64:2:4:4",
-    384: "96:128:2:4:8",
-}
-SDOWN_ROWS = {288: "96:128:2:4:1", 384: "192:64:4:2:1"}
+# Sorted (lo, hi, cfg) row ranges overriding CFGS where its tiles need a second BLOCKS round or pad a row tile past b;
+# every bucket fits one round, and the front and in_proj do at every row count up to max(CFGS) (unit tested)
+FRONT_ROW_RANGES = (
+    (65, 96, "96:128:2:4:8"),
+    (129, 191, "96:128:2:4:4"),
+    (192, 192, "64:128:2:4:4"),
+    (193, 288, "96:128:2:4:4"),
+)
+INP_ROW_RANGES = (
+    (65, 96, "96:128:2:4:4"),
+    (129, 192, "192:128:4:2:4"),
+    (193, 256, "128:128:2:4:2"),
+)
+UP_ROW_RANGES = (
+    (65, 96, "96:64:2:4:8"),
+    (129, 192, "96:64:2:4:8"),
+    (256, 256, "128:64:4:2:8"),
+    (257, 288, "96:64:2:4:4"),
+    (384, 384, "96:128:2:4:8"),
+)
+SDOWN_ROW_RANGES = (
+    (257, 288, "96:128:2:4:1"),
+    (384, 384, "192:64:4:2:1"),
+)
+_TUNED_ROW_KEYS = tuple(sorted(CFGS))
+
+
+def _row_override(
+    b: int, ranges: tuple[tuple[int, int, str], ...], default: str
+) -> str:
+    for lo, hi, cfg in ranges:
+        if lo <= b <= hi:
+            return cfg
+    return default
+
+
 NARROW = 8  # rows up to this run Kimi-K3's launches (the wide launch starts at 2 requests above 8 rows)
 
 
@@ -158,9 +181,6 @@ def tokens() -> int:
     if spec.speculative_algorithm is None:
         return 1
     return int(spec.speculative_num_draft_tokens or 1)
-
-
-TUNED_REQS = tuple(sorted(b // 8 for b in CFGS))
 
 
 def req_buckets() -> tuple:
@@ -177,16 +197,21 @@ def buckets(L: int = 8, *, max_rows: int | None = None) -> tuple:
     return tuple(b for b in bs if b <= top)
 
 
-def cfg_rows(b: int, L: int) -> str:
+def cfg_rows(b: int, L: int) -> tuple[str, str, str, str, str]:
+    """The tile configs of an L-token bucket of b rows."""
     assert b % L == 0 and b // L in REQ_BUCKETS, (b, L)
-    tuned = next((r for r in TUNED_REQS if r >= b // L), TUNED_REQS[-1])
-    up, inp, oproj, front, sdown = CFGS[8 * tuned]
+    return _row_cfgs(b)
+
+
+def _row_cfgs(b: int) -> tuple[str, str, str, str, str]:
+    tuned_rows = next((k for k in _TUNED_ROW_KEYS if k >= b), _TUNED_ROW_KEYS[-1])
+    up, inp, oproj, front, sdown = CFGS[tuned_rows]
     return (
-        UP_ROWS.get(b, up),
-        INP_ROWS.get(b, inp),
+        _row_override(b=b, ranges=UP_ROW_RANGES, default=up),
+        _row_override(b=b, ranges=INP_ROW_RANGES, default=inp),
         oproj,
-        FRONT_ROWS.get(b, front),
-        SDOWN_ROWS.get(b, sdown),
+        _row_override(b=b, ranges=FRONT_ROW_RANGES, default=front),
+        _row_override(b=b, ranges=SDOWN_ROW_RANGES, default=sdown),
     )
 
 
