@@ -91,18 +91,12 @@ SGLANG_READS = {
 }
 
 TP, H, SL, E, NF, LAT = 8, 7168, 896, 896, 2096, 3584
-REQ_BUCKETS = (
-    2,
-    4,
-    8,
-    16,
-    32,
-    48,
-)  # requests a bucket holds; its rows are L x requests
+# Requests a bucket holds. The launch's sort serves only a step that fills its bucket.
+REQ_BUCKETS = (*range(2, 9), *range(10, 33, 2), *range(36, 57, 4))
 SUPPORTED_L = (6, 8)
 BUCKETS = tuple(8 * r for r in REQ_BUCKETS)
-CFGS = {  # 8-token bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; an L-token
-    # bucket of the same requests takes the same configs
+CFGS = {  # rows -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; a bucket of b rows takes
+    # the smallest key >= b (the largest key past them all), then the *_ROW_RANGES overrides below
     16: (
         "16:128:1:8:8",
         "16:128:1:8:4",
@@ -140,19 +134,49 @@ CFGS = {  # 8-token bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:w
         "128:64:2:4:1",
     ),
 }
-# bucket rows -> MoE front config, where the CFGS one is a poor fit: 17 column tiles x the row tiles x ks must stay
-# within BLOCKS (one round), and a row tile past m is wasted work
-FRONT_ROWS = {192: "64:128:2:4:4", 256: "96:128:2:4:4", 288: "96:128:2:4:4"}
-# bucket rows -> in_proj config, by the same rule (50 column tiles x row tiles x ks within BLOCKS, no padded row tile)
-INP_ROWS = {96: "96:128:2:4:4", 192: "192:128:4:2:4", 256: "128:128:2:4:2"}
-# bucket rows -> latent up / shared down configs, by the same rule (o_proj: padded rows measured no cost, kept)
-UP_ROWS = {
-    192: "96:64:2:4:8",
-    256: "128:64:4:2:8",
-    288: "96:64:2:4:4",
-    384: "96:128:2:4:8",
-}
-SDOWN_ROWS = {288: "96:128:2:4:1", 384: "192:64:4:2:1"}
+# Sorted (lo, hi, cfg) row ranges overriding CFGS where its tiles need a second BLOCKS round or pad a row tile past b.
+# They keep all five tile stages in one round at every row count up to max(SUPPORTED_L) x REQ_BUCKETS[-1] (unit
+# tested): 256's up takes 448 tasks anywhere in 129 .. 256 rows and 384's up and shared down 336 in 257 .. 384, so
+# their ranges span those whole; past 384 rows all five stages would overflow without the 385 .. 448 ranges.
+FRONT_ROW_RANGES = (
+    (65, 96, "96:128:2:4:8"),
+    (129, 191, "96:128:2:4:4"),
+    (192, 192, "64:128:2:4:4"),
+    (193, 288, "96:128:2:4:4"),
+    (385, 448, "160:128:2:4:4"),
+)
+INP_ROW_RANGES = (
+    (65, 96, "96:128:2:4:4"),
+    (129, 192, "192:128:4:2:4"),
+    (193, 256, "128:128:2:4:2"),
+    (385, 448, "224:128:2:4:2"),
+)
+OPROJ_ROW_RANGES = ((385, 448, "128:128:2:4:1"),)
+UP_ROW_RANGES = (
+    (65, 96, "96:64:2:4:8"),
+    (129, 192, "96:64:2:4:8"),
+    (193, 256, "128:64:4:2:8"),
+    (257, 288, "96:64:2:4:4"),
+    (289, 384, "96:128:2:4:8"),
+    (385, 448, "128:128:2:4:8"),
+)
+SDOWN_ROW_RANGES = (
+    (257, 288, "96:128:2:4:1"),
+    (289, 384, "192:64:4:2:1"),
+    (385, 448, "128:128:2:4:1"),
+)
+_TUNED_ROW_KEYS = tuple(sorted(CFGS))
+
+
+def _row_override(
+    b: int, ranges: tuple[tuple[int, int, str], ...], default: str
+) -> str:
+    for lo, hi, cfg in ranges:
+        if lo <= b <= hi:
+            return cfg
+    return default
+
+
 NARROW = 8  # rows up to this run Kimi-K3's launches (the wide launch starts at 2 requests above 8 rows)
 
 
@@ -172,24 +196,33 @@ def req_buckets() -> tuple:
     return tuple(sorted(int(x) // 8 for x in env.split(","))) if env else REQ_BUCKETS
 
 
-def buckets(L: int = 8) -> tuple:
-    return tuple(L * r for r in req_buckets())
+def buckets(L: int = 8, *, max_rows: int | None = None) -> tuple:
+    bs = tuple(L * r for r in req_buckets())
+    if max_rows is None:
+        return bs
+    top = next((b for b in bs if b >= max_rows), bs[-1])
+    return tuple(b for b in bs if b <= top)
 
 
-def cfg_rows(b: int, L: int) -> str:
-    """The CFGS entry of an L-token bucket of b rows."""
+def cfg_rows(b: int, L: int) -> tuple[str, str, str, str, str]:
+    """The tile configs of an L-token bucket of b rows (they depend on b only)."""
     assert b % L == 0 and b // L in REQ_BUCKETS, (b, L)
-    up, inp, oproj, front, sdown = CFGS[8 * (b // L)]
+    return _row_cfgs(b)
+
+
+def _row_cfgs(b: int) -> tuple[str, str, str, str, str]:
+    tuned_rows = next((k for k in _TUNED_ROW_KEYS if k >= b), _TUNED_ROW_KEYS[-1])
+    up, inp, oproj, front, sdown = CFGS[tuned_rows]
     return (
-        UP_ROWS.get(b, up),
-        INP_ROWS.get(b, inp),
-        oproj,
-        FRONT_ROWS.get(b, front),
-        SDOWN_ROWS.get(b, sdown),
+        _row_override(b=b, ranges=UP_ROW_RANGES, default=up),
+        _row_override(b=b, ranges=INP_ROW_RANGES, default=inp),
+        _row_override(b=b, ranges=OPROJ_ROW_RANGES, default=oproj),
+        _row_override(b=b, ranges=FRONT_ROW_RANGES, default=front),
+        _row_override(b=b, ranges=SDOWN_ROW_RANGES, default=sdown),
     )
 
 
-def wide_widths(max_reqs: int = 48) -> tuple:
+def wide_widths(max_reqs: int = REQ_BUCKETS[-1]) -> tuple:
     # only widths a warmed bucket holds: a graph capture must not meet a cold one; rows
     # up to a bucket left out below the smallest one stay on SGLang's own path. The
     # server's draft tokens are not known at import: every supported L's widths (the
@@ -203,12 +236,13 @@ def wide_widths(max_reqs: int = 48) -> tuple:
         for r in range(max(2, lo + 1), top + 1)
         if L * r > NARROW
     }
-    # the binding serves a width at every L it is a multiple of: drop one another L
-    # reads as more requests than the largest bucket holds (8-token 312 .. 384 rows
-    # would be 52 .. 64 requests at 6 tokens)
+    # the binding serves a width at every L it is a multiple of;
+    # drop any width another L reads outside (lo, top] (8-token 360 rows: 60 at L = 6)
     return tuple(
         sorted(
-            w for w in widths if all(w // L <= top for L in SUPPORTED_L if w % L == 0)
+            w
+            for w in widths
+            if all(lo < w // L <= top for L in SUPPORTED_L if w % L == 0)
         )
     )
 
@@ -454,6 +488,15 @@ def _front_weight(moe, rank):
     return torch.cat([p.to(torch.bfloat16) for p in parts]).contiguous(), None
 
 
+def _capture_stream(bb) -> str:
+    # sgl-project/sglang#52503 adds dspark_aux_hidden_stream; older SGLang captures attn_res.
+    # Read it directly, and list it in SGLANG_READS, once the CI image has #52503.
+    stream = getattr(bb, "dspark_aux_hidden_stream", "attn_res")
+    if stream not in ("attn_res", "prefix"):
+        raise ValueError(f"unsupported dspark_aux_hidden_stream: {stream!r}")
+    return stream
+
+
 def _is_covered(layer) -> bool:
     from sglang.srt.models.kimi_k3 import KimiK3MoE
 
@@ -476,7 +519,7 @@ def _tail_fusable(layer) -> bool:
 
 
 class Wide:
-    def __init__(self, model, rank, group, device, L=8):
+    def __init__(self, model, rank, group, device, *, L=8, max_rows=None):
         from sgl_amd_mono.common import guard
 
         assert L in SUPPORTED_L, L
@@ -503,7 +546,8 @@ class Wide:
         self.slots = {i: n for n, i in enumerate(idx)}  # a launch's slot in the step
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
-        self.buckets = buckets(L)
+        # each bucket holds buffers and compiles a launch
+        self.buckets = buckets(L=L, max_rows=max_rows)
         self.tabs = {}  # (bucket, layer) -> KDA table: every pointer in it is fixed once built
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # long enough for a capture variant's first compile on one rank while the
@@ -548,8 +592,8 @@ class Wide:
             *(Gemm(*(int(v) for v in c.split(":"))) for c in cfg_rows(b, self.L))
         )
 
-    def _variant(self, pk, b, L, captures):
-        cap = (pk.i - 1) in captures
+    def _variant(self, pk, *, captures, capture_stream):
+        cap = capture_stream if (pk.i - 1) in captures else False
         return dict(
             nvb_a=pk.nvb,
             nvb_m=pk.nvb + int(pk.write),
@@ -559,7 +603,7 @@ class Wide:
             restart=pk.write,
         )
 
-    def _ensure(self, b, L, captures):
+    def _ensure(self, *, b, L):
         """Peer buffer and activation buffers of bucket b (collective on first use:
         every rank reaches it on the same step)."""
         if b in self.bufs:
@@ -570,12 +614,12 @@ class Wide:
         cfg = self._cfg(b)
         half, scratch = 0, 0
         for pk in self.layers.values():
-            v = self._variant(pk, b, L, captures)
-            for cap in (
-                False,
-                True,
-            ):  # sized for a capture launch too: the captured layers come later
-                pl = lay.plan(b, cfg, L, v["nvb_a"], v["nvb_m"], NF, cap)[0]
+            nvb_a, nvb_m = pk.nvb, pk.nvb + int(pk.write)
+            # sized for either capture stream too: the captured layers come later
+            for cap in (False, "attn_res", "prefix"):
+                pl = lay.plan(b, cfg, L, nvb_a=nvb_a, nvb_m=nvb_m, nf=NF, capture=cap)[
+                    0
+                ]
                 half, scratch = (
                     max(half, pl.peer_offsets[1]),
                     max(scratch, pl.scratch_bytes()),
@@ -743,13 +787,13 @@ class Wide:
         )
         n = 0
         for b in buckets or self.buckets:
-            bufs = self._ensure(b, L, set())
+            bufs = self._ensure(b=b, L=L)
             st_idx = torch.full((b // L, L), -1, dtype=torch.int32, device=dev)
             num_acc = torch.ones(b // L, dtype=torch.int32, device=dev)
             win_row = torch.full((b // L,), -1, dtype=torch.int32, device=dev)
             seen = set()
             for pk in self.layers.values():
-                v = self._variant(pk, b, L, set())
+                v = self._variant(pk, captures=set(), capture_stream="attn_res")
                 key = tuple(sorted(v.items()))
                 if key in seen:
                     continue
@@ -922,13 +966,17 @@ class Wide:
         rows = hidden.shape[0]
         L = int(fb.spec_info.draft_token_num)
         assert L == self.L and rows % L == 0, (rows, L, self.L)
+        captures = set(m.dspark_layers_to_capture or ())
+        capture_stream = _capture_stream(m) if captures else "attn_res"
         if not getattr(self, "_said", False):
             self._said = True
-            _say(f"first wide step: rows {rows}, L {L}")
+            _say(
+                f"first wide step: rows {rows}, L {L}, "
+                f"captures {sorted(captures)} ({capture_stream})"
+            )
         R = rows // L
         b = next(x for x in self.buckets if x >= rows)
-        captures = set(m.dspark_layers_to_capture or ())
-        bufs = self._ensure(b, L, captures)
+        bufs = self._ensure(b=b, L=L)
         cfg = bufs["cfg"]
         start(fb)
         zero_allocator = BumpAllocator(
@@ -994,7 +1042,7 @@ class Wide:
                 i += 1
             for n, li in enumerate(run):
                 pk = self.layers[li]
-                v = self._variant(pk, b, L, captures)
+                v = self._variant(pk, captures=captures, capture_stream=capture_stream)
                 assert v["t1"] == (n > 0 or (li - 1) in self.entry)
                 assert res.num_valid_blocks == pk.nvb, (
                     li,
