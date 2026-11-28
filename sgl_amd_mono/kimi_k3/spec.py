@@ -930,7 +930,9 @@ def _mla_build(layer, rows: int):
             shape=(mp.GATE, HIDDEN),
         )
         qb_fmt, w_qb, w_qb_s = _mla_proj_operands(
-            linear=attn.q_b_proj, name="q_b_proj", shape=(mp.QB, mp.QL)
+            linear=getattr(attn, "q_b_proj", None),
+            name="q_b_proj",
+            shape=(mp.QB, mp.QL),
         )
     except ValueError as err:
         logger.info("monokernel: no MLA front for layer %d: %s", layer_id, err)

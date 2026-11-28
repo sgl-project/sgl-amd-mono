@@ -228,6 +228,14 @@ def test_a_qweight_only_kda_projection_is_refused_with_a_reason(monkeypatch):
     )
     with pytest.raises(ValueError, match="b_proj has no weight"):
         k1_mod._validate_in_proj_operands(split)
+    # a bf16 b_proj with a bias: the packing reads its weight only
+    biased_b = SimpleNamespace(
+        weight=torch.empty(12, 7168, dtype=torch.bfloat16), bias=torch.zeros(12)
+    )
+    with pytest.raises(ValueError, match="b_proj has a bias"):
+        k1_mod._validate_in_proj_operands(
+            SimpleNamespace(**{**vars(split), "b_proj": biased_b})
+        )
 
 
 def test_k31_refuses_k3_wide_disabled(monkeypatch):

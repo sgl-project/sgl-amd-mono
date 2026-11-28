@@ -329,6 +329,8 @@ def _validate_in_proj_operands(attn) -> None:
             )
         if not isinstance(getattr(bp, "weight", None), torch.Tensor):
             raise ValueError("the KDA b_proj has no weight tensor the launch can read")
+        if getattr(bp, "bias", None) is not None:
+            raise ValueError("the KDA b_proj has a bias, which the launch does not add")
         if bp.weight.dtype == torch.bfloat16:
             if bp.weight.shape not in ((HIDDEN, kda.NH), (kda.NH, HIDDEN)):
                 raise ValueError(

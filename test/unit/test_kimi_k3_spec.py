@@ -792,6 +792,12 @@ def test_mla_build_accepts_quark_fp8_without_indexer(monkeypatch, caplog):
         for m in ("wk", "weights_proj", "wq_b"):
             assert k3._mla_build(indexed(m), 8) is None, m
     assert "biased ['wq_b']" in caplog.text
+    # an indexer-free candidate without q_b_proj falls back with the reason
+    no_qb = make_layer()
+    del no_qb.self_attn.q_b_proj
+    with caplog.at_level(logging.INFO):
+        assert k3._mla_build(no_qb, 8) is None
+    assert "q_b_proj is missing" in caplog.text
     assert "indexer layers require bf16" in caplog.text
 
 
@@ -820,8 +826,11 @@ def test_mla_pre_launch_refuses_an_indexer_layer_without_its_outputs(monkeypatch
         w_k=bf(mp.IK, HIDDEN), w_p=bf(mp.IW, HIDDEN), w_iq=bf(mp.IQ, mp.QL),
         q_nw=bf(mp.QL), kv_nw=bf(mp.KV),
     )  # fmt: skip
-    full = {n: bf(1) for n in ("q", "latent", "k_nope", "q_lora", "gate")}
-    full.update(idx_q=bf(8, mp.IQ), idx_k=bf(8, mp.IK), idx_w=bf(8, mp.IW))
+    full = dict(
+        q=bf(8, mp.QB), latent=bf(8, mp.KV + mp.ROPE), k_nope=bf(8, mp.KV),
+        q_lora=bf(8, mp.QL), gate=bf(8, mp.GATE),
+        idx_q=bf(8, mp.IQ), idx_k=bf(8, mp.IK), idx_w=bf(8, mp.IW),
+    )  # fmt: skip
     kw = dict(prefix=bf(8, HIDDEN), blocks=bf(8, 8, HIDDEN), w=w, scratch=bf(1),
               layer=3, epoch=torch.zeros(1, dtype=torch.int32))  # fmt: skip
     mp.mla_pre_launch(key, out=full, **kw)
@@ -830,7 +839,9 @@ def test_mla_pre_launch_refuses_an_indexer_layer_without_its_outputs(monkeypatch
         out = {n: t for n, t in full.items() if n != gone}
         with pytest.raises(AssertionError, match=f"lacks \\['{gone}'\\]"):
             mp.mla_pre_launch(key, out=out, **kw)
-        # an undersized buffer (one element) is refused as well
-        with pytest.raises(AssertionError, match=gone):
-            mp.mla_pre_launch(key, out={**full, gone: bf(1)}, **kw)
+        # a buffer with too few rows, or the wrong columns, is refused as well
+        cols = full[gone].shape[1]
+        for bad in (bf(7, cols), bf(8, cols + 32)):
+            with pytest.raises(AssertionError, match=gone):
+                mp.mla_pre_launch(key, out={**full, gone: bad}, **kw)
     assert len(dispatched) == 1
