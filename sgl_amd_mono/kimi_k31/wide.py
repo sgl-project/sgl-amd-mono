@@ -659,7 +659,8 @@ def _mono_pre_q_view(tree):
       None and pre is not None`` (or ``if pre is not None``), itself a statement of the
       function body.
     - Before that ``if``: only imports, a docstring, the two assignments above and names
-      set to constants. In its branch before the view: only names the head count reads.
+      set to constants. In its branch before the view: only single-name assignments of
+      head-count expressions.
       After the view: only name assignments (in ifs too), never using ``name``, whose
       calls have SGLang's callee forms (``self.indexer``, ``self.should_run_indexer``,
       ``maybe_capture_indexer_topk``, ``pre[...].unsqueeze``; a name filter on those
@@ -670,8 +671,9 @@ def _mono_pre_q_view(tree):
       What the split's outputs go through afterwards is not checked.
     - No other way to bind a name (``:=``, ``match``, lambdas, nested functions or
       classes, comprehensions, ``global`` / ``nonlocal``, ``except ... as``, ``import
-      ... as``, an import of the names above), no rebinding of ``self`` or
-      ``maybe_capture_indexer_topk``, no call by a reflective name (``setattr``,
+      ... as``, an import of the names above), no rebinding of ``self``, no parameter,
+      import or assignment named ``maybe_capture_indexer_topk`` (a name-form check), no
+      call by a reflective name (``setattr``,
       ``exec``, ``vars``, ...; aliases are not resolved), and no ``assert``, ``raise``
       or ``try``."""
     import ast
@@ -874,13 +876,13 @@ def _mono_pre_q_view(tree):
             )
         )
 
-    if any(
+    if "maybe_capture_indexer_topk" in params | imported or any(
         isinstance(n, ast.Name)
         and n.id == "maybe_capture_indexer_topk"
         and not isinstance(n.ctx, ast.Load)
         for n in ast.walk(fn)
     ):
-        return None
+        return None  # SGLang's module-level helper, not a parameter, import or local
     rest = guard.body[at + 1 :]
     if not all(plain(s) for s in rest) or any(
         (isinstance(n, ast.Name) and n.id == name)
