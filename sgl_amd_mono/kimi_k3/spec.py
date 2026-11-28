@@ -572,14 +572,15 @@ def _valid_bf16_tensor(t, shape: tuple[int, ...]) -> bool:
 
 def _head_count(node, assigned: dict, *, qrep: bool):
     """A ``pre["q"].view`` head-count expression with ``q_replicate_active = qrep``, as
-    ``(coefficient, power of self.num_local_heads, power of self.dcp_size)``; None for any
-    other form (a literal, another attribute, a name bound in a nested statement, ...)."""
+    ``(coefficient, power of self.num_local_heads, power of self.dcp_size)``. Reads int
+    literals, those two attributes, ``*``, a conditional on the bare ``q_replicate_active``
+    and names in ``assigned``; None for anything else."""
     import ast
 
     if isinstance(node, ast.Constant) and type(node.value) is int:
         return node.value, 0, 0
     if isinstance(node, ast.Name):
-        if assigned.get(node.id) is None:
+        if node.id not in assigned:
             return None
         return _head_count(assigned[node.id], {}, qrep=qrep)
     if (
@@ -603,14 +604,51 @@ def _head_count(node, assigned: dict, *, qrep: bool):
     return None
 
 
-def _mono_pre_q_views(tree) -> list[tuple]:
-    """``(head expression, names bound before it)`` for every ``pre["q"].view(rows, heads,
-    dim)`` inside an ``if`` on ``pre``. A name keeps the value of the last plain assignment
-    of it in that branch before the view's statement; a name also bound any other way there
-    (a nested statement, an augmented assignment, a walrus, ...) maps to None."""
+def _mono_pre_q_view(tree):
+    """``(head expression, plain assignments before it)`` of SGLang's ``_mono_pre`` handoff,
+    or None unless it has this one shape: a single ``pre["q"].view(rows, heads, dim)`` in the
+    function, as a simple statement directly in an ``if`` on ``pre`` that only plain name
+    assignments precede, and ``q_replicate_active`` bound once before it. Any other shape
+    reads as unsupported, and the layer keeps SGLang's own projection front."""
     import ast
 
-    views = []
+    def is_view(n) -> bool:
+        return (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "view"
+            and isinstance(n.func.value, ast.Subscript)
+            and isinstance(n.func.value.value, ast.Name)
+            and n.func.value.value.id == "pre"
+            and isinstance(n.func.value.slice, ast.Constant)
+            and n.func.value.slice.value == "q"
+            and len(n.args) == 3
+        )
+
+    views = [n for n in ast.walk(tree) if is_view(n)]
+    fn = tree.body[0] if tree.body else None
+    if len(views) != 1 or not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    # the predicate is bound once: a parameter, or one plain assignment in the function's
+    # own body before the view (SGLang computes it from is_dcp_q_replicate_phase)
+    a = fn.args
+    params = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    stores = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Name)
+        and isinstance(n.ctx, ast.Store)
+        and n.id == "q_replicate_active"
+    ]
+    if len(stores) + ("q_replicate_active" in params) != 1:
+        return None
+    if stores and not any(
+        isinstance(s, ast.Assign)
+        and s.targets == [stores[0]]
+        and s.lineno < views[0].lineno
+        for s in fn.body
+    ):
+        return None
     for node in ast.walk(tree):
         if not isinstance(node, ast.If) or "pre" not in {
             n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
@@ -618,35 +656,18 @@ def _mono_pre_q_views(tree) -> list[tuple]:
             continue
         assigned: dict = {}
         for stmt in node.body:
-            plain = set()
-            if isinstance(stmt, ast.Assign):
-                plain = {id(t) for t in stmt.targets if isinstance(t, ast.Name)}
-            other = {
-                n.id
-                for n in ast.walk(stmt)
-                if isinstance(n, ast.Name)
-                and isinstance(n.ctx, ast.Store)
-                and id(n) not in plain
-            }
-            for sub in ast.walk(stmt):
-                if (
-                    isinstance(sub, ast.Call)
-                    and isinstance(sub.func, ast.Attribute)
-                    and sub.func.attr == "view"
-                    and isinstance(sub.func.value, ast.Subscript)
-                    and isinstance(sub.func.value.value, ast.Name)
-                    and sub.func.value.value.id == "pre"
-                    and isinstance(sub.func.value.slice, ast.Constant)
-                    and sub.func.value.slice.value == "q"
-                    and len(sub.args) == 3
-                ):
-                    views.append((sub.args[1], {**assigned, **dict.fromkeys(other)}))
-            if isinstance(stmt, ast.Assign):
-                for t in stmt.targets:
-                    if isinstance(t, ast.Name):
-                        assigned[t.id] = stmt.value
-            assigned.update(dict.fromkeys(other))
-    return views
+            if isinstance(stmt, (ast.Assign, ast.Return, ast.Expr)) and any(
+                n is views[0] for n in ast.walk(stmt)
+            ):
+                return views[0].args[1], assigned
+            if not (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+            ):
+                break
+            assigned[stmt.targets[0].id] = stmt.value
+    return None
 
 
 def _sglang_mono_pre_supports_qrep(attn) -> bool:
@@ -669,11 +690,12 @@ def _sglang_mono_pre_supports_qrep(attn) -> bool:
                 isinstance(n, ast.Constant) and n.value == "_mono_pre"
                 for n in ast.walk(tree)
             ):
-                ok = any(
-                    _head_count(head, assigned, qrep=False) == (1, 1, 0)
-                    and _head_count(head, assigned, qrep=True) == (1, 1, 1)
-                    for head, assigned in _mono_pre_q_views(tree)
-                )
+                view = _mono_pre_q_view(tree)
+                if view is not None:
+                    head, assigned = view
+                    ok = _head_count(head, assigned, qrep=False) == (1, 1, 0) and (
+                        _head_count(head, assigned, qrep=True) == (1, 1, 1)
+                    )
         except (OSError, TypeError, SyntaxError):
             ok = False
     attn._k3_mono_pre_qrep_ok = ok

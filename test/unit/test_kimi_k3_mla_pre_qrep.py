@@ -305,11 +305,36 @@ def test_qrep_ast_reads_the_head_count_under_both_q_replicate_states() -> None:
             )
         return None
 
+    def _local_view_on_the_qrep_path(self, q_replicate_active=False):
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            if q_replicate_active:
+                return pre["q"].view(-1, self.num_local_heads, self.qk_head_dim)
+            return pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return None
+
+    def _rebound_predicate(self, q_replicate_active=False):
+        q_replicate_active = q_replicate_active and self.dcp_size > 8
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            return pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return None
+
     for prepare, ok in (
         (_inverted, False),
         (_reassigned_after_view, False),
         (_nested_override, False),
         (_literal, False),
+        (_local_view_on_the_qrep_path, False),
+        (_rebound_predicate, False),
         (_inline, True),
     ):
         layer = _fake_layer(prepare_fn=prepare)
