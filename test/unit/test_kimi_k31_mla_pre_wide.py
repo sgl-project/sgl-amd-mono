@@ -1064,6 +1064,38 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
             ignored = maybe_capture_indexer_topk(self, None)
         return self._split_q_nope_pe(q, None)
 
+    def _qrep_batch_varargs(self, *forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_batch_kwargs(self, **forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, None)
+
     cases = (
         (_local_view_dcp_elsewhere, (True, False)),
         (_qrep_view_inline, (True, True)),
@@ -1110,6 +1142,8 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
         (_qrep_topk_helper_import, (False, False)),
         (_qrep_topk_helper_varargs, (False, False)),
         (_qrep_topk_helper_kwargs, (False, False)),
+        (_qrep_batch_varargs, (False, False)),
+        (_qrep_batch_kwargs, (False, False)),
         (_qrep_sglang_shaped_branch, (True, True)),
     )
     wrong = {
