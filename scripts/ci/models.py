@@ -359,7 +359,12 @@ MODELS = {
         "kernel_tests": ["test/kernels/test_kimi_k31_k1_ring.py"],
         "e2e_tests": [],
         "microbench": [
-            "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --rows 16,128"
+            "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py --rows 16,128",
+            # DSpark's raw-prefix capture: must equal the gathered prefix bit for bit
+            (
+                "torchrun --nproc-per-node 8 test/kernels/kimi_k31/layer_bench.py"
+                " --rows 16,128 --nvb-a 7 --nvb-m 7 --capture prefix"
+            ),
         ],
         "evals": [],
         "concurrency": [],

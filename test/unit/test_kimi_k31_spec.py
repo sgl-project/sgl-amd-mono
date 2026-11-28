@@ -231,3 +231,24 @@ def test_the_wide_launch_refuses_a_bf16_kda_state(monkeypatch):
         assert refused()
     with envs.SGLANG_MAMBA_SSM_DTYPE.override("float32"):
         assert not refused()
+
+
+def test_wide_capture_stream_and_variant():
+    """A captured layer's wide launch writes the stream the DSpark draft asked for,
+    not always the attn_res mixture; SGLang without the field still means attn_res."""
+    assert wide._capture_stream(SimpleNamespace()) == "attn_res"
+    assert (
+        wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="prefix"))
+        == "prefix"
+    )
+    with pytest.raises(ValueError, match="unsupported dspark_aux_hidden_stream"):
+        wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="unknown"))
+
+    pk = SimpleNamespace(i=76, nvb=7, write=False, t1=True)
+    w = object.__new__(wide.Wide)
+    assert w._variant(pk, captures={75}, capture_stream="prefix")["capture"] == "prefix"
+    assert (
+        w._variant(pk, captures={75}, capture_stream="attn_res")["capture"]
+        == "attn_res"
+    )
+    assert w._variant(pk, captures={79}, capture_stream="prefix")["capture"] is False

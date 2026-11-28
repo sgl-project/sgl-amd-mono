@@ -456,6 +456,15 @@ def _front_weight(moe, rank):
     return torch.cat([p.to(torch.bfloat16) for p in parts]).contiguous(), None
 
 
+def _capture_stream(bb) -> str:
+    # sgl-project/sglang#52503 adds dspark_aux_hidden_stream; older SGLang captures attn_res.
+    # Read it directly, and list it in SGLANG_READS, once the CI image has #52503.
+    stream = getattr(bb, "dspark_aux_hidden_stream", "attn_res")
+    if stream not in ("attn_res", "prefix"):
+        raise ValueError(f"unsupported dspark_aux_hidden_stream: {stream!r}")
+    return stream
+
+
 def _is_covered(layer) -> bool:
     from sglang.srt.models.kimi_k3 import KimiK3MoE
 
@@ -551,8 +560,8 @@ class Wide:
             *(Gemm(*(int(v) for v in c.split(":"))) for c in cfg_rows(b, self.L))
         )
 
-    def _variant(self, pk, b, L, captures):
-        cap = (pk.i - 1) in captures
+    def _variant(self, pk, *, captures, capture_stream):
+        cap = capture_stream if (pk.i - 1) in captures else False
         return dict(
             nvb_a=pk.nvb,
             nvb_m=pk.nvb + int(pk.write),
@@ -562,7 +571,7 @@ class Wide:
             restart=pk.write,
         )
 
-    def _ensure(self, b, L, captures):
+    def _ensure(self, *, b, L):
         """Peer buffer and activation buffers of bucket b (collective on first use:
         every rank reaches it on the same step)."""
         if b in self.bufs:
@@ -573,12 +582,14 @@ class Wide:
         cfg = self._cfg(b)
         half, scratch = 0, 0
         for pk in self.layers.values():
-            v = self._variant(pk, b, L, captures)
+            nvb_a, nvb_m = pk.nvb, pk.nvb + int(pk.write)
             for cap in (
                 False,
                 True,
             ):  # sized for a capture launch too: the captured layers come later
-                pl = lay.plan(b, cfg, L, v["nvb_a"], v["nvb_m"], NF, cap)[0]
+                pl = lay.plan(b, cfg, L, nvb_a=nvb_a, nvb_m=nvb_m, nf=NF, capture=cap)[
+                    0
+                ]
                 half, scratch = (
                     max(half, pl.peer_offsets[1]),
                     max(scratch, pl.scratch_bytes()),
@@ -746,13 +757,13 @@ class Wide:
         )
         n = 0
         for b in buckets or self.buckets:
-            bufs = self._ensure(b, L, set())
+            bufs = self._ensure(b=b, L=L)
             st_idx = torch.full((b // L, L), -1, dtype=torch.int32, device=dev)
             num_acc = torch.ones(b // L, dtype=torch.int32, device=dev)
             win_row = torch.full((b // L,), -1, dtype=torch.int32, device=dev)
             seen = set()
             for pk in self.layers.values():
-                v = self._variant(pk, b, L, set())
+                v = self._variant(pk, captures=set(), capture_stream="attn_res")
                 key = tuple(sorted(v.items()))
                 if key in seen:
                     continue
@@ -925,13 +936,17 @@ class Wide:
         rows = hidden.shape[0]
         L = int(fb.spec_info.draft_token_num)
         assert L == self.L and rows % L == 0, (rows, L, self.L)
+        captures = set(m.dspark_layers_to_capture or ())
+        capture_stream = _capture_stream(m) if captures else "attn_res"
         if not getattr(self, "_said", False):
             self._said = True
-            _say(f"first wide step: rows {rows}, L {L}")
+            _say(
+                f"first wide step: rows {rows}, L {L}, "
+                f"captures {sorted(captures)} ({capture_stream})"
+            )
         R = rows // L
         b = next(x for x in self.buckets if x >= rows)
-        captures = set(m.dspark_layers_to_capture or ())
-        bufs = self._ensure(b, L, captures)
+        bufs = self._ensure(b=b, L=L)
         cfg = bufs["cfg"]
         start(fb)
         zero_allocator = BumpAllocator(
@@ -997,7 +1012,7 @@ class Wide:
                 i += 1
             for n, li in enumerate(run):
                 pk = self.layers[li]
-                v = self._variant(pk, b, L, captures)
+                v = self._variant(pk, captures=captures, capture_stream=capture_stream)
                 assert v["t1"] == (n > 0 or (li - 1) in self.entry)
                 assert res.num_valid_blocks == pk.nvb, (
                     li,
