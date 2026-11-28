@@ -593,48 +593,77 @@ def _pre_o_proj(layer, x, positions, fb, zero_allocator):
             get_attn_tp_context().clear_attn_inputs()
 
 
-def _mono_pre_q_heads(tree) -> list:
-    """The head-count expressions of every ``pre["q"].view(rows, heads, dim)`` inside an
-    ``if`` on ``pre``, with a head name assigned in that branch replaced by its value."""
+def _head_count(node, assigned: dict, *, qrep: bool, nlh: int, dcp: int):
+    """Evaluate a ``pre["q"].view`` head-count expression with ``q_replicate_active = qrep``,
+    ``self.num_local_heads = nlh`` and ``self.dcp_size = dcp``; None for any other form."""
     import ast
 
-    heads = []
+    if isinstance(node, ast.Constant) and type(node.value) in (int, bool):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id == "q_replicate_active":
+            return qrep
+        if node.id in assigned:
+            return _head_count(assigned[node.id], {}, qrep=qrep, nlh=nlh, dcp=dcp)
+        return None
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    ):
+        return {"num_local_heads": nlh, "dcp_size": dcp}.get(node.attr)
+    if isinstance(node, ast.IfExp):
+        test = _head_count(node.test, assigned, qrep=qrep, nlh=nlh, dcp=dcp)
+        if test is None:
+            return None
+        branch = node.body if test else node.orelse
+        return _head_count(branch, assigned, qrep=qrep, nlh=nlh, dcp=dcp)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        a = _head_count(node.left, assigned, qrep=qrep, nlh=nlh, dcp=dcp)
+        b = _head_count(node.right, assigned, qrep=qrep, nlh=nlh, dcp=dcp)
+        return None if a is None or b is None else a * b
+    return None
+
+
+def _mono_pre_q_views(tree) -> list[tuple]:
+    """``(head expression, names assigned before it)`` for every ``pre["q"].view(rows,
+    heads, dim)`` inside an ``if`` on ``pre``; only assignments in that branch that come
+    before the view's statement are kept."""
+    import ast
+
+    views = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.If) or "pre" not in {
             n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
         }:
             continue
-        assigned = {
-            tgt.id: stmt.value
-            for stmt in node.body
-            if isinstance(stmt, ast.Assign)
-            for tgt in stmt.targets
-            if isinstance(tgt, ast.Name)
-        }
-        for sub in (n for stmt in node.body for n in ast.walk(stmt)):
-            if (
-                isinstance(sub, ast.Call)
-                and isinstance(sub.func, ast.Attribute)
-                and sub.func.attr == "view"
-                and isinstance(sub.func.value, ast.Subscript)
-                and isinstance(sub.func.value.value, ast.Name)
-                and sub.func.value.value.id == "pre"
-                and isinstance(sub.func.value.slice, ast.Constant)
-                and sub.func.value.slice.value == "q"
-                and len(sub.args) == 3
-            ):
-                head = sub.args[1]
-                if isinstance(head, ast.Name) and head.id in assigned:
-                    head = assigned[head.id]
-                heads.append(head)
-    return heads
+        assigned: dict = {}
+        for stmt in node.body:
+            for sub in ast.walk(stmt):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "view"
+                    and isinstance(sub.func.value, ast.Subscript)
+                    and isinstance(sub.func.value.value, ast.Name)
+                    and sub.func.value.value.id == "pre"
+                    and isinstance(sub.func.value.slice, ast.Constant)
+                    and sub.func.value.slice.value == "q"
+                    and len(sub.args) == 3
+                ):
+                    views.append((sub.args[1], dict(assigned)))
+            if isinstance(stmt, ast.Assign):
+                for tgt in stmt.targets:
+                    if isinstance(tgt, ast.Name):
+                        assigned[tgt.id] = stmt.value
+    return views
 
 
 def _sglang_mono_pre_caps(attn) -> tuple[bool, bool]:
-    """Return ``(supports_local, supports_qrep)`` for SGLang's ``_mono_pre`` handoff
-    in ``forward_absorb_rocm_prepare``: whether it views ``pre["q"]`` at all, and whether
-    that view's head count is ``num_local_heads * dcp_size`` under DCP q-replicate
-    (sgl-project/sglang#53130), not only somewhere in the same branch."""
+    """Return ``(supports_local, supports_qrep)`` for SGLang's ``_mono_pre`` handoff in
+    ``forward_absorb_rocm_prepare``: whether it views ``pre["q"]`` with the local heads
+    without q-replicate, and whether that view takes ``num_local_heads * dcp_size`` heads
+    under it (sgl-project/sglang#53130), read from the view's head expression."""
     cached = getattr(attn, "_k31_mono_pre_caps", None)
     if cached is not None:
         return cached
@@ -651,15 +680,14 @@ def _sglang_mono_pre_caps(attn) -> tuple[bool, bool]:
                 isinstance(n, ast.Constant) and n.value == "_mono_pre"
                 for n in ast.walk(tree)
             ):
-                heads = _mono_pre_q_heads(tree)
-                local_ok = bool(heads)
-                qrep_ok = any(
-                    "dcp_size"
-                    in {n.attr for n in ast.walk(h) if isinstance(n, ast.Attribute)}
-                    and "q_replicate_active"
-                    in {n.id for n in ast.walk(h) if isinstance(n, ast.Name)}
-                    for h in heads
-                )
+                # distinct primes: a product of the two can only come from both
+                nlh, dcp = 3, 5
+                for head, assigned in _mono_pre_q_views(tree):
+                    local = _head_count(head, assigned, qrep=False, nlh=nlh, dcp=dcp)
+                    full = _head_count(head, assigned, qrep=True, nlh=nlh, dcp=dcp)
+                    if local == nlh:
+                        local_ok = True
+                        qrep_ok = qrep_ok or full == nlh * dcp
         except (OSError, TypeError, SyntaxError):
             local_ok, qrep_ok = False, False
     caps = (local_ok, qrep_ok)
