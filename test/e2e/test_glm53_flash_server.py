@@ -5,9 +5,11 @@ path, and requests join and leave a running batch that steps past 16 rows and ba
 (4 to 16 rows) on the kernels (GSM8K and the draft's accept length), and eager
 verify steps that check each request's page-table row is repeated; the tokens of
 covered steps scored again by the normal prefill path (KL consistency); each layer's launch against SGLang's own
-layer, and the tail's logits against SGLang's, under SGLANG_AMD_MONO_CHECK; the
-hidden states a covered step returns; and a fault on one rank that stops the server
-before any token of the failed step is sent."""
+layer, and the tail's logits against SGLang's, under SGLANG_AMD_MONO_CHECK; on a
+bf16 KDA state (``--mamba-ssm-dtype bfloat16``), MTP's GSM8K and accept length and
+the SGLANG_AMD_MONO_CHECK layers; the hidden states a covered step returns; and a
+fault on one rank that stops the server before any token of the failed step is
+sent."""
 
 import os
 import re
@@ -18,7 +20,7 @@ from types import SimpleNamespace
 
 import requests
 import torch
-from glm53_flash_server import ARGS, ENV, MODEL, MTP
+from glm53_flash_server import ARGS, BF16_STATE, ENV, MODEL, MTP
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
 )
@@ -159,64 +161,87 @@ class TestMonokernelMtpEager(CustomTestCase):
         self.assertTrue(len(verify) == 4 and min(verify) > 0, verify)
 
 
+def _check_numerics(test, extra_args=()):
+    # SGLANG_AMD_MONO_CHECK (eager) runs the normal layer next to each layer's
+    # launch, and SGLang's final norm and logits next to the tail; 1, 3, 8, 11
+    # and 16 rows run at widths 2, 4, 8, 12 and 16 (pad rows at 1, 3 and 11),
+    # and the long prompt's positions pass 2048, where the sparse attention
+    # selects keys
+    para = "The river valley archive lists the flood height of every year. "
+    with (
+        tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
+        tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
+    ):
+        process = _launch(
+            extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
+            extra_args=[
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
+                *extra_args,
+            ],
+            log=(out, err),
+        )
+        try:
+            for n, repeats in ((1, 2), (3, 2), (8, 2), (11, 2), (16, 2), (1, 200)):
+                r = requests.post(
+                    DEFAULT_URL_FOR_TEST + "/generate",
+                    json={
+                        "text": [f"Record {i}. " + para * repeats for i in range(n)],
+                        "sampling_params": {"max_new_tokens": 4, "temperature": 0},
+                    },
+                    timeout=600,
+                )
+                r.raise_for_status()
+        finally:
+            terminate_and_kill_process_tree(process)
+        err.seek(0)
+        out.seek(0)
+        log = err.read() + out.read()
+    checks = re.findall(
+        r"monokernel check layer \d+ \((kda|dsa|dense), (\d+) rows, positions "
+        r"\d+\.\.(\d+)\): (.*)",
+        log,
+    )
+    values = {}
+    for _, _, _, fields in checks:
+        for name, v in re.findall(r"(\S+)=(\S+)", fields):
+            values.setdefault(name, []).append(float(v))
+    for name, vs in sorted(values.items()):
+        print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
+    seen = {(kind, int(rows)) for kind, rows, _, _ in checks}
+    covered = (1, 3, 8, 11, 16)
+    want = {(kind, rows) for kind in ("kda", "dsa", "dense") for rows in covered}
+    test.assertTrue(want <= seen, seen)
+    tails = re.findall(r"monokernel check tail \((\d+) rows\): (.*)", log)
+    test.assertEqual({int(rows) for rows, _ in tails} & set(covered), set(covered))
+    test.assertTrue(any(k == "dsa" and int(hi) >= 2048 for k, _, hi, _ in checks))
+    violations = re.findall(r"monokernel check violation: .*", log)
+    test.assertEqual(violations, [], "\n".join(violations[:20]))
+
+
 class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
-        # SGLANG_AMD_MONO_CHECK (eager) runs the normal layer next to each layer's
-        # launch, and SGLang's final norm and logits next to the tail; 1, 3, 8, 11
-        # and 16 rows run at widths 2, 4, 8, 12 and 16 (pad rows at 1, 3 and 11),
-        # and the long prompt's positions pass 2048, where the sparse attention
-        # selects keys
-        para = "The river valley archive lists the flood height of every year. "
-        with (
-            tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
-            tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
-        ):
-            process = _launch(
-                extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
-                extra_args=[
-                    "--disable-decode-cuda-graph",
-                    "--disable-prefill-cuda-graph",
-                ],
-                log=(out, err),
-            )
-            try:
-                for n, repeats in ((1, 2), (3, 2), (8, 2), (11, 2), (16, 2), (1, 200)):
-                    r = requests.post(
-                        DEFAULT_URL_FOR_TEST + "/generate",
-                        json={
-                            "text": [
-                                f"Record {i}. " + para * repeats for i in range(n)
-                            ],
-                            "sampling_params": {"max_new_tokens": 4, "temperature": 0},
-                        },
-                        timeout=600,
-                    )
-                    r.raise_for_status()
-            finally:
-                terminate_and_kill_process_tree(process)
-            err.seek(0)
-            out.seek(0)
-            log = err.read() + out.read()
-        checks = re.findall(
-            r"monokernel check layer \d+ \((kda|dsa|dense), (\d+) rows, positions "
-            r"\d+\.\.(\d+)\): (.*)",
-            log,
-        )
-        values = {}
-        for _, _, _, fields in checks:
-            for name, v in re.findall(r"(\S+)=(\S+)", fields):
-                values.setdefault(name, []).append(float(v))
-        for name, vs in sorted(values.items()):
-            print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
-        seen = {(kind, int(rows)) for kind, rows, _, _ in checks}
-        covered = (1, 3, 8, 11, 16)
-        want = {(kind, rows) for kind in ("kda", "dsa", "dense") for rows in covered}
-        self.assertTrue(want <= seen, seen)
-        tails = re.findall(r"monokernel check tail \((\d+) rows\): (.*)", log)
-        self.assertEqual({int(rows) for rows, _ in tails} & set(covered), set(covered))
-        self.assertTrue(any(k == "dsa" and int(hi) >= 2048 for k, _, hi, _ in checks))
-        violations = re.findall(r"monokernel check violation: .*", log)
-        self.assertEqual(violations, [], "\n".join(violations[:20]))
+        _check_numerics(self)
+
+
+class TestMonokernelBf16State(CustomTestCase):
+    # --mamba-ssm-dtype bfloat16: the KDA launches load and store a bf16 state
+    def test_gsm8k_and_accept_length_on_the_kernels(self):
+        # MTP, 4 requests at a time: every verify step runs the kernels, which write
+        # the verify scratch in bf16
+        process = _launch(extra_args=[*MTP, *BF16_STATE, "--watchdog-timeout", "1200"])
+        try:
+            metrics = _gsm8k(threads=4)
+            info = requests.get(DEFAULT_URL_FOR_TEST + "/get_server_info").json()
+        finally:
+            terminate_and_kill_process_tree(process)
+        accept = info["internal_states"][0]["avg_spec_accept_length"]
+        print(f"{metrics=} {accept=}")
+        self.assertGreater(metrics["score"], GSM8K_BOUND)
+        self.assertGreater(accept, MTP_ACCEPT_BOUND)
+
+    def test_each_covered_layer_within_its_numerics(self):
+        _check_numerics(self, BF16_STATE)
 
 
 def _lm_head() -> torch.Tensor:

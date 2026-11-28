@@ -16,12 +16,12 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | --- | --- | --- | --- |
 | DeepSeek-V4.1-Flash | MI350X, MI355X (gfx950) | 2, 4 | All 40 layers in decode and DSpark verify steps of up to 48 rows, and the DSpark draft stages |
 | DeepSeek-V4-Pro | MI355X (gfx950) | 8 | All 61 layers (one launch each) in decode steps of up to 8 rows, and DSpark verify steps of one request (5 to 8 tokens) |
-| GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | All 45 layers (one launch each; layer 0 from the tokens, with the embedding) and the final norm, LM head and logits (one launch), in decode steps of up to 8 rows (4 at TP2) |
+| GLM-5.3-Flash | MI355X (gfx950) | 2, 4, 8 | All 45 layers (one launch each; layer 0 from the tokens, with the embedding) and the final norm, LM head and logits (one launch), in decode and MTP verify steps of up to 16 rows (4 at TP2), on an f32 or bf16 KDA state (`--mamba-ssm-dtype bfloat16`) |
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows |
 | GLM-5.2 (MXFP4 experts) | MI355X (gfx950) | 4, 8 | As GLM-5.3; the routed experts in MXFP4, on MXFP8 activations |
 | GLM-5.3 (MXFP4) | MI355X (gfx950) | 4, 8 | As GLM-5.3 |
-| Kimi-K3 | MI350X, MI355X (gfx950) | 8 | Every MoE layer in decode and DSpark verify steps of up to 8 rows |
-| Kimi-K3.1 | MI350X, MI355X (gfx950) | 8 | Kimi-K3's launches on every MoE layer in DSpark and DFLASH verify steps of one request (the MLA layers' projection front too, at DCP1 and at DCP8 with replicated Q), and one launch a KDA layer in verify steps of 2 to 48 requests |
+| Kimi-K3 | MI350X, MI355X (gfx950) | 8 | Every MoE layer in narrow steps (<= 8 rows) and wide DSpark verify steps (2 to 60 requests at L in {5, 6, 8}), bf16 or Quark FP8 attention, 68 KDA + 24 MLA `dsa_post`, DCP1/DCP8, HiCache only as KV offload; a server whose steps pass 8 rows without a supported draft length (e.g. plain decode) needs `SGLANG_AMD_MONO_K3_WIDE=0` (narrow only) |
+| Kimi-K3.1 | MI350X, MI355X (gfx950) | 8 | Kimi-K3's launches on every MoE layer in DSpark and DFLASH verify steps of one request (the MLA layers' projection front too, at DCP1 and at DCP8 with replicated Q); in verify steps of 2 to 60 requests of 5, 6 or 8 draft tokens, one launch a KDA layer and eligible DSA-layer fusions (bf16 or Quark FP8 o_proj), with or without HiCache (with `SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT` off); sparse attention and DCP combine stay on SGLang; `SGLANG_AMD_MONO_K3_WIDE=0` turns the Kimi-K3.1 spec off |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
 | Qwen3.5-397B-A17B-FP8 | MI355X (gfx950) | 4, 8 (MTP verify: 4) | Decode steps of up to 8 rows, and EAGLE/MTP target-verify steps of up to 8 requests x 4 draft tokens: every layer's norms, FP8 quants and dense projections, and the 45 GDN layers' conv and gated delta (two launches a GDN layer in decode, three in verify). Attention, the MoE and the MTP draft run SGLang's kernels. See [its README](sgl_amd_mono/qwen35_a17b/README.md) |
@@ -45,6 +45,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 - AMD Instinct MI350X or MI355X
 - MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--enable-amd-monokernel` refuses MiniMax-M3 and names them.
 - MiniMax-M3.1-Flash needs SGLang's MiniMax-M3.1-Flash support ([sgl-project/sglang#45925](https://github.com/sgl-project/sglang/pull/45925)) and its gfx950 path ([#45936](https://github.com/sgl-project/sglang/pull/45936)).
+- GLM-5.3-Flash on a bf16 KDA state (`--mamba-ssm-dtype bfloat16`): SGLang's gfx950 HIP prefill and row-streaming decode take a bf16 state with [sgl-project/sglang#49036](https://github.com/sgl-project/sglang/pull/49036) (on [#44659](https://github.com/sgl-project/sglang/pull/44659)). Without them, SGLang's prefill and its decode steps the kernels do not cover run its Triton kernels.
 - Qwen3.8-2.4T runs the fused shared expert (`--enforce-shared-experts-fusion`) in MXFP4 with [sgl-project/sglang#41899](https://github.com/sgl-project/sglang/pull/41899), and the MXFP4 GDN projections of [sgl-project/sglang#43839](https://github.com/sgl-project/sglang/pull/43839).
 
 ### Installation
@@ -125,6 +126,18 @@ SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 python -m sglang.launch_server \
 The narrow MLA projection front supports DCP1 and DCP8 replicated-Q verify
 when SGLang supplies the full-head `_mono_pre` handoff. Unsupported handoffs
 fall back to SGLang without changing collective participation.
+
+Kimi-K3.1's wide DSA projection-front and post-attention fusions are enabled
+when their shape and model contracts are supported. These plugin-owned controls
+are available for A/B checks:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `SGLANG_AMD_MONO_K31_WIDE_DSA_POST` | `1` | Set `0` to use SGLang's post-attention path (also turns off the wide MLA projection front, which runs only in a `dsa_post` layer) |
+| `SGLANG_AMD_MONO_K31_WIDE_MLA_PRE` | `1` | Set `0` to use SGLang's projection front |
+| `SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS` | `32` | Maximum eligible rows, constrained to `1` through `64` |
+
+Replicated-Q projections require SGLang's full-head `_mono_pre` handoff.
 
 Kimi-K3.1, with DFLASH (the launches read and write the ReplaySSM ring):
 
@@ -330,7 +343,8 @@ pytest test/kernels -k qwen35_a17b_fp8                          # 1 x MI355X, no
 pytest test/e2e -k qwen35_a17b_fp8                              # MI355X, QWEN35_FP8_MODEL_PATH set; QWEN35_FP8_TP=4 (default) or 8 for decode, MTP at TP4
 pytest test/kernels test/e2e -k qwen38_a95b_mxfp4               # 8 x MI355X, QWEN38_A95B_MXFP4_MODEL_PATH set: K1 on 1 GPU, K2 on 8, server at TP8
 pytest test/kernels test/e2e -k qwen38_flash_next               # 1 x MI355X, QWEN38_FLASH_NEXT_MODEL_PATH set (the kernel test needs no checkpoint)
-pytest test/kernels test/e2e -k kimi_k3                         # 8 x MI350X or MI355X, KIMI_K3_MODEL_PATH and KIMI_K3_DSPARK_MODEL_PATH set
+pytest test/kernels test/e2e -k "kimi_k3 and not quark"       # 8 x MI350X or MI355X, KIMI_K3_MODEL_PATH and KIMI_K3_DSPARK_MODEL_PATH set
+pytest test/e2e -k kimi_k3_quark                                # 8 x MI355X, KIMI_K3_QUARK_MODEL_PATH and KIMI_K3_DSPARK_MODEL_PATH set; needs sgl-project/sglang#44362 for K1
 ```
 
 Kernel-only time of a DeepSeek-V4.1-Flash layer: `torchrun --nproc-per-node 4 test/kernels/deepseek_v41/time_layer.py --widths 6,12`.

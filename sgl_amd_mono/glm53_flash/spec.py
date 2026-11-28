@@ -256,8 +256,16 @@ def _dense(config, i: int) -> bool:
     return i < _text(config).first_k_dense_replace
 
 
-def _config_disable_reasons(cfg, hf_config) -> list[str]:
+def _state_dtypes():
+    """The KDA state pool's dtypes. GLM-5.3-Flash's cache params name no dtype, so
+    SGLang allocates the pool with ``mamba2_state_dtype(None)``: ``--mamba-ssm-dtype``,
+    never a ``mamba_ssm_dtype`` in the checkpoint's config."""
     from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+
+    return mamba2_state_dtype(None)
+
+
+def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sglang.srt.layers.attention.dsa.utils import (
         aiter_can_use_preshuffle_paged_mqa,
     )
@@ -274,10 +282,12 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         for key, want in LINEAR_ATTN_CONFIG.items()
         if linear.get(key) != want
     ]
-    dtypes = mamba2_state_dtype(hf_config)
-    if dtypes.temporal != torch.float32 or dtypes.conv != torch.bfloat16:
+    dtypes = _state_dtypes()
+    if dtypes.temporal not in (torch.float32, torch.bfloat16) or (
+        dtypes.conv != torch.bfloat16
+    ):
         reasons.append(
-            f"needs the KDA state in f32 and its conv state in bf16, got "
+            f"needs the KDA state in f32 or bf16 and its conv state in bf16, got "
             f"{dtypes.temporal} and {dtypes.conv}"
         )
     if cfg.page_size not in (None, PAGE_SIZE):
@@ -679,7 +689,7 @@ class _Built:
             conv.dtype == torch.bfloat16
             and tuple(conv.shape[1:]) == (3, P3)
             and conv.stride()[1:] == (P3, 1)
-            and rec.dtype == torch.float32
+            and rec.dtype in (torch.float32, torch.bfloat16)
             and tuple(rec.shape[1:]) == (H, D, D)
             and rec.stride()[1:] == (D * D, D, 1)
             and conv.shape[0] == rec.shape[0]
@@ -688,11 +698,11 @@ class _Built:
                 f"GLM-5.3-Flash monokernel: layer {L.i}: KDA state conv "
                 f"{conv.dtype} {tuple(conv.shape)} {conv.stride()}, recurrent "
                 f"{rec.dtype} {tuple(rec.shape)} {rec.stride()}; needs bf16 "
-                f"[slots, 3, {P3}] and f32 [slots, {H}, {D}, {D}]"
+                f"[slots, 3, {P3}] and f32 or bf16 [slots, {H}, {D}, {D}]"
             )
         if verify > 1 and not (
             ir is not None
-            and ir.dtype == torch.float32
+            and ir.dtype == rec.dtype
             and tuple(ir.shape[1:]) == (verify, H, D, D)
             and ir.stride()[1:] == (H * D * D, D * D, D, 1)
             and ic.dtype == torch.bfloat16
@@ -702,8 +712,8 @@ class _Built:
             raise RuntimeError(
                 f"GLM-5.3-Flash monokernel: layer {L.i}: KDA verify scratch "
                 f"{None if ir is None else (ir.dtype, tuple(ir.shape), ir.stride())}, "
-                f"conv window {ic.dtype} {tuple(ic.shape)} {ic.stride()}; needs f32 "
-                f"[rows, {verify}, {H}, {D}, {D}] and dense bf16 "
+                f"conv window {ic.dtype} {tuple(ic.shape)} {ic.stride()}; needs "
+                f"{rec.dtype} [rows, {verify}, {H}, {D}, {D}] and dense bf16 "
                 f"[rows, {verify}, 3, {P3}]"
             )
         L.state = FlashKdaState(
@@ -875,6 +885,7 @@ def _build(model, hf_config, ctx) -> _Built:
         if sp.speculative_algorithm is not None
         else 1
     )
+    state_bf16 = _state_dtypes().temporal == torch.bfloat16
     runtimes, heads = {}, {}
     cap = TP_MAX_ROWS.get(tp, max(WIDTHS))
     widths = sorted({_width(r) for r in ctx.widths if r <= cap})
@@ -903,6 +914,7 @@ def _build(model, hf_config, ctx) -> _Built:
                 launches_per_step=len(ids),
                 inter=inter,
                 kda=kind != "dsa",
+                state_bf16=state_bf16 and kind != "dsa",
                 dsa=kind == "dsa",
                 max_pools=max_pools if kind == "dsa" else 0,
                 qkv_fp8=qkv8,

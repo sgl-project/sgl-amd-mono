@@ -102,6 +102,7 @@ from sgl_amd_mono.common.sync import (
     sreg,
 )
 from sgl_amd_mono.kimi_k3.gfx950.stages import gemv as gemv
+from sgl_amd_mono.kimi_k3.gfx950.stages.dims import BETA, LBETA
 from sgl_amd_mono.kimi_k3.gfx950.stamps import (
     stamp,
     stamp_begin,
@@ -139,7 +140,6 @@ RI = 384  # routed intermediate a rank
 SI = 768  # shared intermediate a rank
 ROWS = 16
 LOG2E = 1.0 / math.log(2.0)
-BETA, LBETA = 4.0, 25.0
 
 R_GROUPS = E // TP // ROWS  # 7 router row groups a rank
 R_PARTS = 4  # K quarters: the router is on the path to the route

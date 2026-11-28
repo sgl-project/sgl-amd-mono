@@ -90,6 +90,11 @@ KDA_PTRS = (
     "core_out",
     "conv_win",
     "win_row",
+    "w_ip_scale",
+    "w_ip_fab",
+    "w_o_scale",
+    "rstate0",
+    "init_slot",
 )
 KDA_INTS = (
     "cs_seq",
@@ -105,6 +110,7 @@ KDA_INTS = (
     "cw_seq",
     "cw_tok",
     "cw_q",
+    "rs0_seq",
 )
 
 
@@ -124,6 +130,11 @@ def kda_table(
     conv_win,
     win_row,
     ring=None,
+    w_ip_scale=None,
+    w_ip_fab=None,
+    w_o_scale=None,
+    rstate0=None,
+    init_slot=None,
 ):
     """The KDA stage's arguments (Kimi-K3's K1 layouts and strides), packed for the
     launch's ``kda_tab``.
@@ -158,6 +169,11 @@ def kda_table(
         core_out=core_out,
         conv_win=conv_win,
         win_row=win_row,
+        w_ip_scale=w_ip_scale,
+        w_ip_fab=w_ip_fab,
+        w_o_scale=w_o_scale,
+        rstate0=rstate0,
+        init_slot=init_slot,
     )
     ints = dict(
         cs_seq=conv_state.stride(0),
@@ -173,6 +189,7 @@ def kda_table(
         cw_seq=conv_win.stride(0),
         cw_tok=conv_win.stride(1),
         cw_q=conv_win.stride(2),
+        rs0_seq=rstate0.stride(0) if rstate0 is not None else 0,
     )
     vals = [0 if ptrs[k] is None else ptrs[k].data_ptr() for k in KDA_PTRS] + [
         ints[k] for k in KDA_INTS
@@ -533,11 +550,14 @@ def _seam(
                     cache_modifier=CM_SYS,
                 )
 
+    cap_mode = "attn_res" if capture is True else (capture or None)
+    assert cap_mode in (None, "attn_res", "prefix"), capture
     emit_mixed = None
-    if const_expr(capture):
+    emit_prefix = None
+    if const_expr(cap_mode is not None):
         caps = [c["cap_of"](p) for p in range(TP)]
 
-        def emit_mixed(q, live, vec):
+        def _emit_cap(q, live, vec):
             if live:
                 for p in range_constexpr(TP):
                     bo.buffer_store(
@@ -546,6 +566,11 @@ def _seam(
                         (row * H + rank * SL + 8 * q) // 2,
                         cache_modifier=CM_SYS,
                     )
+
+        if const_expr(cap_mode == "prefix"):
+            emit_prefix = _emit_cap
+        else:
+            emit_mixed = _emit_cap
 
     attnres_row(
         c,
@@ -565,19 +590,20 @@ def _seam(
         write,
         0,
         emit_mixed,
+        emit_prefix=emit_prefix,
     )
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     coll.put_each_peer(
         c,
         [("agf", rank * m + row, fx.Int32(1))]
-        + ([("capf", rank * m + row, fx.Int32(1))] if capture else []),
+        + ([("capf", rank * m + row, fx.Int32(1))] if cap_mode is not None else []),
     )
 
 
 @flyc.jit
 def capture_row(c, row, m, cap_out, cap_ld):
-    """The row's gathered pre-norm mixture -> the DSpark capture slot (row stride
+    """The row's gathered capture (pre-norm mixture or raw prefix) -> the DSpark slot (row stride
     ``cap_ld`` elements, e.g. a column block of the packed aux buffer)."""
     tid = c["tid"]
     if tid < TP:

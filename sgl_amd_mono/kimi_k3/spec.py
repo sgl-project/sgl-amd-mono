@@ -26,9 +26,12 @@ the full-attention layers reach that point the same way. At TP8 both stop at a
 kind.
 
 The kernels read SGLang's weights in place. The dense weights are read as bf16
-in their checkpoint layout. The experts are read in whichever MXFP4 layout
-``Mxfp4MoEMethod`` left behind. There is no prepared-weight copy, so the KV
-cache budget pays nothing.
+in their checkpoint layout. o_proj may instead be a Quark per-channel FP8
+weight, read as SGLang stored it for its FP8 GEMM (``_o_proj_operands``). The
+experts are read in whichever MXFP4 layout AITER's MoE was given: gate / up
+interleaved (A8W4, the A16W4 default) or separated (``AITER_SITUV2_A4W4``),
+whose preshuffle is byte for byte the one the launch was written for. There is
+no prepared-weight copy, so the KV cache budget pays nothing.
 
 Two further differences from DeepSeek-V4.1 are deliberate. Each is argued in
 the module that holds it. The mailbox epoch is bumped by the host, not advanced
@@ -88,6 +91,9 @@ K2_OPT = os.environ.get("SGLANG_AMD_MONO_K3_K2_OPT")
 MLA_PRE = os.environ.get("SGLANG_AMD_MONO_K3_MLA_PRE", "1") == "1"
 # SGLANG_AMD_MONO_K3_K1=0 builds no K1: every KDA layer keeps SGLang's attention.
 K1 = os.environ.get("SGLANG_AMD_MONO_K3_K1", "1") == "1"
+# SGLANG_AMD_MONO_K3_WIDE=0 keeps only the <=8-row narrow launches.
+WIDE = os.environ.get("SGLANG_AMD_MONO_K3_WIDE", "1") == "1"
+DCP_SIZES = (1, 8)
 
 # The SGLang names this glue reads, by file under the sglang package (``f(p)``:
 # a parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
@@ -101,8 +107,35 @@ SGLANG_READS = {
         "NumericsKind",
         "Requirements",
     ),
-    # the MXFP4 expert layout the launch reads, as Mxfp4MoEMethod chose it
+    # the MXFP4 expert layout the launch reads, as AITER's MoE was given it
     "srt/layers/quantization/mxfp4.py": ("_aiter_situ_uses_gu_interleaved_weights",),
+    # the K3 AITER switch the expert layout depends on (its renamed Envs field is
+    # optional: SGLANG_AITER_K3_OPT is read where it does not exist yet) and the
+    # host-only Mamba checkpoint switch (required)
+    "srt/environ.py": ("envs", "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT"),
+    # the SiTU parameters K2 hard-codes
+    "srt/configs/kimi_linear.py": (
+        "activation_situ_beta",
+        "activation_situ_linear_beta",
+    ),
+    # a Quark per-channel FP8 projection, and whether SGLang preshuffled it; scheme is
+    # set on every Quark linear, and a non-Quark linear has none (a guarded read)
+    "srt/layers/quantization/quark/quark.py": ("scheme",),
+    "srt/layers/quantization/quark/schemes/quark_w8a8_fp8.py": (
+        "QuarkW8A8Fp8",
+        "weight_qscheme",
+        "is_static_input_scheme",
+        "weight_scale",
+    ),
+    "srt/layers/quantization/fp8_utils.py": (
+        "use_aiter_bpreshuffle_gemm",
+        "use_aiter_bpreshuffle_gemm(output_size)",
+    ),
+    # o_proj's bias, which the launch has no term for
+    "srt/layers/linear.py": ("bias",),
+    # the experts' activation, which the launch computes as SiTU
+    "srt/layers/moe/fused_moe_triton/layer.py": ("moe_runner_config",),
+    "srt/layers/moe/moe_runner/base.py": ("activation",),
     "srt/utils/common.py": (
         "BumpAllocator",
         "get_bool_env_var",
@@ -122,8 +155,34 @@ SGLANG_READS = {
         "start",
         "written_residual",
     ),
-    "srt/runtime_context.py": ("get_parallel", '"dcp_enabled"'),
-    "srt/arg_groups/fields/parallel.py": ("dcp_replicate_q_proj",),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        "get_exec",
+        "get_spec",
+        "get_schedule",
+        '"dcp_enabled"',
+    ),
+    "srt/arg_groups/fields/exec_.py": (
+        "cuda_graph_max_bs_decode",
+        "enable_linear_replayssm_spec",
+    ),
+    "srt/arg_groups/fields/schedule.py": ("max_running_requests",),
+    "srt/arg_groups/fields/spec.py": (
+        "speculative_algorithm",
+        "speculative_num_draft_tokens",
+    ),
+    "srt/arg_groups/fields/parallel.py": (
+        "dcp_size",
+        "attn_cp_size",
+        "enable_prefill_cp",
+        "dcp_replicate_q_proj",
+    ),
+    # the KV offload paths Feature.KV_OFFLOAD admits besides HiCache
+    "srt/arg_groups/fields/*.py": (
+        "enable_lmcache",
+        "enable_flexkv",
+        "disaggregation_decode_enable_offload_kvcache",
+    ),
     "srt/models/deepseek_v2.py": (
         "q_b_proj_qrep_weight",
         "w_kc_qrep",
@@ -185,15 +244,23 @@ def _covered_layers(hf_config) -> list[int]:
     return [i for i in range(dense, int(t.num_hidden_layers)) if i % freq == 0]
 
 
-def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    """What ``SPEC.requires`` cannot state: the shapes, which live on the text
-    config and so are out of ``requires.hf_config``'s reach; aiter's own flags;
-    and FlyDSL."""
-    from sglang.srt.layers.quantization.mxfp4 import (
-        _aiter_situ_uses_gu_interleaved_weights,
-    )
+# SGLang's Kimi-K3 AITER switch, which keeps the experts at their native
+# 384-wide intermediate; an SGLang without the Envs field reads the old name.
+def _k3_aiter_opt() -> bool:
+    from sglang.srt.environ import envs
+
+    field = getattr(envs, "SGLANG_OPT_HIP_K3_AITER", None)
+    if field is not None:
+        return bool(field.get())
     from sglang.srt.utils.common import get_bool_env_var
 
+    return get_bool_env_var("SGLANG_AITER_K3_OPT")
+
+
+def _config_disable_reasons(cfg, hf_config) -> list[str]:
+    """What ``SPEC.requires`` cannot state: the shapes, which live on the text
+    config and so are out of ``requires.hf_config``'s reach; SGLang's K3 AITER
+    switch; and FlyDSL."""
     t = _text_config(hf_config)
     linear = _linear_attn_config(hf_config)
     reasons = [
@@ -219,16 +286,181 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
                 f"attn_res_block_size {block} gives layer {last} {blocks} "
                 f"attention-residual blocks, the launch is built for {MAX_BLOCKS}"
             )
-    if not _aiter_situ_uses_gu_interleaved_weights():
+    if not _k3_aiter_opt():
         reasons.append(
-            "needs the MXFP4 experts in aiter's gate / up interleaved layout; "
-            "set AITER_SITUV2_A8W4=1 or leave AITER_SITUV2_A4W4 unset"
+            "needs SGLANG_OPT_HIP_K3_AITER=1 (SGLANG_AITER_K3_OPT=1 before the "
+            "rename): without it the experts are padded past their native "
+            "384-wide intermediate"
         )
-    if not get_bool_env_var("SGLANG_AITER_K3_OPT"):
-        reasons.append("needs SGLANG_AITER_K3_OPT=1")
+    # K2 computes SiTU with fixed (beta, linear_beta); SGLang reads them from the config
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import BETA, LBETA
+
+    situ = (t.activation_situ_beta, t.activation_situ_linear_beta)
+    if situ != (BETA, LBETA):
+        reasons.append(
+            f"SiTU (beta, linear_beta) is {situ}; the launch computes ({BETA}, {LBETA})"
+        )
+    if cfg is not None:
+        reasons += _offload_disable_reasons(cfg)
+        dcp = cfg.dcp_size or 1
+        if dcp not in DCP_SIZES:
+            reasons.append(f"--dcp-size {dcp} is not one of {list(DCP_SIZES)}")
+        if (cfg.attn_cp_size or 1) > 1 or cfg.enable_prefill_cp:
+            reasons.append(
+                "attention context parallel is on; only --dcp-size is accepted"
+            )
+    if WIDE and cfg is not None:
+        from sgl_amd_mono.kimi_k31 import wide
+
+        tokens, wide_runs = _wide_step_shape(
+            cfg.speculative_algorithm,
+            cfg.speculative_num_draft_tokens,
+            cfg.cuda_graph_max_bs_decode,
+            cfg.max_running_requests,
+        )
+        if wide_runs and tokens not in wide.SUPPORTED_L:
+            reasons.append(
+                f"wide launch requires --speculative-num-draft-tokens in "
+                f"{list(wide.SUPPORTED_L)} (got {tokens}); set SGLANG_AMD_MONO_K3_WIDE=0 "
+                "for narrow-only <=8-row serving"
+            )
+        if wide_runs and cfg.enable_linear_replayssm_spec and _host_only_mamba():
+            reasons.append(HOST_ONLY_RING_REASON)
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
+
+
+# A Quark per-channel FP8 linear -> (in AITER's (16, 16) preshuffle, the [out, in]
+# storage, its fp32 row scale); raises ValueError naming the misfit.
+def _quark_fp8_storage(linear, name: str):
+    from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    scheme = getattr(linear, "scheme", None)
+    if not (
+        isinstance(scheme, QuarkW8A8Fp8) and scheme.weight_qscheme == "per_channel"
+    ):
+        raise ValueError(f"an FP8 {name} is read only as Quark per-channel FP8")
+    if getattr(linear, "bias", None) is not None:
+        raise ValueError(f"the FP8 {name} has a bias, which the launch does not add")
+    # The launch multiplies the bf16 activation and applies only the weight scale;
+    # a static input scale would be clipped and rounded by SGLang and not by it.
+    if scheme.is_static_input_scheme:
+        raise ValueError(f"the FP8 {name} quantizes its input statically")
+    if linear.weight.dim() != 2:
+        raise ValueError(f"the FP8 {name} weight is not 2-D")
+    # SGLang stores the weight transposed for its FP8 GEMM
+    storage = linear.weight.t()
+    if storage.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"the FP8 {name} is {storage.dtype}, not E4M3 (float8_e4m3fn)")
+    if not storage.is_contiguous():
+        raise ValueError(f"the FP8 {name} is not SGLang's transposed contiguous weight")
+    rows = storage.shape[0]
+    scale = linear.weight_scale
+    if not (
+        isinstance(scale, torch.Tensor)
+        and scale.dtype == torch.float32
+        and scale.numel() == rows
+        and scale.is_contiguous()
+    ):
+        raise ValueError(
+            f"the FP8 {name} has no fp32 scale for each of its {rows} rows"
+        )
+    # preshuffled exactly when SGLang's own GEMM chose that at load
+    return use_aiter_bpreshuffle_gemm(rows), storage, scale.view(rows)
+
+
+# o_proj as the launch reads it: (``O_*`` format, the [7168, 1536] storage,
+# its fp32 scale a row or None). Raises ValueError naming what does not fit.
+def _o_proj_operands(o_proj):
+    from sgl_amd_mono.kimi_k3.gfx950.stages import oproj
+
+    hidden = HF_CONFIG["hidden_size"]
+    # GPTQ / AWQ-style linears keep qweight and have no weight
+    weight = getattr(o_proj, "weight", None)
+    if weight is None:
+        raise ValueError("o_proj has no weight")
+    if o_proj.bias is not None:
+        raise ValueError("o_proj has a bias")
+    if weight.dtype == torch.bfloat16:
+        if tuple(weight.shape) != (hidden, CORE) or not weight.is_contiguous():
+            raise ValueError(f"o_proj is not a contiguous bf16 [{hidden}, {CORE}]")
+        return oproj.O_BF16, weight, None
+    if weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"o_proj is {weight.dtype}, not bf16 or Quark FP8 E4M3")
+    shuffled, storage, scale = _quark_fp8_storage(linear=o_proj, name="o_proj")
+    if tuple(storage.shape) != (hidden, CORE):
+        raise ValueError(
+            f"the FP8 o_proj is {tuple(storage.shape)}, not [{hidden}, {CORE}]"
+        )
+    return (oproj.O_FP8_SHUFFLED if shuffled else oproj.O_FP8), storage, scale
+
+
+def _offload_disable_reasons(cfg) -> list[str]:
+    # Feature.KV_OFFLOAD also admits these; only HiCache has run under the wide launches.
+    flags = {
+        "--enable-lmcache": cfg.enable_lmcache,
+        "--enable-flexkv": cfg.enable_flexkv,
+        "--disaggregation-decode-enable-offload-kvcache": (
+            cfg.disaggregation_decode_enable_offload_kvcache
+        ),
+    }
+    return [
+        f"{flag}: only HiCache's KV offload is supported"
+        for flag, on in flags.items()
+        if on
+    ]
+
+
+HOST_ONLY_RING_REASON = (
+    "wide launch does not support request-scoped ReplaySSM rings "
+    "(SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT=1 with --enable-linear-replayssm-spec)"
+)
+
+
+def _host_only_mamba() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get())
+
+
+def _wide_step_shape(
+    spec_algo, draft_tokens, graph_max_bs, max_running_reqs
+) -> tuple[int, bool]:
+    """(tokens a request, whether a step goes wide): with no cap known, yes; at a supported
+    draft length, when the smallest width it serves fits the cap's rows; at any other,
+    when a step passes MAX_ROWS rows (so the draft-length check refuses it)."""
+    from sgl_amd_mono.kimi_k31 import wide
+
+    tokens = int(draft_tokens or 1) if spec_algo is not None else 1
+    # the larger cap: an eager server routes up to max_running_reqs, a graph one up to
+    # the graph cap (and an unset one is 0)
+    max_bs = max(int(graph_max_bs or 0), int(max_running_reqs or 0))
+    if max_bs == 0:
+        return tokens, True
+    if tokens not in wide.SUPPORTED_L:
+        return tokens, max_bs * tokens > MAX_ROWS
+    mine = wide.widths_at(tokens)
+    return tokens, bool(mine) and mine[0] <= max_bs * tokens
+
+
+def _wide_will_run() -> bool:
+    """Whether the current server's steps reach a width the wide launch serves
+    (``_wide_step_shape``)."""
+    from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
+
+    try:
+        spec = get_spec()
+        _, wide_runs = _wide_step_shape(
+            spec.speculative_algorithm,
+            spec.speculative_num_draft_tokens,
+            get_exec().graph.cuda_graph_max_bs_decode,
+            get_schedule().max_running_requests,
+        )
+    except ValueError:
+        return False
+    return wide_runs
 
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
@@ -239,6 +471,8 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         from sglang.srt.layers.dp_attention import require_mlp_sync
     except ImportError:  # SGLang before sgl-project/sglang#48781
         from sglang.srt.utils.common import require_mlp_sync
+
+    from sgl_amd_mono.kimi_k3.gfx950.stages.moe import LAT, RI, E
 
     hidden = HF_CONFIG["hidden_size"]
     covered = _covered_layers(hf_config)
@@ -253,8 +487,11 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         attn, moe = layer.self_attn, layer.mlp
         experts = getattr(moe, "experts", None)
         up = getattr(moe, "routed_expert_up_proj", None)
-        o_proj = getattr(attn, "o_proj", None)
-        weight = getattr(o_proj, "weight", None)
+        try:
+            _o_proj_operands(attn.o_proj)
+            o_proj_reason = None
+        except ValueError as e:
+            o_proj_reason = str(e)
         checks = (
             (moe.use_latent_moe, "not a latent MoE layer"),
             (moe.routed_expert_norm is not None, "no latent RMSNorm"),
@@ -269,6 +506,23 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
                 and getattr(experts.w13_weight, "is_shuffled", False)
                 and getattr(experts.w2_weight, "is_shuffled", False),
                 "the experts are not in aiter's preshuffled MXFP4 layout",
+            ),
+            # The launch indexes an expert at its native 384-wide intermediate;
+            # a padded one (512) would be read at the wrong strides.
+            (
+                experts is None
+                or (
+                    tuple(experts.w13_weight.shape) == (E, 2 * RI, LAT // 2)
+                    and tuple(experts.w2_weight.shape) == (E, LAT, RI // 2)
+                ),
+                f"the experts are not [{E}, {2 * RI}, {LAT // 2}] / "
+                f"[{E}, {LAT}, {RI // 2}] packed MXFP4 (a padded intermediate)",
+            ),
+            # K2 computes SiTU for routed and shared experts alike; another
+            # activation would also read as AITER's separated A4W4 layout.
+            (
+                experts is not None and experts.moe_runner_config.activation == "situ",
+                "the experts' activation is not SiTU, which the launch computes",
             ),
             (layer.use_attn_residuals, "no attention-residual stream"),
             # SP-MoE reduce-scatters o_proj's output and the fused all-reduce
@@ -288,26 +542,29 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
                 "the MLA output gate is off, and the split before o_proj "
                 "rides on its wrapper (mla_use_output_gate)",
             ),
-            (
-                weight is not None
-                and weight.dtype == torch.bfloat16
-                and tuple(weight.shape) == (hidden, CORE)
-                and weight.is_contiguous(),
-                f"o_proj is not a contiguous bf16 [{hidden}, {CORE}]",
-            ),
-            (
-                o_proj is not None and getattr(o_proj, "bias", None) is None,
-                "o_proj has a bias",
-            ),
+            (o_proj_reason is None, o_proj_reason),
         )
         reasons += [f"layer {i}: {why}" for ok, why in checks if not ok]
         if reasons and i > covered[0]:
             break  # one layer's reasons say it for all
+    if WIDE and _wide_will_run():
+        from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
+
+        _, state_reasons = k1_mod._state_config()
+        reasons += state_reasons
+        kda_layers = [i for i in covered if k1_mod._is_kda_layer(layers[i])]
+        for i in kda_layers:
+            attn = layers[i].self_attn
+            try:
+                k1_mod._validate_in_proj_operands(attn)
+            except ValueError as e:
+                reasons.append(f"layer {i}: {e}")
+                break
     return reasons
 
 
-def _build(model, hf_config, ctx):
-    """Pack every covered layer and compile the widths, before graph capture."""
+def _build_narrow(model, hf_config, ctx, narrow_widths):
+    """Pack every covered layer and compile the narrow (<= MAX_ROWS) widths."""
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
@@ -320,7 +577,7 @@ def _build(model, hf_config, ctx):
     runner = K3MonoRunner(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
     runner.set_deadline(ctx.deadline_s)
     layers, batches = {}, {}
-    for rows in ctx.widths:
+    for rows in narrow_widths:
         for i in _covered_layers(hf_config):
             packed = _weights(backbone.layers[i], i, rows, runner)
             layers.setdefault(rows, {})[i] = packed
@@ -336,6 +593,67 @@ def _build(model, hf_config, ctx):
         batches[rows] = k1_mod.build_batch(layers[rows], device)
         _warmup(runner, layers[rows], rows)
     return _Built(model, runner, layers, batches)
+
+
+def _build(model, hf_config, ctx, *, use_wide: bool | None = None):
+    """Pack every covered layer and compile the narrow and (when reached) wide widths."""
+    from sglang.srt.runtime_context import get_parallel
+
+    narrow_widths = tuple(w for w in ctx.widths if w <= MAX_ROWS)
+    narrow = _build_narrow(model, hf_config, ctx, narrow_widths)
+    wide_on = WIDE if use_wide is None else use_wide
+    if not (wide_on and any(w > MAX_ROWS for w in ctx.widths)):
+        return narrow
+    from sgl_amd_mono.kimi_k31 import wide
+
+    L = wide.tokens()
+    served = _wide_build_rows(ctx.widths, L)
+    if not served:
+        # every routed width past MAX_ROWS is another draft length's: no wide launch to
+        # build, and those steps run SGLang's own backbone
+        return _WideBuilt(narrow, None)
+
+    def mem():
+        return (
+            torch.cuda.mem_get_info()[0],
+            torch.cuda.memory_allocated(),
+            torch.cuda.memory_reserved(),
+        )
+
+    def used(a, b):
+        return "device {:.2f} / torch allocated {:.2f} / reserved {:.2f} GiB".format(
+            *((x - y) / 2**30 for x, y in ((a[0], b[0]), (b[1], a[1]), (b[2], a[2])))
+        )
+
+    p = get_parallel()
+    device = _backbone(model).layers[0].input_layernorm.weight.device
+    m0 = mem()
+    w = wide.Wide(
+        model,
+        p.tp_rank,
+        p.tp_group.cpu_group,
+        device,
+        L=L,
+        max_rows=max(served),
+    )
+    m1 = mem()
+    w.warmup()
+    m2 = mem()
+    torch.cuda.empty_cache()
+    wide._say(
+        f"memory: wide layers {used(m0, m1)}; warmup {used(m1, m2)}; "
+        f"after empty_cache {used(m0, mem())}"
+    )
+    return _WideBuilt(narrow, w)
+
+
+def _wide_build_rows(widths, L: int) -> list:
+    """The routed widths the wide launch serves at L draft tokens (the binding also routes
+    another L's widths that are multiples of L; those run SGLang's own backbone)."""
+    from sgl_amd_mono.kimi_k31 import wide
+
+    mine = set(wide.widths_at(L))
+    return [w for w in widths if w in mine]
 
 
 def _warmup(runner, packed_layers: dict, rows: int) -> None:
@@ -438,6 +756,15 @@ NUMERICS = Numerics(
         "k2.prefix.cosine": 1.0 - 1e-7,
         # The seam: slice, gate, mix, then the FFN input norm. Also exact.
         "k2.x.cosine": 1.0 - 1e-7,
+        # The same two on a Quark FP8 o_proj (check_k2 --o-proj fp8*). Not exact:
+        # the launch widens the weight to bf16 and sums in MFMA order, SGLang's
+        # FP8 GEMM quantizes the activation, and no reference sums in the
+        # launch's order, so a sum near a bf16 rounding boundary can land one ulp
+        # apart. Measured on 8x MI355X against check_k2's torch reference (the
+        # E4M3 weight in fp32 times the unquantized activation, row-scaled): prefix
+        # 1 - 1.19e-7 accumulating (one fp32 ulp of the cosine), exactly 1 resetting.
+        "k2_fp8.prefix.cosine": 1.0 - 1e-6,
+        "k2_fp8.x.cosine": 1.0 - 1e-6,
         # The layer output: the MoE on top of the seam. The expert sums land in
         # another order, so this is bf16 rounding, not exact.
         "k2.out.cosine": 0.99999,
@@ -478,21 +805,62 @@ NUMERICS = Numerics(
         # points down. Measured exact, so the bound is tight on purpose.
         "k1.window.cosine": 1.0 - 1e-6,
         "k1.window.rel": 0.001,
+        # K1 on a Quark FP8 in-projection (k1_fp8), against the same check. SGLang
+        # quantizes the projection's input to FP8 a token and K1 multiplies it
+        # in bf16, so every output moves by that quantization, about 1%; the
+        # bank row is still exact. Worst of 10385 layer steps of three requests
+        # at TP8 with ReplaySSM and a bf16 state, with room:
+        #
+        #   core    cos 0.99788   rel 0.065    window  cos 0.99994  rel 0.0115
+        #   ring_k  cos 0.99990   rel 0.0139   ring_v  cos 0.99970  rel 0.0245
+        #   ring_g  cos 0.99988   rel 0.0167   ring_b  cos 0.99995  rel 0.0100
+        #
+        # ring_* are the ReplaySSM ring rows the commit replays (raw k / v, the
+        # log-decay gate, beta), in place of the ssm state.
+        "k1_fp8.core.cosine": 0.997,
+        "k1_fp8.core.rel": 0.08,
+        "k1_fp8.bank.cosine": 1.0 - 1e-6,
+        "k1_fp8.bank.rel": 0.0,
+        "k1_fp8.window.cosine": 0.9999,
+        "k1_fp8.window.rel": 0.015,
+        # The cosine is what test_kimi_k3_wide_fp8.py measures on wide snapshots
+        # (ring=False, bf16/fp32 state); the rel metric stays unbounded until measured.
+        "k1_fp8.ssm.cosine": 0.9995,
+        "k1_fp8.ring_k.cosine": 0.9998,
+        "k1_fp8.ring_k.rel": 0.02,
+        "k1_fp8.ring_v.cosine": 0.9995,
+        "k1_fp8.ring_v.rel": 0.03,
+        "k1_fp8.ring_g.cosine": 0.9997,
+        "k1_fp8.ring_g.rel": 0.025,
+        "k1_fp8.ring_b.cosine": 0.9999,
+        "k1_fp8.ring_b.rel": 0.015,
     },
 )
+
+
+def _k3_widths() -> tuple[int, ...]:
+    base = tuple(range(1, MAX_ROWS + 1))
+    if not WIDE:
+        return base
+    from sgl_amd_mono.kimi_k31 import wide
+
+    return base + wide.wide_widths()
+
 
 SPEC = MonoSpec(
     name="kimi_k3_hip",
     devices={
         "gfx950": DeviceLimits(
-            widths=tuple(range(1, MAX_ROWS + 1)),
+            widths=_k3_widths(),
             tp_sizes=(TP_SIZE,),
             resident_blocks=BLOCKS,
         )
     },
-    # The measured win is on DSpark target-verify steps; a plain decode step of
-    # at most MAX_ROWS rows takes the same launch.
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # Narrow launches cover decode and DSpark verify steps <= 8 rows; wide launches
+    # cover multi-request DSpark verify steps (including DCP8 and HiCache KV offload).
+    features=frozenset(
+        {Feature.SPECULATIVE_DECODING, Feature.CONTEXT_PARALLEL, Feature.KV_OFFLOAD}
+    ),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"aiter"}),
@@ -525,6 +893,9 @@ class _Layer(msgspec.Struct):
     module: Any  # the KimiK3DecoderLayer, for the tensors read per step
     k1: Any = None  # the KDA front launch (gfx950/k1.py), where it applies
     mla: Any = None  # (MlaPreBuild, weights): an MLA layer's projection front
+    # o_proj's storage and its FP8 scale (None for bf16): _o_proj_operands
+    w_o: Any = None
+    w_os: Any = None
 
 
 def _k2_blocks(layer) -> int:
@@ -542,6 +913,7 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
     from sgl_amd_mono.kimi_k3.gfx950.layer import K2Build
 
     moe = layer.mlp
+    ofmt, w_o, w_os = _o_proj_operands(layer.self_attn.o_proj)
     return _Layer(
         k1=k1_mod.build(layer, i, rows) if K1 else None,
         mla=_mla_build(layer, rows) if MLA_PRE else None,
@@ -555,10 +927,13 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
             reset=layer.is_block_write_layer,
             opt=k2.K2_OPT if K2_OPT is None else int(K2_OPT),
             guint=_gu_interleaved(moe),
+            ofmt=ofmt,
             fault_site=runner.fault_site,
             fault_after=runner.fault_after,
         ),
         module=layer,
+        w_o=w_o,
+        w_os=w_os,
     )
 
 
@@ -959,26 +1334,56 @@ def _mla_out_view(out: dict, nhq: int) -> dict:
     }
 
 
+# Resolve an MLA linear projection as contiguous bf16 or Quark per-channel FP8;
+# raises ValueError naming the misfit.
+def _mla_proj_operands(linear, name: str, shape: tuple[int, int]):
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
+
+    if linear is None:
+        raise ValueError(f"{name} is missing")
+    # GPTQ / AWQ-style linears keep qweight and have no weight.
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        raise ValueError(f"{name} has no weight")
+    if getattr(linear, "bias", None) is not None:
+        raise ValueError(f"{name} has a bias, which the launch does not add")
+    if weight.dtype == torch.bfloat16:
+        if tuple(weight.shape) != shape or not weight.is_contiguous():
+            raise ValueError(
+                f"{name} is {weight.dtype} {tuple(weight.shape)}, not contiguous bf16 {shape}"
+            )
+        return wfmt.BF16, weight, None
+    shuffled, storage, scale = _quark_fp8_storage(linear=linear, name=name)
+    if tuple(storage.shape) != shape:
+        raise ValueError(f"the FP8 {name} is {tuple(storage.shape)}, not {shape}")
+    return (wfmt.FP8_SHUFFLED if shuffled else wfmt.FP8), storage, scale
+
+
 def _mla_build(layer, rows: int):
     """An MLA layer's projection-front key and the weights it reads in place, or
     None (a KDA layer, or weights the launch does not take: SGLang's path)."""
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
     attn = layer.self_attn
-    idx = getattr(attn, "indexer", None)
     fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
-    if hasattr(attn, "qkv_conv1d") or idx is None or fused is None:
+    if hasattr(attn, "qkv_conv1d") or fused is None:
         return None
+    layer_id = getattr(layer, "layer_id", -1)
+    idx = getattr(attn, "indexer", None)  # an MLA layer without one has no attribute
+    has_indexer = idx is not None
     par = get_parallel()
     if par.attn_dcp_size > 1:
         # Under DCP8 q-replicate, run the full 96-head q_b_proj_qrep_weight and
         # in-place w_kc_qrep once SGLang's _mono_pre handoff supports full heads.
         dcp_size = getattr(attn, "dcp_size", 1)
+        # the 96-head front runs only on bf16 layers with an indexer (Kimi-K3.1)
         if not (
-            getattr(par, "dcp_enabled", False)
+            has_indexer
+            and getattr(par, "dcp_enabled", False)
             and getattr(par, "dcp_replicate_q_proj", False)
             and dcp_size > 1
             and not getattr(attn, "use_deep_gemm_bmm", False)
@@ -987,8 +1392,9 @@ def _mla_build(layer, rows: int):
             and _sglang_mono_pre_supports_qrep(attn)
         ):
             logger.info(
-                "monokernel: no DCP MLA front for layer %d: dcp=%s qrep=%s heads=%s qrep_handoff=%s",
-                layer.layer_id if hasattr(layer, "layer_id") else -1,
+                "monokernel: no DCP MLA front for layer %d: indexer=%s dcp=%s qrep=%s heads=%s qrep_handoff=%s",
+                layer_id,
+                has_indexer,
                 dcp_size,
                 getattr(par, "dcp_replicate_q_proj", False),
                 getattr(attn, "num_local_heads", 0) * dcp_size,
@@ -998,28 +1404,74 @@ def _mla_build(layer, rows: int):
         nhq, qn_rm = mp.NHQ_QREP, True
     else:
         nhq, qn_rm = mp.NHQ, False
+    try:
+        qkv_fmt, w_qkv, w_qkv_s = _mla_proj_operands(
+            linear=fused, name="fused_qkv_a_proj_with_mqa", shape=(mp.LATW, HIDDEN)
+        )
+        g_fmt, w_g, w_g_s = _mla_proj_operands(
+            linear=getattr(attn, "g_proj", None),
+            name="g_proj",
+            shape=(mp.GATE, HIDDEN),
+        )
+        qb_fmt, w_qb, w_qb_s = _mla_proj_operands(
+            linear=getattr(attn, "q_b_proj", None),
+            name="q_b_proj",
+            shape=(mp.QB, mp.QL),
+        )
+    except ValueError as err:
+        logger.info("monokernel: no MLA front for layer %d: %s", layer_id, err)
+        return None
+    if qkv_fmt != g_fmt:
+        logger.info(
+            "monokernel: no MLA front for layer %d: w_qkv format %d != g_proj format %d",
+            layer_id,
+            qkv_fmt,
+            g_fmt,
+        )
+        return None
+    if has_indexer and (qkv_fmt != wfmt.BF16 or qb_fmt != wfmt.BF16):
+        logger.info(
+            "monokernel: no MLA front for layer %d: indexer layers require bf16 projections",
+            layer_id,
+        )
+        return None
     w = {
         "ares_nw": layer.self_attention_res_norm.weight,
         "ares_qk": layer.self_attention_res_proj.weight.view(HIDDEN),
         "in_nw": layer.input_layernorm.weight,
-        "w_qkv": fused.weight,
-        "w_g": getattr(getattr(attn, "g_proj", None), "weight", None),
-        "w_k": getattr(getattr(idx, "wk", None), "weight", None),
-        "w_p": getattr(getattr(idx, "weights_proj", None), "weight", None),
-        "w_qb": attn.q_b_proj.weight,
-        "w_iq": getattr(getattr(idx, "wq_b", None), "weight", None),
+        "w_qkv": w_qkv,
+        "w_qkv_s": w_qkv_s,
+        "w_g": w_g,
+        "w_g_s": w_g_s,
+        "w_qb": w_qb,
+        "w_qb_s": w_qb_s,
         "q_nw": attn.q_a_layernorm.weight,
         "kv_nw": attn.kv_a_layernorm.weight,
     }
-    want = {
-        "w_qkv": (mp.LATW, HIDDEN), "w_g": (mp.GATE, HIDDEN), "w_k": (mp.IK, HIDDEN),
-        "w_p": (mp.IW, HIDDEN), "w_qb": (mp.QB, mp.QL), "w_iq": (mp.IQ, mp.QL),
-    }  # fmt: skip
-    for n, shp in want.items():
-        t = w[n]
-        if not _valid_bf16_tensor(t, shp):
-            logger.info("monokernel: no MLA front for layer %d: %s is %s", layer.layer_id if hasattr(layer, "layer_id") else -1, n, None if t is None else (t.dtype, tuple(t.shape)))  # fmt: skip
+    if has_indexer:
+        mods = {"w_k": "wk", "w_p": "weights_proj", "w_iq": "wq_b"}
+        biased = [
+            m
+            for m in mods.values()
+            if getattr(getattr(idx, m, None), "bias", None) is not None
+        ]
+        if biased:  # stages 1 and 2 read the weights only
+            logger.info(
+                "monokernel: no MLA front for layer %d: biased %s", layer_id, biased
+            )
             return None
+        for n, m in mods.items():
+            w[n] = getattr(getattr(idx, m, None), "weight", None)
+        want_idx = {
+            "w_k": (mp.IK, HIDDEN),
+            "w_p": (mp.IW, HIDDEN),
+            "w_iq": (mp.IQ, mp.QL),
+        }
+        for n, shp in want_idx.items():
+            t = w[n]
+            if not _valid_bf16_tensor(t, shp):
+                logger.info("monokernel: no MLA front for layer %d: %s is %s", layer_id, n, None if t is None else (t.dtype, tuple(t.shape)))  # fmt: skip
+                return None
     # the absorb's weight as SGLang's bf16 bmm multiplies it: w_kc itself, unscaled
     wkc, wsc = getattr(attn, "w_kc", None), getattr(attn, "w_scale", None)
     qn = (
@@ -1036,6 +1488,9 @@ def _mla_build(layer, rows: int):
         qn=qn,
         nhq=nhq,
         qn_rm=qn and qn_rm,
+        has_indexer=has_indexer,
+        qkv_fmt=qkv_fmt,
+        qb_fmt=qb_fmt,
         nblocks=layer.prev_valid_blocks,
         eps=layer.self_attention_res_norm.variance_epsilon,
         out_eps=layer.input_layernorm.variance_epsilon,
@@ -1065,10 +1520,11 @@ def _mla_outputs(rows: int, device, nhq: int | None = None) -> dict:
 def _gu_interleaved(moe) -> bool:
     """Whether the experts carry the gate / up interleaved MXFP4 layout.
 
-    ``is_shuffled`` alone cannot answer this: Mxfp4MoEMethod sets it on both of
-    its branches and only the SiTU A8W4 branch interleaves. Reading those bytes
-    with the wrong layout does not fail, it returns wrong numbers, so ask the
-    same question Mxfp4MoEMethod asked.
+    ``is_shuffled`` alone cannot answer this: Mxfp4MoEMethod and Quark's MXFP4
+    MoE set it on both of their branches, and only the SiTU branch AITER runs
+    as A8W4 or A16W4 interleaves; ``AITER_SITUV2_A4W4`` alone keeps gate and up
+    separated. Reading those bytes with the wrong layout does not fail, it
+    returns wrong numbers, so ask the same question both methods asked.
     """
     from sglang.srt.layers.quantization.mxfp4 import (
         _aiter_situ_uses_gu_interleaved_weights,
@@ -1100,7 +1556,8 @@ def _k2_launch(
     k2.k2_launch(
         packed.key,
         core=core,
-        w_o=module.self_attn.o_proj.weight,
+        w_o=packed.w_o,
+        w_os=packed.w_os,
         prefix=prefix,
         blocks=blocks,
         ares_nw=module.mlp_res_norm.weight,
@@ -1455,14 +1912,17 @@ class _Built:
             "q_lora": out["q_lora"], "gate": out["gate"],
             "q_nope_out": out["qn"] if key.qn else None,
         }  # fmt: skip
-        attn.indexer.__dict__["_mono_pre"] = {
-            "q": out["idx_q"], "k": out["idx_k"], "w": out["idx_w"],
-        }  # fmt: skip
+        idx = getattr(attn, "indexer", None)
+        if idx is not None:
+            idx.__dict__["_mono_pre"] = {
+                "q": out["idx_q"], "k": out["idx_k"], "w": out["idx_w"],
+            }  # fmt: skip
         try:
             return self._pre_o_proj(layer, x, forward_batch, zero_allocator)
         finally:
             attn.__dict__.pop("_mono_pre", None)
-            attn.indexer.__dict__.pop("_mono_pre", None)
+            if idx is not None:
+                idx.__dict__.pop("_mono_pre", None)
 
     def _pre_o_proj(self, layer, x, forward_batch, zero_allocator):
         """``KimiK3DecoderLayer._run_self_attn`` stopped before o_proj: the
@@ -1489,3 +1949,36 @@ class _Built:
         finally:
             if latent is not None:
                 get_attn_tp_context().clear_attn_inputs()
+
+
+class _WideBuilt(_Built):
+    """Narrow launches for <= MAX_ROWS rows, and the wide KDA layer launch above (None
+    when this draft length serves none of the routed wide widths)."""
+
+    def __init__(self, narrow, wide_runner) -> None:
+        self.__dict__.update(narrow.__dict__)
+        self._wide = wide_runner
+        self._shim = _LanguageModelShim(self)
+
+    def _backbone(self, input_ids, forward_batch, input_embeds):
+        rows = self._plan.key.rows
+        if rows <= MAX_ROWS:
+            return super()._backbone(input_ids, forward_batch, input_embeds)
+        if self._wide is None or not self._wide.serves(rows):
+            # a multiple of this L in the spec's widths only for another draft length:
+            # SGLang's own backbone, as for a step past the widths
+            return self.backbone(
+                input_ids, self._positions, forward_batch, input_embeds
+            )
+        try:
+            return self._wide.backbone(self, input_ids, forward_batch, input_embeds)
+        except Exception as e:
+            import traceback
+
+            from sgl_amd_mono.kimi_k31 import wide
+
+            wide._say(
+                f"wide backbone raised {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()[-2000:]}"
+            )
+            raise

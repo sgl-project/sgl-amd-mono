@@ -7,12 +7,23 @@ nodes:
   its tests, GSM8K with the monokernels on and off, and speed against the base
   branch.
 - `nightly-amd.yml`, the **nightly**: Sunday to Friday, on main and the newest
-  SGLang ROCm image, the accuracy benchmarks (but the `weekly` ones: AIME26 x4,
-  the costliest, and a model's `weekly_evals`, such as Kimi-K3's MMMU-Pro, ~8 h
-  at one request at a time) and the speed test with the monokernels on, for the models marked
-  `nightly` in `models.py`, held to each model's fixed `baseline`. Saturday's
-  **weekly** run has every benchmark with the monokernels on and off; its off
-  results are the reference the nightly and the PR test read until the next one.
+  SGLang ROCm image, `common` (the unit and common kernel tests) and the models
+  marked `nightly` in `models.py` (DeepSeek-V4.1-Flash, GLM-5.3,
+  Qwen3.8-Flash-Next). The PR test runs those models, so the nightly runs them at
+  the **tests** tier (`nightly_tier`): the pinned sgl-amd-mono check, their unit,
+  kernel and serving tests, and no accuracy benchmark or speed test. Every change
+  to them is measured by the PR test, so between PRs only the SGLang image changes,
+  and these tests catch that the day it does. (A nightly model the PR test does not
+  run would run in full: its accuracy benchmarks but the `weekly` ones and the
+  speed test, monokernels on, held to its fixed `baseline`.) The other models the
+  PR test runs get the image check only weekly. Saturday's
+  **weekly** run has every benchmark with the monokernels on and off, for every
+  model in full, and the models marked `weekly` too: GLM-5.3-Flash and
+  Qwen3.5-397B-A17B (the PR test covers every change to them), and
+  Kimi-K3.1, Muse-Spark and MiniMax-M3.1-Flash (their unit, kernel and timing
+  tests: none has a checkpoint or launches the CI nodes can serve yet). The
+  deprecated DeepSeek-V4-Pro and Kimi-K3 run only when dispatched with `models`.
+  The weekly run's off results are the reference the nightly and the PR test read until the next one.
   A run of the nightly workflow with `weekly` ticked writes that reference too,
   from whichever branch it runs, so run it by hand on `main` only.
 
@@ -22,7 +33,10 @@ nodes:
   runs the test again (cancelling the run on the previous head) until a maintainer
   removes it. Only people with triage access or more can add a label, so read a
   fork PR's code before labelling it, and remove the label if a later push needs a
-  second look.
+  second look. Until then each push sets `AMD PR test` to failed ("Not run"), from
+  a GitHub-hosted runner, so a PR cannot merge without the test once the branch
+  rules require it. Adding the label starts a new run; re-running a "Not run" one
+  does not test (the runners check the labels the run started with).
 - `run-ci-extra` runs the same and adds GPQA (or tick `extra` when running the
   workflow by hand). GSM8K's short answers cannot show a loss at long context;
   GPQA's long ones can. Use it for a PR that touches attention, the KV cache or
@@ -36,9 +50,31 @@ comment up to date with the report. Each model's logs (servers, benchmarks,
 tests) are in the run's `mono-ci-<model>` artifact. The nightly writes its report
 to the run's summary.
 
+The PR test's GPU jobs share the two runners with the nightly and with each
+other, so a run can wait hours for one. While it waits or runs, its pending
+status says where it stands: `Waiting for a GPU runner: ~N jobs ahead. Will run
+...`, then `3/14 done; running <model>; 9 waiting, ~N jobs ahead`. The plan job
+sets it, and `queue-status.yml` (every 10 minutes, `queue_status.py`) keeps it
+current until the report sets the result. "Ahead" counts the GPU jobs running now
+and those queued by older runs; GitHub does not promise to hand queued jobs out
+oldest first, so it is an estimate.
+
+The same scheduled pass cancels the scheduled nightly run when a GPU job of it has
+waited for a runner more than 12 hours (`NIGHTLY_MAX_QUEUE_HOURS` in
+`queue_status.py`) and none of its GPU jobs is running: the nightly's jobs take
+about 4.5 GPU hours, so it should end the day it starts, and the next one tests a
+newer image. GitHub cancels a whole run, so it waits for a running job to end
+rather than kill it. A nightly dispatched by hand and the weekly run are never
+cancelled this way.
+
 ## What runs
 
-`scope.py` maps a PR's changed files to models (`models.py`):
+`scope.py` maps a PR's changed files to models (`models.py`). The PR test runs
+only the models InferenceX still benchmarks (the "default" models of
+<https://inferencex.semianalysis.com/infx/inference>). An entry with `"pr": False`
+is not in it: a model InferenceX lists as deprecated (DeepSeek-V4-Pro, Kimi-K3,
+MiniMax-M3) or one whose checkpoint is not on the CI nodes. A dispatch with
+`models` still runs it, and the weekly run runs those it lists. Of the others:
 
 - a model whose own package code (`sgl_amd_mono/<pkg>/`) changed runs the
   **full** tier;
@@ -49,6 +85,22 @@ to the run's summary.
   test or accuracy benchmark, since the served kernels are the base branch's;
 - a PR that changes no model runs `common`: the unit tests and the common kernel
   tests.
+- a PR whose package code changes in more than `FULL_TIER_MAX_MODELS` (3) models,
+  such as a refactor or an API move across packages, runs each of them at the
+  **smoke** tier instead of the full one, and `common` in full: fourteen full-tier
+  jobs would hold both GPU runners for most of a day. The weekly run runs them in
+  full; to run a PR in full anyway, run the workflow by hand with `models`.
+
+Every run tests `common` first, as **stage A** (the `stage-a` job, shown as
+`test (common, full)`; ~5 minutes, estimated): the unit tests and the common
+kernel tests except the TP4 fault sweep (`PR_COMMON_KERNEL_DESELECT`, ~9 minutes),
+which the nightly runs; the TP2 fault test and the clean run still run on every
+PR. The model jobs start only once it passes, so a PR that breaks the package fails
+in minutes instead of holding both runners for hours; the report then lists each
+model as not run. Only a test failure stops them: when stage A's cluster job does
+not run at all (Slurm, the node), the model jobs still run and the report fails
+`common`. GitHub queues the model jobs when stage A ends, so on a busy day they
+wait behind jobs queued in the meantime.
 
 A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
 checks representative widths only (DeepSeek-V4.1's K1, K2 and target FFN launch at
@@ -72,13 +124,13 @@ these sides:
   only, read-only in the PR test and the nightly. The weekly run hands the files
   it writes to the directory's owner (the runner account).
 
-| Check | PR test, full tier | PR test, smoke tier | Nightly | Weekly |
-| --- | --- | --- | --- | --- |
-| Tests | unit (on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same | unit, kernel and serving tests | same |
-| Kernel microbenchmark | the model's timing scripts, base and PR | same | main | main |
-| Accuracy | sgl-eval GSM8K (1319 questions), on and off; GPQA too with `run-ci-extra` | the serving tests' GSM8K and KL bounds | GSM8K, GPQA Diamond (and MMMU-Pro for vision models), on | the nightly's and AIME26 x4, on and off |
-| E2E performance | InferenceX fixed length at the model's concurrencies, base and on | the gate concurrencies only | on (against the monokernel-off reference) | off and on |
-| Scope | the server's startup lines that say which steps the launches serve | same | same | same |
+| Check | PR test, full tier | PR test, smoke tier | Nightly, tests tier (models the PR test runs) | Nightly, full (a dispatch with `models`) | Weekly |
+| --- | --- | --- | --- | --- | --- |
+| Tests | unit (on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same | unit, kernel (the PR test's widths) and serving tests | unit, kernel and serving tests | same |
+| Kernel microbenchmark | the model's timing scripts, base and PR | same | main | main | main |
+| Accuracy | sgl-eval GSM8K (1319 questions), on and off; GPQA too with `run-ci-extra` | the serving tests' GSM8K and KL bounds | the serving tests' bounds | GSM8K, GPQA Diamond (and MMMU-Pro for vision models), on | every benchmark (AIME26 x4 too), on and off |
+| E2E performance | InferenceX fixed length at the model's concurrencies, base and on | the gate concurrencies only | none | on (against the monokernel-off reference) | off and on |
+| Scope | the server's startup lines that say which steps the launches serve | same | the serving tests | same | same |
 
 E2E performance is `sglang.benchmark.serving`: random 8k in / 1k out, range
 ratio 0.8, 10 prompts a slot. The report keeps median TPOT (p50), which gates, and
@@ -132,7 +184,7 @@ the pinned commit serves, a server with the monokernels on answering a few
 requests. A change in SGLang that the pinned commit does not follow, such as a
 field added to an op, fails that check the day the image picks it up.
 
-The nightly fails the same way on tests. It holds each on score to the model's
+The nightly fails the same way on tests. For a model it runs in full, it holds each on score to the model's
 `baseline` in `models.py`: GSM8K below it fails, the other benchmarks warn. A
 benchmark without a baseline is compared with the monokernel-off reference (the
 latest weekly off result) instead. Each weekly report suggests baselines (the off
@@ -164,6 +216,17 @@ and the reviewer verifies them. OCRBench and LiveCodeBench are not in the CI yet
   time and each job takes a whole node, whichever of the two is free, so the two
   nodes run two models at once and never two jobs on one node. The runner's
   `.env` holds no node setting.
+- Job-start hook: the repository is public, so a PR could add a workflow of its
+  own that names the runners' label. `job_started_hook.sh`, which `runner.sh`
+  copies next to the runners and sets as their `ACTIONS_RUNNER_HOOK_JOB_STARTED`,
+  refuses every job but `pr-test-amd.yml` and `nightly-amd.yml` as main has them,
+  on their own events (a dispatch may run from any branch), and a PR test of a PR
+  without `run-ci` or `run-ci-extra`.
+  After changing it, `bash runner.sh hook` on the runner host puts the new copy in
+  place (the runners read it at each job; no restart). Each verdict in a job's
+  log ends with `(hook <hash>)`, the copy's git blob hash: when it differs from
+  `git ls-tree origin/main scripts/ci/job_started_hook.sh`, the runners have an
+  old copy.
 - `slurm_launch.sh` (on the runner) submits `slurm_job.sh` as a whole-node job,
   streams its log and collects its results; `slurm_job.sh` (on the node) fetches
   the PR and base commits onto node-local disk, starts the SGLang ROCm container

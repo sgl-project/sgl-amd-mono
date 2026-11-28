@@ -3,8 +3,11 @@ name: Nightly (AMD)
 # main on the newest SGLang ROCm image, each nightly model (`nightly` in
 # scripts/ci/models.py; the weekly run adds the `weekly` models): its tests,
 # accuracy benchmarks and speed test.
-# Sunday to Friday, the nightly runs the monokernels on only, skips the `weekly`
-# benchmarks (AIME26 x4) and holds the scores to each model's fixed `baseline`.
+# Sunday to Friday, a nightly model the PR test runs (every change to it is
+# measured there; all of them today) runs at the tests tier: its tests and serving
+# tests on the new image, no benchmark or speed test (models.py, nightly_tier). One
+# it does not run would run in full: monokernels on only, no `weekly` benchmarks
+# (AIME26 x4), the scores held to its fixed `baseline`.
 # Saturday's weekly run has every benchmark with the monokernels on and off; its
 # off results become the monokernel-off reference (monokernel_off_ref) the nightly
 # and the PR test read until the next one. See scripts/ci/README.md.

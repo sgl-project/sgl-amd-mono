@@ -9,6 +9,7 @@ import torch
 from sgl_amd_mono.kimi_k3 import spec
 from sgl_amd_mono.kimi_k3.gfx950 import layer as k2_layer
 from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
 
@@ -158,6 +159,12 @@ def test_mla_build_dcp8_gates(monkeypatch) -> None:
     key, w = res
     assert key.nhq == mp.NHQ_QREP and key.qn is True and key.qn_rm is True
     assert "w_kc" not in w  # in-place w_kc_qrep read at runtime, zero build-time copy
+    assert key.has_indexer and key.qb_fmt == key.qkv_fmt == wfmt.BF16
+
+    # 4b. A Kimi-K3 MLA layer (no indexer attribute) keeps SGLang's front under DCP8
+    no_idx = _fake_layer()
+    del no_idx.self_attn.indexer
+    assert spec._mla_build(no_idx, rows=8) is None
 
     # 5. DCP1 keeps local nhq=12, transposed w_kc
     _set_par(attn_dcp_size=1, dcp_enabled=False, dcp_replicate_q_proj=False)
