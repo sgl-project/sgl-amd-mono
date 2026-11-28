@@ -236,6 +236,36 @@ def test_mono_pre_caps_and_verify_qb_consistency(monkeypatch) -> None:
     assert w._mla_bucket_specs(96) == {}
 
 
+def test_mono_pre_caps_read_the_q_view_head_count() -> None:
+    """A branch that views pre["q"] with local heads is local-only even when
+    q_replicate_active and self.dcp_size appear elsewhere in it: wide would hand a 96-head
+    q to a 12-head view."""
+
+    def _local_view_dcp_elsewhere(self, q_replicate_active=False):
+        pre = self.__dict__.get("_mono_pre")
+        if self.q_lora_rank is not None and pre is not None:
+            q = pre["q"].view(-1, self.num_local_heads, self.qk_head_dim)
+            if q_replicate_active and self.dcp_size > 1:
+                _ = pre["latent"]
+            return q
+        return None
+
+    def _qrep_view_inline(self, q_replicate_active=False):
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            return pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return None
+
+    layer = _fake_mla_layer(dcp_size=8, prepare_fn=_local_view_dcp_elsewhere)
+    assert wide._sglang_mono_pre_caps(layer.self_attn) == (True, False)
+    layer = _fake_mla_layer(dcp_size=8, prepare_fn=_qrep_view_inline)
+    assert wide._sglang_mono_pre_caps(layer.self_attn) == (True, True)
+
+
 def test_mla_row_cap_respects_reachable_verify_rows(monkeypatch) -> None:
     monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS", raising=False)
     runner = object.__new__(wide.Wide)

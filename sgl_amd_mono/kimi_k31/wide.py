@@ -593,10 +593,48 @@ def _pre_o_proj(layer, x, positions, fb, zero_allocator):
             get_attn_tp_context().clear_attn_inputs()
 
 
+def _mono_pre_q_heads(tree) -> list:
+    """The head-count expressions of every ``pre["q"].view(rows, heads, dim)`` inside an
+    ``if`` on ``pre``, with a head name assigned in that branch replaced by its value."""
+    import ast
+
+    heads = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If) or "pre" not in {
+            n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
+        }:
+            continue
+        assigned = {
+            tgt.id: stmt.value
+            for stmt in node.body
+            if isinstance(stmt, ast.Assign)
+            for tgt in stmt.targets
+            if isinstance(tgt, ast.Name)
+        }
+        for sub in (n for stmt in node.body for n in ast.walk(stmt)):
+            if (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Attribute)
+                and sub.func.attr == "view"
+                and isinstance(sub.func.value, ast.Subscript)
+                and isinstance(sub.func.value.value, ast.Name)
+                and sub.func.value.value.id == "pre"
+                and isinstance(sub.func.value.slice, ast.Constant)
+                and sub.func.value.slice.value == "q"
+                and len(sub.args) == 3
+            ):
+                head = sub.args[1]
+                if isinstance(head, ast.Name) and head.id in assigned:
+                    head = assigned[head.id]
+                heads.append(head)
+    return heads
+
+
 def _sglang_mono_pre_caps(attn) -> tuple[bool, bool]:
     """Return ``(supports_local, supports_qrep)`` for SGLang's ``_mono_pre`` handoff
-    in ``forward_absorb_rocm_prepare`` (local handoff vs full-head DCP q-replicate
-    from sgl-project/sglang#53130)."""
+    in ``forward_absorb_rocm_prepare``: whether it views ``pre["q"]`` at all, and whether
+    that view's head count is ``num_local_heads * dcp_size`` under DCP q-replicate
+    (sgl-project/sglang#53130), not only somewhere in the same branch."""
     cached = getattr(attn, "_k31_mono_pre_caps", None)
     if cached is not None:
         return cached
@@ -609,39 +647,19 @@ def _sglang_mono_pre_caps(attn) -> tuple[bool, bool]:
             import textwrap
 
             tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
-            reads_mono_pre = any(
+            if any(
                 isinstance(n, ast.Constant) and n.value == "_mono_pre"
                 for n in ast.walk(tree)
-            )
-            if reads_mono_pre:
-                for node in ast.walk(tree):
-                    if not isinstance(node, ast.If):
-                        continue
-                    test_names = {
-                        n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
-                    }
-                    if "pre" not in test_names:
-                        continue
-                    body_attrs = {
-                        n.attr
-                        for stmt in node.body
-                        for n in ast.walk(stmt)
-                        if isinstance(n, ast.Attribute)
-                    }
-                    body_names = {
-                        n.id
-                        for stmt in node.body
-                        for n in ast.walk(stmt)
-                        if isinstance(n, ast.Name)
-                    }
-                    if "pre" in body_names and "view" in body_attrs:
-                        local_ok = True
-                        if (
-                            "dcp_size" in body_attrs
-                            and "q_replicate_active" in body_names
-                        ):
-                            qrep_ok = True
-                            break
+            ):
+                heads = _mono_pre_q_heads(tree)
+                local_ok = bool(heads)
+                qrep_ok = any(
+                    "dcp_size"
+                    in {n.attr for n in ast.walk(h) if isinstance(n, ast.Attribute)}
+                    and "q_replicate_active"
+                    in {n.id for n in ast.walk(h) if isinstance(n, ast.Name)}
+                    for h in heads
+                )
         except (OSError, TypeError, SyntaxError):
             local_ok, qrep_ok = False, False
     caps = (local_ok, qrep_ok)
