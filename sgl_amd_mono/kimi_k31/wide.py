@@ -276,10 +276,9 @@ def _row_cfgs(b: int) -> tuple[str, str, str, str, str]:
 
 def widths_at(L: int) -> tuple:
     """The rows of every verify step the wide launch serves at L draft tokens: L x r for
-    every r in (lo, top] past NARROW rows, where lo is the ladder bucket below the
-    bucket override's first (1 without one) and top its last. A graph capture must
-    not meet a cold bucket, and rows below the override's first bucket stay on
-    SGLang's own path."""
+    every r in (lo, top] past NARROW rows, where lo is the REQ_BUCKETS entry below the
+    bucket override's first bucket (1 without one) and top its last. A graph capture
+    must not meet a cold bucket; request counts up to lo stay on SGLang's own path."""
     rs = req_buckets()
     lo = max((x for x in REQ_BUCKETS if x < rs[0]), default=1)
     return tuple(L * r for r in range(max(2, lo + 1), rs[-1] + 1) if L * r > NARROW)

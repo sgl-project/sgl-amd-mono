@@ -157,10 +157,9 @@ def run(args, m, rank, dev, cpu):
 
         for i in range(nl):
             parts = [quant(wo_all[i][:, r * KO : (r + 1) * KO]) for r in range(TP)]
-            # the reference sees what every rank's FP8 slice holds
-            wo_all[i] = torch.cat(
-                [(q.float() * s[:, None]).to(BF) for q, s in parts], dim=1
-            )
+            # the f32 reference sees what every rank's FP8 slice holds (the launch scales
+            # its fp32 accumulator, so no bf16 rounding of the weight)
+            wo_all[i] = torch.cat([q.float() * s[:, None] for q, s in parts], dim=1)
             wo[i] = wfmt.preshuffle_fp8(parts[rank][0])
             wo_s[i] = parts[rank][1]
     bank = [b[:, :, cols].contiguous() for b in bank_full]

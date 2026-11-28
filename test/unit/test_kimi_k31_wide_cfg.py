@@ -87,27 +87,28 @@ def _routed(L: int) -> set:
     return {w // L for w in widths if w % L == 0}
 
 
-@pytest.mark.parametrize("point", sorted(RECIPE))
-def test_every_recipe_step_is_routed_to_a_launch(point: str, monkeypatch) -> None:
-    """Every request count a point runs reaches a launch; one that does not runs SGLang's
-    whole step (a request count padded to the next graph pays for the padding instead)."""
+def test_every_recipe_step_is_routed_to_a_launch(monkeypatch) -> None:
+    """Every request count each point runs reaches a launch; one that does not runs SGLang's
+    whole step (or pads to the next graph and pays for the padding)."""
     monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
-    L, max_reqs = RECIPE[point]
-    missing = set(range(1, max_reqs + 1)) - _routed(L)
-    assert not missing, (point, sorted(missing))
+    missing = {
+        point: sorted(set(range(1, max_reqs + 1)) - _routed(L))
+        for point, (L, max_reqs) in RECIPE.items()
+    }
+    assert not any(missing.values()), missing
 
 
-@pytest.mark.parametrize("point", sorted(RECIPE))
-def test_every_recipe_step_past_narrow_runs_the_wide_launch(
-    point: str, monkeypatch
-) -> None:
+def test_every_recipe_step_past_narrow_runs_the_wide_launch(monkeypatch) -> None:
     """A routed step past NARROW rows is one the wide launch serves at the point's L (not
     another L's width that falls back to SGLang), and a bucket holds it."""
     monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
-    L, max_reqs = RECIPE[point]
-    served, top = set(wide.widths_at(L)), wide.buckets(L)[-1]
-    rows = [L * r for r in range(1, max_reqs + 1) if L * r > wide.NARROW]
-    assert all(b in served and b <= top for b in rows), (point, rows)
+    off = {}
+    for point, (L, max_reqs) in RECIPE.items():
+        served, top = set(wide.widths_at(L)), wide.buckets(L)[-1]
+        rows = [L * r for r in range(1, max_reqs + 1) if L * r > wide.NARROW]
+        if bad := [b for b in rows if b not in served or b > top]:
+            off[point] = bad
+    assert not off, off
 
 
 @pytest.mark.parametrize("L", wide.SUPPORTED_L)

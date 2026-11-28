@@ -536,31 +536,13 @@ def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
     assert k3.Feature.KV_OFFLOAD in k3.SPEC.features
     base = k3._config_disable_reasons(SimpleNamespace(**cfg), K3)
     assert not any("HiCache" in r for r in base), base
+    # HiCache itself adds no refusal
+    hicache = SimpleNamespace(**cfg, enable_hierarchical_cache=True)
+    assert k3._config_disable_reasons(hicache, K3) == base
     for flag in _NO_OFFLOAD:
         reasons = k3._config_disable_reasons(SimpleNamespace(**{**cfg, flag: True}), K3)
         extra = [r for r in reasons if r not in base]
         assert len(extra) == 1 and "only HiCache" in extra[0], (flag, extra)
-
-
-def test_hicache_passes_kimi_k3s_own_config_hook(monkeypatch):
-    """HiCache is the KV offload the spec admits: turning it on adds no refusal."""
-    monkeypatch.setattr(k3, "WIDE", True)
-    cfg = dict(
-        dcp_size=8,
-        attn_cp_size=1,
-        enable_prefill_cp=False,
-        speculative_algorithm="DSPARK",
-        speculative_num_draft_tokens=6,
-        cuda_graph_max_bs_decode=16,
-        max_running_requests=16,
-        enable_linear_replayssm_spec=True,
-        **_NO_OFFLOAD,
-    )
-    off = k3._config_disable_reasons(SimpleNamespace(**cfg), K3)
-    on = k3._config_disable_reasons(
-        SimpleNamespace(**cfg, enable_hierarchical_cache=True), K3
-    )
-    assert on == off and not any("offload" in r or "HiCache" in r for r in on), on
 
 
 def test_kimi_k31_says_the_host_only_ring_refusal_once(monkeypatch):
