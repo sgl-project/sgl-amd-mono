@@ -620,7 +620,8 @@ def _mono_pre_q_view(tree):
     and the layer keeps SGLang's own projection front):
 
     - ``q_replicate_active`` is assigned once, in the function body before the view, to
-      ``_QREP_PREDICATE``'s conjunction (any order), and is not a parameter;
+      ``_QREP_PREDICATE``'s conjunction (any order), and is not a parameter; its
+      ``forward_batch`` is the function's parameter, never rebound;
     - ``pre`` is assigned once in the function body; every other use of it is ``pre is
       (not) None``, ``pre["<key>"]`` or ``pre.get("<key>")`` of another key than "q", and
       ``pre["q"]`` is read once; no assignment expression (``:=``) anywhere;
@@ -637,7 +638,15 @@ def _mono_pre_q_view(tree):
         return None
     a = fn.args
     params = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
-    if {"q_replicate_active", "pre"} & params:
+    # the predicate reads the step's own batch: a parameter never rebound
+    if {"q_replicate_active", "pre"} & params or "forward_batch" not in params:
+        return None
+    if any(
+        isinstance(n, ast.Name)
+        and n.id == "forward_batch"
+        and not isinstance(n.ctx, ast.Load)
+        for n in ast.walk(fn)
+    ):
         return None
 
     def dump(e: str) -> str:
