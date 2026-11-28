@@ -875,50 +875,110 @@ def _weights(layer, i: int, rows: int, runner) -> _Layer:
     )
 
 
+# Resolve an MLA linear projection as contiguous bf16 or Quark per-channel FP8;
+# raises ValueError naming the misfit.
+def _mla_proj_operands(linear, name: str, shape: tuple[int, int]):
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
+
+    if linear is None:
+        raise ValueError(f"{name} is missing")
+    # GPTQ / AWQ-style linears keep qweight and have no weight.
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        raise ValueError(f"{name} has no weight")
+    if weight.dtype == torch.bfloat16:
+        if tuple(weight.shape) != shape or not weight.is_contiguous():
+            raise ValueError(
+                f"{name} is {weight.dtype} {tuple(weight.shape)}, not contiguous bf16 {shape}"
+            )
+        return wfmt.BF16, weight, None
+    shuffled, storage, scale = _quark_fp8_storage(linear=linear, name=name)
+    if tuple(storage.shape) != shape:
+        raise ValueError(f"the FP8 {name} is {tuple(storage.shape)}, not {shape}")
+    return (wfmt.FP8_SHUFFLED if shuffled else wfmt.FP8), storage, scale
+
+
 def _mla_build(layer, rows: int):
     """An MLA layer's projection-front key and the weights it reads in place, or
     None (a KDA layer, or weights the launch does not take: SGLang's path)."""
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
     attn = layer.self_attn
-    idx = getattr(attn, "indexer", None)
     fused = getattr(attn, "fused_qkv_a_proj_with_mqa", None)
-    if hasattr(attn, "qkv_conv1d") or idx is None or fused is None:
+    if hasattr(attn, "qkv_conv1d") or fused is None:
         return None
     if get_parallel().attn_dcp_size > 1:
         # under DCP SGLang's MLA forward computes every head's q itself (the
         # replicated q_b); the front hands over this rank's 12
         return None
+    layer_id = getattr(layer, "layer_id", -1)
+    idx = attn.indexer
+    has_indexer = idx is not None
+    try:
+        qkv_fmt, w_qkv, w_qkv_s = _mla_proj_operands(
+            linear=fused, name="fused_qkv_a_proj_with_mqa", shape=(mp.LATW, HIDDEN)
+        )
+        g_fmt, w_g, w_g_s = _mla_proj_operands(
+            linear=getattr(attn, "g_proj", None),
+            name="g_proj",
+            shape=(mp.GATE, HIDDEN),
+        )
+        qb_fmt, w_qb, w_qb_s = _mla_proj_operands(
+            linear=attn.q_b_proj, name="q_b_proj", shape=(mp.QB, mp.QL)
+        )
+    except ValueError as err:
+        logger.info("monokernel: no MLA front for layer %d: %s", layer_id, err)
+        return None
+    if qkv_fmt != g_fmt:
+        logger.info(
+            "monokernel: no MLA front for layer %d: w_qkv format %d != g_proj format %d",
+            layer_id,
+            qkv_fmt,
+            g_fmt,
+        )
+        return None
+    if has_indexer and (qkv_fmt != wfmt.BF16 or qb_fmt != wfmt.BF16):
+        logger.info(
+            "monokernel: no MLA front for layer %d: indexer layers require bf16 projections",
+            layer_id,
+        )
+        return None
     w = {
         "ares_nw": layer.self_attention_res_norm.weight,
         "ares_qk": layer.self_attention_res_proj.weight.view(HIDDEN),
         "in_nw": layer.input_layernorm.weight,
-        "w_qkv": fused.weight,
-        "w_g": getattr(getattr(attn, "g_proj", None), "weight", None),
-        "w_k": getattr(getattr(idx, "wk", None), "weight", None),
-        "w_p": getattr(getattr(idx, "weights_proj", None), "weight", None),
-        "w_qb": attn.q_b_proj.weight,
-        "w_iq": getattr(getattr(idx, "wq_b", None), "weight", None),
+        "w_qkv": w_qkv,
+        "w_qkv_s": w_qkv_s,
+        "w_g": w_g,
+        "w_g_s": w_g_s,
+        "w_qb": w_qb,
+        "w_qb_s": w_qb_s,
         "q_nw": attn.q_a_layernorm.weight,
         "kv_nw": attn.kv_a_layernorm.weight,
     }
-    want = {
-        "w_qkv": (mp.LATW, HIDDEN), "w_g": (mp.GATE, HIDDEN), "w_k": (mp.IK, HIDDEN),
-        "w_p": (mp.IW, HIDDEN), "w_qb": (mp.QB, mp.QL), "w_iq": (mp.IQ, mp.QL),
-    }  # fmt: skip
-    for n, shp in want.items():
-        t = w[n]
-        if (
-            not isinstance(t, torch.Tensor)
-            or t.dtype != torch.bfloat16
-            or tuple(t.shape) != shp
-            or not t.is_contiguous()
-        ):
-            logger.info("monokernel: no MLA front for layer %d: %s is %s", layer.layer_id if hasattr(layer, "layer_id") else -1, n, None if t is None else (t.dtype, tuple(t.shape)))  # fmt: skip
-            return None
+    if has_indexer:
+        w["w_k"] = getattr(getattr(idx, "wk", None), "weight", None)
+        w["w_p"] = getattr(getattr(idx, "weights_proj", None), "weight", None)
+        w["w_iq"] = getattr(getattr(idx, "wq_b", None), "weight", None)
+        want_idx = {
+            "w_k": (mp.IK, HIDDEN),
+            "w_p": (mp.IW, HIDDEN),
+            "w_iq": (mp.IQ, mp.QL),
+        }
+        for n, shp in want_idx.items():
+            t = w[n]
+            if (
+                not isinstance(t, torch.Tensor)
+                or t.dtype != torch.bfloat16
+                or tuple(t.shape) != shp
+                or not t.is_contiguous()
+            ):
+                logger.info("monokernel: no MLA front for layer %d: %s is %s", layer.layer_id if hasattr(layer, "layer_id") else -1, n, None if t is None else (t.dtype, tuple(t.shape)))  # fmt: skip
+                return None
     # the absorb's weight as SGLang's bf16 bmm multiplies it: w_kc itself, unscaled
     wkc, wsc = getattr(attn, "w_kc", None), getattr(attn, "w_scale", None)
     qn = (
@@ -933,6 +993,9 @@ def _mla_build(layer, rows: int):
     key = mp.MlaPreBuild(
         tokens=rows,
         qn=qn,
+        has_indexer=has_indexer,
+        qkv_fmt=qkv_fmt,
+        qb_fmt=qb_fmt,
         nblocks=layer.prev_valid_blocks,
         eps=layer.self_attention_res_norm.variance_epsilon,
         out_eps=layer.input_layernorm.variance_epsilon,
@@ -1320,14 +1383,17 @@ class _Built:
             "q_lora": out["q_lora"], "gate": out["gate"],
             "q_nope_out": out["qn"] if key.qn else None,
         }  # fmt: skip
-        attn.indexer.__dict__["_mono_pre"] = {
-            "q": out["idx_q"], "k": out["idx_k"], "w": out["idx_w"],
-        }  # fmt: skip
+        idx = attn.indexer
+        if idx is not None:
+            idx.__dict__["_mono_pre"] = {
+                "q": out["idx_q"], "k": out["idx_k"], "w": out["idx_w"],
+            }  # fmt: skip
         try:
             return self._pre_o_proj(layer, x, forward_batch, zero_allocator)
         finally:
             attn.__dict__.pop("_mono_pre", None)
-            attn.indexer.__dict__.pop("_mono_pre", None)
+            if idx is not None:
+                idx.__dict__.pop("_mono_pre", None)
 
     def _pre_o_proj(self, layer, x, forward_batch, zero_allocator):
         """``KimiK3DecoderLayer._run_self_attn`` stopped before o_proj: the

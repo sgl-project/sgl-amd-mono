@@ -21,6 +21,7 @@ from sgl_amd_mono.common.ops import (
     rsrc,
 )
 from sgl_amd_mono.common.plan import THREADS, WAVES
+from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
 
 ROWS = 16
 KCH = 128
@@ -64,7 +65,7 @@ def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, nbytes=None):
     return out
 
 
-def mfmas(lane, wave, xl, xrow, k, s, ops):
+def mfmas(lane, wave, xl, xrow, k, s, ops, fmt=wfmt.BF16):
     """``loads``' operands against token rows 0 .. s - 1 of the LDS rows ``xl``
     (``xrow`` bf16 a row) -> this wave's 16x16 accumulator."""
     per, n = chunks(k)
@@ -87,7 +88,7 @@ def mfmas(lane, wave, xl, xrow, k, s, ops):
                     [live.select(xb[d], fx.Int32(0)) for d in range(4)], fx.Int32
                 )
             acc = mfma_bf16(
-                ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
+                wfmt.operand(fmt=fmt, w=ops[i][q]), xb.bitcast(fx.BFloat16), acc
             )
     return acc
 
