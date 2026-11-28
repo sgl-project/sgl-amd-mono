@@ -41,7 +41,8 @@ def _tile_tasks(b: int, L: int, cfgs) -> dict:
     cfg = _cfg(cfgs)
     plans = {
         "kda": lay.plan(b, cfg, L, 3, 4, wide.NF, False)[0],
-        "kda capture": lay.plan(b, cfg, L, 3, 4, wide.NF, True)[0],
+        "kda attn_res capture": lay.plan(b, cfg, L, 3, 4, wide.NF, "attn_res")[0],
+        "kda prefix capture": lay.plan(b, cfg, L, 3, 4, wide.NF, "prefix")[0],
     }
     tasks = {
         (kind, s.name): s.tasks
@@ -84,8 +85,8 @@ def test_every_bucket_fits_one_round(L: int) -> None:
 
 
 def test_every_row_count_fits_one_round() -> None:
-    """Not only today's buckets: a bucket or draft length added later lands on a row
-    count the configs already keep in one round."""
+    """Not only today's buckets: a bucket or draft length added later within 9 ..
+    max(SUPPORTED_L) x REQ_BUCKETS[-1] rows lands on a row count kept in one round."""
     top = max(wide.SUPPORTED_L) * wide.REQ_BUCKETS[-1]
     over = {}
     for b in range(wide.NARROW + 1, top + 1):
@@ -94,8 +95,8 @@ def test_every_row_count_fits_one_round() -> None:
     assert not over, over
 
 
-def test_every_row_count_config_builds() -> None:
-    """The tile constraints the launch builds assert, at every row count."""
+def test_every_row_count_config_meets_tile_constraints() -> None:
+    """The tile constraints the launch builds assert, checked on CPU at every row count."""
     top = max(wide.SUPPORTED_L) * wide.REQ_BUCKETS[-1]
     for b in range(wide.NARROW + 1, top + 1):
         cfg = _cfg(wide._row_cfgs(b))
