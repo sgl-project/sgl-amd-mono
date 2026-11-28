@@ -11,19 +11,23 @@ from sgl_amd_mono.common.plan import BLOCKS, WAVES
 from sgl_amd_mono.kimi_k31 import wide
 from sgl_amd_mono.kimi_k31.gfx950 import mla_pre_wide as mpw
 
+_STREAM = object()
+
 
 def _dispatch_directly(monkeypatch) -> list:
-    """Stand AITER's compiled dispatch in for the fake launchers; return the launchers it ran."""
+    """Stand AITER's compiled dispatch in for the fake launchers; return the launchers it ran.
+    Each launch must pass the current stream as its last positional argument."""
     from aiter.ops.flydsl.kernels import tensor_shim
 
     dispatched = []
 
     def run(exe, *args):
+        assert args and args[-1] is _STREAM, args[-1:]
         dispatched.append(exe)
         exe(*args)
 
     monkeypatch.setattr(tensor_shim, "_run_compiled", run)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _STREAM)
     return dispatched
 
 
@@ -372,8 +376,8 @@ def test_run_mla_pre_wiring_and_partial_padding(
         layer.self_attn.w_kc_qrep = z(1)
         layer.self_attn.q_b_proj_qrep_weight = z(mpw.QB_QREP, mpw.QL)
     assert w._run_mla_pre(pk, bufs, h_full, fb=None) is None
-    # every launch went through the compiled dispatch, and a fallback launched nothing
-    assert len(dispatched) == len(recorded)
+    # the four launches above went through the compiled dispatch; no fallback launched
+    assert len(recorded) == 4 and len(dispatched) == 4
 
 
 def test_dsa_step_sets_and_pops_mono_pre_on_normal_and_exception(monkeypatch) -> None:
