@@ -529,12 +529,45 @@ _NO_OFFLOAD = dict(
 )
 
 
+def test_decode_context_parallel_is_served_on_the_a2a_exchange_only(monkeypatch):
+    """DCP8 was validated on the a2a exchange; another backend at DCP8 is refused, one
+    reason, while DCP1 (where SGLang resolves the backend to ag_rs) is unaffected.
+    Kimi-K3.1's hook takes Kimi-K3's checks, so it refuses it too."""
+    from sgl_amd_mono.kimi_k31 import spec as k31
+
+    monkeypatch.setattr(k3, "WIDE", True)
+    cfg = dict(
+        dcp_size=8,
+        dcp_comm_backend="a2a",
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=6,
+        cuda_graph_max_bs_decode=16,
+        max_running_requests=16,
+        enable_linear_replayssm_spec=True,
+        **_NO_OFFLOAD,
+    )
+    base = k3._config_disable_reasons(SimpleNamespace(**cfg), K3)
+    assert not any("--dcp-comm-backend" in r for r in base), base
+    ag_rs = {**cfg, "dcp_comm_backend": "ag_rs"}
+    reasons = k3._config_disable_reasons(SimpleNamespace(**ag_rs), K3)
+    backend = [r for r in reasons if "--dcp-comm-backend" in r]
+    assert len(backend) == 1 and "--dcp-comm-backend ag_rs" in backend[0], reasons
+    assert [r for r in reasons if r not in backend] == base
+    dcp1 = SimpleNamespace(**{**ag_rs, "dcp_size": 1})
+    assert k3._config_disable_reasons(dcp1, K3) == base
+    k31_reasons = k31._config_disable_reasons(SimpleNamespace(**ag_rs), K3)
+    assert sum("--dcp-comm-backend ag_rs" in r for r in k31_reasons) == 1, k31_reasons
+
+
 def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
     """The spec declares KV_OFFLOAD for HiCache; the other offload paths it admits are
     refused, one reason each, through Kimi-K3's own config hook."""
     monkeypatch.setattr(k3, "WIDE", True)
     cfg = dict(
         dcp_size=8,
+        dcp_comm_backend="a2a",
         attn_cp_size=1,
         enable_prefill_cp=False,
         speculative_algorithm="DSPARK",
@@ -567,6 +600,7 @@ def test_the_host_only_ring_refusal_follows_the_widths_this_draft_length_serves(
     monkeypatch.setattr(k3, "_host_only_mamba", lambda: True)
     cfg = SimpleNamespace(
         dcp_size=8,
+        dcp_comm_backend="a2a",
         attn_cp_size=1,
         enable_prefill_cp=False,
         speculative_algorithm="DSPARK",
@@ -599,6 +633,7 @@ def test_kimi_k31_says_the_host_only_ring_refusal_once(monkeypatch):
     monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
     cfg = SimpleNamespace(
         dcp_size=8,
+        dcp_comm_backend="a2a",
         attn_cp_size=1,
         enable_prefill_cp=False,
         speculative_algorithm="DSPARK",
@@ -654,6 +689,7 @@ def test_wide_config_guards_draft_tokens_and_request_scoped_ring(monkeypatch):
     monkeypatch.setattr(k3, "_host_only_mamba", lambda: True)
     ring_cfg = SimpleNamespace(
         dcp_size=8,
+        dcp_comm_backend="a2a",
         attn_cp_size=1,
         enable_prefill_cp=False,
         speculative_algorithm="DSPARK",

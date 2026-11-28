@@ -167,6 +167,7 @@ SGLANG_READS = {
     ),
     "srt/arg_groups/fields/parallel.py": (
         "dcp_size",
+        "dcp_comm_backend",
         "attn_cp_size",
         "enable_prefill_cp",
     ),
@@ -236,7 +237,8 @@ def _k3_aiter_opt() -> bool:
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     """What ``SPEC.requires`` cannot state: the shapes, which live on the text
     config and so are out of ``requires.hf_config``'s reach; SGLang's K3 AITER
-    switch; and FlyDSL."""
+    switch; the server's KV offload, context parallel (DCP size and exchange) and
+    wide-step settings; and FlyDSL."""
     t = _text_config(hf_config)
     linear = _linear_attn_config(hf_config)
     reasons = [
@@ -281,6 +283,11 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         dcp = cfg.dcp_size or 1
         if dcp not in DCP_SIZES:
             reasons.append(f"--dcp-size {dcp} is not one of {list(DCP_SIZES)}")
+        elif dcp > 1 and cfg.dcp_comm_backend != "a2a":
+            # DCP was validated on the a2a exchange, SGLang's default on ROCm at DCP8
+            reasons.append(
+                f"--dcp-comm-backend {cfg.dcp_comm_backend} is not served; DCP runs on a2a"
+            )
         if (cfg.attn_cp_size or 1) > 1 or cfg.enable_prefill_cp:
             reasons.append(
                 "attention context parallel is on; only --dcp-size is accepted"

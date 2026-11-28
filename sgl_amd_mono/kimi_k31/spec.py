@@ -55,8 +55,8 @@ NUMERICS = Numerics(
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sglang.srt.environ import envs
 
-    # Kimi-K3's checks also take the DCP sizes, attention CP, the wide draft lengths and
-    # the KV offload paths other than HiCache
+    # Kimi-K3's checks also take the DCP sizes and exchange, attention CP, the wide draft
+    # lengths and the KV offload paths other than HiCache
     reasons = k3._config_disable_reasons(cfg=cfg, hf_config=hf_config)
     if envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get():
         # SGLang then rings ReplaySSM state by request row; the launches index it by slot
