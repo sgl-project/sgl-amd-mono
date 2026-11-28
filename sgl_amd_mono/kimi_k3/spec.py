@@ -134,6 +134,7 @@ SGLANG_READS = {
     ),
     "srt/models/deepseek_common/attention_forward_methods/forward_mla.py": (
         "is_dcp_q_replicate_phase",
+        "_split_q_nope_pe",
     ),
     "srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py": (
         "forward_absorb_rocm_prepare",
@@ -616,24 +617,41 @@ def _head_count(node, assigned: dict, *, qrep: bool):
 
 def _mono_pre_q_view(tree):
     """``(head expression, plain assignments before it)`` of SGLang's ``_mono_pre`` handoff,
-    or None unless the function has exactly this shape (anything else reads as unsupported,
-    and the layer keeps SGLang's own projection front):
+    or None unless the function's source has exactly this shape (a source-shape check:
+    anything else reads as unsupported, and the layer keeps SGLang's own projection front):
 
     - ``q_replicate_active`` is assigned once, in the function body before the view, to
       ``_QREP_PREDICATE``'s conjunction (any order), and is not a parameter; its
       ``forward_batch`` is the function's parameter, never rebound;
-    - ``pre`` is assigned once in the function body; every other use of it is ``pre is
-      (not) None``, ``pre["<key>"]`` or ``pre.get("<key>")`` of another key than "q", and
-      ``pre["q"]`` is read once; no assignment expression (``:=``) anywhere;
+    - ``pre = self.__dict__.get("_mono_pre")`` is its one assignment, in the function body;
+      every other use of it is ``pre is (not) None``, ``pre["<key>"]`` or
+      ``pre.get("<key>")`` of another key than "q", and
+      ``pre["q"]`` is read once;
     - that read is ``name = pre["q"].view(-1 or pre["q_lora"].shape[0], heads,
       self.qk_head_dim)``, a statement directly in an ``if`` whose test is or has the
-      conjunct ``pre is not None``, after only plain name assignments in that branch, and
-      ``name`` is not rebound later in it."""
+      conjunct ``pre is not None`` (a statement of the function body), after only plain
+      name assignments in that branch; ``name`` is not used again in it, and after the
+      ``if`` chain it is only an argument of ``self._split_q_nope_pe``;
+    - no other way to bind a name (``:=``, ``match``, lambdas, nested functions or
+      classes, comprehensions, ``global`` / ``nonlocal``, ``except ... as``, ``import
+      ... as``)."""
     import ast
 
     fn = tree.body[0] if tree.body else None
-    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or any(
-        isinstance(n, ast.NamedExpr) for n in ast.walk(fn)
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    # no construct that binds or shadows a name where a Name store would not show it
+    hidden = (ast.NamedExpr, ast.Match, ast.Lambda, ast.ClassDef, ast.Global)
+    hidden += (ast.Nonlocal, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    if any(
+        isinstance(n, hidden)
+        or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not fn)
+        or (isinstance(n, ast.ExceptHandler) and n.name is not None)
+        or (
+            isinstance(n, (ast.Import, ast.ImportFrom))
+            and any(x.asname is not None for x in n.names)
+        )
+        for n in ast.walk(fn)
     ):
         return None
     a = fn.args
@@ -718,6 +736,7 @@ def _mono_pre_q_view(tree):
         or pred.targets[0] is not stores["q_replicate_active"][0]
         or top.get("pre") is None
         or top["pre"].targets[0] is not stores["pre"][0]
+        or ast.dump(top["pre"].value) != dump('self.__dict__.get("_mono_pre")')
         or not isinstance(pred.value, ast.BoolOp)
         or not isinstance(pred.value.op, ast.And)
         or sorted(ast.dump(v) for v in pred.value.values)
@@ -733,6 +752,7 @@ def _mono_pre_q_view(tree):
         and isinstance(stmt.targets[0], ast.Name)
         and isinstance(guard, ast.If)
         and stmt in guard.body
+        and guard in fn.body
     ):
         return None
     conjuncts = (
@@ -745,11 +765,22 @@ def _mono_pre_q_view(tree):
     at = guard.body.index(stmt)
     name = stmt.targets[0].id
     if any(
-        isinstance(n, ast.Name) and n.id == name and not isinstance(n.ctx, ast.Load)
+        isinstance(n, ast.Name) and n.id == name
         for s in guard.body[at + 1 :]
         for n in ast.walk(s)
     ):
-        return None  # the viewed q is rebound later in the branch
+        return None  # the viewed q is read or rebound later in its branch
+    for n in ast.walk(fn):
+        # past the if / elif chain the viewed q only goes to SGLang's split, as is
+        if isinstance(n, ast.Name) and n.id == name and n.lineno > guard.end_lineno:
+            call = parent.get(id(n))
+            if not (
+                isinstance(n.ctx, ast.Load)
+                and isinstance(call, ast.Call)
+                and n in call.args
+                and ast.dump(call.func) == dump("self._split_q_nope_pe")
+            ):
+                return None
     assigned: dict = {}
     for s in guard.body[:at]:
         if not (
