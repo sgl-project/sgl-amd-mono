@@ -141,6 +141,7 @@ def _fake_dsa_layer(
     res_eps=1e-5,
     ln_eps=1e-5,
     res_proj_shape=(1, wide.H),
+    res_proj_transposed=False,
     w_ln_shape=(wide.H,),
     w_ln_contig=True,
     act_kind="situ",
@@ -189,7 +190,13 @@ def _fake_dsa_layer(
             else None
         ),
         mlp_res_proj=(
-            SimpleNamespace(weight=torch.empty(res_proj_shape, dtype=torch.bfloat16))
+            SimpleNamespace(
+                weight=(
+                    torch.empty(res_proj_shape[::-1], dtype=torch.bfloat16).t()
+                    if res_proj_transposed
+                    else torch.empty(res_proj_shape, dtype=torch.bfloat16)
+                )
+            )
             if has_mlp_res_proj
             else None
         ),
@@ -234,6 +241,7 @@ def test_dsa_fusable_negative_gates(monkeypatch) -> None:
         {"res_norm_shape": (1024,)},
         {"res_norm_shape": (wide.H, 1)},
         {"res_proj_shape": (1, 1024)},
+        {"res_proj_shape": (wide.H // 2, 2), "res_proj_transposed": True},
         {"w_ln_shape": (1024,)},
         {"w_ln_contig": False},
         {"act_kind": "silu"},
