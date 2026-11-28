@@ -245,12 +245,21 @@ def run_one(m, qb_rows, nl, flush_mb, show_tl, check_only=False):
                 errs[k] = float("inf") if (v != v or prev != prev) else max(prev, v)
         return errs
 
-    # 1. Check numerical accuracy after 4 eager steps (tests fbuf zeroing + tag advance)
-    for _ in range(4):
+    # 1. Check 4 eager steps, each on new inputs (tests fbuf zeroing + tag advance): a step
+    #    that skips an output keeps the previous step's and fails its check (a small stale
+    #    region can stay under the rel-L2 bound)
+    errs = {}
+    for step in range(4):
+        if step:
+            torch.manual_seed(7000 + m * 31 + qb_rows + step)
+            for i in range(nl):
+                x[i].copy_(torch.randn(m, mpw.H, dtype=BF, device=dev) * 0.5)
         for i in range(nl):
             call_fused(i)
-    torch.cuda.synchronize()
-    errs = check_outputs()
+        torch.cuda.synchronize()
+        for k, v in check_outputs().items():
+            prev = errs.get(k, 0.0)
+            errs[k] = float("inf") if (v != v or prev != prev) else max(prev, v)
 
     # 2. Capture CUDA graph (and time unless check_only), then replay with fresh inputs
     if check_only:

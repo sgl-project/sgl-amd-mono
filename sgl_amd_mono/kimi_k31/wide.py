@@ -77,10 +77,12 @@ SGLANG_READS = {
     ),
     "srt/models/deepseek_common/attention_forward_methods/forward_mla.py": (
         "is_dcp_q_replicate_phase",
+        "_split_q_nope_pe",
     ),
     "srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py": (
         "forward_absorb_rocm_prepare",
         '"_mono_pre"',
+        "q_replicate_active",
     ),
     "srt/layers/attention/dsa/dsa_indexer.py": ("wk", "weights_proj", "wq_b"),
     "srt/layers/attention/dsa/indexer_prologue_hip.py": ('"_mono_pre"',),
@@ -614,8 +616,10 @@ def _dsa_fusable(layer) -> bool:
         and w_ln.is_contiguous()
         and res_proj_w is not None
         and res_proj_w.numel() == H
-        and getattr(res_norm, "variance_epsilon", None)
-        == getattr(ln, "variance_epsilon", None)
+        and getattr(ln, "variance_epsilon", None) is not None
+        and getattr(res_norm, "variance_epsilon", None) == ln.variance_epsilon
+        and isinstance(getattr(res_norm, "weight", None), torch.Tensor)
+        and tuple(res_norm.weight.shape) == (H,)
         and isinstance(act_fn, SituAndMul)
         and act_fn.beta == 4.0
         and act_fn.linear_beta == 25.0
@@ -650,10 +654,290 @@ def _pre_o_proj(layer, x, positions, fb, zero_allocator):
             get_attn_tp_context().clear_attn_inputs()
 
 
+# SGLang's q-replicate predicate in forward_absorb_rocm_prepare, conjunct by conjunct: the
+# one the plugin evaluates at every step before it hands a replicated-Q front over (the
+# wide launch in _run_mla_pre, the narrow one in _mla_covered)
+_QREP_PREDICATE = (
+    "self.is_dcp_q_replicate_phase(forward_batch)",
+    "not self.use_deep_gemm_bmm",
+    "self.w_kc_qrep is not None",
+    "self.q_b_proj_qrep_weight is not None",
+)
+
+
+def _head_count(node, assigned: dict, *, qrep: bool):
+    """A ``pre["q"].view`` head-count expression with ``q_replicate_active = qrep``, as
+    ``(coefficient, power of self.num_local_heads, power of self.dcp_size)``. Reads int
+    literals, those two attributes, ``*``, a conditional on the bare ``q_replicate_active``
+    and names in ``assigned``; None for anything else."""
+    import ast
+
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value, 0, 0
+    if isinstance(node, ast.Name):
+        if node.id not in assigned:
+            return None
+        return _head_count(assigned[node.id], {}, qrep=qrep)
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    ):
+        return {"num_local_heads": (1, 1, 0), "dcp_size": (1, 0, 1)}.get(node.attr)
+    if (
+        isinstance(node, ast.IfExp)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "q_replicate_active"
+    ):
+        return _head_count(node.body if qrep else node.orelse, assigned, qrep=qrep)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        a = _head_count(node.left, assigned, qrep=qrep)
+        b = _head_count(node.right, assigned, qrep=qrep)
+        if a is None or b is None:
+            return None
+        return a[0] * b[0], a[1] + b[1], a[2] + b[2]
+    return None
+
+
+def _mono_pre_q_view(tree):
+    """``(head expression, plain assignments before it)`` of SGLang's ``_mono_pre`` handoff,
+    or None unless the function's source has exactly this shape (a source-shape check:
+    anything else reads as unsupported, and the layer keeps SGLang's own projection front):
+
+    - ``q_replicate_active`` is assigned once, in the function body before the view, to
+      ``_QREP_PREDICATE``'s conjunction (any order), and is not a parameter; its
+      ``forward_batch`` is the function's parameter, never rebound;
+    - ``pre = self.__dict__.get("_mono_pre")`` is its one assignment, in the function body;
+      every other use of it is ``pre is (not) None``, ``pre["<key>"]`` or
+      ``pre.get("<key>")`` of another key than "q", and
+      ``pre["q"]`` is read once;
+    - that read is ``name = pre["q"].view(-1 or pre["q_lora"].shape[0], heads,
+      self.qk_head_dim)``, a statement directly in ``if self.q_lora_rank is not None and
+      pre is not None`` (or ``if pre is not None``), a statement of the function body
+      that only imports, plain assignments and a docstring precede,
+      after only plain name assignments in that branch; ``name`` is not used again in it,
+      the rest of the branch only assigns (in ifs too), and the statement right after the
+      ``if`` chain is an assignment or return whose value is the call
+      ``self._split_q_nope_pe(name, ...)`` (every later use is such a call);
+    - no write to a ``pre["<key>"]`` field;
+    - ``"_mono_pre"`` appears once (pre's assignment), and no import binds ``self``,
+      ``pre``, ``forward_batch``, ``q_replicate_active`` or ``name``;
+    - no other way to bind a name (``:=``, ``match``, lambdas, nested functions or
+      classes, comprehensions, ``global`` / ``nonlocal``, ``except ... as``, ``import
+      ... as``), no rebinding of ``self``, and no ``assert``, ``raise`` or ``try``."""
+    import ast
+
+    fn = tree.body[0] if tree.body else None
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    # no construct that binds or shadows a name where a Name store would not show it
+    hidden = (ast.NamedExpr, ast.Match, ast.Lambda, ast.ClassDef, ast.Global)
+    hidden += (ast.Nonlocal, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    # nor a statement that stops the step on one path (SGLang's handoff has none)
+    hidden += (ast.Assert, ast.Raise, ast.Try)
+    if any(
+        isinstance(n, hidden)
+        or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not fn)
+        or (isinstance(n, ast.ExceptHandler) and n.name is not None)
+        or (
+            isinstance(n, (ast.Import, ast.ImportFrom))
+            and any(x.asname is not None or x.name == "*" for x in n.names)
+        )
+        for n in ast.walk(fn)
+    ):
+        return None
+    imported = {
+        x.name.split(".")[0]
+        for n in ast.walk(fn)
+        if isinstance(n, (ast.Import, ast.ImportFrom))
+        for x in n.names
+    }
+    # the handoff dict is named once, where pre is read from it
+    if (
+        sum(
+            isinstance(n, ast.Constant) and n.value == "_mono_pre" for n in ast.walk(fn)
+        )
+        != 1
+        or {"self", "pre", "forward_batch", "q_replicate_active"} & imported
+    ):
+        return None
+    a = fn.args
+    params = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    # the predicate reads the step's own batch: a parameter never rebound
+    if {"q_replicate_active", "pre"} & params or "forward_batch" not in params:
+        return None
+    if any(
+        isinstance(n, ast.Name)
+        and n.id in ("forward_batch", "self")
+        and not isinstance(n.ctx, ast.Load)
+        for n in ast.walk(fn)
+    ):
+        return None
+
+    def dump(e: str) -> str:
+        return ast.dump(ast.parse(e, mode="eval").body)
+
+    parent = {id(c): n for n in ast.walk(fn) for c in ast.iter_child_nodes(n)}
+    stores = {"pre": [], "q_replicate_active": []}
+    q_reads = []
+    for n in ast.walk(fn):
+        if not (isinstance(n, ast.Name) and n.id in stores):
+            continue
+        if not isinstance(n.ctx, ast.Load):
+            stores[n.id].append(n)
+            continue
+        if n.id != "pre":
+            continue
+        up = parent.get(id(n))
+        if isinstance(up, ast.Compare) and ast.dump(up) in (
+            dump("pre is not None"),
+            dump("pre is None"),
+        ):
+            continue
+        if (
+            isinstance(up, ast.Subscript)
+            and isinstance(up.ctx, ast.Load)
+            and isinstance(up.slice, ast.Constant)
+            and isinstance(up.slice.value, str)
+        ):
+            if up.slice.value == "q":
+                q_reads.append(up)
+            continue
+        call = parent.get(id(up))
+        if not (
+            isinstance(up, ast.Attribute)
+            and up.attr == "get"
+            and isinstance(call, ast.Call)
+            and call.func is up
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+            and call.args[0].value != "q"
+        ):
+            return None
+    if len(q_reads) != 1 or any(len(v) != 1 for v in stores.values()):
+        return None
+    view = parent.get(id(parent.get(id(q_reads[0]))))
+    if not (
+        isinstance(view, ast.Call)
+        and isinstance(view.func, ast.Attribute)
+        and view.func.attr == "view"
+        and view.func.value is q_reads[0]
+        and len(view.args) == 3
+        and not view.keywords
+        and ast.dump(view.args[0]) in (dump("-1"), dump('pre["q_lora"].shape[0]'))
+        and ast.dump(view.args[2]) == dump("self.qk_head_dim")
+    ):
+        return None
+    top = {}
+    for s in fn.body:
+        if (
+            isinstance(s, ast.Assign)
+            and len(s.targets) == 1
+            and isinstance(s.targets[0], ast.Name)
+            and s.lineno < view.lineno
+        ):
+            top[s.targets[0].id] = s
+    pred = top.get("q_replicate_active")
+    if (
+        pred is None
+        or pred.targets[0] is not stores["q_replicate_active"][0]
+        or top.get("pre") is None
+        or top["pre"].targets[0] is not stores["pre"][0]
+        or ast.dump(top["pre"].value) != dump('self.__dict__.get("_mono_pre")')
+        or not isinstance(pred.value, ast.BoolOp)
+        or not isinstance(pred.value.op, ast.And)
+        or sorted(ast.dump(v) for v in pred.value.values)
+        != sorted(dump(e) for e in _QREP_PREDICATE)
+    ):
+        return None
+    stmt = parent.get(id(view))
+    guard = parent.get(id(stmt))
+    if not (
+        isinstance(stmt, ast.Assign)
+        and stmt.value is view
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and isinstance(guard, ast.If)
+        and stmt in guard.body
+        and guard in fn.body
+    ):
+        return None
+    # before the guard only imports, plain assignments and a docstring: no early way out
+    for s in fn.body[: fn.body.index(guard)]:
+        doc = isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)
+        if not (doc or isinstance(s, (ast.Assign, ast.Import, ast.ImportFrom))):
+            return None
+    # SGLang's guard (or the bare ``pre`` test): its branch runs in both q-replicate states
+    if ast.dump(guard.test) not in (
+        dump("self.q_lora_rank is not None and pre is not None"),
+        dump("pre is not None"),
+    ):
+        return None
+    at = guard.body.index(stmt)
+    name = stmt.targets[0].id
+    if name in imported:
+        return None
+
+    def plain(s) -> bool:  # assignments, and ifs of them (SGLang: the indexer's top-k)
+        if isinstance(s, ast.If):
+            return all(plain(x) for x in (*s.body, *s.orelse))
+        return isinstance(s, ast.Assign)
+
+    exits = (ast.Return, ast.Break, ast.Continue, ast.Yield, ast.YieldFrom, ast.Await)
+    rest = guard.body[at + 1 :]
+    if not all(plain(s) for s in rest) or any(
+        (isinstance(n, ast.Name) and n.id == name) or isinstance(n, exits)
+        for s in rest
+        for n in ast.walk(s)
+    ):
+        return None  # the viewed q is used again, or the branch does more than assign
+    # the next statement after the if chain is `... = self._split_q_nope_pe(name, ...)` or
+    # `return self._split_q_nope_pe(name, ...)`: the split runs whenever the view did
+    nxt = fn.body.index(guard) + 1
+    after = fn.body[nxt] if nxt < len(fn.body) else None
+    head = after.value if isinstance(after, (ast.Assign, ast.Return)) else None
+    if not (
+        isinstance(head, ast.Call)
+        and ast.dump(head.func) == dump("self._split_q_nope_pe")
+        and head.args
+        and isinstance(head.args[0], ast.Name)
+        and head.args[0].id == name
+    ):
+        return None
+    split = 0
+    for n in ast.walk(fn):
+        # past the if / elif chain the viewed q only goes to SGLang's split, as is
+        if isinstance(n, ast.Name) and n.id == name and n.lineno > guard.end_lineno:
+            call = parent.get(id(n))
+            if not (
+                isinstance(n.ctx, ast.Load)
+                and isinstance(call, ast.Call)
+                and call.args
+                and call.args[0] is n
+                and ast.dump(call.func) == dump("self._split_q_nope_pe")
+            ):
+                return None
+            split += 1
+    if not split:
+        return None
+    assigned: dict = {}
+    for s in guard.body[:at]:
+        if not (
+            isinstance(s, ast.Assign)
+            and len(s.targets) == 1
+            and isinstance(s.targets[0], ast.Name)
+        ):
+            return None
+        assigned[s.targets[0].id] = s.value
+    return view.args[1], assigned
+
+
 def _sglang_mono_pre_caps(attn) -> tuple[bool, bool]:
-    """Return ``(supports_local, supports_qrep)`` for SGLang's ``_mono_pre`` handoff
-    in ``forward_absorb_rocm_prepare`` (local handoff vs full-head DCP q-replicate
-    from sgl-project/sglang#53130)."""
+    """Return ``(supports_local, supports_qrep)`` for SGLang's ``_mono_pre`` handoff in
+    ``forward_absorb_rocm_prepare``: whether it views ``pre["q"]`` with the local heads
+    without q-replicate, and whether that view takes ``num_local_heads * dcp_size`` heads
+    under it (sgl-project/sglang#53130), read from the view's head expression."""
     cached = getattr(attn, "_k31_mono_pre_caps", None)
     if cached is not None:
         return cached
@@ -666,39 +950,17 @@ def _sglang_mono_pre_caps(attn) -> tuple[bool, bool]:
             import textwrap
 
             tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
-            reads_mono_pre = any(
+            if any(
                 isinstance(n, ast.Constant) and n.value == "_mono_pre"
                 for n in ast.walk(tree)
-            )
-            if reads_mono_pre:
-                for node in ast.walk(tree):
-                    if not isinstance(node, ast.If):
-                        continue
-                    test_names = {
-                        n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
-                    }
-                    if "pre" not in test_names:
-                        continue
-                    body_attrs = {
-                        n.attr
-                        for stmt in node.body
-                        for n in ast.walk(stmt)
-                        if isinstance(n, ast.Attribute)
-                    }
-                    body_names = {
-                        n.id
-                        for stmt in node.body
-                        for n in ast.walk(stmt)
-                        if isinstance(n, ast.Name)
-                    }
-                    if "pre" in body_names and "view" in body_attrs:
-                        local_ok = True
-                        if (
-                            "dcp_size" in body_attrs
-                            and "q_replicate_active" in body_names
-                        ):
-                            qrep_ok = True
-                            break
+            ):
+                view = _mono_pre_q_view(tree)
+                if view is not None:
+                    head, assigned = view
+                    local_ok = _head_count(head, assigned, qrep=False) == (1, 1, 0)
+                    qrep_ok = local_ok and (
+                        _head_count(head, assigned, qrep=True) == (1, 1, 1)
+                    )
         except (OSError, TypeError, SyntaxError):
             local_ok, qrep_ok = False, False
     caps = (local_ok, qrep_ok)
@@ -976,8 +1238,10 @@ class Wide:
     def _mla_bucket_specs(self, b: int) -> dict[int, int]:
         """Map eligible ``qb_rows -> m_mla`` launch width for wide bucket ``b``.
 
-        A bucket can use the MLA launch only when its smallest reachable
-        multiple of ``L`` does not exceed ``max_rows``.
+        A bucket can use the MLA launch only when the smallest served width it
+        holds (``wide_widths`` at this ``L``, past the previous bucket) does not
+        exceed ``max_rows``. The first bucket starts at the served lower cut, not at
+        0: with a bucket override or a small cap, no step reaches a launch below it.
         """
         buckets = getattr(self, "buckets", ())
         if b in buckets:
@@ -985,13 +1249,19 @@ class Wide:
             prev_b = buckets[idx - 1] if idx > 0 else 0
         else:
             prev_b = b - 1
+        reach = min(
+            (w for w in wide_widths() if w % self.L == 0 and prev_b < w <= b),
+            default=None,
+        )
         specs: dict[int, int] = {}
+        if reach is None:
+            return specs
         for pk in self.dsa_layers.values():
             qb = pk.mla_pre_qb
             if qb is None:
                 continue
             lim = _mla_max_rows(qb)
-            if prev_b + self.L <= lim:
+            if reach <= lim:
                 specs[qb] = min(b, lim)
         return specs
 
