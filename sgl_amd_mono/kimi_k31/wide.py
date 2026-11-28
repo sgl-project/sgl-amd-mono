@@ -1239,7 +1239,7 @@ class Wide:
         """Map eligible ``qb_rows -> m_mla`` launch width for wide bucket ``b``.
 
         A bucket can use the MLA launch only when the smallest served width it
-        holds (``wide_widths`` at this ``L``, past the previous bucket) does not
+        holds (``widths_at(L)``, past the previous bucket) does not
         exceed ``max_rows``. The first bucket starts at the served lower cut, not at
         0: with a bucket override or a small cap, no step reaches a launch below it.
         """
@@ -1250,7 +1250,7 @@ class Wide:
         else:
             prev_b = b - 1
         reach = min(
-            (w for w in wide_widths() if w % self.L == 0 and prev_b < w <= b),
+            (w for w in widths_at(self.L) if prev_b < w <= b),
             default=None,
         )
         specs: dict[int, int] = {}
