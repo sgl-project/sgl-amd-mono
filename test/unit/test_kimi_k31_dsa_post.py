@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Derived-property and negative-branch unit tests for wide ``dsa_post``."""
+"""Derived-property, bug-regression, and negative-branch tests for wide ``dsa_post``."""
 
 from types import SimpleNamespace
 
@@ -24,11 +24,12 @@ def _gemms(b: int, L: int):
 def test_dsa_post_plan_and_tile_invariants_across_buckets(
     L: int, timeline: bool
 ) -> None:
-    """Every bucket satisfies dsa_post K-split, CTA placement, and nvb-invariant peer offsets."""
+    """Every bucket's oproj/front/sdown config satisfies dsa_post's K-split, sort CTA, and peer sizing."""
     for b in wide.buckets(L):
-        _, _, go, gf, gs = _gemms(b, L)
-        assert dp.KO % go.ks == 0 and (dp.KO // go.ks) % BK == 0
-        assert go.bm % go.ks == 0 and dp.SL % go.bn == 0
+        gu, gi, go, gf, gs = _gemms(b, L)
+        assert dp.KO % go.ks == 0, (L, b, go)
+        assert (dp.KO // go.ks) % BK == 0, (L, b, go)
+        assert go.bm % go.ks == 0 and dp.SL % go.bn == 0, (L, b, go)
         ref_peer = None
         for nvb in (0, 1, 4, 8):
             pl, _ = dp.plan(b, go, gf, gs, wide.NF, nvb, timeline=timeline)
@@ -44,8 +45,21 @@ def test_dsa_post_plan_and_tile_invariants_across_buckets(
             assert BLOCKS - b - 1 - mf.SORT_HELPERS >= max(b, n_s), (L, b, gs)
 
 
+def test_dsa_post_peer_mailbox_offsets_invariant_across_nvb() -> None:
+    """Bug regression: every nvb_m sharing peers_dsa must place all peer regions and mailboxes
+    at identical byte offsets so raw logits/activations from one layer never alias another's flags."""
+    _, _, go, gf, gs = _gemms(12, 6)
+    base_offs, base_half = dp.plan(12, go, gf, gs, wide.NF, nvb_m=0, nbk=8)[
+        0
+    ].peer_offsets
+    for nvb in range(1, 9):
+        offs, half = dp.plan(12, go, gf, gs, wide.NF, nvb_m=nvb, nbk=8)[0].peer_offsets
+        assert offs == base_offs and half == base_half, (nvb, offs, base_offs)
+
+
 def test_dsa_launch_args_zero_copy_and_partial_bucket_isolation() -> None:
-    """Full contiguous inputs pass zero-copy; partial/strided inputs copy and zero-pad tail rows."""
+    """Derived property: _dsa_launch_args passes core/prefix zero-copy when full & contiguous,
+    and copies + zero-pads stale bucket rows when partial or strided, using scratch_dsa and cnt_dsa."""
     b, rows, rank = 16, 12, 3
     w = object.__new__(wide.Wide)
     w.rank = rank
@@ -85,14 +99,23 @@ def test_dsa_launch_args_zero_copy_and_partial_bucket_isolation() -> None:
         sort=z(256, dt=torch.uint8),
     )
 
-    col0 = 2 * rank * wide.SL
+    # 1. Full bucket, contiguous: zero-copy core & prefix, dedicated cnt_dsa & scratch_dsa
     core_full = torch.randn(b, wide.KO, dtype=torch.bfloat16)
     pfx_full = torch.randn(b, wide.H, dtype=torch.bfloat16)
     args = w._dsa_launch_args(pk, b, bufs, core_full, pfx_full, cur=1, slot=2)
+    col0 = 2 * rank * wide.SL
     assert args[0] == core_full.data_ptr()
     assert args[3] == pfx_full.data_ptr() + col0
+    assert args[16] == bufs["lat_p"][1].data_ptr()
+    assert args[2] == 0  # a bf16 o_proj has no FP8 scale
+    assert args[18] == bufs["cnt_dsa"].data_ptr()
+    assert args[19] == bufs["scratch_dsa"].data_ptr()
+    assert args[19] != bufs["scratch"].data_ptr()
+    assert args[20] == w.peers_dsa[b].addresses.data_ptr()
+    assert args[20] != w.peers[b].addresses.data_ptr()
     assert args[24] == b * wide.H * 2 - col0
 
+    # 2. Partial bucket (rows < b) with strided prefix: copies & zeroes tail rows of bufs["core"]
     core_part = torch.randn(rows, wide.KO, dtype=torch.bfloat16)
     pfx_strided = torch.randn(rows, wide.H * 2, dtype=torch.bfloat16)[:, : wide.H]
     args2 = w._dsa_launch_args(pk, b, bufs, core_part, pfx_strided, cur=1, slot=2)
@@ -194,6 +217,7 @@ def test_dsa_fusable_negative_gates(monkeypatch) -> None:
         {"block_write": True},
         {"ar_fusion": True},
         {"output_gate": False},
+        {"has_pre_o_proj": False},
         {"has_mlp_res_norm": False},
         {"has_mlp_res_proj": False},
         {"wo_dtype": torch.float8_e4m3fn},
@@ -215,32 +239,51 @@ def test_dsa_fusable_negative_gates(monkeypatch) -> None:
         assert wide._dsa_fusable(_fake_dsa_layer(**bad_kwargs)) is False, bad_kwargs
 
 
-def test_dsa_post_builder_validation_and_fp8_aux16(monkeypatch) -> None:
-    """dsa_post rejects invalid tile/sort/nvb invariants and accepts Quark FP8 + wide aux16."""
-    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
-
+def test_dsa_post_factory_builds_launcher_on_cpu() -> None:
+    """Bug regression: dsa_post() must construct and cache its launcher without importing
+    non-existent helper modules (guarding against startup ModuleNotFoundError in warmup)."""
     _, _, go, gf, gs = _gemms(16, 8)
     launch, pl = dp.dsa_post(16, go, gf, gs, wide.NF, nvb_m=1, launches=92)
+    assert callable(launch) and pl.peer_offsets[1] > 0
     launch2, pl2 = dp.dsa_post(16, go, gf, gs, wide.NF, nvb_m=1, launches=92)
     assert launch2 is launch and pl2 is pl
 
     with pytest.raises(AssertionError):
         dp.dsa_post(16, go, gf, gs, wide.NF, nvb_m=9, nbk=8, launches=92)
+
+    # Partial shared-down tile width (7168 % 192 != 0) must cover the final partial tile.
+    gs_part = Gemm(32, 192, 2, 4, 1)
+    pl_part, _ = dp.plan(32, go, gf, gs_part, wide.NF, nvb_m=1)
+    sdown_stage = next(s for s in pl_part.stages if s.name == "sdown")
+    assert sdown_stage.tasks == (dp.H + gs_part.bn - 1) // gs_part.bn
+
+    # Front K-splits that cross peer-slice boundaries (7168 / 7 = 1024 > SL=896) must be rejected.
+    gf_bad = Gemm(32, 128, 2, 4, 7)
     with pytest.raises(AssertionError):
-        dp.dsa_post(32, go, Gemm(32, 128, 2, 4, 7), gs, wide.NF, nvb_m=1, launches=24)
+        dp.dsa_post(32, go, gf_bad, gs, wide.NF, nvb_m=1, launches=24)
+
+    # Front K-splits that do not evenly divide bm (or exceed bm) must be rejected in plan().
     for gf_uneven in (Gemm(64, 128, 2, 4, 56), Gemm(32, 128, 2, 4, 56)):
         with pytest.raises(AssertionError):
             dp.plan(64, go, gf_uneven, gs, wide.NF, nvb_m=1)
+
+    # o_proj tiles must satisfy go.bm % go.ks == 0 and SL % go.bn == 0.
     for go_bad in (Gemm(16, 128, 1, 8, 3), Gemm(16, 192, 1, 8, 4)):
         with pytest.raises(AssertionError):
             dp.plan(16, go_bad, gf, gs, wide.NF, nvb_m=1)
 
-    _, _, go2, gf2, gs2 = _gemms(288, 6)
+
+def test_dsa_post_takes_a_quark_fp8_o_proj(monkeypatch) -> None:
+    """Kimi-K3's Quark FP8 o_proj: dsa_post builds an FP8 o_proj variant (with the wide aux16
+    sort past SORT_MAX_ROWS rows), and _dsa_fusable accepts the layer."""
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    _, _, go, gf, gs = _gemms(288, 6)
     launch_fp8, _ = dp.dsa_post(
         288,
-        go2,
-        gf2,
-        gs2,
+        go,
+        gf,
+        gs,
         wide.NF,
         nvb_m=3,
         launches=23,
@@ -249,7 +292,7 @@ def test_dsa_post_builder_validation_and_fp8_aux16(monkeypatch) -> None:
     )
     assert callable(launch_fp8)
     with pytest.raises(AssertionError):
-        dp.dsa_post(288, go2, gf2, gs2, wide.NF, nvb_m=3, launches=23, sort="sgl")
+        dp.dsa_post(288, go, gf, gs, wide.NF, nvb_m=3, launches=23, sort="sgl")
 
     layer = _fake_dsa_layer()
     scheme = QuarkW8A8Fp8(

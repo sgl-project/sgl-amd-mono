@@ -2,8 +2,13 @@
 """The Kimi-K3.1 spec routes one request's verify steps to Kimi-K3's launches and
 wider ones to the wide launch."""
 
+import ast
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import sgl_amd_mono
@@ -37,6 +42,121 @@ def test_every_wide_width_has_a_bucket_at_each_draft_length():
         for L in wide.SUPPORTED_L:
             if w % L == 0:
                 assert w // L <= top, (w, L)
+
+
+def test_the_spec_serves_up_to_60_requests():
+    # SPEC reads its widths at import, so read them in a process without a bucket override.
+    # The gaps are widths a shorter draft length reads as more than 60 requests (MonoSpec
+    # widths are not per draft length): 6 tokens' 330 and 360 rows are 66 and 72 at L = 5.
+    env = {
+        k: v for k, v in os.environ.items() if k != "SGLANG_AMD_MONO_K31_WIDE_BUCKETS"
+    }
+    # the child imports exactly what this process does
+    script = (
+        f"import sys; sys.path[:] = {sys.path!r}; "
+        "from sgl_amd_mono.kimi_k31 import spec, wide; "
+        "print([w for w in spec.SPEC.widths('gfx950') if w > wide.NARROW])"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    widths = ast.literal_eval(out.strip().splitlines()[-1])
+    served = {L: {w // L for w in widths if w % L == 0} for L in (5, 6, 8)}
+    assert served[5] == set(range(2, 61))
+    assert served[6] == set(range(2, 61)) - {55, 60}
+    assert served[8] == set(range(2, 61)) - {40, 45, 48, 50, 51, 54, 55, 57, 60}
+
+
+def test_the_trimmed_buckets_still_hold_every_served_width(monkeypatch):
+    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    # A launch takes the smallest bucket holding its rows;
+    # trimming one bucket too many leaves the widest served step without one.
+    for L in wide.SUPPORTED_L:
+        full = wide.buckets(L=L)
+        for top in (w for w in wide.wide_widths() if w % L == 0):
+            kept = wide.buckets(L=L, max_rows=top)
+            assert kept == full[: len(kept)], (L, top)
+            assert kept[-1] >= top and (len(kept) == 1 or kept[-2] < top), (L, top)
+
+
+def test_every_bucket_resolves_to_a_tuned_config(monkeypatch):
+    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    # cfg_rows borrows the next tuned count's configs;
+    # a bucket past every tuned count must still resolve rather than raise KeyError at warmup.
+    for L in wide.SUPPORTED_L:
+        for b in wide.buckets(L=L):
+            configs = wide.cfg_rows(b=b, L=L)
+            assert len(configs) == 5, (L, b)
+            assert all(len(c.split(":")) == 5 for c in configs), (L, b, configs)
+    assert wide.cfg_rows(b=24, L=8) == wide.CFGS[32]
+    # past every tuned count and row range: the largest tuned count's configs
+    tables = (
+        wide.UP_ROW_RANGES,
+        wide.INP_ROW_RANGES,
+        wide.OPROJ_ROW_RANGES,
+        wide.FRONT_ROW_RANGES,
+        wide.SDOWN_ROW_RANGES,
+    )
+    past = max(max(wide.CFGS), *(hi for t in tables for _, hi, _ in t)) + 1
+    assert wide._row_cfgs(past) == wide.CFGS[max(wide.CFGS)]
+
+
+def test_an_override_keeps_its_cut_at_every_draft_length(monkeypatch):
+    """A shared wide graph key must clear the override's lower cutoff at every draft length."""
+    monkeypatch.setenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", value="128,256,384")
+    lo = max(r for r in wide.REQ_BUCKETS if r < 16)
+    widths = wide.wide_widths()
+    for w in widths:
+        for L in wide.SUPPORTED_L:
+            if w % L == 0:
+                assert lo < w // L <= 48, (w, L)
+    assert 96 not in widths and 120 in widths
+
+
+def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
+    monkeypatch.setattr(
+        target=k31.k3, name="_config_disable_reasons", value=lambda cfg, hf_config: []
+    )
+    monkeypatch.delenv(name="SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", raising=False)
+    # the fp32 KDA state the wide launch reads, so the offload flags are the only refusals
+    monkeypatch.setenv(name="SGLANG_MAMBA_SSM_DTYPE", value="float32")
+    hf_config = SimpleNamespace(dsa_config={"index_topk": 2048})
+    off = dict(
+        enable_lmcache=False,
+        enable_flexkv=False,
+        disaggregation_decode_enable_offload_kvcache=False,
+    )
+    cfg = dict(
+        enable_hierarchical_cache=True,
+        dcp_size=8,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_num_draft_tokens=6,
+        **off,
+    )
+    assert k31.Feature.KV_OFFLOAD in k31.SPEC.features
+    assert (
+        k31.SPEC.config_disable_reasons(cfg=SimpleNamespace(**cfg), hf_config=hf_config)
+        == []
+    )
+    for flag in off:
+        reasons = k31.SPEC.config_disable_reasons(
+            cfg=SimpleNamespace(
+                **{**cfg, "enable_hierarchical_cache": False, flag: True}
+            ),
+            hf_config=hf_config,
+        )
+        assert len(reasons) == 1 and "HiCache" in reasons[0], (flag, reasons)
+    # host-only checkpoints ring ReplaySSM state by request row, not by mamba slot
+    monkeypatch.setenv(name="SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", value="1")
+    reasons = k31.SPEC.config_disable_reasons(
+        cfg=SimpleNamespace(**cfg), hf_config=hf_config
+    )
+    assert len(reasons) == 1 and "mamba slot" in reasons[0], reasons
 
 
 def test_the_launches_name_their_server_args():
@@ -90,8 +210,13 @@ def test_an_unmerged_in_proj_is_refused(monkeypatch):
 
 def test_k31_refuses_k3_wide_disabled(monkeypatch):
     monkeypatch.setattr(k31.k3, "WIDE", False)
-    monkeypatch.setattr(k31.k3, "_config_disable_reasons", lambda *a: [])
-    cfg = SimpleNamespace(speculative_num_draft_tokens=6)
+    monkeypatch.setattr(k31.k3, "_config_disable_reasons", lambda **kwargs: [])
+    cfg = SimpleNamespace(
+        speculative_num_draft_tokens=6,
+        enable_lmcache=False,
+        enable_flexkv=False,
+        disaggregation_decode_enable_offload_kvcache=False,
+    )
     hf = SimpleNamespace(text_config=SimpleNamespace(dsa_config={"index_topk": 2048}))
     reasons = k31._config_disable_reasons(cfg, hf)
     assert any("SGLANG_AMD_MONO_K3_WIDE=0" in r for r in reasons), reasons
@@ -118,3 +243,24 @@ def test_row_count_tile_configs_meet_plan_and_tile_invariants():
             assert (
                 math.ceil(b / gf.bm) * math.ceil(wide.NF / gf.bn) * gf.ks <= BLOCKS * 4
             )
+
+
+def test_wide_capture_stream_and_variant():
+    """A captured layer's wide launch writes the stream the DSpark draft asked for,
+    not always the attn_res mixture; SGLang without the field still means attn_res."""
+    assert wide._capture_stream(SimpleNamespace()) == "attn_res"
+    assert (
+        wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="prefix"))
+        == "prefix"
+    )
+    with pytest.raises(ValueError, match="unsupported dspark_aux_hidden_stream"):
+        wide._capture_stream(SimpleNamespace(dspark_aux_hidden_stream="unknown"))
+
+    pk = SimpleNamespace(i=76, nvb=7, write=False, t1=True)
+    w = object.__new__(wide.Wide)
+    assert w._variant(pk, captures={75}, capture_stream="prefix")["capture"] == "prefix"
+    assert (
+        w._variant(pk, captures={75}, capture_stream="attn_res")["capture"]
+        == "attn_res"
+    )
+    assert w._variant(pk, captures={79}, capture_stream="prefix")["capture"] is False

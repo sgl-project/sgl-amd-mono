@@ -30,6 +30,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
@@ -592,8 +593,8 @@ def mla_pre_launch(
         assert (
             tuple(t.shape) == shp and t.is_contiguous() and t.dtype == torch.bfloat16
         ), (n, t.shape, t.dtype)
-    f = build(key)
-    f(
+    _run_compiled(
+        build(key),
         prefix.data_ptr(), blocks.data_ptr(), blocks.stride(0), blocks.stride(1),
         w["ares_nw"].data_ptr(), w["ares_qk"].data_ptr(), w["in_nw"].data_ptr(),
         w["w_qkv"].data_ptr(), w["w_g"].data_ptr(), w["w_k"].data_ptr(), w["w_p"].data_ptr(),
@@ -602,5 +603,5 @@ def mla_pre_launch(
         ptr(out.get("q_lora")), out["gate"].data_ptr(), out["idx_q"].data_ptr(),
         out["idx_k"].data_ptr(), out["idx_w"].data_ptr(), ptr(w.get("w_kc")),
         ptr(out.get("qn")), scratch.data_ptr(), layer,
-        epoch.data_ptr(), ptr(tl), stream=torch.cuda.current_stream(),
+        epoch.data_ptr(), ptr(tl), torch.cuda.current_stream(),
     )  # fmt: skip

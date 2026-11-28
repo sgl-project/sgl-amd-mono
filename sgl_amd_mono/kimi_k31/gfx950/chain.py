@@ -146,7 +146,11 @@ def _rs_piece(
         stamp(tl_on, tls, tid, 3)
     band, cj = piece // ct, piece % ct
     # res None: a block-write layer, whose prefix restarts at the attention output
-    r_res = None if res is None else rsrc(res, res_bytes)
+    r_res = (
+        None
+        if res is None
+        else (rsrc(res) if res_bytes is None else rsrc(res, res_bytes))
+    )
     r_out, r_rs = rsrc(res_out), rsrc(c["rs_own"].value)
     for u in range(tid, rb * q8, THREADS):
         row = band * rb + u // q8

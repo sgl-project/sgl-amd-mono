@@ -2,15 +2,15 @@
 """Kimi-K3.1 on gfx950: the monokernel spec (RFC #43949).
 
 A routed step is a speculative verify step (DSpark or DFLASH) of L draft tokens a
-request (L = 6 or 8). One request's step runs Kimi-K3's launches: K1 on the KDA
+request (L = 5, 6 or 8). One request's step runs Kimi-K3's launches: K1 on the KDA
 layers, the MLA projection front on the DSA layers and the layer launch (o_proj to
 the MoE output) on every MoE layer. A step of R >= 2 requests runs
 ``wide.Wide.backbone``: one persistent launch a KDA layer, SGLang's routed experts
-between launches, and SGLang's own path for layer 0, the DSA layers and each run's
-exit.
+between launches, and SGLang's own path for layer 0, DSA attention and each run's
+exit. Eligible DSA projection-front and post-attention stages use fused launches.
 
-The DSA layers keep SGLang's attention up to o_proj, so the indexer, the sparse MLA
-and the decode context parallel (DCP) combine stay on SGLang's path. Under DCP the
+The indexer, sparse MLA and decode context parallel (DCP) combine stay on
+SGLang's path. The fused projection front uses the `_mono_pre` handoff. Under DCP the
 attention hands o_proj the same TP-local 12-head core as without it.
 """
 
@@ -30,7 +30,14 @@ SGLANG_READS = {
     "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "Feature",
         "Numerics",
+        "KV_OFFLOAD",
     ),
+    "srt/arg_groups/fields/*.py": (
+        "enable_lmcache",
+        "enable_flexkv",
+        "disaggregation_decode_enable_offload_kvcache",
+    ),
+    "srt/environ.py": ("envs", "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT"),
     "srt/models/kimi_k3.py": ("KimiK31ForConditionalGeneration",),
 }
 
@@ -49,8 +56,40 @@ NUMERICS = Numerics(
 )
 
 
+def _offload_disable_reasons(
+    *, lmcache: bool, flexkv: bool, decode_offload: bool, host_only_checkpoint: bool
+) -> list[str]:
+    # Feature.KV_OFFLOAD also admits these; only HiCache has run under the launches.
+    flags = {
+        "--enable-lmcache": lmcache,
+        "--enable-flexkv": flexkv,
+        "--disaggregation-decode-enable-offload-kvcache": decode_offload,
+    }
+    reasons = [
+        f"{flag}: only HiCache's KV offload is supported"
+        for flag, on in flags.items()
+        if on
+    ]
+    if host_only_checkpoint:
+        # SGLang then rings ReplaySSM state by request row; the launches index it by slot.
+        reasons.append(
+            "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT: the launches index the ReplaySSM ring "
+            "by mamba slot"
+        )
+    return reasons
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    reasons = k3._config_disable_reasons(cfg, hf_config)
+    from sglang.srt.environ import envs
+
+    # Kimi-K3's checks also take the DCP sizes, attention CP and the wide draft lengths
+    reasons = k3._config_disable_reasons(cfg=cfg, hf_config=hf_config)
+    reasons += _offload_disable_reasons(
+        lmcache=cfg.enable_lmcache,
+        flexkv=cfg.enable_flexkv,
+        decode_offload=cfg.disaggregation_decode_enable_offload_kvcache,
+        host_only_checkpoint=envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get(),
+    )
     if not getattr(k3._text_config(hf_config), "dsa_config", None):
         reasons.append("no dsa_config: a Kimi-K3 checkpoint, served by kimi_k3")
     if not k3.WIDE:
@@ -103,8 +142,8 @@ SPEC = msgspec.structs.replace(
             widths=tuple(range(1, k3.MAX_ROWS + 1)) + wide.wide_widths(),
         )
     },
-    # DCP (CONTEXT_PARALLEL) shards the DSA layers' KV; KV_OFFLOAD (HiCache) moves
-    # pages and KDA states between host and device pools between steps.
+    # DCP shards the DSA layers' KV, which run on SGLang's path.
+    # HiCache moves KDA states between steps; a launch reads the device state pool by slot.
     features=k3.SPEC.features | {Feature.CONTEXT_PARALLEL, Feature.KV_OFFLOAD},
     requires=msgspec.structs.replace(
         k3.SPEC.requires,

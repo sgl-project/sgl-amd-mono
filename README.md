@@ -21,7 +21,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | GLM-5.2 (MXFP4 experts) | MI355X (gfx950) | 4, 8 | As GLM-5.3; the routed experts in MXFP4, on MXFP8 activations |
 | GLM-5.3 (MXFP4) | MI355X (gfx950) | 4, 8 | As GLM-5.3 |
 | Kimi-K3 | MI350X, MI355X (gfx950) | 8 | Every MoE layer in narrow steps (<= 8 rows) and wide DSpark verify steps (2 to 60 requests at L in {5, 6, 8}, bf16 or Quark FP8 attention, 68 KDA + 24 MLA `dsa_post`, DCP1/DCP8, HiCache; set `SGLANG_AMD_MONO_K3_WIDE=0` for narrow-only plain decode > 8 rows) |
-| Kimi-K3.1 | MI350X, MI355X (gfx950) | 8 | Kimi-K3's launches on every MoE layer in DSpark and DFLASH verify steps of one request (the MLA layers' projection front too, without DCP), and wide KDA + MLA/DSA `dsa_post` launches in verify steps of 2 to 60 requests (L in {5, 6, 8}); `SGLANG_AMD_MONO_K3_WIDE=0` keeps narrow-only, `SGLANG_AMD_MONO_K31_WIDE_DSA_POST=0` disables `dsa_post` |
+| Kimi-K3.1 | MI350X, MI355X (gfx950) | 8 | Kimi-K3's launches on every MoE layer in DSpark and DFLASH verify steps of one request (the MLA layers' projection front too, without DCP); in verify steps of 2 to 60 requests of 5, 6 or 8 draft tokens (6 tokens: not 55 or 60 requests; 8 tokens: not 40, 45, 48, 50, 51, 54, 55, 57 or 60), one launch a KDA layer and eligible DSA-layer fusions (bf16 or Quark FP8 o_proj), with or without HiCache (with `SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT` off); sparse attention and DCP combine stay on SGLang; `SGLANG_AMD_MONO_K3_WIDE=0` keeps narrow-only |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
 | Qwen3.5-397B-A17B-FP8 | MI355X (gfx950) | 4, 8 (MTP verify: 4) | Decode steps of up to 8 rows, and EAGLE/MTP target-verify steps of up to 8 requests x 4 draft tokens: every layer's norms, FP8 quants and dense projections, and the 45 GDN layers' conv and gated delta (two launches a GDN layer in decode, three in verify). Attention, the MoE and the MTP draft run SGLang's kernels. See [its README](sgl_amd_mono/qwen35_a17b/README.md) |
@@ -122,6 +122,18 @@ SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 python -m sglang.launch_server \
   --speculative-dspark-block-size 7 \
   --enable-amd-monokernel
 ```
+
+Kimi-K3.1's wide DSA projection-front and post-attention fusions are enabled
+when their shape and model contracts are supported. These plugin-owned controls
+are available for A/B checks:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `SGLANG_AMD_MONO_K31_WIDE_DSA_POST` | `1` | Set `0` to use SGLang's post-attention path (also turns off the wide MLA projection front, which runs only in a `dsa_post` layer) |
+| `SGLANG_AMD_MONO_K31_WIDE_MLA_PRE` | `1` | Set `0` to use SGLang's projection front |
+| `SGLANG_AMD_MONO_K31_WIDE_MLA_PRE_MAX_ROWS` | `32` | Maximum eligible rows, constrained to `1` through `64` |
+
+Replicated-Q projections require SGLang's full-head `_mono_pre` handoff.
 
 Kimi-K3.1, with DFLASH (the launches read and write the ReplaySSM ring):
 

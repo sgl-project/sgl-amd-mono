@@ -26,7 +26,6 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
 )
 from sgl_amd_mono.common.sync import sreg
-from sgl_amd_mono.kimi_k3.gfx950.compiled_launch import compiled_launch
 from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
 from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k31.gfx950 import chain as post
@@ -714,6 +713,5 @@ def dsa_post(
             sort_buf,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
-    fn = compiled_launch(launch)
-    _BUILDS[key] = (fn, pl)
-    return fn, pl
+    _BUILDS[key] = (launch, pl)
+    return launch, pl
