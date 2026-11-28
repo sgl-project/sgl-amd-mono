@@ -402,18 +402,24 @@ def _host_only_mamba() -> bool:
 def _wide_step_shape(
     spec_algo, draft_tokens, graph_max_bs, max_running_reqs
 ) -> tuple[int, bool]:
-    """(tokens a request, whether a step can reach a width the wide launch serves at that
-    L): with no cap known, yes; else the smallest such width fits the cap's rows."""
+    """(tokens a request, whether a step goes wide): with no cap known, yes; at a supported
+    draft length, when the smallest width it serves fits the cap's rows; at any other,
+    when a step passes MAX_ROWS rows (so the draft-length check refuses it)."""
     from sgl_amd_mono.kimi_k31 import wide
 
     tokens = int(draft_tokens or 1) if spec_algo is not None else 1
     max_bs = int(graph_max_bs or 0) or int(max_running_reqs or 0)
+    if max_bs == 0:
+        return tokens, True
+    if tokens not in wide.SUPPORTED_L:
+        return tokens, max_bs * tokens > MAX_ROWS
     mine = wide.widths_at(tokens)
-    return tokens, (max_bs == 0 or (bool(mine) and mine[0] <= max_bs * tokens))
+    return tokens, bool(mine) and mine[0] <= max_bs * tokens
 
 
 def _wide_will_run() -> bool:
-    """Whether the current server configuration reaches widths > MAX_ROWS."""
+    """Whether the current server's steps reach a width the wide launch serves
+    (``_wide_step_shape``)."""
     from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
 
     try:

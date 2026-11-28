@@ -609,6 +609,18 @@ def test_wide_config_guards_draft_tokens_and_request_scoped_ring(monkeypatch):
     )
     reasons = k3._config_disable_reasons(bad_decode, K3)
     assert any("SGLANG_AMD_MONO_K3_WIDE=0" in r for r in reasons), reasons
+    # an unsupported draft length past MAX_ROWS rows is refused even with one request
+    ten = SimpleNamespace(
+        **{
+            **vars(bad_decode),
+            "speculative_algorithm": "DSPARK",
+            "speculative_num_draft_tokens": 10,
+            "cuda_graph_max_bs_decode": 1,
+            "max_running_requests": 1,
+        }
+    )
+    reasons_ten = k3._config_disable_reasons(ten, K3)
+    assert any("SGLANG_AMD_MONO_K3_WIDE=0" in r for r in reasons_ten), reasons_ten
 
     narrow_decode = SimpleNamespace(
         **{**vars(bad_decode), "cuda_graph_max_bs_decode": 4, "max_running_requests": 4}

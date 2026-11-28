@@ -289,10 +289,10 @@ def test_a_width_only_another_draft_length_serves_runs_sglang(monkeypatch):
     """The binding routes every spec width that is a multiple of L; one only another L
     serves (330 rows: 55 requests at L = 6, 66 at L = 5, past every bucket) runs SGLang's
     own backbone instead of the wide launch, as a step past the widths does."""
-    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
-    assert 330 in wide.wide_widths() and 330 not in wide.widths_at(5)
     runner = object.__new__(wide.Wide)
-    runner.widths = frozenset(wide.widths_at(5))
+    runner.widths = frozenset(
+        {300}
+    )  # 60 requests at L = 5; 330 is not one of its widths
     runner.backbone = lambda built, ids, fb, embeds: ("wide", ids, fb, embeds)
     built = object.__new__(k31.k3._WideBuilt)
     built._wide, built._positions = runner, "positions"
@@ -343,8 +343,10 @@ def test_a_draft_length_serving_no_routed_wide_width_builds_no_wide_launch(monke
     model = SimpleNamespace(
         model=SimpleNamespace(layers=[SimpleNamespace(input_layernorm=norm)])
     )
-    routed = (*range(1, 9), *(w for w in wide.wide_widths() if w % 8 == 0 and w <= 96))
-    assert 96 in routed and 96 not in wide.widths_at(8)
+    routed = (
+        *range(1, 9),
+        96,
+    )  # L = 8 serves 120 (15 requests) and up under the override
 
     built = k3._build(model, None, SimpleNamespace(widths=routed), use_wide=True)
     assert made == [] and built._wide is None
