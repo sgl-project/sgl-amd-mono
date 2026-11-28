@@ -112,6 +112,8 @@ def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
         target=k31.k3, name="_config_disable_reasons", value=lambda cfg, hf_config: []
     )
     monkeypatch.delenv(name="SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", raising=False)
+    # the fp32 KDA state the wide launch reads, so the offload flags are the only refusals
+    monkeypatch.setenv(name="SGLANG_MAMBA_SSM_DTYPE", value="float32")
     hf_config = SimpleNamespace(dsa_config={"index_topk": 2048})
     off = dict(
         enable_lmcache=False,
