@@ -596,7 +596,8 @@ def _pre_o_proj(layer, x, positions, fb, zero_allocator):
 
 
 # SGLang's q-replicate predicate in forward_absorb_rocm_prepare, conjunct by conjunct: the
-# one _run_mla_pre evaluates before it hands a replicated-Q front over
+# one the plugin evaluates at every step before it hands a replicated-Q front over (the
+# wide launch in _run_mla_pre, the narrow one in _mla_covered)
 _QREP_PREDICATE = (
     "self.is_dcp_q_replicate_phase(forward_batch)",
     "not self.use_deep_gemm_bmm",
@@ -652,10 +653,12 @@ def _mono_pre_q_view(tree):
       ``pre.get("<key>")`` of another key than "q", and
       ``pre["q"]`` is read once;
     - that read is ``name = pre["q"].view(-1 or pre["q_lora"].shape[0], heads,
-      self.qk_head_dim)``, a statement directly in an ``if`` whose test is or has the
-      conjunct ``pre is not None`` (a statement of the function body), after only plain
-      name assignments in that branch; ``name`` is not used again in it, and after the
-      ``if`` chain it is only an argument of ``self._split_q_nope_pe``;
+      self.qk_head_dim)``, a statement directly in ``if self.q_lora_rank is not None and
+      pre is not None`` (or ``if pre is not None``), a statement of the function body,
+      after only plain name assignments in that branch; ``name`` is not used again in it,
+      and after the ``if`` chain it goes to ``self._split_q_nope_pe`` and nowhere else;
+    - ``"_mono_pre"`` appears once (pre's assignment), and no import binds ``self``,
+      ``pre``, ``forward_batch``, ``q_replicate_active`` or ``name``;
     - no other way to bind a name (``:=``, ``match``, lambdas, nested functions or
       classes, comprehensions, ``global`` / ``nonlocal``, ``except ... as``, ``import
       ... as``)."""
@@ -673,9 +676,24 @@ def _mono_pre_q_view(tree):
         or (isinstance(n, ast.ExceptHandler) and n.name is not None)
         or (
             isinstance(n, (ast.Import, ast.ImportFrom))
-            and any(x.asname is not None for x in n.names)
+            and any(x.asname is not None or x.name == "*" for x in n.names)
         )
         for n in ast.walk(fn)
+    ):
+        return None
+    imported = {
+        x.name.split(".")[0]
+        for n in ast.walk(fn)
+        if isinstance(n, (ast.Import, ast.ImportFrom))
+        for x in n.names
+    }
+    # the handoff dict is named once, where pre is read from it
+    if (
+        sum(
+            isinstance(n, ast.Constant) and n.value == "_mono_pre" for n in ast.walk(fn)
+        )
+        != 1
+        or {"self", "pre", "forward_batch", "q_replicate_active"} & imported
     ):
         return None
     a = fn.args
@@ -779,21 +797,23 @@ def _mono_pre_q_view(tree):
         and guard in fn.body
     ):
         return None
-    conjuncts = (
-        guard.test.values
-        if isinstance(guard.test, ast.BoolOp) and isinstance(guard.test.op, ast.And)
-        else [guard.test]
-    )
-    if dump("pre is not None") not in {ast.dump(c) for c in conjuncts}:
+    # SGLang's guard (or the bare ``pre`` test): its branch runs in both q-replicate states
+    if ast.dump(guard.test) not in (
+        dump("self.q_lora_rank is not None and pre is not None"),
+        dump("pre is not None"),
+    ):
         return None
     at = guard.body.index(stmt)
     name = stmt.targets[0].id
+    if name in imported:
+        return None
     if any(
         isinstance(n, ast.Name) and n.id == name
         for s in guard.body[at + 1 :]
         for n in ast.walk(s)
     ):
         return None  # the viewed q is read or rebound later in its branch
+    split = 0
     for n in ast.walk(fn):
         # past the if / elif chain the viewed q only goes to SGLang's split, as is
         if isinstance(n, ast.Name) and n.id == name and n.lineno > guard.end_lineno:
@@ -805,6 +825,9 @@ def _mono_pre_q_view(tree):
                 and ast.dump(call.func) == dump("self._split_q_nope_pe")
             ):
                 return None
+            split += 1
+    if not split:
+        return None  # the split never receives the viewed q
     assigned: dict = {}
     for s in guard.body[:at]:
         if not (

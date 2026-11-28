@@ -580,6 +580,61 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
             )
         return self._split_q_nope_pe(q, None)
 
+    def _qrep_guard_skips_the_qrep_state(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None and not q_replicate_active:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, None)
+
+    def _qrep_split_bypasses_q(self, forward_batch):
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(
+            self.__dict__["_mono_pre"]["q"].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            ),
+            None,
+        )
+
+    def _qrep_imported_batch(self, forward_batch):
+        from sglang.srt.model_executor import forward_batch
+
+        q_replicate_active = (
+            self.is_dcp_q_replicate_phase(forward_batch)
+            and not self.use_deep_gemm_bmm
+            and self.w_kc_qrep is not None
+            and self.q_b_proj_qrep_weight is not None
+        )
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            q = pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return self._split_q_nope_pe(q, None)
+
     for prepare, caps in (
         (_local_view_dcp_elsewhere, (True, False)),
         (_qrep_view_inline, (True, True)),
@@ -600,9 +655,12 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
         (_qrep_reshaped_on_return, (False, False)),
         (_qrep_match_rebinds_batch, (False, False)),
         (_qrep_shifted_dcp_factor, (True, False)),
+        (_qrep_guard_skips_the_qrep_state, (False, False)),
+        (_qrep_split_bypasses_q, (False, False)),
+        (_qrep_imported_batch, (False, False)),
     ):
-        layer = _fake_mla_layer(dcp_size=8, prepare_fn=prepare)
-        assert wide._sglang_mono_pre_caps(layer.self_attn) == caps, prepare.__name__
+        attn = SimpleNamespace(forward_absorb_rocm_prepare=prepare)
+        assert wide._sglang_mono_pre_caps(attn) == caps, prepare.__name__
 
 
 def test_mla_row_cap_respects_reachable_verify_rows(monkeypatch) -> None:
