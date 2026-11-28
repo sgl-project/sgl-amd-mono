@@ -564,9 +564,11 @@ def test_the_host_only_ring_refusal_follows_the_widths_this_draft_length_serves(
         **_NO_OFFLOAD,
     )
     monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
-    assert k3.HOST_ONLY_RING_REASON in k3._config_disable_reasons(cfg, K3)
+    reasons = k3._config_disable_reasons(cfg, K3)
+    assert any("request-scoped ReplaySSM" in r for r in reasons), reasons
     monkeypatch.setenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", "128,256,384")
-    assert k3.HOST_ONLY_RING_REASON not in k3._config_disable_reasons(cfg, K3)
+    reasons = k3._config_disable_reasons(cfg, K3)
+    assert not any("request-scoped ReplaySSM" in r for r in reasons), reasons
 
 
 def test_kimi_k31_says_the_host_only_ring_refusal_once(monkeypatch):
@@ -577,6 +579,7 @@ def test_kimi_k31_says_the_host_only_ring_refusal_once(monkeypatch):
     monkeypatch.setattr(k3, "WIDE", True)
     monkeypatch.setattr(k3, "_host_only_mamba", lambda: True)
     monkeypatch.setenv("SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", "1")
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
     cfg = SimpleNamespace(
         dcp_size=8,
         attn_cp_size=1,

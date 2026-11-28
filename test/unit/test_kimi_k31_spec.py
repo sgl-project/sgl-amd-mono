@@ -267,9 +267,10 @@ def test_every_bucket_is_a_served_width_so_its_launch_sort_is_read(
     monkeypatch.setattr(presort, "sort_kind", lambda: "aux16")
     for L in wide.SUPPORTED_L:
         for b in wide.buckets(L=L):
-            assert b in wide.widths_at(L), (L, b)
             want = "aux16" if b <= mf.sort_max_rows("aux16") else None
             assert wide._launch_sort(b) == want, (L, b)
+    for L in wide.SUPPORTED_L:
+        assert set(wide.buckets(L=L)) <= set(wide.widths_at(L)), L
 
 
 def test_the_wide_launch_refuses_an_unsupported_state_dtype_before_building(

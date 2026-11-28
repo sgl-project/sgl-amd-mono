@@ -434,7 +434,8 @@ def run(args, m, rank, dev, cpu):
                 flush=True,
             )
         print(
-            f"dsa_post m {m:3d} us: {us:5.1f}  " + ("PASS" if ok else "FAIL"),
+            f"dsa_post m {m:3d} o_proj {'fp8' if args.o_fp8 else 'bf16'} "
+            f"us: {us:5.1f}  " + ("PASS" if ok else "FAIL"),
             flush=True,
         )
     if args.timeline:

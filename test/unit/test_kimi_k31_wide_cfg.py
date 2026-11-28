@@ -113,14 +113,25 @@ def test_every_recipe_step_past_narrow_runs_the_wide_launch(monkeypatch) -> None
     assert not off, off
 
 
-@pytest.mark.parametrize("L", wide.SUPPORTED_L)
-def test_every_draft_length_serves_every_request_count(L: int, monkeypatch) -> None:
+def test_every_draft_length_serves_every_request_count(monkeypatch) -> None:
     """Each L serves 2 .. REQ_BUCKETS[-1] requests: no width is dropped because another
     draft length reads it as more requests than a bucket holds."""
     monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
-    want = {r for r in range(2, wide.REQ_BUCKETS[-1] + 1) if L * r > wide.NARROW}
-    assert want <= _routed(L), sorted(want - _routed(L))
-    assert set(wide.widths_at(L)) == {L * r for r in want}
+    want = {
+        L: {r for r in range(2, wide.REQ_BUCKETS[-1] + 1) if L * r > wide.NARROW}
+        for L in wide.SUPPORTED_L
+    }
+    missing = {L: sorted(want[L] - _routed(L)) for L in wide.SUPPORTED_L}
+    assert not any(missing.values()), missing
+    for L in wide.SUPPORTED_L:
+        assert set(wide.widths_at(L)) == {L * r for r in want[L]}, L
+
+
+def test_kimi_k31_c48_keeps_217s_in_proj_tiles() -> None:
+    """No timing backs a different in_proj tile at 257-320 rows: Kimi-K3.1's c48 step (6 x 48
+    = 288 rows) keeps #217's 192-row tiles, one round."""
+    assert wide.cfg_rows(288, 6)[1] == "192:128:4:2:2"
+    assert not _over(288, 6, wide.cfg_rows(288, 6))
 
 
 @pytest.mark.parametrize("L", wide.SUPPORTED_L)
