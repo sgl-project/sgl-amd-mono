@@ -251,8 +251,8 @@ def kda_layer(
         and (not write_a or nvb_m <= nvb_a + 1)
         and (not write_m or nvb_m < nbk)
     )
-    # sort: the routed experts' sort (+ "sgl": mxfp8 quant) + output zeroing made here (mf.sort_rows), m <= 64
-    # (a 64-bit token mask an expert); sort_buf holds mf.sort_layout(m, sort), the MoE output sits right before
+    # sort: the routed experts' sort (+ "sgl": mxfp8 quant) + output zeroing made here (mf.sort_rows), up to
+    # mf.sort_max_rows(sort) rows ("sgl": 64, a 64-bit token mask an expert); sort_buf holds mf.sort_layout(m, sort), the MoE output sits right before
     # sh_out (wide's flat ping)
     assert not sort or m <= mf.sort_max_rows(sort), (sort, m)
     # the up and in_proj finishes read and zero linbf tiles
