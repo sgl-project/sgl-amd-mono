@@ -243,7 +243,7 @@ def run(args, m, rank, dev, cpu):
         refs.append((p_ref, lat_ref, sh_ref, logits_ref))
 
     e_p = e_lat = e_sh = e_lg = e_own_w = 0.0
-    own_diff = 0
+    own_diff = route_diff = 0
     sort_bad = 0
     if args.sort == "sgl":
         from layer_bench import sort_check
@@ -268,17 +268,32 @@ def run(args, m, rank, dev, cpu):
             # k-th score either expert is one (the launch and torch.topk break it apart)
             sc = sig_own + bias[i]
             kth = sc.gather(-1, own_idx).min(-1, keepdim=True).values
-            mine = sc.gather(-1, tk_ids[i].long())
-            distinct = (tk_ids[i].sort(-1).values.diff(dim=-1) != 0).all(-1)
+            ids = tk_ids[i].long()
+            in_range = ((ids >= 0) & (ids < E)).all(
+                -1
+            )  # an out-of-range id fails its row
+            ids = ids.clamp(0, E - 1)
+            mine = sc.gather(-1, ids)
+            ids_s = ids.sort(-1).values
+            distinct = (ids_s.diff(dim=-1) != 0).all(-1)
             above = (sc > kth).sum(-1) == (mine > kth).sum(-1)
-            own_diff += int((~((mine >= kth).all(-1) & above & distinct)).sum())
-            mine_w = sig_own.gather(-1, tk_ids[i].long())
+            top_ok = in_range & (mine >= kth).all(-1) & above & distinct
+            own_diff += int((~top_ok).sum())
+            mine_w = sig_own.gather(-1, ids)
             e_own_w = max(e_own_w, rel(tk_w[i], mine_w / mine_w.sum(-1, keepdim=True)))
+            # every rank must route a row to the same experts, a tie broken the same way
+            ids_0 = ids_s.clone()
+            dist.broadcast(ids_0, src=0)
+            route_diff += int((ids_s != ids_0).any(-1).sum())
         if args.sort == "aux16":
             sort_bad += sort_check_aux16(m, nl, tk_ids, tk_w, moe_out, sortb, rank)
         elif args.sort == "sgl":
             sort_bad += sort_check(m, nl, tk_ids, tk_w, lat_out, moe_out, sortb, rank)
 
+    # rank 0 is the reference rank: report the worst rank's disagreement
+    rd = torch.tensor([route_diff], dtype=torch.int64, device=dev)
+    dist.all_reduce(rd, op=dist.ReduceOp.MAX)
+    route_diff = int(rd.item())
     ok = (
         e_p < 2e-2
         and e_lat < 2e-2
@@ -286,6 +301,7 @@ def run(args, m, rank, dev, cpu):
         and e_lg < 2e-2
         and e_own_w < 1e-5
         and own_diff == 0
+        and route_diff == 0
         and sort_bad == 0
     )
     ok_t = torch.tensor([1 if ok else 0], dtype=torch.int32, device=dev)
@@ -311,7 +327,7 @@ def run(args, m, rank, dev, cpu):
         print(
             f"dsa_post m {m:3d} nvb {nvm} pfx_short {args.pfx_short}  "
             f"rel_l2 pout {e_p:.2e} lat {e_lat:.2e} sh {e_sh:.2e} logits {e_lg:.2e} "
-            f"own_w {e_own_w:.1e} own_diff {own_diff}  us: {us:5.1f}  "
+            f"own_w {e_own_w:.1e} own_diff {own_diff} route_diff {route_diff}  us: {us:5.1f}  "
             + ("PASS" if ok else "FAIL"),
             flush=True,
         )
