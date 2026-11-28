@@ -134,29 +134,36 @@ CFGS = {  # rows -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks;
         "128:64:2:4:1",
     ),
 }
-# Sorted (lo, hi, cfg) row ranges overriding CFGS where its tiles need a second BLOCKS round or pad a row tile past b;
-# every bucket fits one round, and the front and in_proj do at every row count up to max(CFGS) (unit tested)
+# Sorted (lo, hi, cfg) row ranges overriding CFGS where its tiles need a second BLOCKS round or pad a row tile past b.
+# They keep all five tile stages in one round at every row count up to max(SUPPORTED_L) x REQ_BUCKETS[-1] (unit
+# tested): 256's up takes 448 tasks anywhere in 129 .. 256 rows and 384's up and shared down 336 in 257 .. 384, so
+# their ranges span those whole; past 384 rows all five stages would overflow without the 385 .. 448 ranges.
 FRONT_ROW_RANGES = (
     (65, 96, "96:128:2:4:8"),
     (129, 191, "96:128:2:4:4"),
     (192, 192, "64:128:2:4:4"),
     (193, 288, "96:128:2:4:4"),
+    (385, 448, "160:128:2:4:4"),
 )
 INP_ROW_RANGES = (
     (65, 96, "96:128:2:4:4"),
     (129, 192, "192:128:4:2:4"),
     (193, 256, "128:128:2:4:2"),
+    (385, 448, "224:128:2:4:2"),
 )
+OPROJ_ROW_RANGES = ((385, 448, "128:128:2:4:1"),)
 UP_ROW_RANGES = (
     (65, 96, "96:64:2:4:8"),
     (129, 192, "96:64:2:4:8"),
-    (256, 256, "128:64:4:2:8"),
+    (193, 256, "128:64:4:2:8"),
     (257, 288, "96:64:2:4:4"),
-    (384, 384, "96:128:2:4:8"),
+    (289, 384, "96:128:2:4:8"),
+    (385, 448, "128:128:2:4:8"),
 )
 SDOWN_ROW_RANGES = (
     (257, 288, "96:128:2:4:1"),
-    (384, 384, "192:64:4:2:1"),
+    (289, 384, "192:64:4:2:1"),
+    (385, 448, "128:128:2:4:1"),
 )
 _TUNED_ROW_KEYS = tuple(sorted(CFGS))
 
@@ -198,7 +205,7 @@ def buckets(L: int = 8, *, max_rows: int | None = None) -> tuple:
 
 
 def cfg_rows(b: int, L: int) -> tuple[str, str, str, str, str]:
-    """The tile configs of an L-token bucket of b rows."""
+    """The tile configs of an L-token bucket of b rows (they depend on b only)."""
     assert b % L == 0 and b // L in REQ_BUCKETS, (b, L)
     return _row_cfgs(b)
 
@@ -209,7 +216,7 @@ def _row_cfgs(b: int) -> tuple[str, str, str, str, str]:
     return (
         _row_override(b=b, ranges=UP_ROW_RANGES, default=up),
         _row_override(b=b, ranges=INP_ROW_RANGES, default=inp),
-        oproj,
+        _row_override(b=b, ranges=OPROJ_ROW_RANGES, default=oproj),
         _row_override(b=b, ranges=FRONT_ROW_RANGES, default=front),
         _row_override(b=b, ranges=SDOWN_ROW_RANGES, default=sdown),
     )

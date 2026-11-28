@@ -91,7 +91,8 @@ def test_every_bucket_resolves_to_a_tuned_config(monkeypatch):
             assert len(configs) == 5, (L, b)
             assert all(len(c.split(":")) == 5 for c in configs), (L, b, configs)
     assert wide.cfg_rows(b=24, L=8) == wide.CFGS[32]
-    assert wide.cfg_rows(b=448, L=8) == wide.CFGS[384]
+    # past every tuned count and row range: the largest tuned count's configs
+    assert wide._row_cfgs(max(wide.CFGS) + 65) == wide.CFGS[max(wide.CFGS)]
 
 
 def test_an_override_keeps_its_cut_at_every_draft_length(monkeypatch):
