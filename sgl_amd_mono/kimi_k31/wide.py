@@ -186,6 +186,8 @@ CFGS = {  # rows -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; a
 # They keep all five tile stages in one round at every row count up to max(SUPPORTED_L) x REQ_BUCKETS[-1] (unit
 # tested): 256's up takes 448 tasks anywhere in 129 .. 256 rows and 384's up and shared down 336 in 257 .. 384, so
 # their ranges span those whole; past 384 rows all five stages would overflow without the 385 .. 480 ranges.
+# Timed up to 448 rows; 449 .. 480 (only 8 tokens at 57 .. 60 requests) keep the 385 .. 448 tiles, which stay in one
+# round there, except in_proj, whose 224-row tiles would take 300 tasks: 256-row tiles, untimed.
 FRONT_ROW_RANGES = (
     (65, 96, "96:128:2:4:8"),
     (129, 191, "96:128:2:4:4"),
@@ -197,7 +199,6 @@ INP_ROW_RANGES = (
     (65, 96, "96:128:2:4:4"),
     (129, 192, "192:128:4:2:4"),
     (193, 256, "128:128:2:4:2"),
-    (257, 320, "160:128:2:4:2"),
     (385, 448, "224:128:2:4:2"),
     (449, 480, "256:128:4:2:2"),
 )
