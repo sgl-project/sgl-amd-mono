@@ -236,6 +236,21 @@ def test_a_qweight_only_kda_projection_is_refused_with_a_reason(monkeypatch):
         k1_mod._validate_in_proj_operands(
             SimpleNamespace(**{**vars(split), "b_proj": biased_b})
         )
+    # f_b_proj: bias-free passes the split branch, a bias is refused (cached copy or not)
+    bf16_b = SimpleNamespace(
+        weight=torch.empty(12, 7168, dtype=torch.bfloat16), bias=None
+    )
+    ok = SimpleNamespace(**{**vars(split), "b_proj": bf16_b})
+    k1_mod._validate_in_proj_operands(ok)
+    fb = SimpleNamespace(
+        weight=torch.empty(1536, 128, dtype=torch.bfloat16), bias=torch.zeros(1536)
+    )
+    for cached in (None, torch.empty(1536, 128, dtype=torch.bfloat16)):
+        biased_fb = SimpleNamespace(
+            **{**vars(ok), "f_b_proj": fb, "_bfa_f_b_w": cached}
+        )
+        with pytest.raises(ValueError, match="f_b_proj has a bias"):
+            k1_mod._validate_in_proj_operands(biased_fb)
 
 
 def test_k31_refuses_k3_wide_disabled(monkeypatch):

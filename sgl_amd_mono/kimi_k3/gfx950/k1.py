@@ -241,6 +241,9 @@ def _resolve_f_b(attn):
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
     from sgl_amd_mono.kimi_k3.spec import _quark_fp8_storage
 
+    fb_mod = getattr(attn, "f_b_proj", None)
+    if getattr(fb_mod, "bias", None) is not None:
+        raise ValueError("f_b_proj has a bias, which the launch does not add")
     w_fb = attn._bfa_f_b_w
     if (
         isinstance(w_fb, torch.Tensor)
@@ -249,7 +252,6 @@ def _resolve_f_b(attn):
         and w_fb.is_contiguous()
     ):
         return w_fb, None
-    fb_mod = getattr(attn, "f_b_proj", None)
     w = getattr(fb_mod, "weight", None)
     if not isinstance(w, torch.Tensor):  # e.g. a qweight-only (GPTQ / AWQ) projection
         raise ValueError("f_b_proj has no weight tensor the launch can read")

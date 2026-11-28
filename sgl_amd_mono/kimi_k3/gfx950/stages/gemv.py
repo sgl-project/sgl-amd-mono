@@ -66,8 +66,9 @@ def loads(lane, wave, w, row0, k, nt=True, ldk=None, k0=0, nbytes=None):
 
 
 def mfmas(lane, wave, xl, xrow, k, s, ops, fmt=wfmt.BF16):
-    """``loads``' operands against token rows 0 .. s - 1 of the LDS rows ``xl``
-    (``xrow`` bf16 a row) -> this wave's 16x16 accumulator."""
+    """``loads``' operands (bf16, or FP8 in ``fmt`` as ``wfmt.fp8_loads`` gives them)
+    against token rows 0 .. s - 1 of the LDS rows ``xl`` (``xrow`` bf16 a row) -> this
+    wave's 16x16 accumulator."""
     per, n = chunks(k)
     g = lane // ROWS
     t = fx.min(lane % ROWS, s - 1)
