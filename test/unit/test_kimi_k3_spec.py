@@ -536,9 +536,10 @@ def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
     assert k3.Feature.KV_OFFLOAD in k3.SPEC.features
     base = k3._config_disable_reasons(SimpleNamespace(**cfg), K3)
     assert not any("HiCache" in r for r in base), base
-    # HiCache itself adds no refusal
+    # with the expert padding check satisfied, the real hook accepts a HiCache server
+    monkeypatch.setattr(k3, "_k3_aiter_opt", lambda: True)
     hicache = SimpleNamespace(**cfg, enable_hierarchical_cache=True)
-    assert k3._config_disable_reasons(hicache, K3) == base
+    assert k3._config_disable_reasons(hicache, K3) == []
     for flag in _NO_OFFLOAD:
         reasons = k3._config_disable_reasons(SimpleNamespace(**{**cfg, flag: True}), K3)
         extra = [r for r in reasons if r not in base]

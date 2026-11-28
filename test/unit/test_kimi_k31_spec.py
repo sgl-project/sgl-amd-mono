@@ -362,5 +362,6 @@ def test_a_draft_length_serving_no_routed_wide_width_builds_no_wide_launch(monke
         None,
     )
 
-    k3._build(model, None, SimpleNamespace(widths=(*routed, 120)), use_wide=True)
-    assert made == [(8, 120)]
+    # sized to the widest width this L serves (120 and 256 sit in different buckets)
+    k3._build(model, None, SimpleNamespace(widths=(*routed, 120, 256)), use_wide=True)
+    assert made == [(8, 256)]
