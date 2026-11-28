@@ -721,6 +721,7 @@ def _mono_pre_q_view(tree):
         return None
     a = fn.args
     params = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    params |= {p.arg for p in (a.vararg, a.kwarg) if p is not None}
     # the predicate reads the step's own batch: a parameter never rebound
     if {"q_replicate_active", "pre"} & params or "forward_batch" not in params:
         return None
