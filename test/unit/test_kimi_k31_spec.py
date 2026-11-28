@@ -211,13 +211,19 @@ def test_the_wide_launch_refuses_a_bf16_kda_state(monkeypatch):
     Kimi-K3's K1 accepts) must not reach it."""
     from sglang.srt.environ import envs
 
-    monkeypatch.setattr(k31.k3, "_config_disable_reasons", lambda *a: [])
+    monkeypatch.setattr(k31.k3, "_config_disable_reasons", lambda **kwargs: [])
     monkeypatch.setattr(
         k31.k3, "_text_config", lambda hf: SimpleNamespace(dsa_config={})
     )
 
     def refused():
-        cfg = SimpleNamespace(dcp_size=8, speculative_num_draft_tokens=6)
+        cfg = SimpleNamespace(
+            dcp_size=8,
+            speculative_num_draft_tokens=6,
+            enable_lmcache=False,
+            enable_flexkv=False,
+            disaggregation_decode_enable_offload_kvcache=False,
+        )
         reasons = k31._config_disable_reasons(cfg, None)
         return any("the wide launch reads float32" in r for r in reasons)
 
