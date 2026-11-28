@@ -28,6 +28,8 @@ from sgl_amd_mono.kimi_k3 import spec as k3
 from sgl_amd_mono.kimi_k31 import wide
 
 SGLANG_READS = {
+    # the KDA state dtype SGLang allocates, which the wide launch reads as fp32
+    "srt/configs/mamba_utils.py": ("mamba2_state_dtype", "temporal"),
     "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "Feature",
         "Numerics",
@@ -39,7 +41,11 @@ SGLANG_READS = {
         "disaggregation_decode_enable_offload_kvcache",
     ),
     "srt/environ.py": ("envs", "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT"),
-    "srt/models/kimi_k3.py": ("KimiK31ForConditionalGeneration", "_qkvgbfa_layer"),
+    "srt/models/kimi_k3.py": (
+        "KimiK31ForConditionalGeneration",
+        "_qkvgbfa_layer",
+        "o_proj",
+    ),
     "srt/runtime_context.py": ("get_parallel",),
 }
 
@@ -103,6 +109,13 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     ):
         # CONTEXT_PARALLEL is accepted for DCP; attention CP reshapes the decode rows
         reasons.append("attention context parallel is on; only --dcp-size is accepted")
+    # The wide KDA stage reads the recurrent state as fp32 (4 B a slot element);
+    # Kimi-K3's K1 also takes bf16, the wide launch does not.
+    from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+
+    state = mamba2_state_dtype(None).temporal
+    if state != torch.float32:
+        reasons.append(f"the KDA state is {state}; the wide launch reads float32")
     tokens = getattr(cfg, "speculative_num_draft_tokens", None)
     if tokens not in wide.SUPPORTED_L:
         reasons.append(
@@ -113,7 +126,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     """Kimi-K3's per-layer checks, and what the wide launch reads on top: every
-    KDA layer's merged in_proj."""
+    KDA layer's merged in_proj, and its in_proj and o_proj weights as bf16."""
     reasons = k3._model_disable_reasons(model, hf_config, copies)
     layers = k3._backbone(model).layers
     covered = [i for i, layer in enumerate(layers) if wide._is_covered(layer)]
@@ -126,6 +139,28 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     ]
     if unmerged:
         reasons.append(f"layers {unmerged}: the KDA in_proj is not merged")
+
+    # Kimi-K3's checks take a Quark FP8 o_proj and in-projection (K1 and the layer
+    # launch read them); the wide launch reads both as bf16 only.
+    def _o_proj_not_bf16(attn) -> bool:
+        # a qweight-only o_proj has no weight; K3's checks already report it
+        weight = getattr(attn.o_proj, "weight", None)
+        return weight is not None and weight.dtype != torch.bfloat16
+
+    not_bf16 = [
+        i
+        for i in covered
+        if i not in unmerged
+        and (
+            layers[i].self_attn._qkvgbfa_layer.weight.dtype != torch.bfloat16
+            or _o_proj_not_bf16(layers[i].self_attn)
+        )
+    ]
+    if not_bf16:
+        reasons.append(
+            f"layers {not_bf16}: the KDA in_proj or o_proj is not bf16, which the "
+            "wide launch reads"
+        )
     return reasons
 
 

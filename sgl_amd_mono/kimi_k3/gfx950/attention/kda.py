@@ -59,6 +59,7 @@ from sgl_amd_mono.common.plan import (
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, sreg
+from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import (
     COLS,
     GSL,
@@ -72,8 +73,10 @@ from sgl_amd_mono.kimi_k3.gfx950.stages.dims import (
     ROWS,
 )
 from sgl_amd_mono.kimi_k3.gfx950.stages.seam import (
+    bf4_words,
     bf16r,
     f32_of,
+    ld_bf4,
     stage_gate,
     stage_mix,
     stage_slice,
@@ -101,6 +104,10 @@ PER_WAVE = NKCH // WAVES  # 7
 VCH = 16  # state rows a KDA task
 NVCH = HD // VCH  # 8
 CONV_W = 4
+# in_proj's weight formats (``key.wfmt``), [NPROJ, HIDDEN]: see stages.wfmt. An
+# FP8 one may have more rows (SGLang pads its merged Quark FP8 in-proj to a
+# multiple of 64 rows, which is what it preshuffles).
+W_BF16, W_FP8, W_FP8_SHUFFLED = wfmt.BF16, wfmt.FP8, wfmt.FP8_SHUFFLED
 # timeline points: start, slice, gate, mix, load_x, gemv0, gemv1, k.stage,
 # k.conv, k.gates, k.recur, k.norm
 TL_POINTS = 15
@@ -134,6 +141,15 @@ class KdaPreBuild:
     # state, read and never written; each token's conv k / v, gate and beta go
     # to the ring rows SGLang's commit replays, instead of a state a token.
     ring: bool = False
+    wfmt: int = W_BF16  # in_proj's weight format
+    # the recurrent state rows (rstate, rstate0), read and written, are bf16
+    # (--mamba-ssm-dtype bfloat16)
+    state_bf16: bool = False
+
+
+# The recurrent state's dtype (rstate, rstate0, SGLang's pools).
+def state_dtype(key: KdaPreBuild) -> torch.dtype:
+    return torch.bfloat16 if key.state_bf16 else torch.float32
 
 
 def scratch_layout(key: KdaPreBuild) -> dict:
@@ -178,9 +194,19 @@ def sigmoid(z):
 # ---------------------------------------------------------------- gemv CTAs
 def gemv_loads(c, rg, chunks):
     """This wave's weight operands of rows 16 rg .. for its K chunks ``chunks``
-    (indices into wave, wave + 8, ..): a lane 64 contiguous bytes of its row a
-    chunk (4 dwordx4). ``rg`` past the last group loads the last group."""
+    (indices into wave, wave + 8, ..), a lane's slice of its row a chunk: bf16
+    4 x 16 B, FP8 4 x 8 B. ``rg`` past the last group loads the last group."""
     lane, wave = c["lane"], c["wave"]
+    if c["wfmt"] != W_BF16:
+        return wfmt.fp8_loads(
+            w=c["args"]["w_in"],
+            fmt=c["wfmt"],
+            lane=lane,
+            rg=rg,
+            chunks=(wave + WAVES * i for i in chunks),
+            k=HIDDEN,
+            rg_max=GEMV_TASKS - 1,
+        )
     r_w = rsrc(c["args"]["w_in"])
     row = fx.min(rg, GEMV_TASKS - 1) * ROWS + lane % ROWS
     g = lane // ROWS
@@ -203,6 +229,14 @@ def gemv_loads(c, rg, chunks):
             ]
         )
     return out
+
+
+# Row 16 rg + r's fp32 sum, an FP8 in_proj's per-channel scale applied as
+# its GEMM applies it. A plain function, as stages.oproj's o_scaled.
+def w_scaled(c, rg, r, v):
+    if c["wfmt"] == W_BF16:
+        return v
+    return v * ld_f32(c["args"]["w_ins"], fx.min(rg, GEMV_TASKS - 1) * ROWS + r)
 
 
 @flyc.jit
@@ -246,14 +280,14 @@ def stage_gemv(c, rg, ops):
                 )
             )
             acc = mfma_bf16(
-                ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
+                wfmt.operand(fmt=c["wfmt"], w=ops[i][q]), xb.bitcast(fx.BFloat16), acc
             )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     if (tid < ROWS * s) & (rg < GEMV_TASKS):
         r = tid % ROWS
         tt = tid // ROWS
-        v = bf16r(row_sum(red, r, tt))
+        v = bf16r(w_scaled(c, rg=rg, r=r, v=row_sum(red, r, tt)))
         c["put"](c["proj"], tt * NPROJ + rg * ROWS + r, v)
         if const_expr(c["debug"]):
             bo.buffer_store(
@@ -265,6 +299,23 @@ def stage_gemv(c, rg, ops):
 
 
 # ---------------------------------------------------------------- kda
+# The address of recurrent state row ``slot`` of the pool at ``base``
+# (``seq`` elements a slot, fp32 or bf16 ones).
+def state_row(c, base, seq, slot):
+    size = 2 if c["state_bf16"] else 4
+    return base + fx.Int64(fx.max(slot, 0)) * fx.Int64(seq) * fx.Int64(size)
+
+
+# Four state entries of rstate row ``slot`` at ``off``, in the state's dtype.
+def store_state(c, slot, off, stv):
+    a = c["args"]
+    dst = rsrc(state_row(c, base=a["rstate"], seq=a["rs_seq"], slot=slot))
+    if c["state_bf16"]:
+        bo.buffer_store(bf4_words(stv), dst, off // 2)
+    else:
+        bo.buffer_store(fx.Vector.from_elements(stv, fx.Float32), dst, off)
+
+
 def kda_stage(c, req, h, ch):
     """The task's inputs that need no hand-off, issued before its first poll:
     metadata, the owned channels' conv window / weights, the initial state rows,
@@ -302,14 +353,15 @@ def kda_stage(c, req, h, ch):
     if const_expr(c["init_committed"]):
         # the committed state itself: nothing staged it into the scratch
         islot = uniform(ld_i32(a["init_slot"], req))
-        base0 = a["rstate0"] + fx.Int64(fx.max(islot, 0)) * fx.Int64(a["rs0_seq"]) * 4
+        base0 = state_row(c, base=a["rstate0"], seq=a["rs0_seq"], slot=islot)
     else:
-        base0 = (
-            a["rstate"] + fx.Int64(fx.max(k["slot0"], 0)) * fx.Int64(a["rs_seq"]) * 4
+        base0 = state_row(c, base=a["rstate"], seq=a["rs_seq"], slot=k["slot0"])
+    if c["state_bf16"]:
+        k["st"] = ld_bf4(base0, k["head_off"])
+    else:
+        k["st"] = fx.Vector(
+            bo.buffer_load(rsrc(base0), k["head_off"], vec_width=4, dtype=T.f32)
         )
-    k["st"] = fx.Vector(
-        bo.buffer_load(rsrc(base0), k["head_off"], vec_width=4, dtype=T.f32)
-    )
     # f_b: wave w's rows 16 w .. of head h, a lane 64 B of its row
     fr = h * HD + wave * 16 + lane % 16
     fb = (fr * HD + (lane // 16) * 32) // 2
@@ -481,7 +533,6 @@ def kda_recur(c, k, req, h, ch):
     """State rows 16 ch .. of head h: the recurrence over the L tokens, a state
     written a token, bf16 outputs to LDS ``ol`` and their partial norms (ONRM)."""
     L, tid, lane = c["L"], c["tid"], c["lane"]
-    a = c["args"]
     v = tid // 32
     k0 = (tid % 32) * 4
     # See kda_conv: negative is the "no state" marker, row 0 is a real slot.
@@ -502,10 +553,7 @@ def kda_recur(c, k, req, h, ch):
         if const_expr(not c["ring"]):
             slot = k["slots"][j]
             if (slot >= 0) & live0:
-                dst = rsrc(a["rstate"] + fx.Int64(slot) * fx.Int64(a["rs_seq"]) * 4)
-                bo.buffer_store(
-                    fx.Vector.from_elements(stv, fx.Float32), dst, k["head_off"]
-                )
+                store_state(c, slot=slot, off=k["head_off"], stv=stv)
         if lane % 32 == 0:
             fx.ptr_store(o, c["ol"] + (j * VCH + v))
     gpu.barrier()
@@ -612,6 +660,8 @@ def build(key: KdaPreBuild):
         f"k3_mono_kda_pre_s{s}_l{L}_nb{key.nblocks}_d{int(key.delta)}"
         f"_g{int(key.debug)}_t{int(key.timeline)}_r{int(key.ring)}"
         + ("_ic" if key.init_committed else "")
+        + (f"_w{key.wfmt}" if key.wfmt != W_BF16 else "")
+        + ("_b1" if key.state_bf16 else "")
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -654,6 +704,7 @@ def build(key: KdaPreBuild):
         core_out: Int64,
         x_dbg: Int64,
         proj_dbg: Int64,
+        w_ins: Int64,
         scratch: Int64,
         layer: Int32,
         epoch: Int64,
@@ -688,6 +739,8 @@ def build(key: KdaPreBuild):
             "write_idx": key.write_idx,
             "ring": key.ring,
             "init_committed": key.init_committed,
+            "wfmt": key.wfmt,
+            "state_bf16": key.state_bf16,
             "gate_local": False,
             "put": mb.put,
             "poll": mb.poll,
@@ -740,6 +793,7 @@ def build(key: KdaPreBuild):
                 "core_out": core_out,
                 "x_dbg": x_dbg,
                 "proj_dbg": proj_dbg,
+                "w_ins": w_ins,
             },
         }
         for region in ("part", "wgt", "msq", "xrdy", "proj", "qk", "onrm"):
@@ -812,6 +866,7 @@ def build(key: KdaPreBuild):
         core_out: Int64,
         x_dbg: Int64,
         proj_dbg: Int64,
+        w_ins: Int64,
         scratch: Int64,
         layer: Int32,
         epoch: Int64,
@@ -858,6 +913,7 @@ def build(key: KdaPreBuild):
             core_out,
             x_dbg,
             proj_dbg,
+            w_ins,
             scratch,
             layer,
             epoch,
@@ -901,18 +957,36 @@ def kda_pre(
     ring=None,
     rstate0=None,
     init_slot=None,
+    w_in_scale=None,
 ):
     """Host launcher. ``conv_state`` [slots, dim, state_len] or a transposed view
     of [slots, state_len, dim] (strides read); ``rstate`` [slots, 12, 128, 128]
-    fp32; ``st_idx`` [R, >= L] int32; ``scratch`` zeroed before the step's first
-    layer (tags are a layer's); ``epoch`` a device int32 bumped once a step and
-    ``layer`` this launch's slot below ``TAG_SLOTS``."""
-    assert w_in.shape == (NPROJ, HIDDEN) and w_in.is_contiguous()
-    assert rstate.dtype == torch.float32 and rstate[0].numel() == NH * HD * HD
+    fp32, or bf16 with ``key.state_bf16`` (``rstate0`` likewise); ``st_idx``
+    [R, >= L] int32; ``scratch`` zeroed before the step's first layer (tags are
+    a layer's); ``epoch`` a device int32 bumped once a step and ``layer`` this
+    launch's slot below ``TAG_SLOTS``. ``w_in`` is in ``key.wfmt``, with
+    ``w_in_scale`` its fp32 scale a row when that is FP8. ``blocks`` is
+    [tokens, rows, hidden]; a block-write layer stores the updated prefix at
+    row ``write_idx``, so the bank has to be longer than that index. The store
+    is not bounds-checked."""
+    if key.write_idx >= 0:
+        assert blocks.size(1) > key.write_idx, (
+            f"the block-write row is {key.write_idx}, past a bank of "
+            f"{blocks.size(1)} rows {tuple(blocks.shape)}"
+        )
+    wfmt.check(fmt=key.wfmt, w=w_in, scale=w_in_scale, rows=NPROJ, k=HIDDEN)
+    want = state_dtype(key)
+    assert rstate.dtype == want and rstate[0].numel() == NH * HD * HD, rstate.dtype
     assert rstate[0].is_contiguous(), (
         "a slot's state must be dense; slots may be strided"
     )
+    if key.init_committed:
+        assert rstate0 is not None and init_slot is not None
+        assert rstate0.dtype == want and rstate0[0].numel() == NH * HD * HD
+        assert rstate0[0].is_contiguous()
     assert conv_state.dtype == torch.bfloat16
+    # the launch writes its whole layout; a short buffer is overrun, not refused
+    assert scratch.numel() >= scratch_bytes(key), (scratch.numel(), scratch_bytes(key))
     assert (ring is not None) == key.ring, (
         "a ring build takes the ring rows, and only it"
     )
@@ -969,6 +1043,7 @@ def kda_pre(
         core_out.data_ptr(),
         ptr(x_dbg),
         ptr(proj_dbg),
+        ptr(w_in_scale),
         scratch.data_ptr(),
         layer,
         epoch.data_ptr(),

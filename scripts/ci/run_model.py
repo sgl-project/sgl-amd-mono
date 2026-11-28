@@ -30,7 +30,9 @@ widths each test picks as representative; the nightly and weekly run every width
 Nightly mode (``--pr`` and ``--base`` both main): the tests, then the on side with
 the model's benchmarks but the weekly ones, and the speed test. It runs no off
 side: the report holds the on scores to the model's fixed ``baseline`` and shows
-the monokernel-off reference. Weekly mode: on and off, every benchmark and the
+the monokernel-off reference. A model the PR test runs is in the nightly at the
+tests tier (``models.nightly_tier``): its tests at the PR test's kernel widths
+and its serving tests, no benchmark or speed test. Weekly mode: on and off, every benchmark and the
 speed test on both sides; its off results become the monokernel-off reference
 until the next weekly run.
 
@@ -63,6 +65,7 @@ from models import (  # noqa: E402
     ISL,
     MODELS,
     OSL,
+    PR_COMMON_KERNEL_DESELECT,
     PR_EVALS,
     PROMPTS_PER_SLOT,
     RANGE_RATIO,
@@ -203,7 +206,7 @@ class Run:
 
     # -- tests ----------------------------------------------------------------
 
-    def pytest(self, name, files, timeout, src=None, into="tests"):
+    def pytest(self, name, files, timeout, src=None, into="tests", select=""):
         """Run ``files`` of the checkout ``src`` (default: the PR) and record the
         counts, and which tests failed, as ``result[into][name]``."""
         src = src or self.args.pr
@@ -212,8 +215,9 @@ class Run:
             return
         log = name if into == "tests" else f"{into.split('_')[0]}-{name}"  # base-unit
         xml = self.logs / f"{log}.xml"
+        k = f"-k {shlex.quote(select)} " if select else ""
         rc = self.sh(
-            f"python3 -m pytest -v -rA --junitxml={xml} " + " ".join(files),
+            f"python3 -m pytest -v -rA --junitxml={xml} {k}" + " ".join(files),
             log,
             cwd=src,
             timeout=timeout,
@@ -574,15 +578,26 @@ class Run:
         if self.key == "common":
             self.install(a.pr)
             self.pytest("unit", ["test/unit"], 1800)
-            self.pytest("kernels", COMMON_KERNEL_TESTS, 3600)
+            self.pytest(
+                "kernels",
+                COMMON_KERNEL_TESTS,
+                3600,
+                # a PR leaves the TP4 fault sweep to the nightly
+                select=PR_COMMON_KERNEL_DESELECT if a.mode == "pr" else "",
+            )
             return
         if why:
             self.result["skipped"]["serving"] = why
             self.skip_e2e(why)
         if a.mode in ("nightly", "weekly"):
+            if a.tier == "tests":
+                # the weekly run sweeps every width
+                os.environ["MONO_CI_QUICK_KERNELS"] = "1"
             self.install(a.pr)
             self.step("tests", self.tests)
-            if not why:
+            if not why and a.tier == "tests":
+                self.step("e2e", self.e2e)
+            elif not why:
                 evals = [
                     e
                     for e in self.m.get("evals", [])

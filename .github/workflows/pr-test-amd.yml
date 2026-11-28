@@ -110,7 +110,9 @@ jobs:
       statuses: write
       actions: read
     outputs:
+      # the model jobs; stage A (`common`) is a job of its own and runs first
       matrix: ${{ steps.scope.outputs.matrix }}
+      has_models: ${{ steps.scope.outputs.has_models }}
       title_type: ${{ steps.scope.outputs.title_type }}
       pr: ${{ steps.pr.outputs.pr }}
       pr_sha: ${{ steps.pr.outputs.pr_sha }}
@@ -204,11 +206,88 @@ jobs:
             -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             -f description="$(cut -c1-140 <<< "Running: $models")" > /dev/null
 
-  test:
+  # Stage A: `common` (the unit tests and the common kernel tests, ~5 min) runs
+  # first, on its own. The model jobs start only once it passes: a PR that breaks
+  # the package fails here instead of holding both runners for hours. Only a test
+  # failure stops them; a cluster job that never ran (Slurm, the node) lets them
+  # run, and the report still fails `common`.
+  stage-a:
     needs: plan
     # The gate a dispatched run skips is upstream of this job too, and a skipped
     # job anywhere upstream skips it unless its condition says otherwise.
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    # The name the model jobs have: the mono dashboard and the CI monitor read
+    # `test (<model>, <tier>)`.
+    name: test (common, full)
+    # Two runners on a cluster host that submits Slurm jobs (scripts/ci/runner.sh);
+    # each job takes one of the two CI nodes.
+    runs-on: [self-hosted, sgl-amd-mono-mi355x]
+    timeout-minutes: 1200
+    env:
+      CI_IMAGE: ${{ needs.plan.outputs.image }}
+      CI_PR: ${{ needs.plan.outputs.pr }}
+      CI_PR_SHA: ${{ needs.plan.outputs.pr_sha }}
+      CI_BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+      CI_EXTRA: ${{ needs.plan.outputs.extra == 'true' && '1' || '' }}
+      # The runner host's local disk: a shared home may be slow to write.
+      RESULTS: /tmp/sgl-amd-mono-ci/${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      # The scripts that run outside the container come from the base branch. The
+      # cluster job fetches the PR and base commits onto the node itself.
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
+      - name: Run on the CI node
+        id: launch
+        # slurm_launch.sh fails only when the cluster job itself did not run; the
+        # Judge step decides what that means for the gate
+        continue-on-error: true
+        env:
+          CI_RESULTS: ${{ env.RESULTS }}/common
+        run: bash harness/scripts/ci/slurm_launch.sh "common" "full"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mono-ci-common
+          path: ${{ env.RESULTS }}/common
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Judge
+        # bash (not the default bash -e) runs with pipefail: a failed check fails
+        # the job instead of passing through tee's exit status. A cluster job that
+        # did not run is no verdict on the PR: the model jobs still run, and the
+        # report fails `common` for it.
+        shell: bash
+        env:
+          LAUNCH: ${{ steps.launch.outcome }}
+        run: |
+          if [[ "$LAUNCH" != success ]]; then
+            echo "::warning::stage A's cluster job did not run (Slurm or the node, not the PR's tests); the model jobs still run and the report fails common"
+            exit 0
+          fi
+          python3 harness/scripts/ci/report.py --results "$RESULTS" --model "common" \
+            --title-type "${{ needs.plan.outputs.title_type }}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Cancel the cluster job
+        if: cancelled()
+        run: scancel --name "sgl-amd-mono-ci-${{ github.run_id }}-common" || true
+
+      - name: Clean up
+        if: always()
+        run: rm -rf "$RESULTS/common"
+
+  test:
+    needs: [plan, stage-a]
+    # Only after stage A passed, and only when the PR runs a model (an empty
+    # matrix is an error).
+    if: >-
+      !cancelled() && needs.plan.result == 'success'
+      && needs.stage-a.result == 'success' && needs.plan.outputs.has_models == 'true'
     name: test (${{ matrix.model }}, ${{ matrix.tier }})
     # Two runners on a cluster host that submits Slurm jobs (scripts/ci/runner.sh);
     # each job takes one of the two CI nodes.
@@ -265,7 +344,7 @@ jobs:
         run: rm -rf "$RESULTS/${{ matrix.model }}"
 
   report:
-    needs: [plan, test]
+    needs: [plan, stage-a, test]
     # Not on a cancelled run: a newer run (a new label or push) has taken over the status.
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
@@ -291,12 +370,16 @@ jobs:
           PR: ${{ needs.plan.outputs.pr }}
           SHA: ${{ needs.plan.outputs.pr_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STAGE_A: ${{ needs.stage-a.result }}
         run: |
           mkdir -p results
           for d in artifacts/mono-ci-*; do [[ -d "$d" ]] && mv "$d" "results/${d#artifacts/mono-ci-}"; done
           rc=0
+          # the model jobs did not start when stage A failed
+          stage_a=""
+          [[ "$STAGE_A" == success ]] || stage_a=--stage-a-failed
           python3 harness/scripts/ci/report.py --scope artifacts/scope/scope.json --results results \
-            --run-url "$RUN_URL" --out report.md > report.log 2>&1 || rc=$?
+            --run-url "$RUN_URL" --out report.md $stage_a > report.log 2>&1 || rc=$?
           # A crash of report.py itself must still end the pending status.
           if [[ ! -s report.md ]]; then
             rc=1
