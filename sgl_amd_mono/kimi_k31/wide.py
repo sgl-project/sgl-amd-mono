@@ -715,8 +715,8 @@ def _mono_pre_q_view(tree):
     - that read is ``name = pre["q"].view(-1 or pre["q_lora"].shape[0], heads,
       self.qk_head_dim)``, a statement directly in ``if self.q_lora_rank is not None and
       pre is not None`` (or ``if pre is not None``), a statement of the function body
-      that only imports, plain name assignments and a docstring precede,
-      after only plain name assignments in that branch; ``name`` is not used again in it,
+      that only imports, a docstring, pre's and the predicate's assignments and names set
+      to constants precede, after only head-count name assignments in that branch; ``name`` is not used again in it,
       the rest of the branch only assigns (in ifs too), and the statement right after the
       ``if`` chain is an assignment or return whose value is the call
       ``self._split_q_nope_pe(name, ...)`` (every later use is such a call);
@@ -864,14 +864,17 @@ def _mono_pre_q_view(tree):
         and guard in fn.body
     ):
         return None
-    # before the guard only imports, plain name assignments and a docstring: no early way out
+    # before the guard only imports, a docstring and the assignments below: no way out early
     for s in fn.body[: fn.body.index(guard)]:
         doc = isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)
+        # a name set to a constant (SGLang: `q_lora = None`), or pre / the predicate as
+        # matched above; nothing that could change what the head count reads
         named = (
             isinstance(s, ast.Assign)
             and len(s.targets) == 1
             and isinstance(s.targets[0], ast.Name)
-        )  # not `self.dcp_size = ...`: the head count reads those attributes
+            and (isinstance(s.value, ast.Constant) or s in (pred, top["pre"]))
+        )
         if not (doc or named or isinstance(s, (ast.Import, ast.ImportFrom))):
             return None
     # SGLang's guard (or the bare ``pre`` test): its branch runs in both q-replicate states
@@ -929,10 +932,12 @@ def _mono_pre_q_view(tree):
         return None
     assigned: dict = {}
     for s in guard.body[:at]:
+        # before the view only head-count names (SGLang: `num_q_heads = ...`)
         if not (
             isinstance(s, ast.Assign)
             and len(s.targets) == 1
             and isinstance(s.targets[0], ast.Name)
+            and all(_head_count(s.value, {}, qrep=q) is not None for q in (False, True))
         ):
             return None
         assigned[s.targets[0].id] = s.value
