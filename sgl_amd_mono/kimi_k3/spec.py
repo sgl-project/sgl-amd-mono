@@ -1334,8 +1334,15 @@ class _WideBuilt(_Built):
         self._shim = _LanguageModelShim(self)
 
     def _backbone(self, input_ids, forward_batch, input_embeds):
-        if self._plan.key.rows <= MAX_ROWS:
+        rows = self._plan.key.rows
+        if rows <= MAX_ROWS:
             return super()._backbone(input_ids, forward_batch, input_embeds)
+        if not self._wide.serves(rows):
+            # a multiple of this L in the spec's widths only for another draft length:
+            # SGLang's own backbone, as for a step past the widths
+            return self.backbone(
+                input_ids, self._positions, forward_batch, input_embeds
+            )
         try:
             return self._wide.backbone(self, input_ids, forward_batch, input_embeds)
         except Exception as e:

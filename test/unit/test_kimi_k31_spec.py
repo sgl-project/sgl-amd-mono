@@ -33,21 +33,17 @@ def test_the_narrow_and_wide_widths_meet_without_a_gap():
     assert all(w > wide.NARROW for w in widths[MAX_ROWS:])
 
 
-def test_every_wide_width_has_a_bucket_at_each_draft_length():
-    # the binding serves a width at every L it is a multiple of: an 8-token width
-    # that reads as more 6-token requests than the largest bucket holds raised at
-    # the launch
-    top = max(wide.REQ_BUCKETS)
-    for w in wide.wide_widths():
-        for L in wide.SUPPORTED_L:
-            if w % L == 0:
-                assert w // L <= top, (w, L)
+def test_every_width_an_l_serves_has_a_bucket(monkeypatch):
+    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    # a step takes the smallest bucket holding its rows; one past the largest raised
+    for L in wide.SUPPORTED_L:
+        top = wide.buckets(L=L)[-1]
+        assert all(w <= top for w in wide.widths_at(L)), L
 
 
-def test_the_spec_serves_up_to_60_requests():
+def test_the_spec_serves_up_to_60_requests_at_every_draft_length():
     # SPEC reads its widths at import, so read them in a process without a bucket override.
-    # The gaps are widths a shorter draft length reads as more than 60 requests (MonoSpec
-    # widths are not per draft length): 6 tokens' 330 and 360 rows are 66 and 72 at L = 5.
+    # MonoSpec widths are one list for every L: each L's own widths, and nothing else.
     env = {
         k: v for k, v in os.environ.items() if k != "SGLANG_AMD_MONO_K31_WIDE_BUCKETS"
     }
@@ -64,11 +60,8 @@ def test_the_spec_serves_up_to_60_requests():
         text=True,
         check=True,
     ).stdout
-    widths = ast.literal_eval(out.strip().splitlines()[-1])
-    served = {L: {w // L for w in widths if w % L == 0} for L in (5, 6, 8)}
-    assert served[5] == set(range(2, 61))
-    assert served[6] == set(range(2, 61)) - {55, 60}
-    assert served[8] == set(range(2, 61)) - {40, 45, 48, 50, 51, 54, 55, 57, 60}
+    widths = set(ast.literal_eval(out.strip().splitlines()[-1]))
+    assert widths == {L * r for L in (5, 6, 8) for r in range(2, 61)}
 
 
 def test_the_trimmed_buckets_still_hold_every_served_width(monkeypatch):
@@ -77,7 +70,7 @@ def test_the_trimmed_buckets_still_hold_every_served_width(monkeypatch):
     # trimming one bucket too many leaves the widest served step without one.
     for L in wide.SUPPORTED_L:
         full = wide.buckets(L=L)
-        for top in (w for w in wide.wide_widths() if w % L == 0):
+        for top in wide.widths_at(L):
             kept = wide.buckets(L=L, max_rows=top)
             assert kept == full[: len(kept)], (L, top)
             assert kept[-1] >= top and (len(kept) == 1 or kept[-2] < top), (L, top)
@@ -106,15 +99,15 @@ def test_every_bucket_resolves_to_a_tuned_config(monkeypatch):
 
 
 def test_an_override_keeps_its_cut_at_every_draft_length(monkeypatch):
-    """A shared wide graph key must clear the override's lower cutoff at every draft length."""
+    """Each L serves only request counts past the override's lower cut and up to its last
+    bucket; another L's width below the cut stays on SGLang's path (Wide.serves)."""
     monkeypatch.setenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", value="128,256,384")
     lo = max(r for r in wide.REQ_BUCKETS if r < 16)
-    widths = wide.wide_widths()
-    for w in widths:
-        for L in wide.SUPPORTED_L:
-            if w % L == 0:
-                assert lo < w // L <= 48, (w, L)
-    assert 96 not in widths and 120 in widths
+    for L in wide.SUPPORTED_L:
+        assert all(lo < w // L <= 48 for w in wide.widths_at(L)), L
+    # 96 rows: 16 requests at L = 6, 12 (below the cut) at L = 8
+    assert 96 in wide.widths_at(6) and 96 in wide.wide_widths()
+    assert 96 not in wide.widths_at(8) and 120 in wide.widths_at(8)
 
 
 def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
@@ -256,22 +249,27 @@ def test_wide_capture_stream_and_variant():
     assert w._variant(pk, captures={79}, capture_stream="prefix")["capture"] is False
 
 
-def test_a_bucket_no_served_step_fills_makes_no_launch_sort(monkeypatch):
-    """The routed experts read the launch's sort only when a step fills its bucket; a bucket
-    whose own width is not served (8-token 480 rows) must not pay for a sort nobody reads."""
+@pytest.mark.parametrize("override", [None, "128,256,384"])
+def test_every_bucket_is_a_served_width_so_its_launch_sort_is_read(
+    monkeypatch, override
+):
+    """The routed experts read the launch's sort only when a step fills its bucket: every
+    bucket must be a width its L serves, so _launch_sort needs no per-bucket gate."""
     from sgl_amd_mono.kimi_k31 import presort
+    from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
 
-    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    if override is None:
+        monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    else:
+        monkeypatch.setenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", value=override)
     monkeypatch.setenv(name="SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT", value="1")
     monkeypatch.setenv(name="SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK", value="1")
     monkeypatch.setattr(presort, "sort_kind", lambda: "aux16")
-    widths = wide.wide_widths()
-    assert 480 not in widths and 448 in widths
-    assert wide._launch_sort(480) is None
-    assert wide._launch_sort(448) == "aux16"
     for L in wide.SUPPORTED_L:
         for b in wide.buckets(L=L):
-            assert (wide._launch_sort(b) is not None) <= (b in widths), (L, b)
+            assert b in wide.widths_at(L), (L, b)
+            want = "aux16" if b <= mf.sort_max_rows("aux16") else None
+            assert wide._launch_sort(b) == want, (L, b)
 
 
 def test_the_wide_launch_refuses_an_unsupported_state_dtype_before_building(
@@ -285,3 +283,27 @@ def test_the_wide_launch_refuses_an_unsupported_state_dtype_before_building(
     )
     with pytest.raises(ValueError, match="float16"):
         wide.Wide(model=None, rank=0, group=None, device="cpu", L=6)
+
+
+def test_a_width_only_another_draft_length_serves_runs_sglang(monkeypatch):
+    """The binding routes every spec width that is a multiple of L; one only another L
+    serves (330 rows: 55 requests at L = 6, 66 at L = 5, past every bucket) runs SGLang's
+    own backbone instead of the wide launch, as a step past the widths does."""
+    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    assert 330 in wide.wide_widths() and 330 not in wide.widths_at(5)
+    runner = object.__new__(wide.Wide)
+    runner.widths = frozenset(wide.widths_at(5))
+    runner.backbone = lambda built, ids, fb, embeds: ("wide", ids, fb, embeds)
+    built = object.__new__(k31.k3._WideBuilt)
+    built._wide, built._positions = runner, "positions"
+    built.backbone = lambda *args: ("sglang", *args)
+    built._plan = SimpleNamespace(key=SimpleNamespace(rows=330))
+    assert built._backbone("ids", "fb", None) == (
+        "sglang",
+        "ids",
+        "positions",
+        "fb",
+        None,
+    )
+    built._plan = SimpleNamespace(key=SimpleNamespace(rows=300))
+    assert built._backbone("ids", "fb", None) == ("wide", "ids", "fb", None)

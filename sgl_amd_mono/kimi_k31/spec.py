@@ -4,7 +4,7 @@
 A routed step is a speculative verify step (DSpark or DFLASH) of L draft tokens a
 request (L = 5, 6 or 8). One request's step runs Kimi-K3's launches: K1 on the KDA
 layers, the MLA projection front on the DSA layers and the layer launch (o_proj to
-the MoE output) on every MoE layer. A step of R >= 2 requests runs
+the MoE output) on every MoE layer. A step of 2 to 60 requests runs
 ``wide.Wide.backbone``: one persistent launch a KDA layer, SGLang's routed experts
 between launches, and SGLang's own path for layer 0, DSA attention and each run's
 exit. Eligible DSA projection-front and post-attention stages use fused launches.

@@ -25,7 +25,6 @@ state: slot -1).
 """
 
 import contextlib
-import functools
 import os
 
 import torch
@@ -273,29 +272,24 @@ def _row_cfgs(b: int) -> tuple[str, str, str, str, str]:
     )
 
 
-def wide_widths(max_reqs: int = REQ_BUCKETS[-1]) -> tuple:
-    # only widths a warmed bucket holds: a graph capture must not meet a cold one; rows
-    # up to a bucket left out below the smallest one stay on SGLang's own path. The
-    # server's draft tokens are not known at import: every supported L's widths (the
-    # binding keeps those a multiple of the server's)
+def widths_at(L: int) -> tuple:
+    """The rows of every verify step the wide launch serves at L draft tokens: L x r for
+    every r in (lo, top] past NARROW rows, where lo is the ladder bucket below the
+    bucket override's first (1 without one) and top its last. A graph capture must
+    not meet a cold bucket, and rows below the override's first bucket stay on
+    SGLang's own path."""
     rs = req_buckets()
     lo = max((x for x in REQ_BUCKETS if x < rs[0]), default=1)
-    top = min(max_reqs, rs[-1])
-    widths = {
-        L * r
-        for L in SUPPORTED_L
-        for r in range(max(2, lo + 1), top + 1)
-        if L * r > NARROW
-    }
-    # the binding serves a width at every L it is a multiple of;
-    # drop any width another L reads outside (lo, top] (8-token 360 rows: 72 at L = 5)
-    return tuple(
-        sorted(
-            w
-            for w in widths
-            if all(lo < w // L <= top for L in SUPPORTED_L if w % L == 0)
-        )
-    )
+    return tuple(L * r for r in range(max(2, lo + 1), rs[-1] + 1) if L * r > NARROW)
+
+
+def wide_widths() -> tuple:
+    """Every supported L's ``widths_at``: the spec's wide widths. The server's draft tokens
+    are not known at import and ``MonoSpec.widths`` is one list for every L; the binding
+    serves a width at the server's L when it is a multiple of it, and a multiple of L that
+    ``widths_at(L)`` leaves out (6-token 330 rows: 66 requests at L = 5) runs SGLang's own
+    path (``Wide.serves``)."""
+    return tuple(sorted({w for L in SUPPORTED_L for w in widths_at(L)}))
 
 
 def _say(msg):
@@ -319,25 +313,11 @@ def _launch_sort(b):
     ):
         return None
     kind = presort.sort_kind()
-    # the routed experts read the sort only when a step fills its bucket (rows == b); a bucket
-    # whose full width is not served (8-token 480 rows: 80 requests at L = 6) never does
-    if (
-        kind is None
-        or b > mf.sort_max_rows(kind)
-        or b not in _served_widths(_buckets_env())
-    ):
+    # the routed experts read the sort only when a step fills its bucket (rows == b); every
+    # bucket is a width its L serves (unit tested), so a full step reaches each one
+    if kind is None or b > mf.sort_max_rows(kind):
         return None
     return kind
-
-
-def _buckets_env():
-    return os.environ.get("SGLANG_AMD_MONO_K31_WIDE_BUCKETS")
-
-
-@functools.lru_cache(maxsize=4)
-def _served_widths(buckets_env: str | None) -> frozenset:
-    # keyed on the bucket override wide_widths reads: a launch asks once a layer a step
-    return frozenset(wide_widths())
 
 
 def _sort_views(buf, m, kind="sgl"):
@@ -943,6 +923,8 @@ class Wide:
         self.peers_dsa, self.half_dsa = {}, {}
         # each bucket holds buffers and compiles a launch
         self.buckets = buckets(L=L, max_rows=max_rows)
+        # the steps this L serves; the spec's widths also hold other draft lengths' (serves)
+        self.widths = frozenset(w for w in widths_at(L) if w <= self.buckets[-1])
         self.tabs = {}  # (bucket, layer) -> KDA table: every pointer in it is fixed once built
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # long enough for a capture variant's first compile on one rank while the
@@ -982,6 +964,13 @@ class Wide:
                 for k, v in sorted(own.items(), key=lambda x: -x[1])
             )
         )
+
+    def serves(self, rows: int) -> bool:
+        """Whether a routed step of rows rows runs the wide launch. The spec's widths are one
+        list for every draft length, so the binding also routes a multiple of L that only
+        another L serves (6-token 330 rows at L = 5: 66 requests, past every bucket); that
+        step runs SGLang's own path, as a step past the widths does."""
+        return rows in self.widths
 
     # ------------------------------------------------------------ per bucket
     def _mla_bucket_specs(self, b: int) -> dict[int, int]:

@@ -21,9 +21,11 @@ from sgl_amd_mono.kimi_k31.gfx950.chain import Gemm
 TILE_STAGES = ("up", "inproj", "oproj", "rsred", "front", "sdown")
 
 # DSpark verify tokens a request and the most requests a step holds at each deployed
-# point (agentx/opt.sh and its layouts; c1 runs Kimi-K3's narrow launch). The decode
-# graphs cover every batch up to the most, so a point runs every bucket up to it.
+# point (agentx/opt.sh after its run scripts and layouts: 8 tokens at c1/c4/c8, 6 at
+# c16-c56; c1 runs Kimi-K3's narrow launch). The decode graphs cover every batch up to
+# the most, so a point runs every request count, and every bucket, up to it.
 RECIPE = {
+    "c1": (8, 1),
     "c4": (8, 2),
     "c8": (8, 8),
     "c16": (6, 8),
@@ -68,7 +70,7 @@ def _over(b: int, L: int, cfgs) -> dict:
 @pytest.mark.parametrize("point", sorted(RECIPE))
 def test_every_recipe_bucket_fits_one_round(point: str) -> None:
     L, max_reqs = RECIPE[point]
-    assert L in wide.SUPPORTED_L and max_reqs in wide.REQ_BUCKETS
+    assert L in wide.SUPPORTED_L
     over = {}
     for r in wide.REQ_BUCKETS:
         if r <= max_reqs and L * r > wide.NARROW:
@@ -76,6 +78,46 @@ def test_every_recipe_bucket_fits_one_round(point: str) -> None:
             if bad := _over(b, L, wide.cfg_rows(b, L)):
                 over[b] = bad
     assert not over, (point, over)
+
+
+def _routed(L: int) -> set:
+    """Request counts the spec routes to a launch at L draft tokens: the binding takes every
+    width of MonoSpec.widths (1 .. NARROW, then wide_widths) that is a multiple of L."""
+    widths = (*range(1, wide.NARROW + 1), *wide.wide_widths())
+    return {w // L for w in widths if w % L == 0}
+
+
+@pytest.mark.parametrize("point", sorted(RECIPE))
+def test_every_recipe_step_is_routed_to_a_launch(point: str, monkeypatch) -> None:
+    """Every request count a point runs reaches a launch; one that does not runs SGLang's
+    whole step (a request count padded to the next graph pays for the padding instead)."""
+    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    L, max_reqs = RECIPE[point]
+    missing = set(range(1, max_reqs + 1)) - _routed(L)
+    assert not missing, (point, sorted(missing))
+
+
+@pytest.mark.parametrize("point", sorted(RECIPE))
+def test_every_recipe_step_past_narrow_runs_the_wide_launch(
+    point: str, monkeypatch
+) -> None:
+    """A routed step past NARROW rows is one the wide launch serves at the point's L (not
+    another L's width that falls back to SGLang), and a bucket holds it."""
+    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    L, max_reqs = RECIPE[point]
+    served, top = set(wide.widths_at(L)), wide.buckets(L)[-1]
+    rows = [L * r for r in range(1, max_reqs + 1) if L * r > wide.NARROW]
+    assert all(b in served and b <= top for b in rows), (point, rows)
+
+
+@pytest.mark.parametrize("L", wide.SUPPORTED_L)
+def test_every_draft_length_serves_every_request_count(L: int, monkeypatch) -> None:
+    """Each L serves 2 .. REQ_BUCKETS[-1] requests: no width is dropped because another
+    draft length reads it as more requests than a bucket holds."""
+    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
+    want = {r for r in range(2, wide.REQ_BUCKETS[-1] + 1) if L * r > wide.NARROW}
+    assert want <= _routed(L), sorted(want - _routed(L))
+    assert set(wide.widths_at(L)) == {L * r for r in want}
 
 
 @pytest.mark.parametrize("L", wide.SUPPORTED_L)
