@@ -91,6 +91,28 @@ def test_qrep_scratch_fits_runner_allocation() -> None:
     assert mp.scratch_bytes(key) <= k2_layer.scratch_alloc_bytes()
 
 
+def test_tag_offset_clears_the_qrep_scratch_when_it_is_the_widest(monkeypatch) -> None:
+    """The tagged x rows start past every narrow launch's scratch: with the other launches'
+    layouts shrunk to nothing, the 96-head replicated-Q mla_pre still ends below them."""
+    import itertools
+
+    from sgl_amd_mono.kimi_k3 import MAX_BLOCKS, MAX_ROWS
+    from sgl_amd_mono.kimi_k3.gfx950 import k1
+
+    monkeypatch.setattr(k2_layer.k2b, "scratch_bytes", lambda key: 0)
+    monkeypatch.setattr(k2_layer, "scratch_bytes", lambda key: 0)
+    monkeypatch.setattr(k1, "scratch_bytes", lambda rows: 0)
+    widest = max(
+        mp.scratch_bytes(
+            mp.MlaPreBuild(tokens=MAX_ROWS, nblocks=nb, qn=qn, nhq=nhq, qn_rm=rm)
+        )
+        for nb, qn, rm, nhq in itertools.product(
+            range(MAX_BLOCKS + 1), (False, True), (False, True), (mp.NHQ, mp.NHQ_QREP)
+        )
+    )
+    assert k2_layer.tag_offset() >= widest
+
+
 def test_mla_build_dcp8_gates(monkeypatch) -> None:
     def _set_par(**kw):
         par = SimpleNamespace(
