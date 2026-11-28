@@ -731,7 +731,9 @@ def mla_pre_launch(
 ):
     """Host launcher. ``w``: ares_nw, ares_qk, in_nw, w_qkv [2112, 7168], w_g
     [1536, 7168], w_k [128, 7168], w_p [32, 7168], w_qb [nhq * 192, 1536], w_iq
-    [4096, 1536], q_nw [1536], kv_nw [512] (bf16, contiguous); ``out``: q
+    [4096, 1536], q_nw [1536], kv_nw [512] (bf16, contiguous), and with ``key.qn``
+    w_kc: [nhq * 512, 128] transposed, or SGLang's own [nhq, 128, 512] when
+    ``key.qn_rm``; ``out``: q
     [S, nhq * 192], latent, k_nope, gate, idx_q, idx_k, idx_w (and q_lora,
     unused here; qn [S, nhq, 512] when ``key.qn``). ``prefix`` is read, not
     written, unless the layer is a block-write layer (its bank row)."""

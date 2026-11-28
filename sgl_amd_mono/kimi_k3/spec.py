@@ -633,8 +633,8 @@ def _mono_pre_q_view(tree):
       pre is not None`` (or ``if pre is not None``), a statement of the function body,
       after only plain name assignments in that branch; ``name`` is not used again in it,
       the branch does not leave early after it, and the statement right after the
-      ``if`` chain hands it to ``self._split_q_nope_pe`` as its first argument (every
-      later use is such a call);
+      ``if`` chain is an assignment or return whose value is the call
+      ``self._split_q_nope_pe(name, ...)`` (every later use is such a call);
     - no write to a ``pre["<key>"]`` field;
     - ``"_mono_pre"`` appears once (pre's assignment), and no import binds ``self``,
       ``pre``, ``forward_batch``, ``q_replicate_active`` or ``name``;
@@ -794,9 +794,18 @@ def _mono_pre_q_view(tree):
         for n in ast.walk(s)
     ):
         return None  # the viewed q is used again, or the branch leaves early
-    # the next statement after the if chain hands the viewed q to the split
+    # the next statement after the if chain is `... = self._split_q_nope_pe(name, ...)` or
+    # `return self._split_q_nope_pe(name, ...)`: the split runs whenever the view did
     nxt = fn.body.index(guard) + 1
-    if nxt >= len(fn.body):
+    after = fn.body[nxt] if nxt < len(fn.body) else None
+    head = after.value if isinstance(after, (ast.Assign, ast.Return)) else None
+    if not (
+        isinstance(head, ast.Call)
+        and ast.dump(head.func) == dump("self._split_q_nope_pe")
+        and head.args
+        and isinstance(head.args[0], ast.Name)
+        and head.args[0].id == name
+    ):
         return None
     split = 0
     for n in ast.walk(fn):
@@ -811,9 +820,9 @@ def _mono_pre_q_view(tree):
                 and ast.dump(call.func) == dump("self._split_q_nope_pe")
             ):
                 return None
-            split += any(m is n for m in ast.walk(fn.body[nxt]))
+            split += 1
     if not split:
-        return None  # the statement after the if chain does not split the viewed q
+        return None
     assigned: dict = {}
     for s in guard.body[:at]:
         if not (
