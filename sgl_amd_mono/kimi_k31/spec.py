@@ -32,11 +32,6 @@ SGLANG_READS = {
         "Numerics",
         "KV_OFFLOAD",
     ),
-    "srt/arg_groups/fields/*.py": (
-        "enable_lmcache",
-        "enable_flexkv",
-        "disaggregation_decode_enable_offload_kvcache",
-    ),
     "srt/environ.py": ("envs", "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT"),
     "srt/models/kimi_k3.py": ("KimiK31ForConditionalGeneration",),
 }
@@ -56,40 +51,19 @@ NUMERICS = Numerics(
 )
 
 
-def _offload_disable_reasons(
-    *, lmcache: bool, flexkv: bool, decode_offload: bool, host_only_checkpoint: bool
-) -> list[str]:
-    # Feature.KV_OFFLOAD also admits these; only HiCache has run under the launches.
-    flags = {
-        "--enable-lmcache": lmcache,
-        "--enable-flexkv": flexkv,
-        "--disaggregation-decode-enable-offload-kvcache": decode_offload,
-    }
-    reasons = [
-        f"{flag}: only HiCache's KV offload is supported"
-        for flag, on in flags.items()
-        if on
-    ]
-    if host_only_checkpoint:
-        # SGLang then rings ReplaySSM state by request row; the launches index it by slot.
+def _config_disable_reasons(cfg, hf_config) -> list[str]:
+    from sglang.srt.environ import envs
+
+    # Kimi-K3's checks also take the DCP sizes, attention CP, the wide draft lengths and
+    # the KV offload paths other than HiCache
+    reasons = k3._config_disable_reasons(cfg=cfg, hf_config=hf_config)
+    if envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get():
+        # SGLang then rings ReplaySSM state by request row; the launches index it by slot
+        # (K3.1 always runs the ReplaySSM ring, Kimi-K3's check only when it is on).
         reasons.append(
             "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT: the launches index the ReplaySSM ring "
             "by mamba slot"
         )
-    return reasons
-
-
-def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    from sglang.srt.environ import envs
-
-    # Kimi-K3's checks also take the DCP sizes, attention CP and the wide draft lengths
-    reasons = k3._config_disable_reasons(cfg=cfg, hf_config=hf_config)
-    reasons += _offload_disable_reasons(
-        lmcache=cfg.enable_lmcache,
-        flexkv=cfg.enable_flexkv,
-        decode_offload=cfg.disaggregation_decode_enable_offload_kvcache,
-        host_only_checkpoint=envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get(),
-    )
     if not getattr(k3._text_config(hf_config), "dsa_config", None):
         reasons.append("no dsa_config: a Kimi-K3 checkpoint, served by kimi_k3")
     if not k3.WIDE:

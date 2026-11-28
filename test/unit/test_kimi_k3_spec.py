@@ -494,6 +494,37 @@ def test_split_quark_fp8_in_proj_and_caching(monkeypatch, b_dtype):
     assert torch.count_nonzero(unshuf_fab[kda.HD + kda.NH :]) == 0
 
 
+_NO_OFFLOAD = dict(
+    enable_lmcache=False,
+    enable_flexkv=False,
+    disaggregation_decode_enable_offload_kvcache=False,
+)
+
+
+def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
+    """The spec declares KV_OFFLOAD for HiCache; the other offload paths it admits are
+    refused, one reason each, through Kimi-K3's own config hook."""
+    monkeypatch.setattr(k3, "WIDE", True)
+    cfg = dict(
+        dcp_size=8,
+        attn_cp_size=1,
+        enable_prefill_cp=False,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=6,
+        cuda_graph_max_bs_decode=16,
+        max_running_requests=16,
+        enable_linear_replayssm_spec=True,
+        **_NO_OFFLOAD,
+    )
+    assert k3.Feature.KV_OFFLOAD in k3.SPEC.features
+    base = k3._config_disable_reasons(SimpleNamespace(**cfg), K3)
+    assert not any("HiCache" in r for r in base), base
+    for flag in _NO_OFFLOAD:
+        reasons = k3._config_disable_reasons(SimpleNamespace(**{**cfg, flag: True}), K3)
+        extra = [r for r in reasons if r not in base]
+        assert len(extra) == 1 and "only HiCache" in extra[0], (flag, extra)
+
+
 def test_wide_config_guards_draft_tokens_and_request_scoped_ring(monkeypatch):
     monkeypatch.setattr(k3, "WIDE", True)
     bad_decode = SimpleNamespace(
@@ -505,6 +536,7 @@ def test_wide_config_guards_draft_tokens_and_request_scoped_ring(monkeypatch):
         cuda_graph_max_bs_decode=16,
         max_running_requests=16,
         enable_linear_replayssm_spec=False,
+        **_NO_OFFLOAD,
     )
     reasons = k3._config_disable_reasons(bad_decode, K3)
     assert any("SGLANG_AMD_MONO_K3_WIDE=0" in r for r in reasons), reasons
@@ -527,6 +559,7 @@ def test_wide_config_guards_draft_tokens_and_request_scoped_ring(monkeypatch):
         cuda_graph_max_bs_decode=16,
         max_running_requests=16,
         enable_linear_replayssm_spec=True,
+        **_NO_OFFLOAD,
     )
     reasons_ring = k3._config_disable_reasons(ring_cfg, K3)
     assert any("request-scoped ReplaySSM" in r for r in reasons_ring), reasons_ring

@@ -118,39 +118,28 @@ def test_an_override_keeps_its_cut_at_every_draft_length(monkeypatch):
 
 
 def test_kv_offload_is_accepted_for_hicache_only(monkeypatch):
+    # Kimi-K3's checks (test_kimi_k3_spec pins their offload refusals) pass through
     monkeypatch.setattr(
-        target=k31.k3, name="_config_disable_reasons", value=lambda cfg, hf_config: []
+        target=k31.k3,
+        name="_config_disable_reasons",
+        value=lambda cfg, hf_config: ["kimi_k3: lmcache"] if cfg.enable_lmcache else [],
     )
     monkeypatch.delenv(name="SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", raising=False)
-    # the fp32 KDA state the wide launch reads, so the offload flags are the only refusals
-    monkeypatch.setenv(name="SGLANG_MAMBA_SSM_DTYPE", value="float32")
     hf_config = SimpleNamespace(dsa_config={"index_topk": 2048})
-    off = dict(
-        enable_lmcache=False,
-        enable_flexkv=False,
-        disaggregation_decode_enable_offload_kvcache=False,
-    )
     cfg = dict(
         enable_hierarchical_cache=True,
-        dcp_size=8,
-        attn_cp_size=1,
-        enable_prefill_cp=False,
+        enable_lmcache=False,
         speculative_num_draft_tokens=6,
-        **off,
     )
     assert k31.Feature.KV_OFFLOAD in k31.SPEC.features
     assert (
         k31.SPEC.config_disable_reasons(cfg=SimpleNamespace(**cfg), hf_config=hf_config)
         == []
     )
-    for flag in off:
-        reasons = k31.SPEC.config_disable_reasons(
-            cfg=SimpleNamespace(
-                **{**cfg, "enable_hierarchical_cache": False, flag: True}
-            ),
-            hf_config=hf_config,
-        )
-        assert len(reasons) == 1 and "HiCache" in reasons[0], (flag, reasons)
+    reasons = k31.SPEC.config_disable_reasons(
+        cfg=SimpleNamespace(**{**cfg, "enable_lmcache": True}), hf_config=hf_config
+    )
+    assert reasons == ["kimi_k3: lmcache"], reasons
     # host-only checkpoints ring ReplaySSM state by request row, not by mamba slot
     monkeypatch.setenv(name="SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT", value="1")
     reasons = k31.SPEC.config_disable_reasons(

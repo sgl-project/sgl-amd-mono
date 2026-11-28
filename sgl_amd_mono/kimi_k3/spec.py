@@ -109,8 +109,9 @@ SGLANG_READS = {
     ),
     # the MXFP4 expert layout the launch reads, as AITER's MoE was given it
     "srt/layers/quantization/mxfp4.py": ("_aiter_situ_uses_gu_interleaved_weights",),
-    # the K3 AITER switch (expert layout) and host-only Mamba checkpoint switch
-    # (optional on older SGLang where the field does not exist yet)
+    # the K3 AITER switch the expert layout depends on (its renamed Envs field is
+    # optional: SGLANG_AITER_K3_OPT is read where it does not exist yet) and the
+    # host-only Mamba checkpoint switch (required)
     "srt/environ.py": ("envs", "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT"),
     # the SiTU parameters K2 hard-codes
     "srt/configs/kimi_linear.py": (
@@ -168,6 +169,12 @@ SGLANG_READS = {
         "dcp_size",
         "attn_cp_size",
         "enable_prefill_cp",
+    ),
+    # the KV offload paths Feature.KV_OFFLOAD admits besides HiCache
+    "srt/arg_groups/fields/*.py": (
+        "enable_lmcache",
+        "enable_flexkv",
+        "disaggregation_decode_enable_offload_kvcache",
     ),
     # the attention stops here and the launch runs o_proj; both attention
     # classes expose it. The rest are what the forward and the checks read.
@@ -270,6 +277,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
             f"SiTU (beta, linear_beta) is {situ}; the launch computes ({BETA}, {LBETA})"
         )
     if cfg is not None:
+        reasons += _offload_disable_reasons(cfg)
         dcp = cfg.dcp_size or 1
         if dcp not in DCP_SIZES:
             reasons.append(f"--dcp-size {dcp} is not one of {list(DCP_SIZES)}")
@@ -364,6 +372,22 @@ def _o_proj_operands(o_proj):
             f"the FP8 o_proj is {tuple(storage.shape)}, not [{hidden}, {CORE}]"
         )
     return (oproj.O_FP8_SHUFFLED if shuffled else oproj.O_FP8), storage, scale
+
+
+def _offload_disable_reasons(cfg) -> list[str]:
+    # Feature.KV_OFFLOAD also admits these; only HiCache has run under the wide launches.
+    flags = {
+        "--enable-lmcache": cfg.enable_lmcache,
+        "--enable-flexkv": cfg.enable_flexkv,
+        "--disaggregation-decode-enable-offload-kvcache": (
+            cfg.disaggregation_decode_enable_offload_kvcache
+        ),
+    }
+    return [
+        f"{flag}: only HiCache's KV offload is supported"
+        for flag, on in flags.items()
+        if on
+    ]
 
 
 def _host_only_mamba() -> bool:
