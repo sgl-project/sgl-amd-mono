@@ -132,10 +132,11 @@ class MlaPreBuild:
     kv_eps: float = 1e-6  # kv_a_layernorm
     write_idx: int = -1  # a block-write layer's block: the updated prefix stored there
     qn: bool = False  # stage 3: q_nope @ w_kc -> qn (the MLA absorb)
+    timeline: bool = False
+    # new fields after timeline, so a positional timeline keeps its meaning
     has_indexer: bool = True  # Kimi-K3.1 DSA indexer projections (False on Kimi-K3)
     qkv_fmt: int = wfmt.BF16  # w_qkv and w_g format (wfmt.BF16/FP8/FP8_SHUFFLED)
     qb_fmt: int = wfmt.BF16  # weight format of w_qb
-    timeline: bool = False
 
 
 def scratch_layout(key: MlaPreBuild) -> dict:

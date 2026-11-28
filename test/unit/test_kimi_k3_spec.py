@@ -756,31 +756,50 @@ def test_mla_build_accepts_quark_fp8_without_indexer(monkeypatch, caplog):
 
     import logging
 
+    biased = make_layer()
+    biased.self_attn.g_proj.bias = torch.zeros(mp.GATE, dtype=torch.bfloat16)
     with caplog.at_level(logging.INFO):
+        assert k3._mla_build(biased, 8) is None
         assert k3._mla_build(make_layer(g_bf16=True), 8) is None
         assert k3._mla_build(make_layer(with_indexer=True), 8) is None
     assert "w_qkv format" in caplog.text
+    assert "g_proj has a bias" in caplog.text
     assert "indexer layers require bf16" in caplog.text
 
 
-def test_mla_pre_launch_refuses_an_indexer_layer_without_its_outputs():
-    """With an indexer, stages 1 and 2 write its projections: missing buffers are an error
-    before dispatch, not a null pointer."""
+def test_mla_pre_launch_refuses_an_indexer_layer_without_its_outputs(monkeypatch):
+    """With an indexer, stages 1 and 2 write its projections: with every other operand
+    valid, each missing indexer buffer stops the launch before dispatch."""
     import pytest
     import torch
 
     from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
     from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
+    dispatched = []
+    monkeypatch.setattr(mp, "build", lambda key: "launcher")
+    monkeypatch.setattr(mp, "_run_compiled", lambda *a: dispatched.append(a))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+
+    def bf(*shape):
+        return torch.empty(*shape, dtype=torch.bfloat16)
+
     key = mp.MlaPreBuild(tokens=8, nblocks=3)
     assert key.has_indexer
-    blocks = torch.zeros(8, 8, HIDDEN, dtype=torch.bfloat16)
-    w = {n: torch.zeros(1) for n in ("w_k", "w_p", "w_iq")}
-    full = {n: torch.zeros(1) for n in ("idx_q", "idx_k", "idx_w")}
-    for gone in full:
+    w = dict(
+        ares_nw=bf(HIDDEN), ares_qk=bf(HIDDEN), in_nw=bf(HIDDEN),
+        w_qkv=bf(mp.LATW, HIDDEN), w_g=bf(mp.GATE, HIDDEN), w_qb=bf(mp.QB, mp.QL),
+        w_k=bf(mp.IK, HIDDEN), w_p=bf(mp.IW, HIDDEN), w_iq=bf(mp.IQ, mp.QL),
+        q_nw=bf(mp.QL), kv_nw=bf(mp.KV),
+    )  # fmt: skip
+    full = {n: bf(1) for n in ("q", "latent", "k_nope", "q_lora", "gate")}
+    full.update({n: bf(1) for n in ("idx_q", "idx_k", "idx_w")})
+    kw = dict(prefix=bf(8, HIDDEN), blocks=bf(8, 8, HIDDEN), w=w, scratch=bf(1),
+              layer=3, epoch=torch.zeros(1, dtype=torch.int32))  # fmt: skip
+    mp.mla_pre_launch(key, out=full, **kw)
+    assert len(dispatched) == 1
+    for gone in ("idx_q", "idx_k", "idx_w"):
         out = {n: t for n, t in full.items() if n != gone}
         with pytest.raises(AssertionError, match=f"lacks \\['{gone}'\\]"):
-            mp.mla_pre_launch(
-                key, prefix=None, blocks=blocks, w=w, out=out, scratch=None, layer=3,
-                epoch=None,
-            )  # fmt: skip
+            mp.mla_pre_launch(key, out=out, **kw)
+    assert len(dispatched) == 1

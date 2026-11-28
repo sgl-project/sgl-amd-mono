@@ -886,6 +886,8 @@ def _mla_proj_operands(linear, name: str, shape: tuple[int, int]):
     weight = getattr(linear, "weight", None)
     if weight is None:
         raise ValueError(f"{name} has no weight")
+    if getattr(linear, "bias", None) is not None:
+        raise ValueError(f"{name} has a bias, which the launch does not add")
     if weight.dtype == torch.bfloat16:
         if tuple(weight.shape) != shape or not weight.is_contiguous():
             raise ValueError(
