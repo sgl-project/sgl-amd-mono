@@ -559,8 +559,8 @@ def _dsa_fusable(layer) -> bool:
         and w_ln.is_contiguous()
         and res_proj_w is not None
         and res_proj_w.numel() == H
-        and getattr(res_norm, "variance_epsilon", None)
-        == getattr(ln, "variance_epsilon", None)
+        and getattr(ln, "variance_epsilon", None) is not None
+        and getattr(res_norm, "variance_epsilon", None) == ln.variance_epsilon
         and isinstance(act_fn, SituAndMul)
         and act_fn.beta == 4.0
         and act_fn.linear_beta == 25.0
@@ -656,7 +656,8 @@ def _mono_pre_q_view(tree):
       self.qk_head_dim)``, a statement directly in ``if self.q_lora_rank is not None and
       pre is not None`` (or ``if pre is not None``), a statement of the function body,
       after only plain name assignments in that branch; ``name`` is not used again in it,
-      and after the ``if`` chain it goes to ``self._split_q_nope_pe`` and nowhere else;
+      and after the ``if`` chain it goes to ``self._split_q_nope_pe`` as its first
+      argument and nowhere else;
     - ``"_mono_pre"`` appears once (pre's assignment), and no import binds ``self``,
       ``pre``, ``forward_batch``, ``q_replicate_active`` or ``name``;
     - no other way to bind a name (``:=``, ``match``, lambdas, nested functions or
@@ -821,7 +822,8 @@ def _mono_pre_q_view(tree):
             if not (
                 isinstance(n.ctx, ast.Load)
                 and isinstance(call, ast.Call)
-                and n in call.args
+                and call.args
+                and call.args[0] is n
                 and ast.dump(call.func) == dump("self._split_q_nope_pe")
             ):
                 return None

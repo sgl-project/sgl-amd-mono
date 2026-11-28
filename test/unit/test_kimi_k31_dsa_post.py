@@ -224,6 +224,7 @@ def test_dsa_fusable_negative_gates(monkeypatch) -> None:
         {"w_sd_shape": (wide.H, 512)},
         {"w_sd_contig": False},
         {"res_eps": 1e-6, "ln_eps": 1e-5},
+        {"res_eps": None, "ln_eps": None},
         {"res_proj_shape": (1, 1024)},
         {"w_ln_shape": (1024,)},
         {"w_ln_contig": False},
