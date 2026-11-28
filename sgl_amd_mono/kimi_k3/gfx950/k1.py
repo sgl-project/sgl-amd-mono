@@ -311,8 +311,9 @@ def _validate_in_proj_operands(attn) -> None:
                 f"not a contiguous bf16 [{kda.NPROJ}, {HIDDEN}]"
             )
         return
-    qkvg = attn.fused_qkvg_proj
-    if qkvg.weight.dtype == torch.float8_e4m3fn:
+    qkvg = getattr(attn, "fused_qkvg_proj", None)
+    w_qkvg = getattr(qkvg, "weight", None)  # a qweight-only projection has none
+    if w_qkvg is not None and w_qkvg.dtype == torch.float8_e4m3fn:
         fa, bp = attn.f_a_proj, attn.b_proj
         _, w_q, _ = _quark_fp8_storage(linear=qkvg, name="KDA fused_qkvg_proj")
         _, w_f, _ = _quark_fp8_storage(linear=fa, name="KDA f_a_proj")

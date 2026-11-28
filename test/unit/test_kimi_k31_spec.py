@@ -191,6 +191,22 @@ def test_an_unmerged_in_proj_is_refused(monkeypatch):
     assert any("not merged" in r for r in reasons), reasons
 
 
+def test_a_qweight_only_kda_projection_is_refused_with_a_reason(monkeypatch):
+    """An unmerged projection with no `weight` (GPTQ / AWQ-style qweight) is refused with
+    the not-merged reason instead of raising AttributeError out of the check."""
+    from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
+
+    attn = SimpleNamespace(
+        use_full_rank_gate=True,
+        _bfa_f_b_w=None,
+        _qkvgbfa_layer=None,
+        fused_qkvg_proj=SimpleNamespace(qweight=torch.empty(1, dtype=torch.int32)),
+        f_b_proj=SimpleNamespace(weight=torch.empty(1536, 128, dtype=torch.bfloat16)),
+    )
+    with pytest.raises(ValueError, match="not merged"):
+        k1_mod._validate_in_proj_operands(attn)
+
+
 def test_k31_refuses_k3_wide_disabled(monkeypatch):
     monkeypatch.setattr(k31.k3, "WIDE", False)
     monkeypatch.setattr(k31.k3, "_config_disable_reasons", lambda **kwargs: [])
@@ -205,8 +221,9 @@ def test_k31_refuses_k3_wide_disabled(monkeypatch):
     assert any("SGLANG_AMD_MONO_K3_WIDE=0" in r for r in reasons), reasons
 
 
-def test_row_count_tile_configs_meet_plan_and_tile_invariants():
+def test_row_count_tile_configs_meet_plan_and_tile_invariants(monkeypatch):
     # Guards against out-of-bounds K-splits or LDS/CTA overflows across all (L, bucket) pairs.
+    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
     import math
 
     from sgl_amd_mono.common.plan import BLOCKS
@@ -374,3 +391,38 @@ def test_a_draft_length_serving_no_routed_wide_width_builds_no_wide_launch(monke
         model, None, SimpleNamespace(widths=(*range(1, 9), 80, 160, 270)), use_wide=True
     )
     assert made == [(5, 160)]
+
+
+def test_the_narrow_mla_handoff_needs_no_indexer_and_is_cleared_on_error(monkeypatch):
+    """A Kimi-K3 MLA layer has no indexer attribute: the handoff skips it, and `_mono_pre`
+    is gone again even when SGLang's attention raises."""
+    import sglang.srt.layers.layer_boundary.residual.batch as batch
+
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
+    rows = 8
+    monkeypatch.setattr(mp, "mla_pre_launch", lambda key, **kw: None)
+    monkeypatch.setattr(mp, "scratch_layout", lambda key: {"x": (0, rows * HIDDEN * 2)})
+    monkeypatch.setattr(batch, "set_written", lambda *a: None)
+    built = object.__new__(k31.k3._Built)
+    out = {n: torch.zeros(1) for n in ("q", "latent", "k_nope", "q_lora", "gate")}
+    built._mla_out = {rows: out}
+    built.runner = SimpleNamespace(
+        scratch=torch.zeros(rows * HIDDEN * 2, dtype=torch.uint8), epoch=None
+    )
+    seen = []
+
+    def attend(layer, x, forward_batch, zero_allocator):
+        seen.append(dict(layer.self_attn.__dict__["_mono_pre"]))
+        raise RuntimeError("attention failed")
+
+    built._pre_o_proj = attend
+    layer = SimpleNamespace(self_attn=SimpleNamespace())  # no indexer attribute
+    packed = SimpleNamespace(mla=(SimpleNamespace(write_idx=-1, qn=False), {}), i=3)
+    bank = SimpleNamespace(block_residual=None)
+    hidden = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="attention failed"):
+        built._mla_core(layer, packed, hidden, bank, None, None)
+    assert seen and seen[0]["q"] is out["q"] and seen[0]["q_nope_out"] is None
+    assert "_mono_pre" not in layer.self_attn.__dict__

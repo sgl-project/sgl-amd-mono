@@ -671,6 +671,11 @@ def mla_pre_launch(
         f"mla_pre layer {layer} writes bank block {key.write_idx}, the bank has "
         f"{blocks.shape[1]}"
     )
+    if key.has_indexer:
+        # stages 1 and 2 write the indexer's projections: none may be a null pointer
+        missing = [n for n in ("w_k", "w_p", "w_iq") if w.get(n) is None]
+        missing += [n for n in ("idx_q", "idx_k", "idx_w") if out.get(n) is None]
+        assert not missing, f"mla_pre layer {layer} with an indexer lacks {missing}"
     wfmt.check(
         fmt=key.qkv_fmt, w=w["w_qkv"], scale=w.get("w_qkv_s"), rows=LATW, k=HIDDEN
     )

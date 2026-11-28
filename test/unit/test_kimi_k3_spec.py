@@ -761,3 +761,22 @@ def test_mla_build_accepts_quark_fp8_without_indexer(monkeypatch, caplog):
         assert k3._mla_build(make_layer(with_indexer=True), 8) is None
     assert "w_qkv format" in caplog.text
     assert "indexer layers require bf16" in caplog.text
+
+
+def test_mla_pre_launch_refuses_an_indexer_layer_without_its_outputs():
+    """With an indexer, stages 1 and 2 write its projections: missing buffers are an error
+    before dispatch, not a null pointer."""
+    import pytest
+    import torch
+
+    from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+    from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
+
+    key = mp.MlaPreBuild(tokens=8, nblocks=3)
+    assert key.has_indexer
+    blocks = torch.zeros(8, 8, HIDDEN, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="lacks"):
+        mp.mla_pre_launch(
+            key, prefix=None, blocks=blocks, w={}, out={}, scratch=None, layer=3,
+            epoch=None,
+        )  # fmt: skip
