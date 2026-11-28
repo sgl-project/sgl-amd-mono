@@ -35,7 +35,8 @@ def test_the_plugin_registers_the_spec():
         backend=sgl_amd_mono.BACKEND, architectures=arch, isa="gfx950"
     )
     assert found is qwen.SPEC, why
-    assert found.devices["gfx950"].widths == tuple(range(1, 9))
+    # K1 and K2 at 1 to 8 rows, layer_block at 16
+    assert found.devices["gfx950"].widths == (*range(1, 9), 16)
     found, why = registry.find_spec(
         backend=sgl_amd_mono.BACKEND, architectures=arch, isa="gfx942"
     )
@@ -243,3 +244,34 @@ def test_aux_hidden_states_run_sglangs_forward():
     built.lm = LM()
     built.lm.model = SimpleNamespace(layers_to_capture=[2])
     assert built.forward(None, None, None, None) == "sglang"
+
+
+@pytest.mark.parametrize("mxfp4", [False, True])
+def test_the_split_keys_run_the_gdn_front(mxfp4):
+    layers = [_layer(i, fse=True, mxfp4=mxfp4) for i in range(3)]
+    layers.append(_layer(3, gdn=False, fse=True))
+    keys = qwen._split_keys(layers, 1e-6, 1e-5, True, 8, 0, 0)
+    assert [k is None for k in keys] == [False, False, False, True]
+    gdn = keys[:3]
+    assert gdn[0].first and not any(k.first for k in gdn[1:])
+    assert all(k.split and k.tokens == 16 and k.kind == "gdn" for k in gdn)
+    # each split launch runs its own input norm, so each writes its MXFP4 rows
+    assert all(k.first_q4 == ("plain" if mxfp4 else "none") for k in gdn)
+    assert all(k.qkvz == ("mxfp4" if mxfp4 else "bf16") for k in gdn)
+    assert all(k.qkvz_shuffled == mxfp4 for k in gdn)
+    assert all(k.out == "bf16" and k.eps == 1e-6 and k.gdn_eps == 1e-5 for k in gdn)
+    assert all(k.state_bf16 for k in gdn)
+
+
+def test_each_gdn_layer_gets_the_split_key_of_its_format():
+    layers = [_layer(0, fse=True, mxfp4=True), _layer(1, fse=True)]
+    keys = qwen._split_keys(layers, 1e-6, 1e-6, False, 8, 0, 0)
+    assert [k.qkvz for k in keys] == ["mxfp4", "bf16"]
+
+
+def test_the_split_launch_runs_only_in_fse_decode_at_16_rows():
+    fse = [_layer(i, fse=True) for i in range(2)]
+    assert qwen._builds_split(fse, (8, 16), verify=False)
+    assert not qwen._builds_split(fse, (8, 16), verify=True)
+    assert not qwen._builds_split(fse, (8,), verify=False)
+    assert not qwen._builds_split([_layer(0, fse=False)], (8, 16), verify=False)
