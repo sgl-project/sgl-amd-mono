@@ -204,7 +204,7 @@ def test_mono_pre_caps_and_verify_qb_consistency(monkeypatch) -> None:
     dcp4 = _fake_mla_layer(dcp_size=4, qrep_active=True, prepare_fn=_qrep_prepare)
     assert wide._mla_verify_qb(dcp4, par_dcp8) is None
 
-    # 4. Local-only SGLang + DCP1: L=8 enables buckets 16/32 (64 skipped); L=6 bucket 48 runs m_mla=32
+    # 4. Local-only SGLang + DCP1: L=8 enables buckets 16/32 (64 skipped); L=6 bucket 30 runs m_mla=30
     ci_dcp1 = _fake_mla_layer(dcp_size=1, prepare_fn=_local_only_prepare)
     qb_local = wide._mla_verify_qb(ci_dcp1, par_dcp1)
     assert qb_local == mpw.QB_LOCAL
@@ -215,10 +215,12 @@ def test_mono_pre_caps_and_verify_qb_consistency(monkeypatch) -> None:
     w.L = 6
     w.buckets = wide.buckets(6)
     assert w._mla_bucket_specs(24) == {mpw.QB_LOCAL: 24}
-    assert w._mla_bucket_specs(48) == {mpw.QB_LOCAL: 32}
+    # dense ladder: rows 25..30 have bucket 30, so bucket 48 (rows 43..48) is past the cap
+    assert w._mla_bucket_specs(30) == {mpw.QB_LOCAL: 30}
+    assert w._mla_bucket_specs(48) == {}
     assert w._mla_bucket_specs(96) == {}
 
-    # 5. PR #53130 SGLang + DCP8 qrep: L=8 enables buckets 16/32 (64 skipped); L=6 bucket 48 runs m_mla=32
+    # 5. PR #53130 SGLang + DCP8 qrep: L=8 enables buckets 16/32 (64 skipped); L=6 bucket 30 runs m_mla=30
     new_dcp8 = _fake_mla_layer(dcp_size=8, qrep_active=True, prepare_fn=_qrep_prepare)
     assert wide._sglang_mono_pre_caps(new_dcp8.self_attn) == (True, True)
     qb_qrep = wide._mla_verify_qb(new_dcp8, par_dcp8)
@@ -232,7 +234,9 @@ def test_mono_pre_caps_and_verify_qb_consistency(monkeypatch) -> None:
     w.L = 6
     w.buckets = wide.buckets(6)
     assert w._mla_bucket_specs(24) == {mpw.QB_QREP: 24}
-    assert w._mla_bucket_specs(48) == {mpw.QB_QREP: 32}
+    # dense ladder: rows 25..30 have bucket 30, so bucket 48 (rows 43..48) is past the cap
+    assert w._mla_bucket_specs(30) == {mpw.QB_QREP: 30}
+    assert w._mla_bucket_specs(48) == {}
     assert w._mla_bucket_specs(96) == {}
 
 
@@ -513,7 +517,7 @@ def test_mla_warmup_preserves_tp_epoch_and_clears_scratch(monkeypatch) -> None:
             idx_w=z(b, mpw.IW),
         ),
     )
-    w._ensure = lambda bucket, L, caps: bufs
+    w._ensure = lambda *, b, L: bufs
 
     w.warmup(buckets=(b,))
 

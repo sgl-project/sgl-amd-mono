@@ -2,8 +2,9 @@
 """Kimi-K3.1 wide launch tile configs keep every tile stage of a launch in one BLOCKS round.
 
 A launch runs on BLOCKS CTAs; a tile stage with more tasks than BLOCKS sends CTAs
-through a second round of its tiles. The task counts come from the KDA layer
-launch's own plan (``layer.plan``), so they are what the kernel runs, on CPU.
+through a second round of its tiles. The task counts come from the launches' own
+plans (``layer.plan`` for a KDA layer, ``dsa_post.plan`` for a DSA layer), so they
+are what the kernels run, on CPU.
 """
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
 from sgl_amd_mono.kimi_k31 import wide
+from sgl_amd_mono.kimi_k31.gfx950 import dsa_post as dp
 from sgl_amd_mono.kimi_k31.gfx950 import layer as lay
 from sgl_amd_mono.kimi_k31.gfx950.chain import Gemm
 
@@ -43,6 +45,7 @@ def _tile_tasks(b: int, L: int, cfgs) -> dict:
         "kda": lay.plan(b, cfg, L, 3, 4, wide.NF, False)[0],
         "kda attn_res capture": lay.plan(b, cfg, L, 3, 4, wide.NF, "attn_res")[0],
         "kda prefix capture": lay.plan(b, cfg, L, 3, 4, wide.NF, "prefix")[0],
+        "dsa_post": dp.plan(b, cfg.oproj, cfg.front, cfg.sdown, wide.NF, 3)[0],
     }
     tasks = {
         (kind, s.name): s.tasks
@@ -52,8 +55,9 @@ def _tile_tasks(b: int, L: int, cfgs) -> dict:
     }
     # a renamed or dropped stage must not silently leave the check
     for kind in plans:
+        want = TILE_STAGES if kind.startswith("kda") else TILE_STAGES[2:]
         stages = {n for k, n in tasks if k == kind}
-        assert stages == set(TILE_STAGES), (kind, sorted(tasks))
+        assert stages == set(want), (kind, sorted(tasks))
     return tasks
 
 
