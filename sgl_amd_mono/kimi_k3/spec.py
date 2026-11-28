@@ -408,7 +408,9 @@ def _wide_step_shape(
     from sgl_amd_mono.kimi_k31 import wide
 
     tokens = int(draft_tokens or 1) if spec_algo is not None else 1
-    max_bs = int(graph_max_bs or 0) or int(max_running_reqs or 0)
+    # the larger cap: an eager server routes up to max_running_reqs, a graph one up to
+    # the graph cap (and an unset one is 0)
+    max_bs = max(int(graph_max_bs or 0), int(max_running_reqs or 0))
     if max_bs == 0:
         return tokens, True
     if tokens not in wide.SUPPORTED_L:

@@ -1194,10 +1194,7 @@ class Wide:
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
         self.peers_dsa, self.half_dsa = {}, {}
-        # each bucket holds buffers and compiles a launch
-        self.buckets = buckets(L=L, max_rows=max_rows)
-        # the steps this L serves; the spec's widths also hold other draft lengths' (serves)
-        self.widths = frozenset(w for w in widths_at(L) if w <= self.buckets[-1])
+        self._size(L, max_rows)
         self.tabs = {}  # (bucket, layer) -> KDA table: every pointer in it is fixed once built
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # long enough for a capture variant's first compile on one rank while the
@@ -1237,6 +1234,12 @@ class Wide:
                 for k, v in sorted(own.items(), key=lambda x: -x[1])
             )
         )
+
+    def _size(self, L: int, max_rows) -> None:
+        # each bucket holds buffers and compiles a launch
+        self.buckets = buckets(L=L, max_rows=max_rows)
+        # the steps this L serves; the spec's widths also hold other draft lengths' (serves)
+        self.widths = frozenset(w for w in widths_at(L) if w <= self.buckets[-1])
 
     def serves(self, rows: int) -> bool:
         """Whether a routed step of rows rows runs the wide launch. The spec's widths are one

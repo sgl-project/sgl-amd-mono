@@ -569,6 +569,10 @@ def test_the_host_only_ring_refusal_follows_the_widths_this_draft_length_serves(
     monkeypatch.setenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", "128,256,384")
     reasons = k3._config_disable_reasons(cfg, K3)
     assert not any("request-scoped ReplaySSM" in r for r in reasons), reasons
+    # an eager server routes up to its running cap: 16 requests reach 120 rows
+    eager = SimpleNamespace(**{**vars(cfg), "max_running_requests": 16})
+    reasons = k3._config_disable_reasons(eager, K3)
+    assert any("request-scoped ReplaySSM" in r for r in reasons), reasons
 
 
 def test_kimi_k31_says_the_host_only_ring_refusal_once(monkeypatch):

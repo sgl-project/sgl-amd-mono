@@ -90,25 +90,23 @@ def _routed(L: int) -> set:
 
 
 def test_every_recipe_step_is_routed_to_a_launch(monkeypatch) -> None:
-    """Every request count each point runs reaches a launch; one that does not runs SGLang's
-    whole step (or pads to the next graph and pays for the padding)."""
+    """Every request count each point runs reaches a launch (one that does not runs SGLang's
+    whole step, or pads to the next graph), and a step past NARROW rows is one the wide
+    launch built for the point's L and cap serves, not another L's width left to SGLang."""
     monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
     missing = {
         point: sorted(set(range(1, max_reqs + 1)) - _routed(L))
         for point, (L, max_reqs) in RECIPE.items()
     }
     assert not any(missing.values()), missing
-
-
-def test_every_recipe_step_past_narrow_runs_the_wide_launch(monkeypatch) -> None:
-    """A routed step past NARROW rows is one the wide launch serves at the point's L (not
-    another L's width that falls back to SGLang), and a bucket holds it."""
-    monkeypatch.delenv(name="SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
     off = {}
     for point, (L, max_reqs) in RECIPE.items():
-        served, top = set(wide.widths_at(L)), wide.buckets(L)[-1]
         rows = [L * r for r in range(1, max_reqs + 1) if L * r > wide.NARROW]
-        if bad := [b for b in rows if b not in served or b > top]:
+        if not rows:
+            continue
+        runner = object.__new__(wide.Wide)
+        runner._size(L, max_rows=rows[-1])  # what Wide.__init__ sizes for the point
+        if bad := [b for b in rows if not runner.serves(b) or b > runner.buckets[-1]]:
             off[point] = bad
     assert not off, off
 
