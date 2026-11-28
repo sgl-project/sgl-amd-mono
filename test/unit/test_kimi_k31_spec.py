@@ -181,6 +181,20 @@ def test_a_bf16_kda_layer_passes(monkeypatch):
     assert _reasons(monkeypatch) == []
 
 
+def test_a_biased_merged_in_proj_is_refused(monkeypatch):
+    from sgl_amd_mono.kimi_k3.gfx950 import k1 as k1_mod
+
+    real = k1_mod._validate_in_proj_operands
+
+    def biased(attn):
+        attn._qkvgbfa_layer.bias = torch.zeros(1)
+        return real(attn)
+
+    monkeypatch.setattr(k1_mod, "_validate_in_proj_operands", biased)
+    reasons = _reasons(monkeypatch)
+    assert any("merged KDA in-projection has a bias" in r for r in reasons), reasons
+
+
 def test_a_kda_weight_the_wide_launch_cannot_read_is_refused(monkeypatch):
     reasons = _reasons(monkeypatch, in_proj=torch.float32)
     assert any("merged KDA in-projection" in r for r in reasons), reasons

@@ -318,6 +318,8 @@ def _quark_fp8_storage(linear, name: str):
         isinstance(scheme, QuarkW8A8Fp8) and scheme.weight_qscheme == "per_channel"
     ):
         raise ValueError(f"an FP8 {name} is read only as Quark per-channel FP8")
+    if getattr(linear, "bias", None) is not None:
+        raise ValueError(f"the FP8 {name} has a bias, which the launch does not add")
     # The launch multiplies the bf16 activation and applies only the weight scale;
     # a static input scale would be clipped and rounded by SGLang and not by it.
     if scheme.is_static_input_scheme:

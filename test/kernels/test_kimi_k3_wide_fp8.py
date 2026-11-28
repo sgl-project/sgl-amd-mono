@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GPU kernel checks for Kimi-K3 FP8 wide KDA layer, bf16 state, non-ReplaySSM, and split K1."""
+"""GPU kernel checks for Kimi-K3 FP8 wide KDA layer, bf16 state, non-ReplaySSM, split K1,
+and the narrow mla_pre on bf16 / Quark FP8 weights without an indexer."""
 
 import os
 import subprocess

@@ -244,7 +244,7 @@ def _resolve_f_b(attn):
     fb_mod = getattr(attn, "f_b_proj", None)
     if getattr(fb_mod, "bias", None) is not None:
         raise ValueError("f_b_proj has a bias, which the launch does not add")
-    w_fb = attn._bfa_f_b_w
+    w_fb = getattr(attn, "_bfa_f_b_w", None)
     if (
         isinstance(w_fb, torch.Tensor)
         and w_fb.dtype == torch.bfloat16
@@ -304,6 +304,10 @@ def _validate_in_proj_operands(attn) -> None:
         return
     merged = attn._qkvgbfa_layer
     if merged is not None:
+        if getattr(merged, "bias", None) is not None:
+            raise ValueError(
+                "the merged KDA in-projection has a bias, which the launch does not add"
+            )
         w_in = merged.weight
         if not (
             w_in.dtype == torch.bfloat16

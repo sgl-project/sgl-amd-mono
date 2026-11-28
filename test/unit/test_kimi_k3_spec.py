@@ -478,6 +478,17 @@ def test_split_quark_fp8_in_proj_and_caching(monkeypatch, b_dtype):
     )
     k1._validate_in_proj_operands(attn)
     assert not hasattr(attn, "_sgl_amd_mono_k1_ops")
+    # a bias on any FP8 projection the packing reads is refused (the launch adds none)
+    for name in ("fused_qkvg_proj", "f_a_proj"):
+        lin = getattr(attn, name)
+        biased = SimpleNamespace(
+            **{
+                **vars(attn),
+                name: SimpleNamespace(**{**vars(lin), "bias": torch.zeros(1)}),
+            }
+        )
+        with pytest.raises(ValueError, match="has a bias"):
+            k1._validate_in_proj_operands(biased)
     ops1 = k1._in_proj_operands(attn)
     ops2 = k1._in_proj_operands(attn)
     assert ops1 is ops2
