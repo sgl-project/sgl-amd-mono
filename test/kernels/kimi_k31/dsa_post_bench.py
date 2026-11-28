@@ -199,6 +199,7 @@ def run(args, m, rank, dev, cpu):
             launch,
             cores[i].data_ptr(),
             wo[i].data_ptr(),
+            0,  # wo_s: a bf16 o_proj has no FP8 scale
             pfx_full[i].data_ptr() + col0,
             pout[i].data_ptr() + col0,
             bank[i].data_ptr(),
