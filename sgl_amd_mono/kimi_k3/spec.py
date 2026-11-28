@@ -622,8 +622,8 @@ def _mono_pre_q_view(tree):
     check: anything else reads as unsupported, and the layer keeps SGLang's own front.
 
     - ``q_replicate_active`` is not a parameter; it is assigned once, before the view, to
-      ``_QREP_PREDICATE``'s conjunction (any order), whose ``forward_batch`` is the
-      function's parameter, never rebound.
+      ``_QREP_PREDICATE``'s conjunction (any order), whose ``forward_batch`` is a named
+      (not ``*`` / ``**``) parameter of the function, never rebound.
     - ``pre = self.__dict__.get("_mono_pre")`` is its one assignment; every other use of
       ``pre`` is ``pre is (not) None``, a read of ``pre["<key>"]`` or ``pre.get("<key>")``
       of another key than "q"; ``"_mono_pre"`` appears only there.
@@ -639,8 +639,9 @@ def _mono_pre_q_view(tree):
       ``maybe_capture_indexer_topk``, ``pre[...].unsqueeze``; a name filter on those
       forms, the callee objects themselves are not checked).
     - The statement right after the ``if`` chain assigns or returns
-      ``self._split_q_nope_pe(name, <a name or constant>)``; every later use of
-      ``name`` is an argument of that split.
+      ``self._split_q_nope_pe(name, <a name or constant>)``, no keywords; any later use
+      of ``name`` is the first argument of a ``self._split_q_nope_pe`` call (its other
+      arguments are not checked there).
       What the split's outputs go through afterwards is not checked.
     - No other way to bind a name (``:=``, ``match``, lambdas, nested functions or
       classes, comprehensions, ``global`` / ``nonlocal``, ``except ... as``, ``import
@@ -693,10 +694,11 @@ def _mono_pre_q_view(tree):
     ):
         return None
     a = fn.args
-    params = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
-    params |= {p.arg for p in (a.vararg, a.kwarg) if p is not None}
+    named = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    # every parameter name, the variadic ones included (for the shadowing checks)
+    params = named | {p.arg for p in (a.vararg, a.kwarg) if p is not None}
     # the predicate reads the step's own batch: a parameter never rebound
-    if {"q_replicate_active", "pre"} & params or "forward_batch" not in params:
+    if {"q_replicate_active", "pre"} & params or "forward_batch" not in named:
         return None
     if any(
         isinstance(n, ast.Name)
