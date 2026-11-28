@@ -5,7 +5,8 @@ o_proj -> RS + residual -> MLP AttnRes -> MoE front -> route (+ sort) / shared S
 Checks prefix_out (with OOB prefix clamping), latent, shared_out and logits against the f32 reference; the top-k
 ids and weights against the launch's own logits, and the same routing on every rank; the sort against aiter's
 (aux16) or SGLang's (sgl) on the launch's own ids. Checks eager launches, then one CUDA-graph replay on fresh
-inputs, and times the graph with cold-L2 flushing.
+inputs, and times the graph with cold-L2 flushing. ``--o-fp8``: o_proj in Quark per-channel FP8 (Kimi-K3's
+checkpoint), preshuffled as the launch reads it; the reference uses every rank's dequantized slice.
 
     python3 -m torch.distributed.run --nproc-per-node 8 test/kernels/kimi_k31/dsa_post_bench.py \
         --rows 12,24,48 --nvb-m 3 --sort aux16 --front-map --timeline
@@ -74,6 +75,7 @@ def run(args, m, rank, dev, cpu):
 
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
+    from sgl_amd_mono.kimi_k3.gfx950.stages import wfmt
     from sgl_amd_mono.kimi_k31.gfx950 import dsa_post as dp
     from sgl_amd_mono.kimi_k31.gfx950.chain import Gemm
     from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
@@ -106,6 +108,7 @@ def run(args, m, rank, dev, cpu):
         timeline=args.timeline,
         front_rows=front_rows,
         sort=args.sort,
+        o_fmt=wfmt.FP8_SHUFFLED if args.o_fp8 else wfmt.BF16,
     )
     half = pl.peer_offsets[1]
     peers = PeerBuffer(2 * half + guard.FLAG_BYTES, cpu, rank, TP, dev)
@@ -144,6 +147,22 @@ def run(args, m, rank, dev, cpu):
 
     cores = [c[:, rank * KO : (rank + 1) * KO].contiguous() for c in cores_all]
     wo = [w[:, rank * KO : (rank + 1) * KO].contiguous() for w in wo_all]
+    wo_s = [None] * nl
+    if args.o_fp8:
+
+        def quant(w):  # [H, KO] bf16 -> Quark per-channel FP8 and its fp32 row scale
+            s = (w.float().abs().amax(dim=1) / 448.0).clamp(min=1e-12)
+            q = (w.float() / s[:, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            return q.contiguous(), s.contiguous()
+
+        for i in range(nl):
+            parts = [quant(wo_all[i][:, r * KO : (r + 1) * KO]) for r in range(TP)]
+            # the reference sees what every rank's FP8 slice holds
+            wo_all[i] = torch.cat(
+                [(q.float() * s[:, None]).to(BF) for q, s in parts], dim=1
+            )
+            wo[i] = wfmt.preshuffle_fp8(parts[rank][0])
+            wo_s[i] = parts[rank][1]
     bank = [b[:, :, cols].contiguous() for b in bank_full]
     cw_m = [(s.float() * p.float()).contiguous() for s, p in zip(w_s, w_p)]
     w_sd = [w[:, rank * SI : (rank + 1) * SI].contiguous() for w in w_sd_all]
@@ -201,7 +220,7 @@ def run(args, m, rank, dev, cpu):
             launch,
             cores[i].data_ptr(),
             wo[i].data_ptr(),
-            0,  # wo_s: a bf16 o_proj has no FP8 scale
+            0 if wo_s[i] is None else wo_s[i].data_ptr(),  # a bf16 o_proj has no scale
             pfx_full[i].data_ptr() + col0,
             pout[i].data_ptr() + col0,
             bank[i].data_ptr(),
@@ -401,7 +420,8 @@ def run(args, m, rank, dev, cpu):
     if rank == 0:
         for name, (e, phase_ok) in phases.items():
             print(
-                f"dsa_post m {m:3d} nvb {nvm} pfx_short {args.pfx_short} {name:6s} "
+                f"dsa_post m {m:3d} nvb {nvm} pfx_short {args.pfx_short} "
+                f"o_proj {'fp8' if args.o_fp8 else 'bf16'} {name:6s} "
                 f"rel_l2 pout {e['p']:.2e} lat {e['lat']:.2e} sh {e['sh']:.2e} "
                 f"logits {e['lg']:.2e} own_w {e['own_w']:.1e} own_diff {e['own']} "
                 f"route_diff {e['route']} sort_bad {e['sort']}"
@@ -440,6 +460,7 @@ def main():
     p.add_argument("--front-map", action="store_true")
     p.add_argument("--timeline", action="store_true")
     p.add_argument("--sort", default=None, choices=(None, "sgl", "aux16"))
+    p.add_argument("--o-fp8", action="store_true")
     args = p.parse_args()
     if args.reps_check < 1:
         p.error("--reps-check must be at least 1: the eager check would not run")
