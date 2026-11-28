@@ -304,6 +304,29 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
             )
         return None
 
+    def _qrep_local_view_on_the_qrep_path(self, q_replicate_active=False):
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            if q_replicate_active:
+                return pre["q"].view(-1, self.num_local_heads, self.qk_head_dim)
+            return pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return None
+
+    def _qrep_rebound_predicate(self, q_replicate_active=False):
+        q_replicate_active = q_replicate_active and self.dcp_size > 8
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None:
+            return pre["q"].view(
+                -1,
+                self.num_local_heads * (self.dcp_size if q_replicate_active else 1),
+                self.qk_head_dim,
+            )
+        return None
+
     for prepare, caps in (
         (_local_view_dcp_elsewhere, (True, False)),
         (_qrep_view_inline, (True, True)),
@@ -311,6 +334,8 @@ def test_mono_pre_caps_read_the_q_view_head_count() -> None:
         (_qrep_reassigned_after_view, (True, False)),
         (_qrep_nested_override, (False, False)),
         (_qrep_literal, (True, False)),
+        (_qrep_local_view_on_the_qrep_path, (False, False)),
+        (_qrep_rebound_predicate, (False, False)),
     ):
         layer = _fake_mla_layer(dcp_size=8, prepare_fn=prepare)
         assert wide._sglang_mono_pre_caps(layer.self_attn) == caps, prepare.__name__

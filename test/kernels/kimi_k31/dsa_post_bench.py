@@ -401,6 +401,8 @@ def main():
     p.add_argument("--timeline", action="store_true")
     p.add_argument("--sort", default=None, choices=(None, "sgl", "aux16"))
     args = p.parse_args()
+    if args.reps_check < 1:
+        p.error("--reps-check must be at least 1: the eager check would not run")
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl")
