@@ -57,12 +57,7 @@ def xgmi_enabled() -> bool:
 
 
 def _resolve_config() -> XgmiConfig:
-    fp4_env = os.environ.get("SGLANG_AMD_MONO_USE_K31_XGMI_FP4")
-    use_fp4 = (
-        fp4_env == "1"
-        if fp4_env is not None
-        else os.environ.get("AITER_SITUV2_A4W4", "0") == "1"
-    )
+    use_fp4 = os.environ.get("SGLANG_AMD_MONO_USE_K31_XGMI_FP4", "0") == "1"
     return XgmiConfig(
         prefill_min_rows=int(
             os.environ.get(
@@ -76,6 +71,20 @@ def _resolve_config() -> XgmiConfig:
         ),
         use_fp4=use_fp4,
     )
+
+
+def _validate_config(cfg: XgmiConfig) -> None:
+    # The hooked layers run SGLang's A8W4 experts (_forward_row_front), which read MXFP8.
+    if cfg.use_fp4:
+        raise ValueError(
+            "SGLANG_AMD_MONO_USE_K31_XGMI_FP4=1 is not servable: the A8W4 experts "
+            "that read the hook's gathered routed input take MXFP8, not MXFP4"
+        )
+    if cfg.prefill_min_rows > cfg.prefill_max_rows:
+        raise ValueError(
+            f"XGMI prefill row window is empty: min {cfg.prefill_min_rows} "
+            f"> max {cfg.prefill_max_rows}"
+        )
 
 
 def _unwrap_backbone(model):
@@ -442,6 +451,7 @@ def install_xgmi_hooks(
     local_error: Optional[Exception] = None
     try:
         cfg = _resolve_config() if config is None else config
+        _validate_config(cfg)
         moe_targets, plan_entries = _collect_moe_plan(model=model, moe_cls=KimiK3MoE)
         local_plan = (
             cfg.prefill_min_rows,

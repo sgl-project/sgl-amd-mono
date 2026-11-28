@@ -505,6 +505,40 @@ def test_install_xgmi_hooks_keeps_row_shard_read_fields():
     assert bank.ffn_row_shard.shard_front is layer.mlp.shard_front
 
 
+def test_xgmi_fp4_default_ignores_aiter_a4w4(monkeypatch):
+    from sgl_amd_mono.kimi_k31.xgmi.hook import _resolve_config
+
+    monkeypatch.delenv("SGLANG_AMD_MONO_USE_K31_XGMI_FP4", raising=False)
+    monkeypatch.setenv("AITER_SITUV2_A4W4", "1")
+    # The hook only takes layers on SGLang's A8W4 experts, which read MXFP8 input.
+    assert _resolve_config().use_fp4 is False
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"SGLANG_AMD_MONO_USE_K31_XGMI_FP4": "1"},
+        {
+            "SGLANG_AMD_MONO_K31_XGMI_PREFILL_MIN": "4096",
+            "SGLANG_AMD_MONO_K31_XGMI_PREFILL_MAX": "2048",
+        },
+    ],
+    ids=["fp4", "inverted_window"],
+)
+def test_install_xgmi_hooks_rejects_unservable_config(monkeypatch, env):
+    (layer0, _, bank0, orig_read0), (layer1, _, bank1, orig_read1) = _two_moe_layers()
+    votes = []
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    _patch_install_collectives(
+        monkeypatch, all_gather=_gather_same, all_reduce=_record_votes(votes)
+    )
+    with pytest.raises(RuntimeError, match="TP ranks disagree"):
+        _install_two(layer0, layer1)
+    assert votes == [0]
+    assert bank0.ffn_row_shard is orig_read0 and bank1.ffn_row_shard is orig_read1
+
+
 def test_install_xgmi_hooks_remote_rank_failure_leaves_layers_untouched(monkeypatch):
     (layer0, _, bank0, orig_read0), (layer1, _, bank1, orig_read1) = _two_moe_layers()
     _patch_install_collectives(
