@@ -6,11 +6,11 @@ request (L = 6 or 8). One request's step runs Kimi-K3's launches: K1 on the KDA
 layers, the MLA projection front on the DSA layers and the layer launch (o_proj to
 the MoE output) on every MoE layer. A step of R >= 2 requests runs
 ``wide.Wide.backbone``: one persistent launch a KDA layer, SGLang's routed experts
-between launches, and SGLang's own path for layer 0, the DSA layers and each run's
-exit.
+between launches, and SGLang's own path for layer 0, DSA attention and each run's
+exit. Eligible DSA projection-front and post-attention stages use fused launches.
 
-The DSA layers keep SGLang's attention up to o_proj, so the indexer, the sparse MLA
-and the decode context parallel (DCP) combine stay on SGLang's path. Under DCP the
+The indexer, sparse MLA and decode context parallel (DCP) combine stay on
+SGLang's path. The fused projection front uses the `_mono_pre` handoff. Under DCP the
 attention hands o_proj the same TP-local 12-head core as without it.
 """
 

@@ -359,6 +359,24 @@ class TestKimiK3MonoKdaPre(CustomTestCase):
         print(f"core_out: cos {cos:.6f}")
         self.assertGreater(cos, COS_MIN, "the KDA recurrence differs")
 
+    def test_a_warm_launch_skips_jit_dispatch(self):
+        """Warm K1 launches must not retrace."""
+        from unittest import mock
+
+        from flydsl.compiler.jit_function import JitFunction
+
+        # setUpClass ran this key once; a call or flyc.compile both trace through here
+        with mock.patch.object(
+            target=JitFunction,
+            attribute="_compile_or_execute",
+            side_effect=AssertionError("a warm K1 launch retraced"),
+        ):
+            case = K1Case(device=self.device, num_acc=QLEN).run()
+        cos = _cos(a=case.core_out, b=_kda_reference(case))
+        self.assertGreater(
+            a=cos, b=COS_MIN, msg=f"the compiled launch differs: cos {cos:.6f}"
+        )
+
     def test_every_acceptance_count(self):
         """num_acc picks both the conv window offset and the initial state slot.
 
