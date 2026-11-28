@@ -605,6 +605,7 @@ def test_kimi_k31_says_the_host_only_ring_refusal_once(monkeypatch):
 
 def test_wide_config_guards_draft_tokens_and_request_scoped_ring(monkeypatch):
     monkeypatch.setattr(k3, "WIDE", True)
+    monkeypatch.delenv("SGLANG_AMD_MONO_K31_WIDE_BUCKETS", raising=False)
     bad_decode = SimpleNamespace(
         dcp_size=1,
         attn_cp_size=1,
@@ -764,6 +765,33 @@ def test_mla_build_accepts_quark_fp8_without_indexer(monkeypatch, caplog):
         assert k3._mla_build(make_layer(with_indexer=True), 8) is None
     assert "w_qkv format" in caplog.text
     assert "g_proj has a bias" in caplog.text
+
+    # a bf16 layer with an indexer builds; a bias on any indexer projection falls back
+    def bf_lin(rows, cols):
+        return SimpleNamespace(
+            weight=torch.zeros(rows, cols, dtype=torch.bfloat16), bias=None
+        )
+
+    def indexed(bias_on=None):
+        layer = make_layer()
+        attn = layer.self_attn
+        attn.fused_qkv_a_proj_with_mqa = bf_lin(mp.LATW, HIDDEN)
+        attn.g_proj = bf_lin(mp.GATE, HIDDEN)
+        attn.q_b_proj = bf_lin(mp.QB, mp.QL)
+        attn.indexer = SimpleNamespace(
+            wk=bf_lin(mp.IK, HIDDEN),
+            weights_proj=bf_lin(mp.IW, HIDDEN),
+            wq_b=bf_lin(mp.IQ, mp.QL),
+        )
+        if bias_on:
+            getattr(attn.indexer, bias_on).bias = torch.zeros(1, dtype=torch.bfloat16)
+        return layer
+
+    assert k3._mla_build(indexed(), 8)[0].has_indexer is True
+    with caplog.at_level(logging.INFO):
+        for m in ("wk", "weights_proj", "wq_b"):
+            assert k3._mla_build(indexed(m), 8) is None, m
+    assert "biased ['wq_b']" in caplog.text
     assert "indexer layers require bf16" in caplog.text
 
 
@@ -793,7 +821,7 @@ def test_mla_pre_launch_refuses_an_indexer_layer_without_its_outputs(monkeypatch
         q_nw=bf(mp.QL), kv_nw=bf(mp.KV),
     )  # fmt: skip
     full = {n: bf(1) for n in ("q", "latent", "k_nope", "q_lora", "gate")}
-    full.update({n: bf(1) for n in ("idx_q", "idx_k", "idx_w")})
+    full.update(idx_q=bf(8, mp.IQ), idx_k=bf(8, mp.IK), idx_w=bf(8, mp.IW))
     kw = dict(prefix=bf(8, HIDDEN), blocks=bf(8, 8, HIDDEN), w=w, scratch=bf(1),
               layer=3, epoch=torch.zeros(1, dtype=torch.int32))  # fmt: skip
     mp.mla_pre_launch(key, out=full, **kw)
@@ -802,4 +830,7 @@ def test_mla_pre_launch_refuses_an_indexer_layer_without_its_outputs(monkeypatch
         out = {n: t for n, t in full.items() if n != gone}
         with pytest.raises(AssertionError, match=f"lacks \\['{gone}'\\]"):
             mp.mla_pre_launch(key, out=out, **kw)
+        # an undersized buffer (one element) is refused as well
+        with pytest.raises(AssertionError, match=gone):
+            mp.mla_pre_launch(key, out={**full, gone: bf(1)}, **kw)
     assert len(dispatched) == 1

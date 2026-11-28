@@ -675,10 +675,19 @@ def mla_pre_launch(
         f"{blocks.shape[1]}"
     )
     if key.has_indexer:
-        # stages 1 and 2 write the indexer's projections: none may be a null pointer
+        # stages 1 and 2 write the indexer's projections: none may be a null pointer or
+        # smaller than the [S, n] bf16 rows written
         missing = [n for n in ("w_k", "w_p", "w_iq") if w.get(n) is None]
         missing += [n for n in ("idx_q", "idx_k", "idx_w") if out.get(n) is None]
         assert not missing, f"mla_pre layer {layer} with an indexer lacks {missing}"
+        for n, cols in (("idx_q", IQ), ("idx_k", IK), ("idx_w", IW)):
+            t = out[n]
+            assert (
+                t.dtype == torch.bfloat16
+                and t.is_contiguous()
+                and t.shape[0] >= key.tokens
+                and t[0].numel() == cols
+            ), (n, tuple(t.shape), t.dtype)
     wfmt.check(
         fmt=key.qkv_fmt, w=w["w_qkv"], scale=w.get("w_qkv_s"), rows=LATW, k=HIDDEN
     )

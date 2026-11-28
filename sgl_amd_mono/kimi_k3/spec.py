@@ -963,9 +963,19 @@ def _mla_build(layer, rows: int):
         "kv_nw": attn.kv_a_layernorm.weight,
     }
     if has_indexer:
-        w["w_k"] = getattr(getattr(idx, "wk", None), "weight", None)
-        w["w_p"] = getattr(getattr(idx, "weights_proj", None), "weight", None)
-        w["w_iq"] = getattr(getattr(idx, "wq_b", None), "weight", None)
+        mods = {"w_k": "wk", "w_p": "weights_proj", "w_iq": "wq_b"}
+        biased = [
+            m
+            for m in mods.values()
+            if getattr(getattr(idx, m, None), "bias", None) is not None
+        ]
+        if biased:  # stages 1 and 2 read the weights only
+            logger.info(
+                "monokernel: no MLA front for layer %d: biased %s", layer_id, biased
+            )
+            return None
+        for n, m in mods.items():
+            w[n] = getattr(getattr(idx, m, None), "weight", None)
         want_idx = {
             "w_k": (mp.IK, HIDDEN),
             "w_p": (mp.IW, HIDDEN),
