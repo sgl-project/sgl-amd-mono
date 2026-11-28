@@ -110,7 +110,7 @@ jobs:
       statuses: write
       actions: read
     outputs:
-      # the model jobs; stage A (`common`) is a job of its own and runs first
+      # the model jobs; `common` (common-runtime) is a job of its own, before them
       matrix: ${{ steps.scope.outputs.matrix }}
       has_models: ${{ steps.scope.outputs.has_models }}
       title_type: ${{ steps.scope.outputs.title_type }}
@@ -206,23 +206,66 @@ jobs:
             -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             -f description="$(cut -c1-140 <<< "Running: $models")" > /dev/null
 
-  # Stage A: `common` (the unit tests and the common kernel tests, ~5 min) runs
-  # first, on its own. The model jobs start only once it passes: a PR that breaks
-  # the package fails here instead of holding both runners for hours. Only a test
-  # failure stops them; a cluster job that never ran (Slurm, the node) lets them
-  # run, and the report still fails `common`.
-  stage-a:
+  # The stages (scripts/ci/models.py, PR_STAGES): each starts only once the one before
+  # it passed, so a PR that breaks something fails in minutes instead of holding the
+  # two GPU runners for hours.
+  # 1. static-checks: every test under test/unit on a CPU runner. cpu-tests.yml runs
+  #    it on every push to the PR, with no label (a pull_request run: no secret, a
+  #    read-only token); this job waits for that run's verdict on the PR's head. The
+  #    PR's code does not run in this pull_request_target run, whose artifacts the
+  #    report trusts.
+  static-checks:
     needs: plan
-    # The gate a dispatched run skips is upstream of this job too, and a skipped
-    # job anywhere upstream skips it unless its condition says otherwise.
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
-    # The name the model jobs have: the mono dashboard and the CI monitor read
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      checks: read
+    steps:
+      - name: Wait for the CPU Tests of the PR's head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ needs.plan.outputs.pr_sha }}
+          CHECK: static-checks (unit + sglang contract)
+        run: |
+          # the newest run of the check on the head; none yet for 20 minutes means
+          # GitHub holds it (a first-time contributor's run waits for approval) or
+          # the head predates cpu-tests.yml
+          for i in $(seq 1 105); do
+            got="$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.name == env.CHECK)] | sort_by(.started_at) | last
+                    | if . == null then "none -" else "\(.status) \(.conclusion // "-") \(.html_url)" end' \
+              || echo "error -")"
+            read -r status conclusion url <<< "$got"
+            if [[ "$status" == completed ]]; then
+              echo "CPU Tests on ${SHA:0:12}: $conclusion ($url)"
+              echo "static-checks: $conclusion, [CPU Tests run]($url)" >> "$GITHUB_STEP_SUMMARY"
+              [[ "$conclusion" == success ]] && exit 0
+              exit 1
+            fi
+            if [[ "$status" == none ]] && (( i >= 20 )); then
+              echo "::error::No CPU Tests run on ${SHA:0:12} after 20 minutes. A maintainer approves a first-time contributor's run in the Actions tab; a head older than cpu-tests.yml needs a new push."
+              exit 1
+            fi
+            sleep 60
+          done
+          echo "::error::CPU Tests on ${SHA:0:12} did not finish in time"
+          exit 1
+
+  # 2. common-runtime: `common` (the unit tests on a GPU node, the common kernel
+  #    tests). A cluster job that never ran (Slurm, the node) is no verdict on the PR:
+  #    the job fails, and the model jobs still run.
+  common:
+    needs: [plan, static-checks]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.static-checks.result == 'success' }}
+    # The name a model's job has: the mono dashboard and the CI monitor read
     # `test (<model>, <tier>)`.
     name: test (common, full)
-    # Two runners on a cluster host that submits Slurm jobs (scripts/ci/runner.sh);
-    # each job takes one of the two CI nodes.
     runs-on: [self-hosted, sgl-amd-mono-mi355x]
     timeout-minutes: 1200
+    outputs:
+      infra: ${{ steps.infra.outputs.infra }}
     env:
       CI_IMAGE: ${{ needs.plan.outputs.image }}
       CI_PR: ${{ needs.plan.outputs.pr }}
@@ -232,8 +275,6 @@ jobs:
       # The runner host's local disk: a shared home may be slow to write.
       RESULTS: /tmp/sgl-amd-mono-ci/${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      # The scripts that run outside the container come from the base branch. The
-      # cluster job fetches the PR and base commits onto the node itself.
       - uses: actions/checkout@v4
         with:
           path: harness
@@ -242,12 +283,26 @@ jobs:
 
       - name: Run on the CI node
         id: launch
-        # slurm_launch.sh fails only when the cluster job itself did not run; the
-        # Judge step decides what that means for the gate
+        # slurm_launch.sh exits non-zero when the cluster job did not run, or with
+        # the job's exit code; the next step tells the two apart
         continue-on-error: true
         env:
           CI_RESULTS: ${{ env.RESULTS }}/common
-        run: bash harness/scripts/ci/slurm_launch.sh "common" "full"
+        run: bash harness/scripts/ci/slurm_launch.sh common full
+
+      - name: Tell a cluster failure from a test failure
+        id: infra
+        env:
+          LAUNCH: ${{ steps.launch.outcome }}
+        run: |
+          # run_model.py's main run stamps result.json "finished" whatever its tests
+          # did (the base tests before it write one without): no stamp means the
+          # cluster job never got that far
+          finished="$(python3 -c 'import json,sys; print(bool(json.load(open(sys.argv[1])).get("finished")))'             "$RESULTS/common/result.json" 2>/dev/null || echo False)"
+          if [[ "$LAUNCH" != success && "$finished" != True ]]; then
+            echo "infra=true" >> "$GITHUB_OUTPUT"
+            echo "::error::common's cluster job did not run (Slurm, the node, the image), not the PR's tests; the model jobs still run"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -259,18 +314,11 @@ jobs:
 
       - name: Judge
         # bash (not the default bash -e) runs with pipefail: a failed check fails
-        # the job instead of passing through tee's exit status. A cluster job that
-        # did not run is no verdict on the PR: the model jobs still run, and the
-        # report fails `common` for it.
+        # the job instead of passing through tee's exit status
         shell: bash
-        env:
-          LAUNCH: ${{ steps.launch.outcome }}
         run: |
-          if [[ "$LAUNCH" != success ]]; then
-            echo "::warning::stage A's cluster job did not run (Slurm or the node, not the PR's tests); the model jobs still run and the report fails common"
-            exit 0
-          fi
-          python3 harness/scripts/ci/report.py --results "$RESULTS" --model "common" \
+          [[ "${{ steps.infra.outputs.infra }}" == true ]] && exit 1
+          python3 harness/scripts/ci/report.py --results "$RESULTS" --model common \
             --title-type "${{ needs.plan.outputs.title_type }}" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Cancel the cluster job
@@ -281,13 +329,16 @@ jobs:
         if: always()
         run: rm -rf "$RESULTS/common"
 
+  # 3-6. Each model's job: server-check, serving-tests, kernel-tests,
+  #    accuracy-and-perf, in order (run_model.py); the first that fails stops it.
   test:
-    needs: [plan, stage-a]
-    # Only after stage A passed, and only when the PR runs a model (an empty
-    # matrix is an error).
+    needs: [plan, common]
+    # Only once common passed (or never ran: a cluster failure), and only when the
+    # PR runs a model (an empty matrix is an error).
     if: >-
       !cancelled() && needs.plan.result == 'success'
-      && needs.stage-a.result == 'success' && needs.plan.outputs.has_models == 'true'
+      && (needs.common.result == 'success' || needs.common.outputs.infra == 'true')
+      && needs.plan.outputs.has_models == 'true'
     name: test (${{ matrix.model }}, ${{ matrix.tier }})
     # Two runners on a cluster host that submits Slurm jobs (scripts/ci/runner.sh);
     # each job takes one of the two CI nodes.
@@ -344,7 +395,7 @@ jobs:
         run: rm -rf "$RESULTS/${{ matrix.model }}"
 
   report:
-    needs: [plan, stage-a, test]
+    needs: [plan, static-checks, common, test]
     # Not on a cancelled run: a newer run (a new label or push) has taken over the status.
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
@@ -370,16 +421,23 @@ jobs:
           PR: ${{ needs.plan.outputs.pr }}
           SHA: ${{ needs.plan.outputs.pr_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          STAGE_A: ${{ needs.stage-a.result }}
+          STATIC: ${{ needs.static-checks.result }}
+          COMMON: ${{ needs.common.result }}
+          COMMON_INFRA: ${{ needs.common.outputs.infra }}
         run: |
           mkdir -p results
           for d in artifacts/mono-ci-*; do [[ -d "$d" ]] && mv "$d" "results/${d#artifacts/mono-ci-}"; done
           rc=0
-          # the model jobs did not start when stage A failed
-          stage_a=""
-          [[ "$STAGE_A" == success ]] || stage_a=--stage-a-failed
+          # the jobs an earlier stage's failure kept from starting
+          not_run=""
+          if [[ "$STATIC" != success ]]; then
+            not_run="static-checks did not pass"
+          elif [[ "$COMMON" != success && "$COMMON_INFRA" != true ]]; then
+            not_run="common-runtime (common) did not pass"
+          fi
           python3 harness/scripts/ci/report.py --scope artifacts/scope/scope.json --results results \
-            --run-url "$RUN_URL" --out report.md $stage_a > report.log 2>&1 || rc=$?
+            --run-url "$RUN_URL" --out report.md --static-checks "$STATIC" --not-run "$not_run" \
+            > report.log 2>&1 || rc=$?
           # A crash of report.py itself must still end the pending status.
           if [[ ! -s report.md ]]; then
             rc=1

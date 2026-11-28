@@ -149,10 +149,11 @@ fi
 RUN_MODEL=(python3 /ci/harness/scripts/ci/run_model.py
     --model "$CI_MODEL" --tier "${CI_TIER:-full}" --mode "${CI_MODE:-pr}" --pr /ci/pr --base /ci/base --out /ci/out --cache /cache)
 
-if [[ "${CI_MODE:-pr}" == pr ]]; then
+if [[ "${CI_MODE:-pr}" == pr && "$CI_MODEL" == common ]]; then
     # The base branch's unit tests first, on their own, before any of the PR's
     # code runs: what they stage is then the base's alone, and kept for the next
     # job. A failure here only turns the comparison off (the main run retries).
+    # Only `common` runs the unit tests in a PR test; a model's job does not.
     docker exec "$NAME" "${RUN_MODEL[@]}" --base-tests-only || true
     for f in "$WS/out/base_tests"/*.json; do
         [[ -s "$f" && ! -e "$BASE_TESTS_SHARED/${f##*/}" ]] || continue

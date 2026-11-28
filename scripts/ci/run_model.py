@@ -16,16 +16,23 @@ differ only in the package or in ``--enable-amd-monokernel``. Sides:
   is kept as the monokernel-off reference (``monokernel_off_ref``) and reused
   until the next weekly run.
 
-PR mode: the base branch's unit tests (kept per merge-base and image, so run
-once), base, then the unit, kernel and timing tests, on and off (GSM8K only),
-then the model's serving tests. A model whose ``models.py`` entry merged before
-its package has no base package; its off side runs the speed test as its base.
-(A model new in the PR is not run at all: ``models.py`` comes from the base branch.) The smoke tier (a model that runs only
-because shared code, or code in many models, changed) runs no accuracy benchmark, whose bound its serving
-tests hold, and times only the gate concurrencies. The tests tier (only the model's
-tests changed) runs its unit, kernel and serving tests: no base side, speed test or
-accuracy benchmark. A PR's kernel tests run with MONO_CI_QUICK_KERNELS=1, at the
-widths each test picks as representative; the nightly and weekly run every width.
+PR mode runs a model's stages in order (``models.PR_STAGES``; the unit tests run
+once, in ``common`` and on CPU, not here): server-check (the PR's server with the
+monokernels on, its routing lines and a few requests, then the serving tests that
+check routing and the steps against prefill), serving-tests (the model's other
+serving tests), kernel-tests (its kernel tests and timing scripts), then
+accuracy-and-perf (the base side's timing scripts and speed test, then on and
+off, GSM8K only; each speed test after an untimed pass of the same load). The first stage that fails stops the rest. A model whose
+``models.py`` entry merged before its package has no base package; its off side
+runs the speed test as its base. (A model new in the PR is not run at all:
+``models.py`` comes from the base branch.) The smoke tier (a model that runs only
+because shared code, or code in many models, changed) runs no accuracy benchmark,
+whose bound its serving tests hold, and times only the gate concurrencies. The
+tests tier (only the model's tests changed) stops after kernel-tests. A PR's kernel
+tests run with MONO_CI_QUICK_KERNELS=1, at the widths each test picks as
+representative; the nightly and weekly run every width. ``common`` runs the base
+branch's unit tests (kept per merge-base and image, so run once), then the PR's
+unit tests and the common kernel tests.
 
 Nightly mode (``--pr`` and ``--base`` both main): the tests, then the on side with
 the model's benchmarks but the weekly ones, and the speed test. It runs no off
@@ -36,8 +43,8 @@ and its serving tests, no benchmark or speed test. Weekly mode: on and off, ever
 speed test on both sides; its off results become the monokernel-off reference
 until the next weekly run.
 
-Every step runs whatever an earlier one did; ``result.json`` (rewritten after each
-step) and ``logs/`` hold the outcome. ``report.py`` judges it.
+Outside the PR stages, every step runs whatever an earlier one did; ``result.json``
+(rewritten after each step) and ``logs/`` hold the outcome. ``report.py`` judges it.
 """
 
 import argparse
@@ -67,8 +74,10 @@ from models import (  # noqa: E402
     OSL,
     PR_COMMON_KERNEL_DESELECT,
     PR_EVALS,
+    PR_STAGES,
     PROMPTS_PER_SLOT,
     RANGE_RATIO,
+    SERVER_CHECK_SELECT,
     weekly_eval,
 )
 
@@ -207,8 +216,9 @@ class Run:
     # -- tests ----------------------------------------------------------------
 
     def pytest(self, name, files, timeout, src=None, into="tests", select=""):
-        """Run ``files`` of the checkout ``src`` (default: the PR) and record the
-        counts, and which tests failed, as ``result[into][name]``."""
+        """Run ``files`` of the checkout ``src`` (default: the PR), only the tests
+        ``select`` (pytest -k) picks if given, and record the counts, which tests
+        ran and which failed, as ``result[into][name]``."""
         src = src or self.args.pr
         files = [f for f in files if (Path(src) / f).exists()]
         if not files:
@@ -241,6 +251,7 @@ class Run:
                     state.setdefault(tid, "passed")
             for st in state.values():
                 counts[st] += 1
+            counts["ran"] = sorted(state)
             # every failure by id and how it failed, so the report can tell the
             # PR's own from the base branch's (a run that failed whole has none:
             # it judges by count)
@@ -307,6 +318,7 @@ class Run:
         while time.time() < deadline:
             if p.poll() is not None:
                 self.log(f"server {side} exited {p.returncode} during startup")
+                self.start_failure = f"exited {p.returncode} during startup"
                 return None, model, args
             try:
                 if requests.get(
@@ -318,6 +330,7 @@ class Run:
                 pass
             time.sleep(10)
         self.log(f"server {side} not ready after {LAUNCH_TIMEOUT}s")
+        self.start_failure = f"not ready after {LAUNCH_TIMEOUT} s"
         self.stop(p)
         return None, model, args
 
@@ -354,15 +367,29 @@ class Run:
             out = self.logs / f"bench-{side}-c{c}.jsonl"
             out.unlink(missing_ok=True)
             n = max(c * PROMPTS_PER_SLOT, PROMPTS_PER_SLOT)
-            rc = self.sh(
+            bench = (
                 f"python3 -m sglang.benchmark.serving --backend sglang --host 127.0.0.1 "
                 f"--port {PORT} --model {shlex.quote(model)} --dataset-name random "
                 f"--random-input-len {ISL} --random-output-len {OSL} "
                 f"--random-range-ratio {RANGE_RATIO} --max-concurrency {c} "
-                f"--num-prompts {n} --warmup-requests {c} --output-file {out}",
-                f"bench-{side}-c{c}",
-                timeout=3 * 3600,
+                f"--num-prompts {n} --warmup-requests {c} --output-file "
             )
+            # An untimed pass of the same load first: the shapes a server meets the
+            # first time compile then, into caches the next server in this container
+            # reuses, so the side timed first would otherwise read 2-5% slower. Its
+            # prompts are the timed pass's (one seed), so the radix cache is flushed
+            # in between: else about half the timed pass's prefill comes from it.
+            warm = self.logs / f"bench-{side}-c{c}-warmup.jsonl"
+            self.sh(bench + str(warm), f"bench-{side}-c{c}-warmup", timeout=3 * 3600)
+            flushed = self.flush_cache()
+            self.log(f"flush_cache after the warm-up pass: {flushed}")
+            if flushed != 200:
+                res[str(c)] = {
+                    "error": f"cache not flushed after the warm-up ({flushed})"
+                }
+                self.save()
+                continue
+            rc = self.sh(bench + str(out), f"bench-{side}-c{c}", timeout=3 * 3600)
             rows = out.read_text().splitlines() if out.exists() else []
             if rc or not rows:
                 res[str(c)] = {"error": f"exit {rc}"}
@@ -379,6 +406,22 @@ class Run:
                     )
                 }
             self.save()
+
+    def flush_cache(self):
+        """Flush the server's radix cache: its status code, or the error. SGLang
+        refuses while requests are in flight, so it is retried for a minute."""
+        got = None
+        for _ in range(6):
+            try:
+                got = requests.post(
+                    f"http://127.0.0.1:{PORT}/flush_cache", timeout=120
+                ).status_code
+            except requests.RequestException as e:
+                got = type(e).__name__
+            if got == 200:
+                break
+            time.sleep(10)
+        return got
 
     def evals(self, side, threads, names):
         res = self.result["accuracy"].setdefault(side, {})
@@ -573,9 +616,10 @@ class Run:
             # first the sgl-amd-mono the image pins: what a user of this SGLang runs
             self.step("pinned", self.pinned, serve=self.key != "common" and not why)
         if a.mode == "pr":
-            self.step("base-tests", self.base_tests)
             os.environ["MONO_CI_QUICK_KERNELS"] = "1"
         if self.key == "common":
+            if a.mode == "pr":
+                self.step("base-tests", self.base_tests)
             self.install(a.pr)
             self.pytest("unit", ["test/unit"], 1800)
             self.pytest(
@@ -611,14 +655,124 @@ class Run:
                     self.step("off", self.read_monokernel_off_ref, evals, perf=True)
                 self.step("e2e", self.e2e)
             return
+        self.pr_stages(why)
 
-        if a.tier == "tests":
-            self.install(a.pr)
-            self.step("tests", self.tests)
-            if not why:
-                self.step("e2e", self.e2e)
-            return
+    # -- the PR test's stages (models.PR_STAGES) -----------------------------
 
+    def pr_stages(self, why):
+        """A model's stages of the PR test, in order. The first that fails stops
+        the rest (the report lists them as not run): a PR whose server does not
+        start fails in minutes, before its kernel tests and the base side run. The
+        tests tier (only the model's tests changed) has no accuracy-and-perf stage.
+        ``why``: why the model's server cannot run here, or None."""
+        stages = [
+            ("server-check", self.server_check),
+            ("serving-tests", self.serving_tests),
+            ("kernel-tests", self.kernel_tests),
+        ]
+        if self.args.tier != "tests":
+            stages.append(("accuracy-and-perf", self.accuracy_and_perf))
+        assert [n for n, _ in stages] == [n for n, _ in PR_STAGES[2 : 2 + len(stages)]]
+        res = self.result["stages"] = {}
+        failed = None
+        for name, fn in stages:
+            if failed:
+                res[name] = {"state": "not_run", "why": f"{failed} failed"}
+                continue
+            t0 = time.time()
+            try:
+                state, detail = fn(why)
+            except Exception as e:  # an install that failed, a step that raised
+                state, detail = "fail", f"{type(e).__name__}: {e}"
+                self.result.setdefault("step_errors", {})[name] = detail
+            res[name] = {
+                "state": state,
+                "why": detail,
+                "seconds": round(time.time() - t0),
+            }
+            self.log(f"stage {name}: {state}: {detail}")
+            self.save()
+            if state == "fail":
+                failed = name
+        self.save()
+
+    def _tests_state(self, *names):
+        """("fail", why) when one of the ``names`` test runs failed, else ("pass", counts)."""
+        runs = [
+            (n, self.result["tests"][n]) for n in names if n in self.result["tests"]
+        ]
+        bad = [
+            f"{n}: {c['failed']} failed"
+            + (" (timed out)" if c.get("timeout") else "")
+            + "".join(
+                f"; first: `{i}`: {(c.get('failed_msgs') or {}).get(i, '')[:300]}"
+                for i in (c.get("failed_ids") or [])[:1]
+            )
+            for n, c in runs
+            if c["failed"]
+        ]
+        if bad:
+            return "fail", "; ".join(bad)
+        # every file was there, and the selection ran nothing: a renamed test
+        empty = [n for n, c in runs if not c["passed"] and c.get("rc") == 5]
+        if empty:
+            return "fail", f"{', '.join(empty)}: no test selected"
+        return "pass", "; ".join(
+            f"{n}: {c['passed']} passed" for n, c in runs
+        ) or "no tests"
+
+    def server_check(self, why):
+        """The PR's server with the monokernels on (routing lines, a few requests),
+        then the serving tests that check its routing and its steps against prefill."""
+        self.install(self.args.pr)
+        if why:
+            return "skip", f"no server here: {why}"
+        verdict = self.result["server_check"] = self.smoke("on")
+        self.save()
+        if verdict.startswith("fail"):
+            return "fail", verdict
+        self.pytest(
+            "e2e-gate",
+            self.m.get("e2e_tests", []),
+            2 * 3600,
+            select=SERVER_CHECK_SELECT,
+        )
+        state, detail = self._tests_state("e2e-gate")
+        return state, f"server {verdict}; {detail}"
+
+    def serving_tests(self, why):
+        if why:
+            return "skip", f"no server here: {why}"
+        if not self.m.get("e2e_tests"):
+            return "skip", "no serving tests for this model"
+        self.pytest(
+            "e2e",
+            self.m["e2e_tests"],
+            4 * 3600,
+            select=f"not ({SERVER_CHECK_SELECT})",
+        )
+        return self._tests_state("e2e")
+
+    def kernel_tests(self, why):
+        self.install(self.args.pr)
+        self.pytest("kernels", self.m.get("kernel_tests", []), 2 * 3600)
+        self.microbench("pr", self.args.pr)
+        bad = [x["cmd"] for x in self.result["microbench"].get("pr", []) if x["rc"]]
+        state, detail = self._tests_state("kernels")
+        if bad:
+            detail = f"timing script failed: {bad[0]}" + (
+                f"; {detail}" if state == "fail" else ""
+            )
+            return "fail", detail
+        if "kernels" not in self.result["tests"] and not self.m.get("microbench"):
+            return "skip", "no kernel tests or timing scripts for this model"
+        return state, detail
+
+    def accuracy_and_perf(self, why):
+        """The base branch's timing scripts and speed test, then the PR's on side
+        (speed test, GSM8K; GPQA with run-ci-extra) and its off side (the
+        monokernel-off reference, or run here). The report judges them."""
+        a = self.args
         base_has_pkg = all(
             (Path(a.base) / "sgl_amd_mono" / p).is_dir() for p in self.m["packages"]
         )
@@ -635,9 +789,8 @@ class Run:
             evals = []
         if base_has_pkg:
             self.step("base", self.base_side, serve=not why)
-        self.install(a.pr)
-        self.step("tests", self.tests)
         if not why:
+            self.install(a.pr)
             self.step("on", self.side, "on", True, evals=evals)
             # a new model's speed baseline is SGLang's own path
             self.step(
@@ -645,7 +798,9 @@ class Run:
             )
             if not base_has_pkg and "off" in self.result["perf"]:
                 self.result["perf"]["base"] = self.result["perf"].pop("off")
-            self.step("e2e", self.e2e)
+        if why:
+            return "skip", f"no server here: {why}"
+        return "done", "judged by the report"
 
     def pinned(self, serve):
         """The nightly's first step: the image's own sgl-amd-mono, the commit this
@@ -679,40 +834,58 @@ class Run:
             res["serve"] = "skipped: the pinned commit predates this model"
             serve = False
         if serve:
-            p, model, _ = self.serve("pinned", mono=True)
-            if p is None:
-                res["serve"] = "fail: the server did not start"
-            else:
-                try:
-                    self.routing("pinned")
-                    bad = []
-                    for i in range(PINNED_REQUESTS):
-                        try:
-                            r = requests.post(
-                                f"http://127.0.0.1:{PORT}/generate",
-                                json={
-                                    "text": f"Question {i}: what is {i + 17} * 3? Answer:",
-                                    "sampling_params": {
-                                        "max_new_tokens": 64,
-                                        "temperature": 0,
-                                    },
-                                },
-                                timeout=600,
-                            )
-                            if not (r.ok and r.json().get("text")):
-                                bad.append(f"request {i}: HTTP {r.status_code}")
-                        except requests.RequestException as e:
-                            bad.append(f"request {i}: {type(e).__name__}")
-                    routes = self.result["routing"].get("pinned", [])
-                    if bad:
-                        res["serve"] = "fail: " + "; ".join(bad[:3])
-                    elif not routes:
-                        res["serve"] = "fail: no monokernel routing logged"
-                    else:
-                        res["serve"] = f"pass ({PINNED_REQUESTS} requests)"
-                finally:
-                    self.stop(p)
+            res["serve"] = self.smoke("pinned")
         self.save()
+
+    def startup_error(self, side):
+        """The line of the server's log that says why it stopped: the last
+        exception or error line, else its last line."""
+        try:
+            lines = (self.logs / f"server-{side}.log").read_text(errors="replace")
+        except OSError:
+            return "no server log"
+        lines = [x.strip() for x in lines.splitlines() if x.strip()]
+        for x in reversed(lines):
+            if re.search(r"(Error|Exception|error:|Traceback|exit code)", x):
+                return x[-300:]
+        return lines[-1][-300:] if lines else "empty server log"
+
+    def smoke(self, side):
+        """A server with the monokernels on (the installed package): its routing
+        lines and ``PINNED_REQUESTS`` short requests. "pass (...)" or "fail: why"."""
+        p, model, _ = self.serve(side, mono=True)
+        if p is None:
+            why = getattr(self, "start_failure", "")
+            if why.startswith("not ready"):
+                return f"fail: the server did not start: {why}"
+            return f"fail: the server did not start: {self.startup_error(side)}"
+        try:
+            self.routing(side)
+            bad = []
+            for i in range(PINNED_REQUESTS):
+                try:
+                    r = requests.post(
+                        f"http://127.0.0.1:{PORT}/generate",
+                        json={
+                            "text": f"Question {i}: what is {i + 17} * 3? Answer:",
+                            "sampling_params": {
+                                "max_new_tokens": 64,
+                                "temperature": 0,
+                            },
+                        },
+                        timeout=600,
+                    )
+                    if not (r.ok and r.json().get("text")):
+                        bad.append(f"request {i}: HTTP {r.status_code}")
+                except requests.RequestException as e:
+                    bad.append(f"request {i}: {type(e).__name__}")
+            if bad:
+                return "fail: " + "; ".join(bad[:3])
+            if not self.result["routing"].get(side):
+                return "fail: no monokernel routing logged"
+            return f"pass ({PINNED_REQUESTS} requests)"
+        finally:
+            self.stop(p)
 
     def base_side(self, serve):
         """The base branch: its timing scripts and, with ``serve``, its speed test."""

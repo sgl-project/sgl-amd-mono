@@ -69,6 +69,32 @@ cancelled this way.
 
 ## What runs
 
+### Stages
+
+A PR test runs in stages (`PR_STAGES` in `models.py`); each starts only once the
+one before it passed, so a PR that breaks something fails in minutes instead of
+holding both GPU runners for hours. The report lists a stage an earlier failure
+stopped as not run (⏭️).
+
+| Stage | Where | Runs |
+| --- | --- | --- |
+| `static-checks` | `cpu-tests.yml`, a GitHub-hosted CPU runner | every test under `test/unit` (the SGLang contract, each model's spec logic, the copied-code digests) against the SGLang commit inside the newest ROCm image, the one the GPU stages run on (`image_sglang.py`; `SGLANG_FALLBACK_REF` if Docker Hub cannot be read); a test that also fails on the PR's merge-base, the same way, is the base branch's (`cpu_tests.py`). A test that fails only for want of AITER or a GPU is left to `common-runtime`, which runs it on a GPU node |
+| `common-runtime` | the `test (common, full)` job, a CI node | the unit tests again on a GPU node (the base branch's failures excused the same way) and the common kernel tests |
+| `server-check` | each model's job | the PR's server with the monokernels on: startup, its routing lines, 8 requests; then the model's serving tests that check routing and KL against prefill (`SERVER_CHECK_SELECT`) |
+| `serving-tests` | same | the model's other serving tests: MTP verify, per-layer numerics, passkey, GSM8K 200, the fault stop |
+| `kernel-tests` | same | the model's kernel tests at the PR's widths, and its kernel timing scripts |
+| `accuracy-and-perf` | same | the base branch's timing scripts and speed test, then GSM8K on and off (GPQA too with `run-ci-extra`) and the PR's speed test; each speed test runs after an untimed pass of the same load and a radix-cache flush (`/flush_cache`) |
+
+`static-checks` runs on every push to a PR, with no label: `cpu-tests.yml`
+triggers on `pull_request` (no secret, a read-only token), and the AMD PR test's
+`static-checks` job waits for that run's verdict on the PR's head. A first-time
+contributor's run waits for a maintainer's approval in the Actions tab, and so does
+the PR test. A model's stages stop at the first that fails; the tests tier stops after
+`kernel-tests`. A cluster job of `common` that never ran (Slurm, the node) does not
+stop the models: the job fails, and the model jobs still run.
+
+### Which models
+
 `scope.py` maps a PR's changed files to models (`models.py`). The PR test runs
 only the models InferenceX still benchmarks (the "default" models of
 <https://inferencex.semianalysis.com/infx/inference>). An entry with `"pr": False`
@@ -81,26 +107,19 @@ MiniMax-M3) or one whose checkpoint is not on the CI nodes. A dispatch with
 - a change to `sgl_amd_mono/common/`, `sgl_amd_mono/__init__.py` or
   `pyproject.toml` runs every other model's **smoke** tier, and `common`;
 - a model whose tests changed (`test/...`) but not its package code runs the
-  **tests** tier: its unit, kernel and serving tests, with no base side, speed
-  test or accuracy benchmark, since the served kernels are the base branch's;
-- a PR that changes no model runs `common`: the unit tests and the common kernel
-  tests.
+  **tests** tier: its serving and kernel tests, with no base side, speed test or
+  accuracy benchmark, since the served kernels are the base branch's;
+- every PR runs `common` (`common-runtime`), before any model.
 - a PR whose package code changes in more than `FULL_TIER_MAX_MODELS` (3) models,
   such as a refactor or an API move across packages, runs each of them at the
   **smoke** tier instead of the full one, and `common` in full: fourteen full-tier
   jobs would hold both GPU runners for most of a day. The weekly run runs them in
   full; to run a PR in full anyway, run the workflow by hand with `models`.
 
-Every run tests `common` first, as **stage A** (the `stage-a` job, shown as
-`test (common, full)`; ~5 minutes, estimated): the unit tests and the common
-kernel tests except the TP4 fault sweep (`PR_COMMON_KERNEL_DESELECT`, ~9 minutes),
-which the nightly runs; the TP2 fault test and the clean run still run on every
-PR. The model jobs start only once it passes, so a PR that breaks the package fails
-in minutes instead of holding both runners for hours; the report then lists each
-model as not run. Only a test failure stops them: when stage A's cluster job does
-not run at all (Slurm, the node), the model jobs still run and the report fails
-`common`. GitHub queues the model jobs when stage A ends, so on a busy day they
-wait behind jobs queued in the meantime.
+In a PR test, `common` leaves the TP4 fault sweep of the common kernel tests to the
+nightly (`PR_COMMON_KERNEL_DESELECT`, ~9 minutes); the TP2 fault test and the clean
+run still run on every PR. GitHub queues the model jobs when `common` ends, so on
+a busy day they wait behind jobs queued in the meantime.
 
 A PR's kernel tests run with `MONO_CI_QUICK_KERNELS=1`: a test whose sweep is long
 checks representative widths only (DeepSeek-V4.1's K1, K2 and target FFN launch at
@@ -126,7 +145,7 @@ these sides:
 
 | Check | PR test, full tier | PR test, smoke tier | Nightly, tests tier (models the PR test runs) | Nightly, full (a dispatch with `models`) | Weekly |
 | --- | --- | --- | --- | --- | --- |
-| Tests | unit (on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same | unit, kernel (the PR test's widths) and serving tests | unit, kernel and serving tests | same |
+| Tests | unit (in `static-checks` and `common`, on the base branch too), the model's kernel tests and serving tests (`test/e2e`) | same | unit, kernel (the PR test's widths) and serving tests | unit, kernel and serving tests | same |
 | Kernel microbenchmark | the model's timing scripts, base and PR | same | main | main | main |
 | Accuracy | sgl-eval GSM8K (1319 questions), on and off; GPQA too with `run-ci-extra` | the serving tests' GSM8K and KL bounds | the serving tests' bounds | GSM8K, GPQA Diamond (and MMMU-Pro for vision models), on | every benchmark (AIME26 x4 too), on and off |
 | E2E performance | InferenceX fixed length at the model's concurrencies, base and on | the gate concurrencies only | none | on (against the monokernel-off reference) | off and on |
@@ -134,7 +153,7 @@ these sides:
 
 E2E performance is `sglang.benchmark.serving`: random 8k in / 1k out, range
 ratio 0.8, 10 prompts a slot. The report keeps median TPOT (p50), which gates, and
-output throughput, which warns on a loss over 2% at a covered concurrency; the
+output throughput, which warns on a loss over 5% at a covered concurrency; the
 other serving metrics swing too much with the monokernels to judge on. With the
 monokernels on, the accuracy benchmarks send no more requests at once than the
 launches cover (`gate_concurrency`): a wider step takes SGLang's own path, and its
@@ -169,10 +188,8 @@ The PR test's status fails when:
 - GSM8K (and GPQA, with `run-ci-extra`) loses significantly with the monokernels
   on: of the questions the on and off runs answer differently, the on run gets
   more wrong, and an exact one-sided McNemar test gives p < 0.05;
-- median TPOT is more than 2% worse than the base side at a covered concurrency
+- median TPOT is more than 5% worse than the base side at a covered concurrency (`PERF_LOSS`: a single run of the same code moves ~3.5%)
   (`gate_concurrency`); at the model's other concurrencies it is a warning;
-- for a `[Perf]` or `[Feat]` PR, none of the PR's models gains 5% or more in
-  median TPOT at a covered concurrency;
 - a step of the run (base, tests, on, off, e2e, ...) raised an error;
 - the PR changes existing lines of `.github/CODEOWNERS` (a new model's added
   owner line is a warning for the reviewer).

@@ -29,13 +29,19 @@ from models import (  # noqa: E402
     EXTRA_EVALS,
     GAIN_TYPES,
     MODELS,
-    PERF_GAIN,
     PERF_LOSS,
     PR_EVALS,
+    PR_STAGES,
     weekly_eval,
 )
 
 PASS, WARN, FAIL = "pass", "warn", "fail"
+# a check or stage an earlier stage's failure stopped: no verdict of its own
+NOT_RUN = "not_run"
+# shown for the reviewer, no verdict: the measured speed gain of a [Perf] PR
+INFO = "info"
+# a stage with nothing to run for this model (no serving tests, no checkpoint here)
+SKIP = "skip"
 
 
 def tests_tier(r):
@@ -50,12 +56,26 @@ def tests_tier(r):
     )
 
 
-ICON = {PASS: "✅", WARN: "⚠️", FAIL: "❌"}
+ICON = {
+    PASS: "✅ pass",
+    WARN: "⚠️ warn",
+    FAIL: "❌ fail",
+    NOT_RUN: "⏭️ not run",
+    INFO: "ℹ️ info",
+    SKIP: "➖ skip",
+}
 MARKER = "<!-- sgl-amd-mono-ci -->"
 
 
 def worst(*states):
     return FAIL if FAIL in states else WARN if WARN in states else PASS
+
+
+def stopped(r, stage):
+    """Why ``stage`` of a PR test's model job did not run (an earlier stage
+    failed), or None."""
+    st = r.get("stages", {}).get(stage, {})
+    return st.get("why") if st.get("state") == NOT_RUN else None
 
 
 def mcnemar(off, on):
@@ -74,6 +94,11 @@ def scope_check(key, r):
     m = MODELS.get(key, {})
     if r.get("skipped", {}).get("serving"):
         return WARN, f"serving not run: {r['skipped']['serving']}"
+    if str(r.get("server_check", "")).startswith("fail"):
+        return FAIL, f"monokernel server: {r['server_check'][len('fail: ') :]}"
+    if r.get("stages", {}).get("server-check", {}).get("state") == FAIL:
+        if not r.get("routing", {}).get("on"):
+            return FAIL, f"server-check: {r['stages']['server-check']['why']}"
     if r.get("perf", {}).get("on", {}).get("error"):
         return FAIL, f"monokernel server: {r['perf']['on']['error']}"
     if r.get("tier") == "tests":
@@ -91,6 +116,8 @@ def scope_check(key, r):
 
 
 def accuracy_check(key, r):
+    if why := stopped(r, "accuracy-and-perf"):
+        return NOT_RUN, f"not run: {why}"
     m = MODELS.get(key, {})
     names = m.get("evals", [])
     if r.get("mode", "pr") == "pr":
@@ -185,6 +212,8 @@ def perf_check(key, r, needs_gain):
     models (``best_gain``), not per model. Output throughput is shown, and a loss
     over PERF_LOSS at a covered concurrency warns. The other serving metrics
     swing too much with the monokernels to judge on."""
+    if why := stopped(r, "accuracy-and-perf"):
+        return NOT_RUN, f"not run: {why}", []
     m = MODELS.get(key, {})
     nightly = r.get("mode") in ("nightly", "weekly")
     if not m.get("concurrency"):
@@ -252,7 +281,7 @@ def perf_check(key, r, needs_gain):
     else:
         rule = f"no loss over {PERF_LOSS:.0%} at conc {m['gate_concurrency']}"
         if needs_gain and best is not None:
-            rule += f"; best gain {best:+.1%} (the ≥{PERF_GAIN:.0%} gain is judged across the PR)"
+            rule += f"; best gain {best:+.1%} (for reference)"
         sides = "base → PR"
     return (
         worst(PASS, *states),
@@ -345,22 +374,56 @@ def _names(ids, n=3):
     return ", ".join(short) + (f" and {len(ids) - n} more" if len(ids) > n else "")
 
 
+# a PR test's model job: which stage runs each of its test runs (no unit tests:
+# `common` and the CPU stage run them)
+PR_TEST_RUNS = {
+    "e2e-gate": "server-check",
+    "e2e": "serving-tests",
+    "kernels": "kernel-tests",
+}
+# what each test run is, in the report: test/unit, test/kernels and test/e2e
+RUN_LABEL = {
+    "unit": "logic tests (test/unit, no GPU kernels)",
+    "kernels": "kernel tests (test/kernels: each launch against SGLang's ops)",
+    "e2e-gate": "server tests: routing and KL vs prefill (test/e2e)",
+    "e2e": "server tests: the rest (test/e2e)",
+}
+
+
 def tests_check(key, r):
     m = MODELS.get(key, {})
     t = r.get("tests", {})
-    expected = ["unit"] + (
-        ["kernels"] if key == "common" or m.get("kernel_tests") else []
-    )
-    if m.get("e2e_tests") and not r.get("skipped", {}).get("e2e"):
-        expected.append("e2e")
+    serving = m.get("e2e_tests") and not r.get("skipped", {}).get("e2e")
+    if "stages" in r:
+        expected = (["e2e-gate", "e2e"] if serving else []) + (
+            ["kernels"] if m.get("kernel_tests") else []
+        )
+    else:
+        expected = ["unit"] + (
+            ["kernels"] if key == "common" or m.get("kernel_tests") else []
+        )
+        if serving:
+            expected.append("e2e")
     states, parts = [], []
     for name in expected:
         c = t.get(name)
+        if c is None and (why := stopped(r, PR_TEST_RUNS.get(name, ""))):
+            states.append(NOT_RUN)
+            parts.append(f"{RUN_LABEL.get(name, name)}: not run ({why})")
+            continue
+        if c is None and name == "e2e-gate" and "stages" in r:
+            # server-check stopped at the server, before its serving tests
+            st = r["stages"].get("server-check", {})
+            states.append(FAIL if st.get("state") == FAIL else WARN)
+            parts.append(
+                f"{RUN_LABEL.get(name, name)}: did not run ({st.get('why', '?')})"
+            )
+            continue
         if c is None:
             states.append(FAIL)
             parts.append(f"{name}: did not run")
             continue
-        s = f"{name} {c['passed']} passed"
+        s = f"{RUN_LABEL.get(name, name)}: {c['passed']} passed"
         new, why = compare_base(r, name, c) if c["failed"] else (None, None)
         if new == []:
             # every failure also fails on the base branch, with the same message: the
@@ -394,6 +457,8 @@ def micro_check(key, r):
     m = MODELS.get(key, {})
     if not m.get("microbench"):
         return WARN, "no kernel-only timing script for this model in CI yet"
+    if why := stopped(r, "kernel-tests"):
+        return NOT_RUN, f"not run: {why}"
     mb = r.get("microbench", {})
     pr = mb.get("pr", [])
     if not pr:
@@ -433,15 +498,100 @@ def pinned_check(r):
     return (FAIL if bad else PASS), " · ".join(parts)
 
 
+def _test_file(test_id):
+    """test.e2e.test_x_server.TestY::test_z -> test_x_server.py"""
+    parts = test_id.split("::")[0].split(".")
+    if len(parts) > 1 and parts[-1][:1].isupper():
+        parts = parts[:-1]  # a unittest class
+    return parts[-1] + ".py"
+
+
+def stage_tests(r, stage):
+    """What a stage of a model's job ran, for its row: the test files and how many
+    of their tests passed, the timing scripts, the benchmarks."""
+    t, out = r.get("tests", {}), []
+    for name, st in PR_TEST_RUNS.items():
+        c = t.get(name)
+        if st == stage and c:
+            files = sorted({_test_file(i) for i in c.get("ran", [])})
+            out.append(
+                f"{RUN_LABEL.get(name, name)}: {c['passed']}/{c['passed'] + c['failed']} passed"
+                + (f" ({', '.join(files)})" if files else "")
+            )
+    if stage == "server-check" and r.get("server_check"):
+        out.insert(0, f"server: {r['server_check']}")
+    if stage == "kernel-tests" and r.get("microbench", {}).get("pr"):
+        out.append(f"{len(r['microbench']['pr'])} timing script(s)")
+    if stage == "accuracy-and-perf":
+        acc = r.get("accuracy", {}).get("on", {})
+        perf = r.get("perf", {}).get("on", {})
+        if acc:
+            out.append("on: " + ", ".join(sorted(acc)))
+        if perf:
+            done = sorted((c for c in perf if c.isdigit()), key=int)
+            if done:
+                out.append("speed at conc " + ", ".join(done))
+    return "; ".join(out) or "–"
+
+
+def stage_table(r, checks):
+    """A PR test model job's stages: state, what ran, time. accuracy-and-perf runs
+    to the end and has no state of its own: its checks' worst."""
+    by_name = {n: s for n, s, _ in checks}
+    rows, states = [], []
+    for stage, _ in PR_STAGES[2:]:
+        st = r["stages"].get(stage)
+        if st is None:  # the tests tier stops before accuracy-and-perf
+            continue
+        state = st["state"]
+        if state == "done":
+            state = worst(
+                *(by_name.get(n, PASS) for n in ("Accuracy", "E2E performance"))
+            )
+        # (a skipped stage is no verdict; its check rows warn when it matters)
+        states.append(state)
+        why = st.get("why", "")
+        secs = st.get("seconds")
+        ran = stage_tests(r, stage)
+        rows.append(
+            f"| {ICON[state]} | `{stage}` | {ran}"
+            + (
+                f" — {why}"
+                if state in (FAIL, WARN, NOT_RUN, SKIP) and why and why not in ran
+                else ""
+            )
+            + f" | {f'{secs // 60} min' if secs is not None else '–'} |"
+        )
+    return rows, states
+
+
+def fast_fail(r):
+    """The line that says which stage stopped a model's job, on which error, and
+    what it kept from running; None when no stage failed."""
+    stages = r.get("stages", {})
+    failed = [n for n, st in stages.items() if st.get("state") == FAIL]
+    if not failed:
+        return None
+    skipped = [n for n, st in stages.items() if st.get("state") == NOT_RUN]
+    head = f"❌ **FAST FAIL at `{failed[0]}`**: {stages[failed[0]].get('why', '?')}"
+    if not skipped:
+        return head
+    return (
+        head
+        + "\n\nNot run because of it: "
+        + ", ".join(f"`{n}`" for n in skipped)
+        + "."
+    )
+
+
 def model_section(key, r, needs_gain):
     if r.get("not_run"):
-        # stage A failed: the model's job never started, so it has no checks
-        return FAIL, "\n".join(
+        # an earlier stage (static-checks, common-runtime) failed: no job started
+        return NOT_RUN, "\n".join(
             [
                 f"### {MODELS.get(key, {}).get('name', key)} (`{key}`)",
                 "",
-                f"{ICON[FAIL]} Not run: {r['not_run']}. Fix `common` first; the model "
-                "jobs start once it passes.",
+                f"⏭️ Not run: {r['not_run']}.",
             ]
         )
     checks = [("Scope", *scope_check(key, r))] if key != "common" else []
@@ -466,9 +616,13 @@ def model_section(key, r, needs_gain):
         "",
         f"Node `{r.get('node', '?')}` · baseline: {r.get('baseline', 'n/a')} · SGLang `{r.get('sglang', '?')}`",
         "",
-        "| | Check | Result |",
-        "|---|---|---|",
     ]
+    stage_rows, stage_states = stage_table(r, checks) if r.get("stages") else ([], [])
+    if ff := fast_fail(r):
+        lines += [ff, ""]
+    if stage_rows:
+        lines += ["| | Stage | Ran | Time |", "|---|---|---|---|", *stage_rows, ""]
+    lines += ["| | Check | Result |", "|---|---|---|"]
     lines += [f"| {ICON[s]} | {n} | {t} |" for n, s, t in checks]
     if r.get("mode") == "weekly":
         off = r.get("accuracy", {}).get("off", {})
@@ -513,7 +667,7 @@ def model_section(key, r, needs_gain):
                 "```",
                 "</details>",
             ]
-    return worst(*(s for _, s, _ in checks)), "\n".join(lines)
+    return worst(*(s for _, s, _ in checks), *stage_states), "\n".join(lines)
 
 
 def best_gain(key, r):
@@ -531,16 +685,17 @@ def best_gain(key, r):
     return max(gains, default=None)
 
 
-# Set by --stage-a-failed: the model jobs did not start, as stage A (common) failed.
-STAGE_A_FAILED = False
+# Set by --not-run: why the jobs without a result never started (an earlier stage
+# of the PR test failed)
+NOT_RUN_WHY = ""
 
 
 def load(results: Path, key):
     p = results / key / "result.json"
     if p.exists():
         return json.loads(p.read_text())
-    if STAGE_A_FAILED and key != "common":
-        return {"model": key, "not_run": "stage A (`common`) failed"}
+    if NOT_RUN_WHY:
+        return {"model": key, "not_run": NOT_RUN_WHY}
     return {"model": key, "error": "no result.json: the job did not finish"}
 
 
@@ -564,13 +719,18 @@ def main():
     ap.add_argument("--run-url", default="")
     ap.add_argument("--out")
     ap.add_argument(
-        "--stage-a-failed",
-        action="store_true",
-        help="PR test: stage A (common) failed, so the model jobs did not run",
+        "--not-run",
+        default="",
+        help="PR test: why the jobs without a result never started (an earlier stage failed)",
+    )
+    ap.add_argument(
+        "--static-checks",
+        default="",
+        help="PR test: the static-checks job's result (success, failure, ...)",
     )
     args = ap.parse_args()
-    global STAGE_A_FAILED
-    STAGE_A_FAILED = args.stage_a_failed
+    global NOT_RUN_WHY
+    NOT_RUN_WHY = args.not_run
     results = Path(args.results)
 
     if args.model:
@@ -596,7 +756,7 @@ def main():
         overall = worst(*states)
         head = [
             MARKER,
-            f"## {args.title}: {ICON[overall]} {overall}",
+            f"## {args.title}: {ICON[overall]}",
             "",
             f"Models: {', '.join(f'`{k}`' for k in keys)} · monokernels on vs off{run}",
         ]
@@ -604,10 +764,15 @@ def main():
         scope = json.loads(Path(args.scope).read_text())
         needs_gain = scope["needs_gain"]
         rules = scope["rules"]
-        states, sections = [], []
+        states, sections, fast_fails = [], [], []
         for key in sorted(scope["models"]):
-            s, text = model_section(key, load(results, key), needs_gain)
+            r = load(results, key)
+            s, text = model_section(key, r, needs_gain)
             states.append(s)
+            stages = r.get("stages", {})
+            failed = [n for n, st in stages.items() if st.get("state") == FAIL]
+            if failed:
+                fast_fails.append((key, failed[0], stages[failed[0]].get("why", "?")))
             why = scope["models"][key]
             sections.append(
                 text.replace(
@@ -615,6 +780,21 @@ def main():
                 )
             )
         rule_rows = [
+            (f"FAST FAIL: `{k}` at `{stage}`", FAIL, why[:300])
+            for k, stage, why in fast_fails
+        ]
+        if args.static_checks:
+            ok = args.static_checks == "success"
+            rule_rows.append(
+                (
+                    "static-checks (CPU: test/unit, the SGLang contract)",
+                    PASS if ok else FAIL,
+                    "passed"
+                    if ok
+                    else f"{args.static_checks}: see the `static-checks` job's summary in the run",
+                )
+            )
+        rule_rows += [
             ("Rules: CODEOWNERS", *rules["codeowners"]),
             ("Doc", *rules["doc"]),
         ]
@@ -628,28 +808,28 @@ def main():
             }
             if not gains:
                 rule_rows.append(
-                    ("Speed gain", WARN, "no model has a speed result to judge")
+                    ("Speed gain (for reference)", INFO, "no model has a speed result")
                 )
             else:
                 k, g = max(gains.items(), key=lambda kv: kv[1])
-                ok = g >= PERF_GAIN
                 rule_rows.append(
                     (
-                        "Speed gain",
-                        PASS if ok else FAIL,
-                        f"best median-TPOT gain {g:+.1%} (`{k}`); needs ≥{PERF_GAIN:.0%} at a covered concurrency of one of the PR's models",
+                        "Speed gain (for reference)",
+                        INFO,
+                        f"best median-TPOT gain measured here {g:+.1%} (`{k}`, at a covered concurrency); "
+                        "the author's numbers in the PR are what show the speedup",
                     )
                 )
         states += [s for _, s, _ in rule_rows]
         overall = worst(*states)
         gain_note = (
-            f"`[{scope['title_type']}]` PR: needs a ≥{PERF_GAIN:.0%} median-TPOT gain at a covered concurrency of one of its models."
+            f"`[{scope['title_type']}]` PR: the author shows the speedup; this test checks for no loss over {PERF_LOSS:.0%} and shows the gain it measures."
             if needs_gain
             else f"`[{scope['title_type'] or '?'}]` PR: no speed gain needed; no loss over {PERF_LOSS:.0%}."
         )
         head = [
             MARKER,
-            f"## AMD PR test: {ICON[overall]} {overall}",
+            f"## AMD PR test: {ICON[overall]}",
             "",
             f"Models: {', '.join(f'`{k}`' for k in sorted(scope['models']))} · {gain_note}{run}",
             "",
@@ -657,6 +837,16 @@ def main():
             "|---|---|---|",
         ]
         head += [f"| {ICON[s]} | {n} | {t} |" for n, s, t in rule_rows]
+        head += [
+            "",
+            "<details><summary>Stages: each starts only once the one before it passed</summary>",
+            "",
+            "| Stage | Runs |",
+            "|---|---|",
+            *(f"| `{n}` | {what} |" for n, what in PR_STAGES),
+            "",
+            "</details>",
+        ]
     report = "\n".join(head) + "\n\n" + "\n\n".join(sections) + "\n"
     if args.out:
         Path(args.out).write_text(report)

@@ -1,0 +1,117 @@
+name: CPU Tests
+
+# The first stage of the AMD PR test: every test under test/unit (the SGLang
+# contract, each model's spec logic, the copied-code digests, layouts) on a
+# GitHub-hosted CPU runner. It runs on every push to a PR, with no label, and
+# pr-test-amd.yml waits for its verdict on the PR's head before any GPU job starts.
+# A test that fails on the PR's merge-base too, the same way, is the base branch's
+# and does not fail it (scripts/ci/cpu_tests.py). See scripts/ci/README.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpu-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-checks:
+    name: static-checks (unit + sglang contract)
+    runs-on: ubuntu-latest
+    # two runs of test/unit (cpu_tests.py gives each 30 min) after the install
+    timeout-minutes: 90
+    env:
+      REF: ${{ github.event.pull_request.head.sha || github.sha }}
+      # a PR compares with its merge-base, a push to main with the commit before it
+      BASE: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+      # When the newest image's SGLang commit cannot be read (Docker Hub down), the
+      # tests run against this one
+      SGLANG_FALLBACK_REF: a987a5b1947d63549bb50e1bb3d2778f477ab27c
+    steps:
+      # The script that judges, from the event's commit (the PR merged into its base)
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the base branch
+        # (a new branch's first push has no commit before it: 000...0)
+        if: env.BASE != '' && !startsWith(env.BASE, '0000000')
+        run: |
+          base="$(git -C pr merge-base "$BASE" "$REF" 2>/dev/null || echo "$BASE")"
+          # (a commit gone from every ref, e.g. after a force-push: no comparison)
+          git -C pr cat-file -e "$base^{commit}" 2>/dev/null             || { echo "::warning::base $base is not in the clone; no comparison"; exit 0; }
+          git -C pr worktree add -q --detach ../base "$base"
+          echo "base: $(git -C base log -1 --format='%h %s')"
+
+      # The SGLang the GPU stages test against: the commit inside the newest ROCm
+      # image, the one the PR test's plan picks (scripts/ci/image_sglang.py)
+      - name: The SGLang commit of the newest ROCm image
+        id: sglang
+        run: |
+          if got="$(python3 harness/scripts/ci/image_sglang.py)"; then
+            read -r tag sha <<< "$got"
+            echo "SGLang $sha from rocm/sgl-dev:$tag"
+          else
+            sha="$SGLANG_FALLBACK_REF"
+            echo "::warning::could not read the newest image's SGLang commit; testing against $sha"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Check out SGLang
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sglang
+          ref: ${{ steps.sglang.outputs.sha }}
+          path: sglang
+          sparse-checkout: python
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # CPU torch first, so SGLang's install does not pull a CUDA build. SGLang's own
+      # package metadata brings the rest of what its modules import; FlyDSL is AITER's
+      # pin in the SGLang ROCm image. The CUDA-only kernel libraries that metadata
+      # adds are not in the ROCm image, and SGLang imports them when present:
+      # FlashInfer loads the CUTLASS DSL, whose MLIR bindings abort next to FlyDSL's.
+      - name: Install SGLang and the test dependencies
+        env:
+          SGLANG_BUILD_RUST_EXTS: none
+        run: |
+          python -m pip install -q uv
+          uv pip install --system -q torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system -q pytest requests msgspec setuptools setuptools-rust setuptools-scm wheel "flydsl==0.4.2"
+          uv pip install --system -q --no-build-isolation --prerelease allow ./sglang/python
+          uv pip uninstall --system flashinfer-python flashinfer-cubin flashinfer-jit-cache nvidia-cutlass-dsl || true
+          uv pip list --system 2>/dev/null | grep -iE "^(torch|flydsl|sglang|sgl-kernel|triton|transformers) " || true
+          echo "SGLANG_SHA=$(git -C sglang rev-parse --short=10 HEAD)" >> "$GITHUB_ENV"
+
+      - name: Run test/unit
+        shell: bash
+        run: |
+          [[ -d base ]] || BASE=""
+          python3 harness/scripts/ci/cpu_tests.py --pr pr ${BASE:+--base base} --out results \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpu-tests
+          path: results
+          retention-days: 30
+          if-no-files-found: warn
