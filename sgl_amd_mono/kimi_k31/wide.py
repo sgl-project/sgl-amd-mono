@@ -95,8 +95,8 @@ TP, H, SL, E, NF, LAT = 8, 7168, 896, 896, 2096, 3584
 REQ_BUCKETS = (*range(2, 9), *range(10, 33, 2), *range(36, 57, 4))
 SUPPORTED_L = (6, 8)
 BUCKETS = tuple(8 * r for r in REQ_BUCKETS)
-CFGS = {  # rows -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks;
-    # a bucket of b rows takes the smallest key >= b
+CFGS = {  # rows -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; a bucket of b rows takes
+    # the smallest key >= b (the largest key past them all), then the *_ROW_RANGES overrides below
     16: (
         "16:128:1:8:8",
         "16:128:1:8:4",
@@ -615,10 +615,8 @@ class Wide:
         half, scratch = 0, 0
         for pk in self.layers.values():
             nvb_a, nvb_m = pk.nvb, pk.nvb + int(pk.write)
-            for cap in (
-                False,
-                True,
-            ):  # sized for a capture launch too: the captured layers come later
+            # sized for either capture stream too: the captured layers come later
+            for cap in (False, "attn_res", "prefix"):
                 pl = lay.plan(b, cfg, L, nvb_a=nvb_a, nvb_m=nvb_m, nf=NF, capture=cap)[
                     0
                 ]
